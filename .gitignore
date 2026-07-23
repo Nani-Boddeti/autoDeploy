@@ -1,0 +1,19 @@
+# Build artifacts
+/bin/
+/dist/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Runtime data and logs
+*.log
+*.db
+/data/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+

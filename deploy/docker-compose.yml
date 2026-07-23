@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:18.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: autodeploy
+      POSTGRES_USER: autodeploy
+      POSTGRES_PASSWORD: ${AUTODEPLOY_POSTGRES_PASSWORD:?set AUTODEPLOY_POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  postgres-data:
