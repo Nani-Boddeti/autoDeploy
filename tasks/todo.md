@@ -117,7 +117,7 @@ State transitions must be validated in the domain layer and committed transactio
 
 ## Implementation Sequence
 
-- [ ] Initialize Git repository, Go module, formatting, linting, and test commands.
+- [x] Initialize Git repository, Go module, formatting, linting, and test commands.
 - [ ] Add architecture decision records for control-plane/agent separation, GitHub App auth,
       secret handling, queue leases, and release strategies.
 - [ ] Implement PostgreSQL migrations and typed persistence repositories.
@@ -216,10 +216,21 @@ State transitions must be validated in the domain layer and committed transactio
 
 ## Review
 
-Pending user confirmation of the proposed decisions, especially:
+Approved by the user:
 
 1. Automatic domain routing and HTTPS should be included.
 2. Single-admin authentication is acceptable for the first release.
 3. Go + PostgreSQL + Docker/BuildKit + Traefik is acceptable.
 4. Both blue/green and stop-then-start strategies should be available per environment.
 
+## Implementation Progress
+
+- [x] Repository scaffold and CI/tooling verified with Go 1.26.5.
+- [x] Deployment aggregate and lifecycle state machine implemented with:
+  - deterministic transition timestamps;
+  - immutable identity and defensive event copies;
+  - explicit transition, cancellation, failure, supersession, and rollback rules;
+  - optimistic-lock revision;
+  - separately versioned and validated persistence snapshots;
+  - race-tested transition-matrix and corruption coverage.
+- [ ] Next: PostgreSQL schema and typed repositories. This is the resume point.
