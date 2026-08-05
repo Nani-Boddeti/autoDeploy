@@ -119,12 +119,12 @@ State transitions must be validated in the domain layer and committed transactio
 ## Implementation Sequence
 
 - [x] Initialize Git repository, Go module, formatting, linting, and test commands.
-- [ ] Add architecture decision records:
+- [x] Add architecture decision records:
   - [x] Control-plane/agent separation.
   - [x] GitHub App authentication.
   - [x] Secret handling.
   - [x] PostgreSQL queue leases.
-  - [ ] Release strategies.
+  - [x] Release strategies.
 - [x] Implement PostgreSQL migrations and typed persistence repositories.
 - [ ] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
 - [ ] Implement envelope encryption, key rotation metadata, and centralized redaction.
@@ -246,7 +246,9 @@ Approved by the user:
       redaction, credential-provider, build/runtime delivery, backup, and deletion boundaries.
 - [x] ADR 0004 records PostgreSQL at-least-once jobs, attempts, lease renewal/expiry, environment
       fencing, retry/dead-letter, cancellation, recovery, and transaction boundaries.
-- [ ] Next: ADR 0005 for release strategies.
+- [x] ADR 0005 records blue/green and stop-then-start release models, health gates, Traefik file
+      routing, fenced activation/reconciliation, rollback, retention, and cleanup boundaries.
+- [ ] Next: plan admin bootstrap, sessions, CSRF, and authorization implementation.
 
 ## Approved Persistence Slice
 

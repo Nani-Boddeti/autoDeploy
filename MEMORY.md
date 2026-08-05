@@ -145,12 +145,45 @@
     and trigger reconciliation rather than claiming monotonic lease time;
   - polling is authoritative; `LISTEN/NOTIFY` may only be a wake-up hint; terminal retention and
     advanced priority fairness remain deferred.
+- ADR 0005 accepts health-gated blue/green by default and explicit stop-then-start for applications
+  that cannot run two revisions concurrently:
+  - deployment history, reusable release desired state, runtime observation, route head, and
+    append-only release operations are distinct; PostgreSQL is desired truth, while the route file
+    plus Traefik/data-plane observation is serving truth, and disagreement blocks reconciliation;
+  - legal release transitions include candidate/ready failure or cancellation cleanup,
+    ready-to-active activation, active-to-retained replacement, retained-to-active rollback, and
+    failed/retained removal; active releases cannot be cleaned directly;
+  - resource-kind-specific immutable labels distinguish release runtimes from shared images and
+    stable environment networks/volumes; image cleanup is reference-based;
+  - releases use immutable image/config digests and IDs; application containers publish no host
+    ports and join only a stable environment network;
+  - Traefik uses agent-written watched file-provider documents, never Docker discovery/socket;
+    atomic rename is followed by secured API observation and an HTTPS certificate-validating probe;
+  - activation linearizes through the fenced database transition to `activating`, expected route
+    revision, operation digest, serialized host switch, observation, and atomic finalization;
+  - ambiguity blocks the environment for reconciliation and never triggers blind rollback;
+  - blue/green health-checks beside the serving release; after switch it drains 30 seconds, stops,
+    and retains the predecessor;
+  - stop-then-start transitions to `activating`, verifies maintenance/503 routing, drains and
+    proves the old runtime stopped before starting/health-checking the candidate, and restores the
+    old release on failure;
+    dual failure leaves maintenance indefinitely and requires operator recovery;
+  - default HTTP health gate is exact host/path/port, 2xx, redirects off, three consecutive
+    successes, 2-second interval/timeout, and 60-second overall deadline;
+  - rollback is a new durable operation, requires a fresh health gate and eligible immutable
+    resources/secrets, and does not rewrite the target deployment's history;
+  - retain active plus at most two prior successful releases for seven days, drain 30 seconds, and
+    retain failed candidates for 24 hours; protected/referenced resources override cleanup limits;
+  - V1 production routes require HTTPS with HTTP redirect; hostname use requires authenticated
+    administrator assignment and DNS readiness is not ownership proof;
+  - each environment/release is pinned to one server; TCP/UDP, HTTP-only, canary, replicas, and
+    cross-host/global switching remain deferred.
 
 ## Resume Point
 
 - Persistence is complete, verified, committed, and pushed.
-- Next task: ADR 0005 for release strategies. Complete the remaining ADRs sequentially,
-  then plan the admin authentication slice.
+- All five architecture ADRs are complete. Next task: plan the admin bootstrap, secure session,
+  CSRF, and authorization implementation slice.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons
