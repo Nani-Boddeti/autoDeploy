@@ -57,12 +57,22 @@
 - Independent code review passed after remediation.
 - `make check`, `go test -race ./...`, `make test-integration` against PostgreSQL 18, and
   `git diff --check` pass. Independent QA and code review report no blockers.
+- Persistence commit `d6fb873 feat: add PostgreSQL deployment persistence` is synchronized with
+  `origin/main`.
+- ADR 0001 accepts separate control-plane and agent process/trust boundaries:
+  - co-location is allowed and preserves separate credentials/responsibilities, but shares the
+    physical host compromise boundary; separate hosts or separately reviewed isolation are needed
+    for host-compromise isolation;
+  - agents initiate authenticated outbound API communication and never access PostgreSQL;
+  - the control plane owns authorization, desired state, jobs, and audit records without Docker
+    or broad SSH access;
+  - agents own authorized target-host Docker/BuildKit, runtime, cleanup, and routing mutations.
 
 ## Resume Point
 
-- Persistence is complete and verified locally but uncommitted.
-- Next task: add the architecture decision records already listed in `tasks/todo.md`, then plan
-  the admin authentication slice.
+- Persistence is complete, verified, committed, and pushed.
+- Next task: ADR 0002 for GitHub App authentication. Complete the remaining ADRs sequentially,
+  then plan the admin authentication slice.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons

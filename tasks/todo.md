@@ -3,8 +3,7 @@
 ## Status
 
 - Implementation is active on `main`; scaffold, deployment domain, and deployment persistence
-  slices are complete locally.
-- The persistence slice is verified but remains uncommitted.
+  slices are committed and synchronized with `origin/main` through `d6fb873`.
 
 ## Product Goal
 
@@ -31,7 +30,7 @@ must support registering and targeting multiple deployment servers without redes
 - Implementation should prioritize low resource use and reliability.
 - Deployment behavior may differ by application.
 
-## Proposed Decisions Requiring Approval
+## Approved Architecture Decisions
 
 - Stack: Go control plane and Go deployment agent, PostgreSQL, server-rendered HTML with
   minimal JavaScript, Docker/BuildKit, and Traefik.
@@ -119,8 +118,12 @@ State transitions must be validated in the domain layer and committed transactio
 ## Implementation Sequence
 
 - [x] Initialize Git repository, Go module, formatting, linting, and test commands.
-- [ ] Add architecture decision records for control-plane/agent separation, GitHub App auth,
-      secret handling, queue leases, and release strategies.
+- [ ] Add architecture decision records:
+  - [x] Control-plane/agent separation.
+  - [ ] GitHub App authentication.
+  - [ ] Secret handling.
+  - [ ] PostgreSQL queue leases.
+  - [ ] Release strategies.
 - [x] Implement PostgreSQL migrations and typed persistence repositories.
 - [ ] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
 - [ ] Implement envelope encryption, key rotation metadata, and centralized redaction.
@@ -235,7 +238,8 @@ Approved by the user:
   - separately versioned and validated persistence snapshots;
   - race-tested transition-matrix and corruption coverage.
 - [x] PostgreSQL schema and typed deployment repository implemented and independently verified.
-- [ ] Next: add the approved architecture decision records before beginning authentication.
+- [x] ADR 0001 records the control-plane/agent process, ownership, and trust boundaries.
+- [ ] Next: ADR 0002 for GitHub App authentication.
 
 ## Approved Persistence Slice
 
