@@ -2,8 +2,9 @@
 
 ## Status
 
-- Planning only; implementation requires user approval.
-- Greenfield workspace; no existing source code or Git repository.
+- Implementation is active on `main`; scaffold, deployment domain, and deployment persistence
+  slices are complete locally.
+- The persistence slice is verified but remains uncommitted.
 
 ## Product Goal
 
@@ -120,7 +121,7 @@ State transitions must be validated in the domain layer and committed transactio
 - [x] Initialize Git repository, Go module, formatting, linting, and test commands.
 - [ ] Add architecture decision records for control-plane/agent separation, GitHub App auth,
       secret handling, queue leases, and release strategies.
-- [ ] Implement PostgreSQL migrations and typed persistence repositories.
+- [x] Implement PostgreSQL migrations and typed persistence repositories.
 - [ ] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
 - [ ] Implement envelope encryption, key rotation metadata, and centralized redaction.
 - [ ] Implement GitHub App installation flow and short-lived clone authentication.
@@ -233,4 +234,63 @@ Approved by the user:
   - optimistic-lock revision;
   - separately versioned and validated persistence snapshots;
   - race-tested transition-matrix and corruption coverage.
-- [ ] Next: PostgreSQL schema and typed repositories. This is the resume point.
+- [x] PostgreSQL schema and typed deployment repository implemented and independently verified.
+- [ ] Next: add the approved architecture decision records before beginning authentication.
+
+## Approved Persistence Slice
+
+Approved on 2026-08-05. Keep this slice limited to the existing deployment aggregate; do not
+invent persistence contracts for users, projects, environments, servers, jobs, webhooks, or
+other domains that are not implemented yet.
+
+### Implementation
+
+- [x] Add a forward-only PostgreSQL migration for `deployments` and append-only
+      `deployment_events`.
+- [x] Enforce identifiers, lifecycle statuses, positive snapshot versions/revisions, timestamp
+      ordering, event shape, and useful environment/server indexes in PostgreSQL.
+- [x] Prevent deployment-event updates and deletes at the database boundary.
+- [x] Add a typed `pgx/v5` deployment repository with `Create`, `GetByID`, and revision-CAS
+      `Save` operations.
+- [x] Keep head updates and event appends in one transaction; preserve immutable identity and
+      distinguish not-found, duplicate, and revision-conflict errors.
+- [x] Validate all writes through `Snapshot` and all reads through `Rehydrate`.
+- [x] Canonicalize domain timestamps to UTC microsecond precision for deterministic PostgreSQL
+      round trips.
+- [x] Reject revisions that cannot fit PostgreSQL `bigint`.
+- [x] Add a dedicated forward-only migration execution path using currently supported stable
+      dependencies verified against official documentation before selection.
+- [x] Keep opaque text identifiers and defer foreign keys to unimplemented domain tables.
+
+### Validation
+
+- [x] Test migration application against real PostgreSQL 18.
+- [x] Test create/load equality and every deployment lifecycle status.
+- [x] Test duplicate IDs, missing IDs, stale revisions, and concurrent compare-and-swap saves.
+- [x] Prove failed event insertion rolls back the head update.
+- [x] Test corrupted persisted state rejection and deterministic event ordering.
+- [x] Test append-only enforcement, equal timestamps, multi-transition saves, cancellation,
+      supersession, and rollback.
+- [x] Update CI and Makefile integration-test commands without weakening existing checks.
+- [x] Pass `make check`, `go test -race ./...`, PostgreSQL integration tests, and
+      `git diff --check`.
+- [x] Obtain independent QA and zero-context code review before marking this slice complete.
+
+### Result
+
+- PostgreSQL 18 integration tests cover repository and migration packages.
+- Aggregate reads use a repeatable-read snapshot; writes use revision CAS and row locking.
+- Migration execution is advisory-lock serialized and verifies SHA-256 checksums.
+- Final independent QA and zero-context review verdicts: PASS with no blockers.
+
+### Risks and Mitigations
+
+- PostgreSQL stores `timestamptz` at microsecond precision: canonicalize timestamps at domain
+  entry points and cover equality with tests.
+- PostgreSQL `bigint` is signed while the domain revision is unsigned: validate before SQL
+  conversion and fail explicitly.
+- Concurrent writers can fork event history: use a conditional head update on the expected
+  revision and append events in the same transaction.
+- Head/event corruption must not be silently repaired: return domain snapshot validation errors.
+- Database status constraints duplicate domain values: update both through reviewed migrations
+  whenever lifecycle states change.

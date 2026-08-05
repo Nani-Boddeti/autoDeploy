@@ -98,6 +98,7 @@ func New(identity Identity, createdAt time.Time) (Deployment, error) {
 	if createdAt.IsZero() {
 		return Deployment{}, fmt.Errorf("%w: creation timestamp is required", ErrInvalidDeployment)
 	}
+	createdAt = canonicalTime(createdAt)
 
 	return Deployment{
 		identity:  identity,
@@ -113,6 +114,11 @@ func New(identity Identity, createdAt time.Time) (Deployment, error) {
 func Rehydrate(snapshot Snapshot) (Deployment, error) {
 	if snapshot.Version != CurrentSchemaVersion {
 		return Deployment{}, fmt.Errorf("%w: unsupported schema version %d", ErrInvalidSnapshot, snapshot.Version)
+	}
+	snapshot.CreatedAt = canonicalTime(snapshot.CreatedAt)
+	snapshot.UpdatedAt = canonicalTime(snapshot.UpdatedAt)
+	for index := range snapshot.Events {
+		snapshot.Events[index].At = canonicalTime(snapshot.Events[index].At)
 	}
 	d := Deployment{
 		identity:  snapshot.Identity,
@@ -175,6 +181,7 @@ func (d Deployment) Transition(to Status, at time.Time) (Deployment, error) {
 	if to == d.status {
 		return d, nil
 	}
+	at = canonicalTime(at)
 	if at.IsZero() || at.Before(d.updatedAt) {
 		return d, fmt.Errorf("%w: current=%s requested=%s", ErrInvalidTimestamp, d.status, to)
 	}
@@ -191,6 +198,10 @@ func (d Deployment) Transition(to Status, at time.Time) (Deployment, error) {
 	next.revision++
 	next.events = append(append([]Event(nil), d.events...), Event{From: d.status, To: to, At: at})
 	return next, nil
+}
+
+func canonicalTime(value time.Time) time.Time {
+	return value.UTC().Truncate(time.Microsecond)
 }
 
 func (d Deployment) validate() error {

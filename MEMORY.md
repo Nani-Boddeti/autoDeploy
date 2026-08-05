@@ -45,15 +45,33 @@
   - CAS revision increments per persisted event;
   - separate snapshot schema version;
   - validated Snapshot/Rehydrate contract with defensive copies.
+- Deployment persistence implemented with PostgreSQL 18 and `pgx/v5`:
+  - forward-only embedded migration plus dedicated migration command;
+  - constrained `deployments` head and append-only `deployment_events` audit stream;
+  - typed Create/GetByID/Save repository with transactional revision CAS;
+  - repeatable-read aggregate loads and locked writes prevent mixed head/event snapshots;
+  - advisory-lock serialized migrations with SHA-256 drift detection;
+  - UTC microsecond timestamps and signed-`bigint` revision guards;
+  - real PostgreSQL coverage for lifecycle, corruption, rollback, concurrency, and migration
+    idempotency/integrity.
 - Independent code review passed after remediation.
-- `go test -race ./...`, `make check`, and `git diff --check` pass using
-  `GOCACHE=/tmp/autodeploy-go-cache`.
+- `make check`, `go test -race ./...`, `make test-integration` against PostgreSQL 18, and
+  `git diff --check` pass. Independent QA and code review report no blockers.
 
 ## Resume Point
 
-- Pause requested after completing and committing the deployment-domain slice.
-- Next task: implement PostgreSQL schema and typed repositories only.
-- Persistence must use the domain Revision as an optimistic compare-and-swap token and the
-  Snapshot schema version for format evolution.
-- Follow `tasks/todo.md`; do not start GitHub, agent, Docker, routing, or UI work until the
-  persistence slice passes tests and independent review.
+- Persistence is complete and verified locally but uncommitted.
+- Next task: add the architecture decision records already listed in `tasks/todo.md`, then plan
+  the admin authentication slice.
+- Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
+
+## Persistence Invariants and Lessons
+
+- Domain Revision is the optimistic CAS token; snapshot schema version evolves independently.
+- Head and event reads must share one repeatable-read snapshot; separate pool queries can mix
+  revisions during concurrent saves.
+- Save contenders lock the head row and equal/stale revisions return a conflict.
+- Migration ledger checks and DDL must share an advisory-locked transaction on one connection.
+- Applied migration checksums are immutable; drift must fail rather than silently diverge.
+- Tests that mutate schema must register cleanup immediately so failed assertions cannot poison
+  later runs.

@@ -55,6 +55,22 @@ func TestNewCreatesRevisionedQueuedDeployment(t *testing.T) {
 	}
 }
 
+func TestTimestampsAreCanonicalUTCToMicroseconds(t *testing.T) {
+	created := time.Date(2026, time.July, 24, 15, 30, 0, 123456789, time.FixedZone("offset", 19800))
+	value, err := New(testIdentity, created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := created.UTC().Truncate(time.Microsecond)
+	if !value.CreatedAt().Equal(want) || value.CreatedAt().Location() != time.UTC {
+		t.Fatalf("created timestamp = %v, want %v UTC", value.CreatedAt(), want)
+	}
+	next, err := value.Transition(StatusAssigned, created.Add(time.Nanosecond))
+	if err != nil || !next.UpdatedAt().Equal(want) {
+		t.Fatalf("canonical transition = %v, %v", next.UpdatedAt(), err)
+	}
+}
+
 func TestTransitionMatrix(t *testing.T) {
 	allowed := map[Status]map[Status]bool{
 		StatusQueued:         {StatusAssigned: true, StatusCancelled: true, StatusSuperseded: true},
