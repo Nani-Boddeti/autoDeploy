@@ -88,11 +88,37 @@
     fail-closed provider interfaces; detailed file protections are deferred to ADR 0003;
   - private cross-repository submodules are rejected unless each repository is independently
     authorized.
+- ADR 0003 accepts application-layer envelope encryption for stored build/runtime secrets:
+  - an external mounted-file AES-256 KEK ring has one active write key and retiring read keys;
+    KEKs never live with database ciphertext;
+  - each immutable secret version gets a random 256-bit DEK; versioned AES-GCM envelopes bind
+    immutable owner/project/environment/variable/version IDs, purpose, and scope as AAD;
+  - each KEK has a durable non-reusable wrap-invocation budget; writes fail closed at `2^31`, and
+    uncertain restored ledgers make the old KEK read-only before activating a fresh write key;
+  - exact versions freeze in the same transaction that claims the agent lease and are reused by
+    retries/reclaimed leases for that deployment;
+  - production credential files are absolute, outside the workspace, regular/read-only,
+    owner-restricted, symlink-safe, atomically replaced, strictly parsed, and fail closed;
+  - only lease-scoped required values cross the confidential authenticated agent channel;
+  - BuildKit secret mounts are mandatory for build secrets; V1 runtime compatibility uses direct
+    Docker API environment injection inside the trusted-host boundary;
+  - agent and control plane redact independently; redaction failure suppresses output;
+  - secret APIs are write-only for values, and mutations/audits commit atomically without value,
+    ciphertext, request-body, or plaintext-hash leakage;
+  - database backups contain ciphertext and use independent encryption; KEK recovery material is
+    stored separately, and production is blocked until restore/KEK-loss procedures are tested;
+  - deletion immediately blocks live materialization but remains pending retention until all
+    wrapped-DEK copies expire; it does not promise immediate physical or cryptographic erasure;
+  - emergency compromise recovery revokes upstream values and removes retained containers carrying
+    them, accepting loss of rollback to those containers;
+  - compromised encrypted versions are revoked and replaced with new immutable version IDs, DEKs,
+    and ciphertext; frozen work fails rather than silently switching, so replacements require a
+    distinct deployment intent.
 
 ## Resume Point
 
 - Persistence is complete, verified, committed, and pushed.
-- Next task: ADR 0003 for secret handling. Complete the remaining ADRs sequentially,
+- Next task: ADR 0004 for PostgreSQL queue leases. Complete the remaining ADRs sequentially,
   then plan the admin authentication slice.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 

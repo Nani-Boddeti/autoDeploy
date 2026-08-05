@@ -51,12 +51,13 @@ must support registering and targeting multiple deployment servers without redes
 - GitHub delivery IDs are unique and idempotent; duplicates do not create deployments.
 - Repository and branch bindings are checked before a job is accepted.
 - GitHub App installation tokens are short lived and never persisted as plaintext.
-- Stored environment values and agent credentials are envelope-encrypted at rest.
+- Recoverable stored environment/provider values are envelope-encrypted; comparison-only
+  agent/session tokens are hashed, and private signing credentials remain provider-held.
 - Secret values are redacted from API responses, UI, audit records, and build/deployment logs.
-- Build secrets use BuildKit secret mounts where possible; ordinary Docker `ARG` values are
+- Build secrets require BuildKit secret mounts; ordinary Docker `ARG` values are
   classified as non-secret because image history or build output may expose them.
-- Runtime secrets are provided only to the target container. Host administrators remain a
-  trusted boundary because Docker administrators can inspect container configuration.
+- Runtime secrets are scoped only to the target deployment, but Docker retains them in container
+  configuration. Host administrators remain trusted because they can inspect that configuration.
 - Deployment state transitions are durable and auditable.
 - Agents claim jobs using expiring leases; abandoned work can be recovered safely.
 - A release never receives production traffic before its configured health gate succeeds.
@@ -121,7 +122,7 @@ State transitions must be validated in the domain layer and committed transactio
 - [ ] Add architecture decision records:
   - [x] Control-plane/agent separation.
   - [x] GitHub App authentication.
-  - [ ] Secret handling.
+  - [x] Secret handling.
   - [ ] PostgreSQL queue leases.
   - [ ] Release strategies.
 - [x] Implement PostgreSQL migrations and typed persistence repositories.
@@ -241,7 +242,9 @@ Approved by the user:
 - [x] ADR 0001 records the control-plane/agent process, ownership, and trust boundaries.
 - [x] ADR 0002 records private GitHub App installation authentication, least-privilege repository
       access, webhook verification, and credential boundaries.
-- [ ] Next: ADR 0003 for secret handling.
+- [x] ADR 0003 records envelope encryption, immutable secret versions, materialization, rotation,
+      redaction, credential-provider, build/runtime delivery, backup, and deletion boundaries.
+- [ ] Next: ADR 0004 for PostgreSQL queue leases.
 
 ## Approved Persistence Slice
 
