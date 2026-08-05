@@ -182,8 +182,15 @@
 ## Resume Point
 
 - Persistence is complete, verified, committed, and pushed.
-- All five architecture ADRs are complete. Next task: plan the admin bootstrap, secure session,
-  CSRF, and authorization implementation slice.
+- ADRs 0001-0006 are complete. ADR 0006 defines the approved administrator authentication slice.
+- Auth specifics: canonical usernames match `[a-z0-9][a-z0-9._-]{2,63}`; bootstrap calibrates and
+  durably stores one Argon2 policy; sessions are digest-only, Strict, 30-minute idle/eight-hour
+  absolute; proxy trust defaults empty; throttle key rotation/cardinality and public audit growth
+  are bounded; GitHub uses a state-to-Strict-handoff flow.
+- Next task: delegate authentication domain primitives and their tests to an implementation
+  specialist; then proceed sequentially through PostgreSQL auth persistence, credential-file/admin
+  CLI, web security, and control-plane wiring.
+- No administrator-auth production code has been started.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons

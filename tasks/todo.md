@@ -248,7 +248,69 @@ Approved by the user:
       fencing, retry/dead-letter, cancellation, recovery, and transaction boundaries.
 - [x] ADR 0005 records blue/green and stop-then-start release models, health gates, Traefik file
       routing, fenced activation/reconciliation, rollback, retention, and cleanup boundaries.
-- [ ] Next: plan admin bootstrap, sessions, CSRF, and authorization implementation.
+- [x] ADR 0006 records administrator bootstrap/recovery, Argon2id password verification,
+      server-side sessions, CSRF/origin protection, durable throttling, trusted-proxy handling,
+      owner-scoped authorization, audit, and the Strict-cookie GitHub handoff boundary.
+- [ ] Next: implement and test administrator authentication domain primitives.
+
+## Approved Administrator Authentication Slice
+
+Approved on 2026-08-05. Implement sequentially; each production step receives its own
+implementation specialist and review. Do not add deployment administration until deployment
+records carry explicit owner scope.
+
+### Architecture and persistence
+
+- [x] Record the security and failure invariants in ADR 0006.
+- [ ] Add a forward-only additive migration for owners, permanent bootstrap state, users,
+      server-side sessions, durable throttle buckets, and append-only authentication audit events.
+- [ ] Add typed PostgreSQL transactions for singleton bootstrap, login attempt reservation and
+      finalization, session creation/validation/revocation, password reset, and cleanup.
+- [ ] Preserve exact owner ID and authentication revision checks in every security-sensitive
+      transaction; audit failure must roll back its associated mutation.
+
+### Authentication domain
+
+- [ ] Implement canonical ASCII usernames and the 15-to-1,024-byte password policy.
+- [ ] Implement bounded Argon2id PHC parsing, hashing, verification, dummy verification, and
+      rehash signaling using a currently supported stable dependency.
+- [ ] Implement versioned 32-byte opaque session tokens, domain-separated digesting, expiry
+      policy, and non-secret principal types.
+- [ ] Implement HMAC-derived session CSRF and independent reusable pre-authentication login CSRF.
+- [ ] Implement exact owner-scoped authorization helpers without a role-based global bypass.
+
+### Operator and configuration boundary
+
+- [ ] Add validated mounted-file credential loading for production database/signing material;
+      accept only non-secret paths and public settings through environment configuration.
+- [ ] Add interactive-terminal-only `admin bootstrap` and `admin reset-password` commands.
+- [ ] Make bootstrap permanently one-time; make reset revoke all sessions, increment the auth
+      revision, clear recovery throttle state, and audit atomically.
+
+### Web boundary
+
+- [ ] Add only login, POST logout, a minimal protected landing page, and non-sensitive health
+      endpoints.
+- [ ] Enforce Strict `__Host-` cookies, exact HTTPS origin/provenance, CSRF, content-type and body
+      bounds, fixed 303 redirects, security headers, timeouts, and graceful shutdown.
+- [ ] Persist replica-safe username/client and IP throttles before password verification; keep all
+      authentication failures generic.
+- [ ] Bound throttle/audit cardinality and preserve live limits across keyed-identifier rotation.
+- [ ] Trust forwarded client addresses only through explicitly configured proxy CIDRs; default to
+      no trusted proxies.
+- [ ] Keep browser middleware separate from GitHub webhook and future agent API authentication.
+
+### Verification and handoff
+
+- [x] ADR 0006 passed independent security review after resolving CSRF provenance, malformed proxy
+      chains, throttle-key rotation/cardinality, username syntax, durable Argon2 policy, login CSRF,
+      bounded audit growth, and GitHub handoff test requirements.
+- [ ] Add unit, race, PostgreSQL integration, concurrency, malformed-input, cross-owner, session,
+      CSRF/origin, throttle, forwarded-address, audit, HTTP-limit, and shutdown coverage required by
+      ADR 0006.
+- [ ] Run `make check`, `go test -race ./...`, the complete integration suite, and
+      `git diff --check`.
+- [ ] Complete independent QA and zero-context security/code review; record findings and results.
 
 ## Approved Persistence Slice
 
