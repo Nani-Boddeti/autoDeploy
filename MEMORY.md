@@ -67,11 +67,32 @@
   - the control plane owns authorization, desired state, jobs, and audit records without Docker
     or broad SSH access;
   - agents own authorized target-host Docker/BuildKit, runtime, cleanup, and routing mutations.
+- ADR 0002 accepts a private GitHub App owned by the same account as every V1 target repository:
+  - explicit permission is Contents: read; explicit subscription is Push, plus mandatory
+    installation lifecycle events;
+  - stable numeric installation/repository IDs and explicit local project binding authorize
+    access; mutable names, webhook sender, callback parameters, or signatures alone do not;
+  - the control plane alone holds App/webhook secrets and mints opaque, one-repository,
+    read-only installation tokens near checkout; tokens and App JWTs are never persisted;
+  - agents receive only transient checkout tokens and never App private keys or PostgreSQL access;
+  - webhook HMAC is verified over the bounded raw body before parsing; delivery attempts bind App
+    registration ID, delivery ID, and digest, while a per-App digest index blocks replay with a
+    substituted delivery ID;
+  - automatic push intent is unique by active project binding, repository ID, full ref, and commit
+    SHA; manual redeploy is a separate authenticated intent;
+  - transient token delivery requires confidentiality-protected transport with server identity
+    verification and no intermediary credential logging;
+  - suspension/removal blocks new work and token minting while preserving the healthy release;
+    additions require reconciliation and explicit binding/reactivation;
+  - service-readable mounted files outside the repository are the V1 credential source behind
+    fail-closed provider interfaces; detailed file protections are deferred to ADR 0003;
+  - private cross-repository submodules are rejected unless each repository is independently
+    authorized.
 
 ## Resume Point
 
 - Persistence is complete, verified, committed, and pushed.
-- Next task: ADR 0002 for GitHub App authentication. Complete the remaining ADRs sequentially,
+- Next task: ADR 0003 for secret handling. Complete the remaining ADRs sequentially,
   then plan the admin authentication slice.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 

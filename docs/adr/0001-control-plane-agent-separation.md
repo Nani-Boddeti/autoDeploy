@@ -59,8 +59,8 @@ local Docker daemon remain inside the trusted-host boundary.
 
 ## Communication and trust boundaries
 
-- All agent coordination uses an authenticated control-plane API; agents never query or mutate
-  PostgreSQL directly.
+- All agent coordination uses an authenticated, confidentiality-protected control-plane API with
+  server identity verification; agents never query or mutate PostgreSQL directly.
 - Agent credentials are scoped to one server identity and must not authorize administrative or
   cross-server operations.
 - Agents initiate connections, so deployment hosts do not require inbound SSH or Docker/API

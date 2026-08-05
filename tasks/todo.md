@@ -120,7 +120,7 @@ State transitions must be validated in the domain layer and committed transactio
 - [x] Initialize Git repository, Go module, formatting, linting, and test commands.
 - [ ] Add architecture decision records:
   - [x] Control-plane/agent separation.
-  - [ ] GitHub App authentication.
+  - [x] GitHub App authentication.
   - [ ] Secret handling.
   - [ ] PostgreSQL queue leases.
   - [ ] Release strategies.
@@ -239,7 +239,9 @@ Approved by the user:
   - race-tested transition-matrix and corruption coverage.
 - [x] PostgreSQL schema and typed deployment repository implemented and independently verified.
 - [x] ADR 0001 records the control-plane/agent process, ownership, and trust boundaries.
-- [ ] Next: ADR 0002 for GitHub App authentication.
+- [x] ADR 0002 records private GitHub App installation authentication, least-privilege repository
+      access, webhook verification, and credential boundaries.
+- [ ] Next: ADR 0003 for secret handling.
 
 ## Approved Persistence Slice
 
