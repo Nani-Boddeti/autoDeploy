@@ -123,7 +123,7 @@ State transitions must be validated in the domain layer and committed transactio
   - [x] Control-plane/agent separation.
   - [x] GitHub App authentication.
   - [x] Secret handling.
-  - [ ] PostgreSQL queue leases.
+  - [x] PostgreSQL queue leases.
   - [ ] Release strategies.
 - [x] Implement PostgreSQL migrations and typed persistence repositories.
 - [ ] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
@@ -244,7 +244,9 @@ Approved by the user:
       access, webhook verification, and credential boundaries.
 - [x] ADR 0003 records envelope encryption, immutable secret versions, materialization, rotation,
       redaction, credential-provider, build/runtime delivery, backup, and deletion boundaries.
-- [ ] Next: ADR 0004 for PostgreSQL queue leases.
+- [x] ADR 0004 records PostgreSQL at-least-once jobs, attempts, lease renewal/expiry, environment
+      fencing, retry/dead-letter, cancellation, recovery, and transaction boundaries.
+- [ ] Next: ADR 0005 for release strategies.
 
 ## Approved Persistence Slice
 

@@ -114,11 +114,42 @@
   - compromised encrypted versions are revoked and replaced with new immutable version IDs, DEKs,
     and ciphertext; frozen work fails rather than silently switching, so replacements require a
     distinct deployment intent.
+- ADR 0004 accepts a PostgreSQL at-least-once queue with durable jobs, immutable attempts, and
+  append-only events:
+  - webhook receipt, deployment creation, and enqueue commit together; exact scope/digest conflicts
+    fail while exact duplicates are idempotent;
+  - claims use short `READ COMMITTED` transactions with `FOR UPDATE SKIP LOCKED`, stable bounded
+    priority ordering, PostgreSQL `clock_timestamp()` authority, and no external work before commit;
+  - one active execution per environment receives a monotonic signed-`BIGINT` fence copied into
+    every lease, mutation, resource label, activation, and cleanup operation;
+  - the host agent persists the highest accepted environment fence; lost/corrupt fence state fails
+    closed pending reconciliation;
+  - claim atomically reserves the environment slot/fence, creates the attempt/90-second lease,
+    freezes exact secret versions, assigns the deployment on first claim, and appends events;
+  - agents renew every 30 seconds with monotonic replay-safe sequences; completion is idempotent
+    only for the same terminal operation/digest, with a separate read-only replay path after lease
+    closure;
+  - queued/retry-wait cancellation is immediately terminal; leased cancellation caps authority at
+    a 60-second cleanup deadline recovered through an authority-expiry index; cancellation during
+    activation is rejected;
+  - at most five attempts use persisted full-jitter backoff from 5 seconds to a 5-minute cap;
+    permanent failures do not retry, exhaustion becomes `dead`, and redeploy creates a new intent;
+  - expired leases advance fencing and require host reconciliation because database expiry cannot
+    undo external side effects;
+  - claims and revocations serialize through authorization revision locks and a global lock order:
+    authorization rows, environment slots, jobs, attempts, deployments, then secret references;
+  - host mutations are serialized per environment; an in-flight syscall cannot be preempted, so
+    expiry/cancellation blocks slot reuse pending reconciliation, and activation linearizes through
+    the atomic transition to `activating`;
+  - PostgreSQL wall-clock skew is monitored/bounded; uncertain regressions pause authority changes
+    and trigger reconciliation rather than claiming monotonic lease time;
+  - polling is authoritative; `LISTEN/NOTIFY` may only be a wake-up hint; terminal retention and
+    advanced priority fairness remain deferred.
 
 ## Resume Point
 
 - Persistence is complete, verified, committed, and pushed.
-- Next task: ADR 0004 for PostgreSQL queue leases. Complete the remaining ADRs sequentially,
+- Next task: ADR 0005 for release strategies. Complete the remaining ADRs sequentially,
   then plan the admin authentication slice.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
