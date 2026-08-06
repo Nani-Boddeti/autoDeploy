@@ -255,7 +255,7 @@ Approved by the user:
       QA-verified, and security-reviewed.
 - [x] Administrator-authentication PostgreSQL migration and typed persistence workflows are
       implemented, live-integration/race-tested, independently QA-verified, and security-reviewed.
-- [ ] Next: implement credential-file configuration and the interactive administrator CLI.
+- [ ] Next: implement the minimal administrator web boundary and control-plane wiring.
 
 ## Approved Administrator Authentication Slice
 
@@ -285,11 +285,37 @@ records carry explicit owner scope.
 
 ### Operator and configuration boundary
 
-- [ ] Add validated mounted-file credential loading for production database/signing material;
+- [x] Add validated mounted-file credential loading for production database/signing material;
       accept only non-secret paths and public settings through environment configuration.
-- [ ] Add interactive-terminal-only `admin bootstrap` and `admin reset-password` commands.
-- [ ] Make bootstrap permanently one-time; make reset revoke all sessions, increment the auth
+- [x] Add interactive-terminal-only `admin bootstrap` and `admin reset-password` commands.
+- [x] Make bootstrap permanently one-time; make reset revoke all sessions, increment the auth
       revision, clear recovery throttle state, and audit atomically.
+
+#### Credential and administrator CLI implementation plan
+
+- [x] Add a Linux mounted-credential loader that requires absolute paths outside configured
+      workspace roots; uses descriptor-relative no-follow opening; verifies the opened regular
+      file's owner/mode/size; reads through the verified descriptor; and returns only sanitized
+      errors. Unsupported platforms fail closed.
+- [x] Accept the production database credential only through
+      `AUTODEPLOY_DATABASE_URL_FILE`; remove the credential-bearing environment-value path from
+      `migrate` and share the same loader/config boundary with the administrator command.
+- [x] Add forward migration `000003` so ordinary known-user pair throttle rows carry a nullable
+      recovery user ID. Keep unknown-user, IP, invalid-forward, and shared-overflow evidence
+      unassociated and uncleared.
+- [x] Extend pair reservation and password reset so reset atomically clears every tagged pair row
+      for the user plus supplied legacy/username aliases, while preserving IP and shared-overflow
+      evidence. Never modify the applied `000002` migration.
+- [x] Add exact `admin bootstrap --username <name>` and
+      `admin reset-password --username <name>` flows. Open and verify `/dev/tty`, read the password
+      twice without echo, reject piped input and all secret argv/env/config inputs, generate opaque
+      IDs from `crypto/rand`, calibrate bootstrap Argon2id once within ADR bounds, and load the
+      durable policy for reset.
+- [x] Cover unsafe file paths/types/ownership/modes/sizes/replacement, strict CLI parsing,
+      terminal refusal, password boundaries/mismatch, concurrent singleton bootstrap, migration
+      upgrade, reset rollback/session revocation/all tagged-pair cleanup, and preservation of
+      IP/overflow evidence. Run unit/race/static checks plus live PostgreSQL integration and
+      independent QA/security review before commit.
 
 ### Web boundary
 
@@ -349,6 +375,29 @@ records carry explicit owner scope.
 - Real PostgreSQL 18.4 integration and race-integration suites pass, including concurrency,
   rollback, ownership, expiry/touch, exact digest, audit, cardinality, overflow, rotation, and
   cleanup regressions. Independent QA and security review report no medium-or-higher findings.
+
+### Operator and configuration result
+
+- Production database credentials now load only from `AUTODEPLOY_DATABASE_URL_FILE`; the legacy
+  credential-bearing environment value is rejected. An explicit repository root prevents storing
+  mounted credentials in the workspace.
+- Darwin/Linux loaders traverse descriptors without following links, verify trusted directories
+  and the opened regular file, bound reads, and compare pre/post inode and metadata so partial
+  in-place replacement fails closed. Unsupported platforms compile but cannot load credentials.
+- Exact raw 32-byte active/retained username-throttle keys are mounted separately; key bytes never
+  enter environment configuration. Domain-separated digests clear every retained username alias.
+- Migration `000003` removes un-attributable pre-web pair rows, adds nullable known-user recovery
+  ownership, and preserves IP, invalid-forward, username, and shared-overflow evidence. Reset and
+  reservation share throttle-admission → user → session lock order.
+- `admin bootstrap` calibrates the bounded Argon2id policy before prompting and persists it through
+  the permanent singleton bootstrap transaction. `admin reset-password` uses the durable policy,
+  revokes sessions, increments authority, clears account recovery state, and audits atomically.
+- Terminal preflight occurs before credential loading, database access, migrations, or calibration;
+  passwords are read twice from one verified `/dev/tty` session and never accepted from argv,
+  environment values, configuration files, or piped stdin.
+- Unit/race/static/format/tidy checks, Linux/Windows builds, and fresh PostgreSQL 18.4 normal and
+  race-integration suites pass. Independent QA and zero-context security review report no
+  medium-or-higher findings.
 
 ## Approved Persistence Slice
 

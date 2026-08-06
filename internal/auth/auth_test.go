@@ -268,3 +268,30 @@ func TestCanonicalHTTPSOrigin(t *testing.T) {
 		}
 	}
 }
+
+func TestUsernameThrottleKeyRing(t *testing.T) {
+	active, retained := make([]byte, 32), make([]byte, 32)
+	active[0], retained[0] = 1, 2
+	ring := UsernameThrottleKeyRing{ActiveVersion: "v2", Keys: map[string][]byte{"v2": active, "v1": retained}, RetainedVersions: []string{"v1"}}
+	digests, err := ring.UsernameDigests("admin")
+	if err != nil || len(digests) != 2 || digests[0] == digests[1] {
+		t.Fatalf("digests %#v err %v", digests, err)
+	}
+	if _, err := ring.UsernameDigests("Admin"); err == nil {
+		t.Fatal("accepted noncanonical username")
+	}
+	ring.RetainedVersions = []string{"v2"}
+	if _, err := ring.UsernameDigests("admin"); err == nil {
+		t.Fatal("accepted duplicate version")
+	}
+	ring.RetainedVersions = []string{"v1"}
+	ring.Keys["v1"] = append([]byte(nil), active...)
+	if _, err := ring.UsernameDigests("admin"); err == nil {
+		t.Fatal("accepted duplicate key")
+	}
+	ring.Keys["v1"][0] = 2
+	ring.Keys["v2"] = make([]byte, 32)
+	if _, err := ring.UsernameDigests("admin"); err == nil {
+		t.Fatal("accepted all-zero key")
+	}
+}

@@ -47,3 +47,15 @@
 - Execute evolving migrations against a fresh real database: checksum protection correctly rejects
   edited already-applied development migrations, and live constraints expose invalid fixtures and
   ordering bugs that compile-only tagged tests cannot.
+- Foreign keys participate in lock ordering: a throttle transaction that writes a user reference
+  can lock the user even without selecting it. Recovery must therefore take throttle admission
+  before the user/session locks, and concurrency tests must exercise first-time FK tagging.
+- Recovery cannot enumerate client-specific pair digests from a username. Persist a non-secret
+  known-user recovery association when the pair is created; remove un-attributable pre-feature rows
+  in an additive migration rather than pretending username digests can clear them.
+- A secure mounted-file read needs same-descriptor pre/post identity and metadata validation, not
+  only no-follow open plus a pre-read `fstat`; otherwise an in-place partial rewrite can be accepted.
+- Reject non-interactive operator commands before loading credentials, connecting, migrating, or
+  calibrating. Terminal-only is an execution boundary, not merely a password-reader check.
+- Integration suites sharing one database must reset durable singleton configuration as well as
+  ordinary rows; otherwise a second normal/race run inherits incompatible limits.

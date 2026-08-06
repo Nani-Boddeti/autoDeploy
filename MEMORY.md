@@ -181,7 +181,8 @@
 
 ## Resume Point
 
-- Persistence is complete, verified, committed, and pushed.
+- Authentication persistence plus the operator/configuration boundary are complete and verified;
+  the current operator changes are ready to commit and push.
 - ADRs 0001-0006 are complete. ADR 0006 defines the approved administrator authentication slice.
 - Auth specifics: canonical usernames match `[a-z0-9][a-z0-9._-]{2,63}`; bootstrap calibrates and
   durably stores one Argon2 policy; sessions are digest-only, Strict, 30-minute idle/eight-hour
@@ -203,8 +204,18 @@
   and one cross-replica global row cap that remains conservative if cleanup is delayed.
 - Real PostgreSQL 18.4 integration and race-integration tests pass; independent QA/security review
   has no medium-or-higher findings.
-- Next task: credential-file configuration and interactive admin bootstrap/reset CLI. No auth web
-  routes or control-plane wiring have started.
+- Production DB URLs and username-throttle keys load only from permission-hardened mounted files
+  named by non-secret environment paths. Darwin/Linux use descriptor-relative no-follow traversal,
+  same-FD pre/post stable metadata checks, exact type/owner/mode/size parsing, and sanitized errors;
+  unsupported platforms fail closed. Legacy DB URL environment values are rejected.
+- `admin bootstrap` and `admin reset-password` preflight one interactive `/dev/tty` before any
+  credential/DB work, never accept secret argv/env/pipe input, use opaque random IDs, persist one
+  calibrated Argon2 policy, and perform atomic repository workflows. Username recovery derives
+  active+retained HMAC aliases from mounted exact 32-byte keys.
+- Migration 000003 deletes un-attributable pre-web pair rows and tags future known-user pairs by
+  opaque user ID. Universal recovery lock order is throttle admission → user → sessions; reset
+  preserves IP/invalid-forward/shared-overflow evidence.
+- Next task: minimal admin web boundary and control-plane wiring. No auth HTTP routes exist yet.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons

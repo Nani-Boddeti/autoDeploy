@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -167,7 +168,10 @@ func TestAuthBootstrapAndSessionPersistence(t *testing.T) {
 func TestThrottlePersistenceLimitsAndCleanup(t *testing.T) {
 	pool := authIntegrationPool(t)
 	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `TRUNCATE auth_throttle_buckets, auth_username_throttles`); err != nil {
+	if _, err := pool.Exec(ctx, `TRUNCATE auth_throttle_buckets, auth_username_throttles, auth_throttle_state`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO auth_throttle_state(id) VALUES(1)`); err != nil {
 		t.Fatal(err)
 	}
 	repo := NewAuthRepository(pool)
@@ -599,6 +603,182 @@ func TestResetRecoveryDigestValidation(t *testing.T) {
 	}
 }
 
+func TestResetPasswordClearsTaggedPairRecoveryBucketsOnly(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,owner_id,username,role,password_phc,password_policy_revision) VALUES('other-reset-user',$1,'otherreset','owner',$2,1)`, user.OwnerID, verifier.PHC); err != nil {
+		t.Fatal(err)
+	}
+	ownCurrent := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "current", Digest: [32]byte{31}, RecoveryUserID: user.ID}
+	ownPrior := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "prior", Digest: [32]byte{32}, RecoveryUserID: user.ID}
+	otherPair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "current", Digest: [32]byte{33}, RecoveryUserID: "other-reset-user"}
+	legacyPair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "legacy", Digest: [32]byte{34}}
+	for _, identity := range []ThrottleIdentity{ownCurrent, ownPrior, otherPair, legacyPair, {Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{35}}} {
+		if reservation, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{identity}, 100); err != nil || !reservation.Allowed {
+			t.Fatalf("reserve %q: %#v %v", identity.Digest, reservation, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures) VALUES('pair_overflow','overflow',decode(repeat('00',32),'hex'),date_trunc('minute',clock_timestamp())-make_interval(mins => extract(minute from clock_timestamp())::int % 15),1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ResetPassword(ctx, user.ID, verifier, "audit-reset-tagged", [][32]byte{legacyPair.Digest}); err != nil {
+		t.Fatal(err)
+	}
+	var ownRows, otherRows, legacyRows, ipRows, overflowRows int
+	if err := pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE kind='pair' AND recovery_user_id=$1),
+		count(*) FILTER (WHERE kind='pair' AND recovery_user_id='other-reset-user'),
+		count(*) FILTER (WHERE kind='pair' AND recovery_user_id IS NULL AND identifier_digest=$2),
+		count(*) FILTER (WHERE kind='ip'),
+		count(*) FILTER (WHERE kind='pair_overflow')
+		FROM auth_throttle_buckets`, user.ID, legacyPair.Digest[:]).Scan(&ownRows, &otherRows, &legacyRows, &ipRows, &overflowRows); err != nil {
+		t.Fatal(err)
+	}
+	if ownRows != 0 || otherRows != 1 || legacyRows != 0 || ipRows != 1 || overflowRows != 1 {
+		t.Fatalf("own=%d other=%d legacy=%d ip=%d overflow=%d", ownRows, otherRows, legacyRows, ipRows, overflowRows)
+	}
+	if _, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{{Kind: ThrottlePair, KeyVersion: otherPair.KeyVersion, Digest: otherPair.Digest, RecoveryUserID: user.ID}}, 100); err == nil {
+		t.Fatal("cross-user pair digest collision was accepted")
+	}
+}
+
+func TestResetPasswordSerializesWithThrottleReservationLock(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{39}, RecoveryUserID: user.ID}
+	holder, err := pgx.Connect(ctx, os.Getenv("AUTODEPLOY_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Close(ctx) })
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_lock(731492845631694123)`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = holder.Exec(context.Background(), `SELECT pg_advisory_unlock(731492845631694123)`) })
+
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- repo.ResetPassword(ctx, user.ID, verifier, "audit-reset-serialized", nil) }()
+	for attempts := 0; ; attempts++ {
+		var waiters int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted`).Scan(&waiters); err != nil {
+			t.Fatal(err)
+		}
+		if waiters > 0 {
+			break
+		}
+		if attempts == 10000 {
+			t.Fatal("reset did not wait for the throttle advisory lock")
+		}
+		runtime.Gosched()
+	}
+	reservationDone := make(chan error, 1)
+	go func() {
+		_, reserveErr := NewAuthRepository(pool).ReserveThrottle(ctx, []ThrottleIdentity{pair}, 100)
+		reservationDone <- reserveErr
+	}()
+	for attempts := 0; ; attempts++ {
+		var waiters int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted`).Scan(&waiters); err != nil {
+			t.Fatal(err)
+		}
+		if waiters >= 2 {
+			break
+		}
+		if attempts == 10000 {
+			t.Fatal("reservation did not wait behind the throttle advisory lock")
+		}
+		runtime.Gosched()
+	}
+	var rows int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM auth_throttle_buckets WHERE kind='pair' AND recovery_user_id=$1`, user.ID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("first-time tagged pair existed before receiving admission lock: %d", rows)
+	}
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_unlock(731492845631694123)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-resetDone; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-reservationDone; err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM auth_throttle_buckets WHERE kind='pair' AND recovery_user_id=$1`, user.ID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("reset then first-time tagged reservation ordering left rows=%d", rows)
+	}
+}
+
+func TestPairThrottleRecoveryTagIsNeverReassigned(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,owner_id,username,role,password_phc,password_policy_revision) VALUES('other-pair-user',$1,'otherpair','owner',$2,1)`, user.OwnerID, verifier.PHC); err != nil {
+		t.Fatal(err)
+	}
+	tagged := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{36}, RecoveryUserID: user.ID}
+	if got, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{tagged}, 100); err != nil || !got.Allowed {
+		t.Fatalf("reserve tagged pair: %#v %v", got, err)
+	}
+	// An unknown attempt can increment the bucket but cannot remove its owner.
+	unknown := tagged
+	unknown.RecoveryUserID = ""
+	if got, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{unknown}, 100); err != nil || !got.Allowed {
+		t.Fatalf("reserve unknown pair: %#v %v", got, err)
+	}
+	var owner string
+	if err := pool.QueryRow(ctx, `SELECT recovery_user_id FROM auth_throttle_buckets WHERE kind='pair' AND key_version='v1' AND identifier_digest=$1`, tagged.Digest[:]).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != user.ID {
+		t.Fatalf("unknown reservation reassigned tag to %q", owner)
+	}
+
+	conflicting := tagged
+	conflicting.RecoveryUserID = "other-pair-user"
+	if _, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{conflicting}, 100); err == nil {
+		t.Fatal("known-user reservation reassigned existing pair tag")
+	}
+
+	// A legacy alias is tagged only after a known-user reservation merges it.
+	legacy := ThrottleAlias{KeyVersion: "legacy", Digest: [32]byte{37}}
+	if _, err := pool.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures) VALUES('pair',$1,$2,date_trunc('minute',clock_timestamp())-make_interval(mins => extract(minute from clock_timestamp())::int % 15),1,1)`, legacy.KeyVersion, legacy.Digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	merged := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "current", Digest: [32]byte{38}, Aliases: []ThrottleAlias{legacy}, RecoveryUserID: user.ID}
+	if got, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{merged}, 100); err != nil || !got.Allowed {
+		t.Fatalf("merge legacy pair alias: %#v %v", got, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT recovery_user_id FROM auth_throttle_buckets WHERE kind='pair' AND key_version='current' AND identifier_digest=$1`, merged.Digest[:]).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner != user.ID {
+		t.Fatalf("merged legacy tag=%q want %q", owner, user.ID)
+	}
+}
+
+func TestResetPasswordRollbackPreservesTaggedRecoveryBuckets(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{41}, RecoveryUserID: user.ID}
+	if reservation, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{pair}, 100); err != nil || !reservation.Allowed {
+		t.Fatalf("reserve tagged pair: %#v %v", reservation, err)
+	}
+	if err := repo.ResetPassword(ctx, user.ID, verifier, "audit-bootstrap-"+t.Name(), nil); err == nil {
+		t.Fatal("duplicate audit reset was accepted")
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM auth_throttle_buckets WHERE kind='pair' AND recovery_user_id=$1`, user.ID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("rollback removed tagged recovery pair rows: %d", rows)
+	}
+}
+
 func TestAuthMigrationConstraintsAndAuditDeletion(t *testing.T) {
 	pool, _, user, verifier := freshAuthRepository(t)
 	ctx := context.Background()
@@ -611,6 +791,8 @@ func TestAuthMigrationConstraintsAndAuditDeletion(t *testing.T) {
 		{`INSERT INTO admin_sessions(id,token_digest,user_id,owner_id,auth_revision,last_seen_at,idle_expires_at,absolute_expires_at) VALUES('bad-session',decode('00','hex'),$1,$2,1,clock_timestamp(),clock_timestamp(),clock_timestamp())`, []any{user.ID, user.OwnerID}},
 		{`WITH n AS (SELECT clock_timestamp() AS v) INSERT INTO admin_sessions(id,token_digest,user_id,owner_id,auth_revision,created_at,last_seen_at,idle_expires_at,absolute_expires_at) SELECT 'bad-time',decode(repeat('00',32),'hex'),$1,$2,1,v,v-interval '1 second',v,v FROM n`, []any{user.ID, user.OwnerID}},
 		{`INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at) VALUES('pair','v1',decode('00','hex'),clock_timestamp())`, nil},
+		{`INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,recovery_user_id) VALUES('ip','v1',decode(repeat('01',32),'hex'),clock_timestamp(),$1)`, []any{user.ID}},
+		{`INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,recovery_user_id) VALUES('pair','v1',decode(repeat('02',32),'hex'),clock_timestamp(),'missing-recovery-user')`, nil},
 	} {
 		if _, err := pool.Exec(ctx, check.statement, check.args...); err == nil {
 			t.Fatalf("constraint accepted: %s", check.statement)

@@ -49,6 +49,11 @@ func TestThrottleInputValidation(t *testing.T) {
 	if err := validateThrottleIdentities([]ThrottleIdentity{valid}, 10); err != nil {
 		t.Fatal(err)
 	}
+	knownPair := valid
+	knownPair.RecoveryUserID = "user-1"
+	if err := validateThrottleIdentities([]ThrottleIdentity{knownPair}, 10); err != nil {
+		t.Fatalf("known-user pair rejected: %v", err)
+	}
 	for _, identities := range [][]ThrottleIdentity{
 		nil,
 		{{Kind: "raw_ip", KeyVersion: "v1"}},
@@ -56,6 +61,8 @@ func TestThrottleInputValidation(t *testing.T) {
 		{{Kind: ThrottleIP, KeyVersion: "overflow"}},
 		{{Kind: ThrottleIP, KeyVersion: "v 1"}},
 		{{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{2}, Aliases: []ThrottleAlias{{KeyVersion: "overflow", Digest: [32]byte{3}}}}},
+		{{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{2}, RecoveryUserID: "user-1"}},
+		{{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{2}, RecoveryUserID: strings.Repeat("u", 129)}},
 		{valid, valid},
 		{{Kind: ThrottleUsername, KeyVersion: "v1", Aliases: make([]ThrottleAlias, maxThrottleAliases+1)}},
 	} {

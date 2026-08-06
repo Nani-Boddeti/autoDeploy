@@ -4,21 +4,21 @@ package main
 import (
 	"context"
 	"log"
-	"os"
 
+	"autodeploy/internal/config"
 	"autodeploy/migrations"
 
 	"github.com/jackc/pgx/v5"
 )
 
 func main() {
-	dsn := os.Getenv("AUTODEPLOY_DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("AUTODEPLOY_DATABASE_URL is required")
+	dsn, err := config.DatabaseURLFromEnvironment()
+	if err != nil {
+		log.Fatal("load database credential: invalid configuration")
 	}
 	conn, err := pgx.Connect(context.Background(), dsn)
 	if err != nil {
-		log.Fatalf("connect database: %v", err)
+		log.Fatal("connect database")
 	}
 	defer conn.Close(context.Background())
 	if err := migrations.Apply(context.Background(), conn); err != nil {

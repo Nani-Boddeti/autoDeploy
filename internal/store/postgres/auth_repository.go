@@ -53,6 +53,9 @@ type ThrottleIdentity struct {
 	KeyVersion string
 	Digest     [32]byte
 	Aliases    []ThrottleAlias
+	// Every future known-user pair reservation must set RecoveryUserID; an
+	// unknown-user pair reservation may remain untagged.
+	RecoveryUserID string
 }
 type ThrottleAlias struct {
 	KeyVersion string
@@ -240,14 +243,26 @@ func (r *AuthRepository) ReserveThrottle(ctx context.Context, identities []Throt
 		primaryExists := false
 		aliasesToMigrate := make([]ThrottleAlias, 0, len(identity.Aliases))
 		var activeBlocked *time.Time
+		// Preserve an existing tag even when this reservation is made before the
+		// username is known. A different known user for the same opaque pair
+		// digest is an invariant violation, never a reassignment.
+		resolvedRecoveryUserID := pairRecoveryUserID(identity, string(identity.Kind))
 		for index, candidate := range append([]ThrottleAlias{{KeyVersion: identity.KeyVersion, Digest: identity.Digest}}, identity.Aliases...) {
 			var a, f int
 			var b *time.Time
-			err = tx.QueryRow(ctx, `SELECT attempts,failures,blocked_until FROM auth_throttle_buckets WHERE kind=$1 AND key_version=$2 AND identifier_digest=$3 AND window_started_at=$4 FOR UPDATE`, identity.Kind, candidate.KeyVersion, candidate.Digest[:], window).Scan(&a, &f, &b)
+			var recoveryUserID *string
+			err = tx.QueryRow(ctx, `SELECT attempts,failures,blocked_until,recovery_user_id FROM auth_throttle_buckets WHERE kind=$1 AND key_version=$2 AND identifier_digest=$3 AND window_started_at=$4 FOR UPDATE`, identity.Kind, candidate.KeyVersion, candidate.Digest[:], window).Scan(&a, &f, &b, &recoveryUserID)
 			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 				return ThrottleReservation{}, fmt.Errorf("lock throttle bucket: %w", err)
 			}
 			if err == nil {
+				if identity.Kind == ThrottlePair && recoveryUserID != nil {
+					if resolvedRecoveryUserID != nil && *recoveryUserID != *resolvedRecoveryUserID {
+						return ThrottleReservation{}, errors.New("pair throttle recovery user collision")
+					}
+					v := *recoveryUserID
+					resolvedRecoveryUserID = &v
+				}
 				if index == 0 {
 					primaryExists = true
 				}
@@ -296,7 +311,7 @@ func (r *AuthRepository) ReserveThrottle(ctx context.Context, identities []Throt
 					return ThrottleReservation{}, fmt.Errorf("delete migrated throttle alias: %w", err)
 				}
 			}
-			if _, err = tx.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures,blocked_until,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,clock_timestamp()) ON CONFLICT(kind,key_version,identifier_digest,window_started_at) DO UPDATE SET attempts=EXCLUDED.attempts,failures=EXCLUDED.failures,blocked_until=CASE WHEN auth_throttle_buckets.blocked_until IS NULL THEN EXCLUDED.blocked_until WHEN EXCLUDED.blocked_until IS NULL THEN auth_throttle_buckets.blocked_until ELSE GREATEST(auth_throttle_buckets.blocked_until,EXCLUDED.blocked_until) END,updated_at=clock_timestamp()`, identity.Kind, identity.KeyVersion, identity.Digest[:], window, activeAttempts, activeFailures, activeBlocked); err != nil {
+			if _, err = tx.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures,blocked_until,recovery_user_id,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp()) ON CONFLICT(kind,key_version,identifier_digest,window_started_at) DO UPDATE SET attempts=EXCLUDED.attempts,failures=EXCLUDED.failures,blocked_until=CASE WHEN auth_throttle_buckets.blocked_until IS NULL THEN EXCLUDED.blocked_until WHEN EXCLUDED.blocked_until IS NULL THEN auth_throttle_buckets.blocked_until ELSE GREATEST(auth_throttle_buckets.blocked_until,EXCLUDED.blocked_until) END,recovery_user_id=COALESCE(auth_throttle_buckets.recovery_user_id,EXCLUDED.recovery_user_id),updated_at=clock_timestamp()`, identity.Kind, identity.KeyVersion, identity.Digest[:], window, activeAttempts, activeFailures, activeBlocked, resolvedRecoveryUserID); err != nil {
 				return ThrottleReservation{}, fmt.Errorf("migrate throttle aliases: %w", err)
 			}
 			primaryExists = true
@@ -317,6 +332,7 @@ func (r *AuthRepository) ReserveThrottle(ctx context.Context, identities []Throt
 		kind := string(identity.Kind)
 		digest := identity.Digest
 		keyVersion := identity.KeyVersion
+		recoveryUserID := resolvedRecoveryUserID
 		// Keep four installation-wide slots available for per-kind overflow.
 		// Delayed cleanup can therefore only fold an unseen identity into an
 		// already bounded shared bucket; it cannot increase cardinality.
@@ -324,6 +340,7 @@ func (r *AuthRepository) ReserveThrottle(ctx context.Context, identities []Throt
 			kind += "_overflow"
 			keyVersion = "overflow"
 			digest = [32]byte{}
+			recoveryUserID = nil
 			if count >= maxRows {
 				var overflowExists bool
 				if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM auth_throttle_buckets WHERE kind=$1 AND key_version=$2 AND identifier_digest=$3 AND window_started_at=$4)`, kind, keyVersion, digest[:], window).Scan(&overflowExists); err != nil {
@@ -370,7 +387,7 @@ func (r *AuthRepository) ReserveThrottle(ctx context.Context, identities []Throt
 			v := now.Add(delay)
 			nextBlock, blocked = &v, v
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures,blocked_until,updated_at) VALUES($1,$2,$3,$4,1,1,$5,clock_timestamp()) ON CONFLICT(kind,key_version,identifier_digest,window_started_at) DO UPDATE SET attempts=auth_throttle_buckets.attempts+1,failures=auth_throttle_buckets.failures+1,blocked_until=COALESCE($5,auth_throttle_buckets.blocked_until),updated_at=clock_timestamp()`, kind, keyVersion, digest[:], window, nextBlock); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures,blocked_until,recovery_user_id,updated_at) VALUES($1,$2,$3,$4,1,1,$5,$6,clock_timestamp()) ON CONFLICT(kind,key_version,identifier_digest,window_started_at) DO UPDATE SET attempts=auth_throttle_buckets.attempts+1,failures=auth_throttle_buckets.failures+1,blocked_until=COALESCE($5,auth_throttle_buckets.blocked_until),recovery_user_id=COALESCE(auth_throttle_buckets.recovery_user_id,EXCLUDED.recovery_user_id),updated_at=clock_timestamp()`, kind, keyVersion, digest[:], window, nextBlock, recoveryUserID); err != nil {
 			return ThrottleReservation{}, fmt.Errorf("reserve throttle bucket: %w", err)
 		}
 	}
@@ -778,6 +795,12 @@ func (r *AuthRepository) ResetPassword(ctx context.Context, userID string, verif
 		return fmt.Errorf("begin password reset: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// The universal credential-flow order is throttle admission -> user ->
+	// session. A first-time tagged pair reservation acquires the user FK lock
+	// after throttle admission, so reset must acquire the advisory lock first.
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(731492845631694123)`); err != nil {
+		return fmt.Errorf("lock reset throttle admission: %w", err)
+	}
 	var owner string
 	var revision, policyRev int64
 	var memory, iterations int32
@@ -797,8 +820,11 @@ func (r *AuthRepository) ResetPassword(ctx context.Context, userID string, verif
 	if _, err = tx.Exec(ctx, `UPDATE admin_sessions SET revoked_at=clock_timestamp(),revoked_reason='password_reset' WHERE user_id=$1 AND revoked_at IS NULL`, userID); err != nil {
 		return fmt.Errorf("revoke reset sessions: %w", err)
 	}
+	if _, err = tx.Exec(ctx, `DELETE FROM auth_throttle_buckets WHERE kind='pair' AND recovery_user_id=$1`, userID); err != nil {
+		return fmt.Errorf("clear tagged recovery pair throttles: %w", err)
+	}
 	for _, d := range recoveryDigests {
-		if _, err = tx.Exec(ctx, `DELETE FROM auth_throttle_buckets WHERE kind='pair' AND identifier_digest=$1`, d[:]); err != nil {
+		if _, err = tx.Exec(ctx, `DELETE FROM auth_throttle_buckets WHERE kind='pair' AND identifier_digest=$1 AND recovery_user_id IS NULL`, d[:]); err != nil {
 			return fmt.Errorf("clear recovery throttle: %w", err)
 		}
 		if _, err = tx.Exec(ctx, `DELETE FROM auth_username_throttles WHERE identifier_digest=$1 AND key_version <> 'overflow'`, d[:]); err != nil {
@@ -835,6 +861,9 @@ func validateThrottleIdentities(identities []ThrottleIdentity, maxRows int) erro
 		if identity.Digest == ([32]byte{}) {
 			return errors.New("invalid zero throttle digest")
 		}
+		if identity.RecoveryUserID != "" && (identity.Kind != ThrottlePair || validID(identity.RecoveryUserID) != nil) {
+			return errors.New("invalid throttle recovery user")
+		}
 		key := string(identity.Kind) + "/" + identity.KeyVersion + string(identity.Digest[:])
 		if _, ok := seen[key]; ok {
 			return errors.New("duplicate throttle identity")
@@ -852,6 +881,13 @@ func validateThrottleIdentities(identities []ThrottleIdentity, maxRows int) erro
 		}
 	}
 	return nil
+}
+
+func pairRecoveryUserID(identity ThrottleIdentity, kind string) *string {
+	if kind != string(ThrottlePair) || identity.RecoveryUserID == "" {
+		return nil
+	}
+	return &identity.RecoveryUserID
 }
 
 func validThrottleKeyVersion(version string) bool {

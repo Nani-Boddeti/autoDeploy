@@ -45,7 +45,11 @@ func CanonicalUsername(input string) (string, error) {
 }
 
 func ValidatePassword(password string) error {
-	if !utf8.ValidString(password) {
+	return ValidatePasswordBytes([]byte(password))
+}
+
+func ValidatePasswordBytes(password []byte) error {
+	if !utf8.Valid(password) {
 		return errors.New("password is not valid UTF-8")
 	}
 	if len(password) < 15 || len(password) > 1024 {
@@ -319,6 +323,78 @@ func CanAccess(principal Principal, resourceOwnerID string, operation Operation)
 type CSRFKeyRing struct {
 	ActiveVersion string
 	Keys          map[string][]byte
+}
+
+// UsernameThrottleKeyRing holds the active key and a bounded set of retained
+// keys used to clear username throttle state during operator recovery.
+// Key bytes are deliberately never serialized or logged.
+type UsernameThrottleKeyRing struct {
+	ActiveVersion    string
+	Keys             map[string][]byte
+	RetainedVersions []string
+}
+
+// UsernameDigests returns active then retained, domain-separated digests for
+// one canonical username. The stable ordering lets callers pass every live
+// alias to a single recovery transaction.
+func (r UsernameThrottleKeyRing) UsernameDigests(username string) ([][32]byte, error) {
+	if err := r.validate(); err != nil {
+		return nil, err
+	}
+	canonical, err := CanonicalUsername(username)
+	if err != nil || canonical != username {
+		return nil, errors.New("invalid canonical username")
+	}
+	versions := append([]string{r.ActiveVersion}, r.RetainedVersions...)
+	digests := make([][32]byte, 0, len(versions))
+	for _, version := range versions {
+		mac := hmac.New(sha256.New, r.Keys[version])
+		mac.Write([]byte("autodeploy/username-throttle/v1"))
+		mac.Write([]byte{0})
+		mac.Write([]byte(canonical))
+		var digest [32]byte
+		copy(digest[:], mac.Sum(nil))
+		digests = append(digests, digest)
+	}
+	return digests, nil
+}
+
+func (r UsernameThrottleKeyRing) validate() error {
+	if !validKeyVersion(r.ActiveVersion) || len(r.Keys) == 0 || len(r.Keys) > 5 || len(r.RetainedVersions) > 4 {
+		return errors.New("invalid username throttle key ring")
+	}
+	seenVersions := make(map[string]struct{}, len(r.Keys))
+	seenKeys := make(map[string]struct{}, len(r.Keys))
+	for _, version := range append([]string{r.ActiveVersion}, r.RetainedVersions...) {
+		if !validKeyVersion(version) || len(r.Keys[version]) != 32 {
+			return errors.New("invalid username throttle key ring")
+		}
+		if _, exists := seenVersions[version]; exists {
+			return errors.New("invalid username throttle key ring")
+		}
+		seenVersions[version] = struct{}{}
+	}
+	if len(seenVersions) != len(r.Keys) {
+		return errors.New("invalid username throttle key ring")
+	}
+	for version, key := range r.Keys {
+		if !validKeyVersion(version) || len(key) != 32 || isZeroKey(key) {
+			return errors.New("invalid username throttle key ring")
+		}
+		if _, exists := seenKeys[string(key)]; exists {
+			return errors.New("invalid username throttle key ring")
+		}
+		seenKeys[string(key)] = struct{}{}
+	}
+	return nil
+}
+
+func isZeroKey(key []byte) bool {
+	var value byte
+	for _, b := range key {
+		value |= b
+	}
+	return value == 0
 }
 
 func (r CSRFKeyRing) validate() error {
