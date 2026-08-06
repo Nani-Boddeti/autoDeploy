@@ -253,8 +253,9 @@ Approved by the user:
       owner-scoped authorization, audit, and the Strict-cookie GitHub handoff boundary.
 - [x] Administrator authentication domain primitives implemented, race-tested, independently
       QA-verified, and security-reviewed.
-- [ ] Next: implement the administrator-authentication PostgreSQL migration and typed persistence
-      workflows.
+- [x] Administrator-authentication PostgreSQL migration and typed persistence workflows are
+      implemented, live-integration/race-tested, independently QA-verified, and security-reviewed.
+- [ ] Next: implement credential-file configuration and the interactive administrator CLI.
 
 ## Approved Administrator Authentication Slice
 
@@ -265,11 +266,11 @@ records carry explicit owner scope.
 ### Architecture and persistence
 
 - [x] Record the security and failure invariants in ADR 0006.
-- [ ] Add a forward-only additive migration for owners, permanent bootstrap state, users,
+- [x] Add a forward-only additive migration for owners, permanent bootstrap state, users,
       server-side sessions, durable throttle buckets, and append-only authentication audit events.
-- [ ] Add typed PostgreSQL transactions for singleton bootstrap, login attempt reservation and
+- [x] Add typed PostgreSQL transactions for singleton bootstrap, login attempt reservation and
       finalization, session creation/validation/revocation, password reset, and cleanup.
-- [ ] Preserve exact owner ID and authentication revision checks in every security-sensitive
+- [x] Preserve exact owner ID and authentication revision checks in every security-sensitive
       transaction; audit failure must roll back its associated mutation.
 
 ### Authentication domain
@@ -330,6 +331,24 @@ records carry explicit owner scope.
   before expensive allocation or cryptographic work.
 - Independent QA passed with 88.0% statement coverage; full unit, race, vet, build, tidy-diff, and
   whitespace checks pass.
+
+### Authentication persistence result
+
+- Added an extension-free forward migration with permanent bootstrap state, exact owner-scoped
+  composite foreign keys, digest-only sessions, append-only audit, durable global throttle
+  cardinality, and bounded cleanup indexes.
+- Added typed transactions for concurrent singleton bootstrap, policy/user loading, session
+  creation/validation/logout/cap/cleanup, password reset, throttle reservation/finalization, and
+  bounded throttle cleanup.
+- New password verifiers must exactly match the durable Argon2 policy; future/stale authority and
+  reset/login races fail closed under explicit user-then-session locking.
+- Pair/IP throttles use fixed 15-minute windows. Username-wide exponential state is separate and
+  durable through 30/60/120/240/480/900-second stages, retained-key migration, and shared overflow.
+- PostgreSQL admission serialization and one durable replica configuration bound combined ordinary
+  and overflow throttle rows even when cleanup is delayed.
+- Real PostgreSQL 18.4 integration and race-integration suites pass, including concurrency,
+  rollback, ownership, expiry/touch, exact digest, audit, cardinality, overflow, rotation, and
+  cleanup regressions. Independent QA and security review report no medium-or-higher findings.
 
 ## Approved Persistence Slice
 

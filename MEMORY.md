@@ -194,8 +194,17 @@
 - Password verifier revisions newer than the running durable policy fail closed; older valid
   revisions/parameters only signal rehash. Dummy verification never exposes success and uses the
   exact policy bound during startup construction.
-- Next task: PostgreSQL authentication migration and typed persistence workflows. No auth schema,
-  repository, CLI, or web code has started.
+- Auth persistence is implemented and verified: extension-free migration 000002; permanent
+  singleton bootstrap/policy; owner-scoped users/sessions/audit; explicit user→session lock order;
+  digest-only 30m/8h sessions with cap/revocation/cleanup; reset revision invalidation; atomic audit;
+  durable bounded throttles and cleanup.
+- Throttling: pair=5 failures/15m; IP/invalid-forward=20 attempts/15m; username has dedicated durable
+  failures/backoff state at 30/60/120/240/480/900s, retained-key merge, shared overflow enforcement,
+  and one cross-replica global row cap that remains conservative if cleanup is delayed.
+- Real PostgreSQL 18.4 integration and race-integration tests pass; independent QA/security review
+  has no medium-or-higher findings.
+- Next task: credential-file configuration and interactive admin bootstrap/reset CLI. No auth web
+  routes or control-plane wiring have started.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons

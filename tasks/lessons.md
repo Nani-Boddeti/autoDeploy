@@ -34,3 +34,16 @@
 - Bound attacker-controlled strings before normalization, splitting, or base64 decoding; crypto
   parameter ceilings alone do not prevent parser allocation abuse.
 - Digest-domain tests must use identical raw input in each domain or they do not prove separation.
+- Exponential username backoff needs durable non-window state; carrying history through fixed
+  windows breaks progression across boundaries, rotation aliases, and shared overflow.
+- Cardinality limits must count every retained row globally under one cross-replica admission lock;
+  counting only the current window makes delayed cleanup an unbounded-storage path.
+- Reserve overflow capacity and read shared overflow counters before admitting work; write-only
+  overflow buckets silently restore unlimited attempts.
+- New password verifiers must match both the durable policy revision and exact Argon2 parameters;
+  a revision label alone can disguise a weak legacy PHC string.
+- Composite `(id, owner_id)` foreign keys prevent cross-owner session/audit corruption before
+  application authorization runs.
+- Execute evolving migrations against a fresh real database: checksum protection correctly rejects
+  edited already-applied development migrations, and live constraints expose invalid fixtures and
+  ordering bugs that compile-only tagged tests cannot.

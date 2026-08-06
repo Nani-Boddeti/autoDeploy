@@ -240,7 +240,8 @@ A forward-only additive migration introduces:
 - `users` with canonical username, role, password PHC string, password-policy revision, status, and
   authentication revision
 - `admin_sessions` with token digest, scope, revision, expiries, and revocation metadata
-- `auth_throttle_buckets`
+- fixed-window `auth_throttle_buckets`, durable username-backoff state, and a singleton durable
+  cardinality configuration shared by every replica
 - append-only `auth_audit_events`
 - short-lived GitHub setup state and handoff records when that flow is implemented
 

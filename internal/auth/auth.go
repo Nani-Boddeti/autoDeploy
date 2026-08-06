@@ -72,6 +72,36 @@ type PasswordVerifier struct {
 	PolicyRevision uint64
 }
 
+// ValidatePasswordVerifier checks storage-safe verifier syntax without hashing a password.
+func ValidatePasswordVerifier(verifier PasswordVerifier) error {
+	if verifier.PolicyRevision == 0 {
+		return errors.New("invalid password verifier revision")
+	}
+	_, err := parsePHC(verifier.PHC)
+	return err
+}
+
+// ValidatePasswordVerifierForPolicy validates a verifier that is about to be
+// persisted.  Loading intentionally remains ceiling-only so older verifiers
+// can be authenticated and rehashed; new writes must exactly match the
+// installation policy and may not merely claim its revision.
+func ValidatePasswordVerifierForPolicy(verifier PasswordVerifier, policy Argon2Policy) error {
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	if err := ValidatePasswordVerifier(verifier); err != nil {
+		return err
+	}
+	parsed, err := parsePHC(verifier.PHC)
+	if err != nil {
+		return err
+	}
+	if verifier.PolicyRevision != policy.Revision || parsed.memory != policy.MemoryKiB || parsed.iterations != policy.Iterations || parsed.lanes != policy.Lanes {
+		return errors.New("password verifier does not exactly match policy")
+	}
+	return nil
+}
+
 type PasswordVerification struct{ Valid, RehashNeeded bool }
 
 const argonSaltBytes = 16
@@ -167,8 +197,8 @@ func VerifyPassword(password string, verifier PasswordVerifier, policy Argon2Pol
 	if err := policy.Validate(); err != nil {
 		return PasswordVerification{}, err
 	}
-	if verifier.PolicyRevision == 0 {
-		return PasswordVerification{}, errors.New("invalid password verifier revision")
+	if err := ValidatePasswordVerifier(verifier); err != nil {
+		return PasswordVerification{}, err
 	}
 	if verifier.PolicyRevision > policy.Revision {
 		return PasswordVerification{}, errors.New("password verifier policy revision is newer than current policy")

@@ -105,6 +105,22 @@ func TestPasswordsRoundTripAndParserDefenses(t *testing.T) {
 	if _, err := VerifyPassword(password, PasswordVerifier{PHC: strings.Repeat("x", maxPHCBytes+1), PolicyRevision: policy.Revision}, policy); err == nil {
 		t.Fatal("accepted oversized PHC")
 	}
+	if err := ValidatePasswordVerifier(phc); err != nil {
+		t.Fatalf("storage validation rejected verifier: %v", err)
+	}
+	if err := ValidatePasswordVerifier(PasswordVerifier{PHC: phc.PHC}); err == nil {
+		t.Fatal("storage validation accepted a zero policy revision")
+	}
+	if err := ValidatePasswordVerifierForPolicy(phc, policy); err != nil {
+		t.Fatalf("exact policy validation rejected verifier: %v", err)
+	}
+	weakCurrent := PasswordVerifier{PHC: legacyPHC, PolicyRevision: policy.Revision}
+	if err := ValidatePasswordVerifier(weakCurrent); err != nil {
+		t.Fatalf("legacy loading validation rejected bounded verifier: %v", err)
+	}
+	if err := ValidatePasswordVerifierForPolicy(weakCurrent, policy); err == nil {
+		t.Fatal("new write validation accepted weak verifier labelled current")
+	}
 }
 
 func TestParsePHCBoundsWithoutHashing(t *testing.T) {
