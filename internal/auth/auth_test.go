@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -38,6 +39,108 @@ func TestUsernameAndPasswordPolicies(t *testing.T) {
 		if err := ValidatePassword(value); err == nil {
 			t.Errorf("invalid password accepted")
 		}
+	}
+}
+
+func TestLoginEnvelopeAndThrottleDigests(t *testing.T) {
+	keys := CSRFKeyRing{ActiveVersion: "k1", Keys: map[string][]byte{"k1": bytes.Repeat([]byte{1}, 32), "old": bytes.Repeat([]byte{2}, 32)}}
+	nonce, err := NewLoginNonce(bytes.NewReader(bytes.Repeat([]byte{3}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	origin := "https://admin.example.test"
+	token, err := NewLoginEnvelope(keys, nonce, now, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ParseLoginEnvelope(keys, token, now.Add(LoginEnvelopeMaxAge), origin)
+	if err != nil || got.Nonce != nonce || !got.IssuedAt.Equal(now) {
+		t.Fatalf("parse = %#v, %v", got, err)
+	}
+	for _, test := range []struct {
+		name   string
+		value  string
+		at     time.Time
+		origin string
+	}{
+		{"expired", token, now.Add(LoginEnvelopeMaxAge + time.Second), origin},
+		{"future", token, now.Add(-time.Second), origin},
+		{"origin", token, now, "https://evil.example.test"},
+		{"padding", token + "=", now, origin},
+		{"oversized", strings.Repeat("x", 1024), now, origin},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := ParseLoginEnvelope(keys, test.value, test.at, test.origin); err == nil {
+				t.Fatal("accepted invalid envelope")
+			}
+		})
+	}
+	old := keys
+	old.ActiveVersion = "old"
+	oldToken, err := NewLoginEnvelope(old, nonce, now, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseLoginEnvelope(keys, oldToken, now, origin); err != nil {
+		t.Fatalf("retained envelope: %v", err)
+	}
+	parts := strings.Split(token, ".")
+	parts[1] = "missing"
+	if _, err := ParseLoginEnvelope(keys, strings.Join(parts, "."), now, origin); err == nil {
+		t.Fatal("accepted unknown key")
+	}
+	// Duplicate retained key bytes remain valid during a deliberate key-ring
+	// overlap; the authenticated selector prevents a rewrite between versions.
+	overlap := CSRFKeyRing{ActiveVersion: "new", Keys: map[string][]byte{"new": bytes.Repeat([]byte{7}, 32), "old": bytes.Repeat([]byte{7}, 32)}}
+	overlapToken, err := NewLoginEnvelope(overlap, nonce, now, origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlapParts := strings.Split(overlapToken, ".")
+	overlapParts[1] = "old"
+	if _, err := ParseLoginEnvelope(overlap, strings.Join(overlapParts, "."), now, origin); err == nil {
+		t.Fatal("accepted selector rewrite with duplicate key bytes")
+	}
+	tampered := strings.Split(token, ".")
+	payload, err := base64.RawURLEncoding.DecodeString(tampered[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload[8] ^= 1
+	tampered[2] = base64.RawURLEncoding.EncodeToString(payload)
+	if _, err := ParseLoginEnvelope(keys, strings.Join(tampered, "."), now, origin); err == nil {
+		t.Fatal("accepted payload MAC tamper")
+	}
+	malformedTimestamp := strings.Split(token, ".")
+	payload, err = base64.RawURLEncoding.DecodeString(malformedTimestamp[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		payload[i] = 0xff
+	}
+	malformedTimestamp[2] = base64.RawURLEncoding.EncodeToString(payload)
+	if _, err := ParseLoginEnvelope(keys, strings.Join(malformedTimestamp, "."), now, origin); err == nil {
+		t.Fatal("accepted malformed timestamp")
+	}
+	if _, err := ParseLoginEnvelope(keys, token, now.Add(LoginEnvelopeMaxAge), origin); err != nil {
+		t.Fatalf("rejected max-age boundary: %v", err)
+	}
+	key := bytes.Repeat([]byte{9}, 32)
+	pair, err := ThrottleDigest(key, "pair", "192.0.2.1", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip, err := ThrottleDigest(key, "ip", "192.0.2.1")
+	if err != nil || pair == ip {
+		t.Fatalf("throttle domain separation failed: %v", err)
+	}
+	if _, err := ThrottleDigest(key, "pair", "192.0.2.1\x00admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ThrottleDigest(make([]byte, 32), "pair", "x"); err == nil {
+		t.Fatal("accepted all-zero key")
 	}
 }
 

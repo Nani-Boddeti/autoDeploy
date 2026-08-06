@@ -713,6 +713,76 @@ func TestResetPasswordSerializesWithThrottleReservationLock(t *testing.T) {
 	}
 }
 
+func TestCompleteLoginSerializesWithThrottleReservationAndReset(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{40}, RecoveryUserID: user.ID}
+	username := ThrottleIdentity{Kind: ThrottleUsername, KeyVersion: "v1", Digest: [32]byte{41}}
+	ip := ThrottleIdentity{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{42}}
+	holder, err := pgx.Connect(ctx, os.Getenv("AUTODEPLOY_TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { holder.Close(ctx) })
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_lock(731492845631694123)`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = holder.Exec(context.Background(), `SELECT pg_advisory_unlock(731492845631694123)`) })
+	loginDone := make(chan error, 1)
+	go func() {
+		_, loginErr := repo.CompleteLogin(ctx, CompleteLoginInput{SessionID: "complete-login-serialized", Token: testToken(t, 40), User: user, AuditID: "audit-complete-login-serialized", SessionLimitAuditID: "audit-complete-login-serialized-limit", ThrottleIdentities: []ThrottleIdentity{pair, username, ip}})
+		loginDone <- loginErr
+	}()
+	resetDone := make(chan error, 1)
+	go func() {
+		resetDone <- NewAuthRepository(pool).ResetPassword(ctx, user.ID, verifier, "audit-complete-login-serialized-reset", nil)
+	}()
+	reservationDone := make(chan error, 1)
+	go func() {
+		_, reserveErr := NewAuthRepository(pool).ReserveThrottle(ctx, []ThrottleIdentity{pair}, 100)
+		reservationDone <- reserveErr
+	}()
+	for attempts := 0; ; attempts++ {
+		var waiters int
+		if err = pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted`).Scan(&waiters); err != nil {
+			t.Fatal(err)
+		}
+		if waiters >= 3 {
+			break
+		}
+		if attempts == 10000 {
+			t.Fatal("complete login did not wait before user/session work")
+		}
+		runtime.Gosched()
+	}
+	var sessions int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM admin_sessions WHERE user_id=$1`, user.ID).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 {
+		t.Fatalf("complete login created session before throttle admission: %d", sessions)
+	}
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_unlock(731492845631694123)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-resetDone; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-reservationDone; err != nil {
+		t.Fatal(err)
+	}
+	if err = <-loginDone; err != nil && !errors.Is(err, ErrUnauthenticated) {
+		t.Fatal(err)
+	}
+	var active int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM admin_sessions WHERE user_id=$1 AND revoked_at IS NULL`, user.ID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("complete login/reset race left active sessions: %d", active)
+	}
+}
+
 func TestPairThrottleRecoveryTagIsNeverReassigned(t *testing.T) {
 	pool, repo, user, verifier := freshAuthRepository(t)
 	ctx := context.Background()
@@ -776,6 +846,173 @@ func TestResetPasswordRollbackPreservesTaggedRecoveryBuckets(t *testing.T) {
 	}
 	if rows != 1 {
 		t.Fatalf("rollback removed tagged recovery pair rows: %d", rows)
+	}
+}
+
+func TestCompleteLoginAtomicallyCreatesSessionAndClearsCredentialThrottles(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,owner_id,username,role,password_phc,password_policy_revision) VALUES('other-login-user',$1,'otherlogin','owner',$2,1)`, user.OwnerID, verifier.PHC); err != nil {
+		t.Fatal(err)
+	}
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{51}, RecoveryUserID: user.ID, Aliases: []ThrottleAlias{{KeyVersion: "prior", Digest: [32]byte{52}}}}
+	username := ThrottleIdentity{Kind: ThrottleUsername, KeyVersion: "v1", Digest: [32]byte{53}, Aliases: []ThrottleAlias{{KeyVersion: "prior", Digest: [32]byte{54}}}}
+	ip := ThrottleIdentity{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{55}}
+	other := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{56}, RecoveryUserID: "other-login-user"}
+	for _, identity := range []ThrottleIdentity{pair, username, ip, other} {
+		if reservation, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{identity}, 100); err != nil || !reservation.Allowed {
+			t.Fatalf("reserve %s: %#v %v", identity.Kind, reservation, err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO auth_throttle_buckets(kind,key_version,identifier_digest,window_started_at,attempts,failures) VALUES('pair_overflow','overflow',decode(repeat('00',32),'hex'),date_trunc('minute',clock_timestamp())-make_interval(mins => extract(minute from clock_timestamp())::int % 15),1,1)`); err != nil {
+		t.Fatal(err)
+	}
+	token := testToken(t, 51)
+	session, err := repo.CompleteLogin(ctx, CompleteLoginInput{SessionID: "complete-login-session", Token: token, User: user, AuditID: "audit-complete-login", SessionLimitAuditID: "audit-complete-login-limit", ThrottleIdentities: []ThrottleIdentity{pair, username, ip}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.UserID != user.ID || session.AuthRevision != user.AuthRevision || session.IdleExpiresAt.Sub(session.CreatedAt) != 30*time.Minute || session.AbsoluteExpiresAt.Sub(session.CreatedAt) != 8*time.Hour {
+		t.Fatalf("unexpected complete-login session: %+v", session)
+	}
+	var ownPair, usernameRows, ipRows, otherPair, overflowRows int
+	if err = pool.QueryRow(ctx, `SELECT
+		count(*) FILTER (WHERE kind='pair' AND recovery_user_id=$1),
+		(SELECT count(*) FROM auth_username_throttles),
+		count(*) FILTER (WHERE kind='ip'),
+		count(*) FILTER (WHERE kind='pair' AND recovery_user_id='other-login-user'),
+		count(*) FILTER (WHERE kind='pair_overflow')
+		FROM auth_throttle_buckets`, user.ID).Scan(&ownPair, &usernameRows, &ipRows, &otherPair, &overflowRows); err != nil {
+		t.Fatal(err)
+	}
+	if ownPair != 0 || usernameRows != 0 || ipRows != 1 || otherPair != 1 || overflowRows != 1 {
+		t.Fatalf("own pair=%d username=%d ip=%d other=%d overflow=%d", ownPair, usernameRows, ipRows, otherPair, overflowRows)
+	}
+	if _, err = repo.ValidateSession(ctx, token); err != nil {
+		t.Fatalf("complete login session invalid: %v", err)
+	}
+}
+
+func TestCompleteLoginAuditFailureRollsBackSessionAndThrottleClear(t *testing.T) {
+	pool, repo, user, _ := freshAuthRepository(t)
+	ctx := context.Background()
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{61}, RecoveryUserID: user.ID}
+	username := ThrottleIdentity{Kind: ThrottleUsername, KeyVersion: "v1", Digest: [32]byte{62}}
+	ip := ThrottleIdentity{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{63}}
+	for _, identity := range []ThrottleIdentity{pair, username, ip} {
+		if reservation, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{identity}, 100); err != nil || !reservation.Allowed {
+			t.Fatalf("reserve %s: %#v %v", identity.Kind, reservation, err)
+		}
+	}
+	_, err := repo.CompleteLogin(ctx, CompleteLoginInput{SessionID: "complete-login-rollback", Token: testToken(t, 61), User: user, AuditID: "audit-bootstrap-" + t.Name(), SessionLimitAuditID: "audit-complete-login-rollback-limit", ThrottleIdentities: []ThrottleIdentity{pair, username, ip}})
+	if err == nil {
+		t.Fatal("duplicate login audit was accepted")
+	}
+	var sessions, pairs int
+	if err = pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM admin_sessions WHERE id='complete-login-rollback'),(SELECT count(*) FROM auth_throttle_buckets WHERE kind='pair' AND recovery_user_id=$1)`, user.ID).Scan(&sessions, &pairs); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 || pairs != 1 {
+		t.Fatalf("rollback sessions=%d pairs=%d", sessions, pairs)
+	}
+}
+
+func TestCompleteLoginRequiresExactlyKnownPairUsernameAndIP(t *testing.T) {
+	_, repo, user, _ := freshAuthRepository(t)
+	ctx := context.Background()
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{64}, RecoveryUserID: user.ID}
+	username := ThrottleIdentity{Kind: ThrottleUsername, KeyVersion: "v1", Digest: [32]byte{65}}
+	ip := ThrottleIdentity{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{66}}
+	for index, identities := range [][]ThrottleIdentity{
+		{pair, username},
+		{pair, username, {Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{67}, RecoveryUserID: user.ID}},
+		{pair, username, {Kind: ThrottleInvalidForward, KeyVersion: "v1", Digest: [32]byte{68}}},
+	} {
+		_, err := repo.CompleteLogin(ctx, CompleteLoginInput{SessionID: fmt.Sprintf("complete-login-invalid-%d", index), Token: testToken(t, byte(64+index)), User: user, AuditID: fmt.Sprintf("audit-complete-login-invalid-%d", index), SessionLimitAuditID: fmt.Sprintf("audit-complete-login-invalid-limit-%d", index), ThrottleIdentities: identities})
+		if err == nil {
+			t.Fatalf("accepted invalid successful-login identities: %#v", identities)
+		}
+	}
+	if _, err := repo.CompleteLogin(ctx, CompleteLoginInput{SessionID: "complete-login-invalid-owner", Token: testToken(t, 69), User: user, AuditID: "audit-complete-login-invalid-owner", SessionLimitAuditID: "audit-complete-login-invalid-owner-limit", ThrottleIdentities: []ThrottleIdentity{{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{69}, RecoveryUserID: "other-user"}, username, ip}}); err == nil {
+		t.Fatal("accepted a pair owned by another user")
+	}
+}
+
+func TestCompleteLoginRehashesAndEnforcesSessionCap(t *testing.T) {
+	pool, repo, user, _ := freshAuthRepository(t)
+	ctx := context.Background()
+	for i := 0; i < 10; i++ {
+		if _, err := repo.CreateSession(ctx, fmt.Sprintf("complete-login-cap-%02d", i), testToken(t, byte(70+i)), user, nil, fmt.Sprintf("audit-complete-login-cap-%02d", i), fmt.Sprintf("audit-complete-login-cap-limit-%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newPolicy := auth.Argon2Policy{Revision: 2, MemoryKiB: 20 * 1024, Iterations: 2, Lanes: 1}
+	if _, err := pool.Exec(ctx, `UPDATE installation_auth SET password_policy_revision=$1,password_memory_kib=$2,password_iterations=$3,password_lanes=$4 WHERE id=1`, int64(newPolicy.Revision), int32(newPolicy.MemoryKiB), int32(newPolicy.Iterations), int16(newPolicy.Lanes)); err != nil {
+		t.Fatal(err)
+	}
+	user, err := repo.FindLoginUserByCanonicalUsername(ctx, "administrator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := auth.HashPassword(strings.Repeat("r", 15), newPolicy, bytes.NewReader(bytes.Repeat([]byte{71}, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{71}, RecoveryUserID: user.ID}
+	username := ThrottleIdentity{Kind: ThrottleUsername, KeyVersion: "v1", Digest: [32]byte{72}}
+	ip := ThrottleIdentity{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{73}}
+	for _, identity := range []ThrottleIdentity{pair, username, ip} {
+		if reservation, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{identity}, 100); err != nil || !reservation.Allowed {
+			t.Fatalf("reserve %s: %#v %v", identity.Kind, reservation, err)
+		}
+	}
+	if _, err = repo.CompleteLogin(ctx, CompleteLoginInput{SessionID: "complete-login-cap-new", Token: testToken(t, 82), User: user, Replacement: &replacement, AuditID: "audit-complete-login-cap-new", SessionLimitAuditID: "audit-complete-login-cap-new-limit", ThrottleIdentities: []ThrottleIdentity{pair, username, ip}}); err != nil {
+		t.Fatal(err)
+	}
+	var active, revoked int
+	var storedPHC string
+	var storedRevision int64
+	if err = pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE revoked_at IS NULL),count(*) FILTER (WHERE revoked_reason='session_limit') FROM admin_sessions`).Scan(&active, &revoked); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(ctx, `SELECT password_phc,password_policy_revision FROM users WHERE id=$1`, user.ID).Scan(&storedPHC, &storedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if active != 10 || revoked != 1 || storedPHC != replacement.PHC || storedRevision != int64(newPolicy.Revision) {
+		t.Fatalf("active=%d revoked=%d replacement=%t policy=%d", active, revoked, storedPHC == replacement.PHC, storedRevision)
+	}
+}
+
+func TestCompleteLoginCannotCommitAcrossPasswordReset(t *testing.T) {
+	pool, repo, user, verifier := freshAuthRepository(t)
+	ctx := context.Background()
+	pair := ThrottleIdentity{Kind: ThrottlePair, KeyVersion: "v1", Digest: [32]byte{91}, RecoveryUserID: user.ID}
+	username := ThrottleIdentity{Kind: ThrottleUsername, KeyVersion: "v1", Digest: [32]byte{92}}
+	ip := ThrottleIdentity{Kind: ThrottleIP, KeyVersion: "v1", Digest: [32]byte{93}}
+	for _, identity := range []ThrottleIdentity{pair, username, ip} {
+		if reservation, err := repo.ReserveThrottle(ctx, []ThrottleIdentity{identity}, 100); err != nil || !reservation.Allowed {
+			t.Fatalf("reserve %s: %#v %v", identity.Kind, reservation, err)
+		}
+	}
+	errs := make(chan error, 2)
+	go func() {
+		_, err := NewAuthRepository(pool).CompleteLogin(ctx, CompleteLoginInput{SessionID: "complete-login-race", Token: testToken(t, 91), User: user, AuditID: "audit-complete-login-race", SessionLimitAuditID: "audit-complete-login-race-limit", ThrottleIdentities: []ThrottleIdentity{pair, username, ip}})
+		errs <- err
+	}()
+	go func() {
+		errs <- NewAuthRepository(pool).ResetPassword(ctx, user.ID, verifier, "audit-complete-login-reset", nil)
+	}()
+	for range 2 {
+		if err := <-errs; err != nil && !errors.Is(err, ErrUnauthenticated) {
+			t.Fatal(err)
+		}
+	}
+	var active int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM admin_sessions WHERE user_id=$1 AND revoked_at IS NULL`, user.ID).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 0 {
+		t.Fatalf("reset/login race left active sessions: %d", active)
 	}
 }
 

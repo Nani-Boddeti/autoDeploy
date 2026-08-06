@@ -59,3 +59,9 @@
   calibrating. Terminal-only is an execution boundary, not merely a password-reader check.
 - Integration suites sharing one database must reset durable singleton configuration as well as
   ordinary rows; otherwise a second normal/race run inherits incompatible limits.
+- Cookie `Expires` and `Max-Age` attributes are not returned to servers. A stateless pre-login
+  cookie therefore needs an authenticated issued-at value (or server-side persistence) to enforce
+  its lifetime consistently across replicas.
+- An integration command exiting zero is not proof that integration ran. Use verbose output or an
+  explicit required-environment preflight and record non-skipped test names before claiming live
+  database coverage.

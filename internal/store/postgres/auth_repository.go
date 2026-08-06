@@ -37,6 +37,18 @@ type Session struct {
 	CreatedAt, LastSeenAt, IdleExpiresAt, AbsoluteExpiresAt time.Time
 }
 
+// CompleteLoginInput carries the already verified, known-user login state into
+// the single persistence transaction that mints authority. Callers must first
+// reserve throttles, verify the password, and supply all pair/username aliases
+// that may be cleared on success.
+type CompleteLoginInput struct {
+	SessionID, AuditID, SessionLimitAuditID string
+	Token                                   auth.SessionToken
+	User                                    LoginUser
+	Replacement                             *auth.PasswordVerifier
+	ThrottleIdentities                      []ThrottleIdentity
+}
+
 type ThrottleKind string
 
 const (
@@ -199,9 +211,9 @@ func (r *AuthRepository) ReserveThrottle(ctx context.Context, identities []Throt
 		return ThrottleReservation{}, fmt.Errorf("begin throttle reservation: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	// Lock order is installation-auth/user/session first for credential flows;
-	// throttle admission uses this independent transaction lock before counting
-	// live rows, so replicas cannot admit past the configured cap.
+	// The universal credential-flow order begins with throttle admission. This
+	// lock serializes cap decisions before a reservation can acquire a user FK
+	// lock for a first-time known-user pair.
 	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(731492845631694123)`); err != nil {
 		return ThrottleReservation{}, fmt.Errorf("lock throttle admission: %w", err)
 	}
@@ -540,6 +552,159 @@ func (r *AuthRepository) FindLoginUserByCanonicalUsername(ctx context.Context, u
 		return LoginUser{}, fmt.Errorf("invalid stored password verifier: %w", err)
 	}
 	return v, nil
+}
+
+// CompleteLogin creates a session and clears only successful credential
+// throttles in one transaction. It takes throttle admission, user, then
+// session locks so a reset cannot mint or preserve stale authority.
+func (r *AuthRepository) CompleteLogin(ctx context.Context, in CompleteLoginInput) (Session, error) {
+	if err := validateCompleteLogin(in); err != nil {
+		return Session{}, err
+	}
+	digest, err := auth.SessionTokenDigest(in.Token)
+	if err != nil {
+		return Session{}, ErrUnauthenticated
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return Session{}, fmt.Errorf("begin complete login: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(731492845631694123)`); err != nil {
+		return Session{}, fmt.Errorf("lock complete login throttle admission: %w", err)
+	}
+	var owner, status, phc string
+	var current, storedPolicyRev, durablePolicyRev int64
+	var durableMemory, durableIterations int32
+	var durableLanes int16
+	err = tx.QueryRow(ctx, `SELECT u.owner_id,u.status,u.auth_revision,u.password_phc,u.password_policy_revision,i.password_policy_revision,i.password_memory_kib,i.password_iterations,i.password_lanes FROM users u JOIN installation_auth i ON i.id=1 WHERE u.id=$1 FOR UPDATE OF u`, in.User.ID).Scan(&owner, &status, &current, &phc, &storedPolicyRev, &durablePolicyRev, &durableMemory, &durableIterations, &durableLanes)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Session{}, ErrUnauthenticated
+	}
+	if err != nil {
+		return Session{}, fmt.Errorf("lock login user: %w", err)
+	}
+	if owner != in.User.OwnerID || status != "active" || current != int64(in.User.AuthRevision) || phc != in.User.Verifier.PHC || storedPolicyRev != int64(in.User.Verifier.PolicyRevision) {
+		return Session{}, ErrUnauthenticated
+	}
+	durablePolicy := auth.Argon2Policy{Revision: uint64(durablePolicyRev), MemoryKiB: uint32(durableMemory), Iterations: uint32(durableIterations), Lanes: uint8(durableLanes)}
+	if err := durablePolicy.Validate(); err != nil {
+		return Session{}, fmt.Errorf("invalid stored password policy: %w", err)
+	}
+	if storedPolicyRev > durablePolicyRev {
+		return Session{}, ErrUnauthenticated
+	}
+	if in.Replacement != nil {
+		if auth.ValidatePasswordVerifierForPolicy(in.User.Verifier, durablePolicy) == nil {
+			return Session{}, errors.New("password rehash is not required")
+		}
+		if err := auth.ValidatePasswordVerifierForPolicy(*in.Replacement, durablePolicy); err != nil {
+			return Session{}, fmt.Errorf("password verifier policy is not current: %w", err)
+		}
+		if _, err = tx.Exec(ctx, `UPDATE users SET password_phc=$2,password_policy_revision=$3,updated_at=clock_timestamp() WHERE id=$1`, in.User.ID, in.Replacement.PHC, int64(in.Replacement.PolicyRevision)); err != nil {
+			return Session{}, fmt.Errorf("rehash password: %w", err)
+		}
+	}
+	var s Session
+	var revision int64
+	err = tx.QueryRow(ctx, `WITH now_value AS (SELECT clock_timestamp() AS v) INSERT INTO admin_sessions(id,token_digest,user_id,owner_id,auth_revision,created_at,last_seen_at,idle_expires_at,absolute_expires_at) SELECT $1,$2,$3,$4,$5,v,v,v+interval '30 minutes',v+interval '8 hours' FROM now_value RETURNING created_at,last_seen_at,idle_expires_at,absolute_expires_at,auth_revision`, in.SessionID, digest[:], in.User.ID, owner, current).Scan(&s.CreatedAt, &s.LastSeenAt, &s.IdleExpiresAt, &s.AbsoluteExpiresAt, &revision)
+	if err != nil {
+		return Session{}, fmt.Errorf("insert login session: %w", err)
+	}
+	s.ID, s.UserID, s.OwnerID, s.AuthRevision = in.SessionID, in.User.ID, owner, uint64(revision)
+	rows, err := tx.Query(ctx, `WITH excessive AS (SELECT id FROM admin_sessions WHERE user_id=$1 AND revoked_at IS NULL ORDER BY created_at DESC,id DESC OFFSET 10 FOR UPDATE) UPDATE admin_sessions SET revoked_at=clock_timestamp(),revoked_reason='session_limit' WHERE id IN (SELECT id FROM excessive) RETURNING id`, in.User.ID)
+	if err != nil {
+		return Session{}, fmt.Errorf("limit login sessions: %w", err)
+	}
+	var revokedIDs []string
+	for rows.Next() {
+		var revokedID string
+		if err = rows.Scan(&revokedID); err != nil {
+			rows.Close()
+			return Session{}, fmt.Errorf("read limited login session: %w", err)
+		}
+		revokedIDs = append(revokedIDs, revokedID)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return Session{}, fmt.Errorf("read limited login sessions: %w", err)
+	}
+	rows.Close()
+	if len(revokedIDs) > 1 {
+		return Session{}, errors.New("session limit revoked more than one session")
+	}
+	if len(revokedIDs) == 1 {
+		if err = insertAudit(ctx, tx, in.SessionLimitAuditID, in.User.ID, owner, "session_revoked", "success"); err != nil {
+			return Session{}, err
+		}
+	}
+	if err = insertAudit(ctx, tx, in.AuditID, in.User.ID, owner, "login_success", "success"); err != nil {
+		return Session{}, err
+	}
+	for _, identity := range in.ThrottleIdentities {
+		if identity.Kind != ThrottlePair && identity.Kind != ThrottleUsername {
+			continue
+		}
+		for _, candidate := range append([]ThrottleAlias{{KeyVersion: identity.KeyVersion, Digest: identity.Digest}}, identity.Aliases...) {
+			if identity.Kind == ThrottlePair {
+				if _, err = tx.Exec(ctx, `DELETE FROM auth_throttle_buckets WHERE kind='pair' AND key_version=$1 AND identifier_digest=$2 AND (recovery_user_id=$3 OR recovery_user_id IS NULL)`, candidate.KeyVersion, candidate.Digest[:], in.User.ID); err != nil {
+					return Session{}, fmt.Errorf("clear successful pair throttle: %w", err)
+				}
+				continue
+			}
+			if _, err = tx.Exec(ctx, `DELETE FROM auth_username_throttles WHERE key_version=$1 AND identifier_digest=$2 AND key_version <> 'overflow'`, candidate.KeyVersion, candidate.Digest[:]); err != nil {
+				return Session{}, fmt.Errorf("clear successful username throttle: %w", err)
+			}
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return Session{}, fmt.Errorf("commit complete login: %w", err)
+	}
+	return s, nil
+}
+
+func validateCompleteLogin(in CompleteLoginInput) error {
+	if err := validID(in.SessionID); err != nil {
+		return err
+	}
+	if err := validID(in.AuditID); err != nil {
+		return err
+	}
+	if err := validID(in.SessionLimitAuditID); err != nil || in.SessionLimitAuditID == in.AuditID {
+		return errors.New("invalid distinct session-limit audit identifier")
+	}
+	if err := userInputValid(in.User); err != nil {
+		return err
+	}
+	if err := validateThrottleIdentities(in.ThrottleIdentities, 8); err != nil {
+		return err
+	}
+	if len(in.ThrottleIdentities) != 3 {
+		return errors.New("invalid successful login throttle identities")
+	}
+	var pairs, usernames, ips int
+	for _, identity := range in.ThrottleIdentities {
+		switch identity.Kind {
+		case ThrottlePair:
+			pairs++
+			if identity.RecoveryUserID != in.User.ID {
+				return errors.New("pair throttle recovery user does not match login user")
+			}
+		case ThrottleUsername:
+			usernames++
+		case ThrottleIP:
+			ips++
+		default:
+			return errors.New("invalid successful login throttle identity")
+		}
+	}
+	if pairs != 1 || usernames != 1 || ips != 1 {
+		return errors.New("invalid successful login throttle identities")
+	}
+	if in.Replacement != nil {
+		return auth.ValidatePasswordVerifier(*in.Replacement)
+	}
+	return nil
 }
 
 // CreateSession locks the user before observing its revision, so a reset cannot create stale authority.

@@ -319,6 +319,18 @@ records carry explicit owner scope.
 
 ### Web boundary
 
+- [x] Approve a signed, timestamped stateless `__Host-ad_login` envelope so every replica can
+      enforce the ten-minute pre-authentication lifetime without a new persistence table.
+- [x] Step 1 — domain/config/request primitives: implement and test the signed login envelope,
+      login/session CSRF derivation, throttle digests, public HTTPS origin, CSRF signing-key ring,
+      trusted-proxy CIDRs, listener settings, and bounded throttle-cardinality configuration.
+- [x] Step 2 — atomic login persistence: add and test one `CompleteLogin` transaction that follows
+      throttle-admission → user → session lock order, conditionally rehashes the password,
+      creates/caps the session, writes audit state, and clears only pair/username throttle evidence.
+- [ ] Step 3 — HTTP/control-plane wiring: implement and test only `GET/POST /login`, `POST /logout`,
+      protected `GET /`, `/livez`, and `/readyz`; strict routing/input/provenance/proxy validation;
+      generic failures; security headers; bounded server timeouts; and graceful shutdown. Do not
+      auto-run migrations or add deployment handlers.
 - [ ] Add only login, POST logout, a minimal protected landing page, and non-sensitive health
       endpoints.
 - [ ] Enforce Strict `__Host-` cookies, exact HTTPS origin/provenance, CSRF, content-type and body
@@ -398,6 +410,28 @@ records carry explicit owner scope.
 - Unit/race/static/format/tidy checks, Linux/Windows builds, and fresh PostgreSQL 18.4 normal and
   race-integration suites pass. Independent QA and zero-context security review report no
   medium-or-higher findings.
+
+### Web boundary Step 1 result
+
+- Added a bounded, canonical, ten-minute login envelope authenticated over the envelope version,
+  key-version selector, issued-at timestamp, 32-byte nonce, and canonical HTTPS origin; retained
+  keys validate old envelopes and selector rewriting fails even during identical-key overlap.
+- Added exact 32-byte mounted CSRF key-ring loading plus validated public origin, trusted proxy
+  CIDRs, listener address, and global authentication-throttle row cap configuration.
+- Added domain-separated, length-prefixed keyed throttle digests for later request identity
+  accounting. Focused unit/race tests, vet, compile-only full-module checks, formatting, and
+  whitespace validation pass.
+
+### Web boundary Step 2 result
+
+- Added one `CompleteLogin` transaction that re-acquires throttle admission before user/session
+  locks, revalidates authority and durable password policy, applies only a required rehash, creates
+  and caps digest-only sessions, audits mutations, and selectively clears pair/username evidence.
+- Successful authority minting requires the previously reserved known-user pair, username, and IP
+  identities. IP, invalid-forward, overflow, unrelated-user, and unrelated recovery state remain.
+- Focused unit/race checks and six non-skipped live PostgreSQL integration tests pass, covering
+  lock ordering, reset races, selective clearing, audit rollback, rehash, session cap, and the
+  successful-login throttle input contract.
 
 ## Approved Persistence Slice
 

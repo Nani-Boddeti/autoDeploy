@@ -123,14 +123,19 @@ material and stable session context. The key is supplied through the external mo
 provider defined by ADR 0003, supports rotation, and is never stored in PostgreSQL or an
 environment-variable value. Tokens are domain-separated and compared in constant time.
 
-The login form uses an independent `__Host-ad_login` cookie containing 32 random bytes encoded as
-unpadded base64url. It is `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, has no `Domain`, and
-expires after ten minutes. The hidden token is a versioned, domain-separated HMAC over the raw
-cookie nonce and canonical origin using the external CSRF signing-key ring. A still-valid nonce is
-reused so multiple browser tabs do not invalidate each other. `GET /login` replaces absent,
+The login form uses an independent `__Host-ad_login` cookie carrying a versioned stateless
+envelope: an issued-at timestamp, 32 random nonce bytes, and a domain-separated HMAC using the
+external CSRF signing-key ring. The envelope is encoded with unpadded base64url and its MAC covers
+the version, issued-at timestamp, raw nonce, and canonical origin. This server-verifiable timestamp
+is authoritative because browsers do not return cookie expiry attributes to the server. The cookie
+is `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/`, has no `Domain`, and expires after ten
+minutes. The hidden token is a separate versioned, domain-separated HMAC over the raw nonce and
+canonical origin using the same key ring. A valid envelope no more than ten minutes old is reused
+so multiple browser tabs do not invalidate each other; future-issued, expired, unknown-key,
+malformed, or incorrectly authenticated envelopes fail closed. `GET /login` replaces absent,
 expired, or malformed state; `POST /login` never mints replacement state. Failed credentials keep
-valid state, while successful login clears it and creates unrelated session state. The cookie and
-form token can never become an authenticated session or authorize another origin.
+valid state, while successful login clears it and creates unrelated session state. The envelope,
+nonce, and form token can never become an authenticated session or authorize another origin.
 
 Every unsafe browser-session request requires all of:
 
@@ -319,6 +324,8 @@ wrong-owner credential files fail closed according to ADR 0003.
   handoff preserves Strict cookies.
 - In-memory throttling: resets on restart and is inconsistent across replicas.
 - Trusting all forwarded headers: permits client-address and origin spoofing.
+- A raw-nonce-only login cookie: cookie expiry attributes are not returned by browsers, so replicas
+  could not independently enforce the ten-minute pre-authentication lifetime.
 - Adding deployment handlers before owner scope exists: would create an authorization ambiguity.
 - External breached-password lookup in V1: introduces privacy and availability dependencies; it
   may be added later behind an explicitly approved policy.

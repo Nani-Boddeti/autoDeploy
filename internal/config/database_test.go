@@ -86,6 +86,53 @@ func TestUsernameThrottleKeyRingFromEnvironment(t *testing.T) {
 	}
 }
 
+func TestWebConfigFromEnvironment(t *testing.T) {
+	root, outside := tempDir(t), tempDir(t)
+	active, retained := filepath.Join(outside, "csrf-active"), filepath.Join(outside, "csrf-retained")
+	if err := os.WriteFile(active, append([]byte{1}, make([]byte, 31)...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retained, append([]byte{2}, make([]byte, 31)...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.RepositoryRootEnv, root)
+	t.Setenv(config.PublicOriginEnv, "HTTPS://Admin.Example.test:443/")
+	t.Setenv(config.CSRFActiveVersionEnv, "v2")
+	t.Setenv(config.CSRFActiveKeyFileEnv, active)
+	t.Setenv(config.CSRFRetainedKeyFilesEnv, "v1="+retained)
+	t.Setenv(config.TrustedProxyCIDRsEnv, "192.0.2.0/24,2001:db8::/32")
+	got, err := config.WebConfigFromEnvironment()
+	if err != nil || got.PublicOrigin != "https://admin.example.test" || got.ListenAddress != ":8080" || got.AuthThrottleMaxRows != 10000 || len(got.CSRFKeys.Keys) != 2 || len(got.TrustedProxyCIDRs) != 2 {
+		t.Fatalf("web config %#v err %v", got, err)
+	}
+	t.Setenv(config.ListenAddressEnv, "127.0.0.1:8081")
+	t.Setenv(config.AuthThrottleMaxRowsEnv, "8")
+	got, err = config.WebConfigFromEnvironment()
+	if err != nil || got.ListenAddress != "127.0.0.1:8081" || got.AuthThrottleMaxRows != 8 {
+		t.Fatalf("configured web config %#v err %v", got, err)
+	}
+	for _, setup := range []func(){
+		func() { t.Setenv(config.PublicOriginEnv, "http://admin.example.test") },
+		func() {
+			t.Setenv(config.PublicOriginEnv, "https://admin.example.test")
+			t.Setenv(config.CSRFRetainedKeyFilesEnv, "v2="+retained)
+		},
+		func() {
+			t.Setenv(config.CSRFRetainedKeyFilesEnv, "v1="+retained)
+			t.Setenv(config.TrustedProxyCIDRsEnv, "192.0.2.1/24")
+		},
+		func() {
+			t.Setenv(config.TrustedProxyCIDRsEnv, "192.0.2.0/24")
+			t.Setenv(config.AuthThrottleMaxRowsEnv, "7")
+		},
+	} {
+		setup()
+		if _, err := config.WebConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+			t.Fatalf("invalid web config error %v", err)
+		}
+	}
+}
+
 func tempDir(t *testing.T) string {
 	t.Helper()
 	path, err := os.MkdirTemp("/private/tmp", "autodeploy-config-test-")

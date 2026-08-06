@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -398,11 +399,11 @@ func isZeroKey(key []byte) bool {
 }
 
 func (r CSRFKeyRing) validate() error {
-	if r.ActiveVersion == "" || !validKeyVersion(r.ActiveVersion) || len(r.Keys[r.ActiveVersion]) < 32 {
+	if !validKeyVersion(r.ActiveVersion) || len(r.Keys) == 0 || len(r.Keys) > 5 || len(r.Keys[r.ActiveVersion]) != 32 {
 		return errors.New("invalid CSRF key ring")
 	}
 	for v, key := range r.Keys {
-		if !validKeyVersion(v) || len(key) < 32 {
+		if !validKeyVersion(v) || len(key) != 32 || isZeroKey(key) {
 			return errors.New("invalid CSRF key")
 		}
 	}
@@ -505,6 +506,15 @@ func ValidateSessionCSRF(r CSRFKeyRing, token, sessionID, origin string) bool {
 
 type LoginNonce [32]byte
 
+const LoginEnvelopeMaxAge = 10 * time.Minute
+
+// LoginEnvelope is an authenticated, short-lived pre-login cookie value.
+// It carries no authority beyond binding the login CSRF token to one browser.
+type LoginEnvelope struct {
+	Nonce    LoginNonce
+	IssuedAt time.Time
+}
+
 func NewLoginNonce(randomness io.Reader) (LoginNonce, error) {
 	if randomness == nil {
 		randomness = rand.Reader
@@ -537,4 +547,103 @@ func NewLoginCSRF(r CSRFKeyRing, nonce LoginNonce, origin string) (string, error
 }
 func ValidateLoginCSRF(r CSRFKeyRing, token string, nonce LoginNonce, origin string) bool {
 	return validateCSRF(r, token, "autodeploy/login-csrf/v1", string(nonce[:]), origin)
+}
+
+// NewLoginEnvelope signs a canonical, second-resolution issue time and nonce.
+func NewLoginEnvelope(r CSRFKeyRing, nonce LoginNonce, issuedAt time.Time, origin string) (string, error) {
+	if err := r.validate(); err != nil {
+		return "", err
+	}
+	origin, err := CanonicalHTTPSOrigin(origin)
+	if err != nil {
+		return "", err
+	}
+	issuedAt = issuedAt.UTC().Truncate(time.Second)
+	if issuedAt.Unix() < 0 {
+		return "", errors.New("invalid login envelope time")
+	}
+	payload := make([]byte, 8+len(nonce)+sha256.Size)
+	binary.BigEndian.PutUint64(payload[:8], uint64(issuedAt.Unix()))
+	copy(payload[8:40], nonce[:])
+	mac := loginEnvelopeMAC(r.Keys[r.ActiveVersion], "v1", r.ActiveVersion, payload[:40], origin)
+	copy(payload[40:], mac)
+	return "v1." + r.ActiveVersion + "." + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+// ParseLoginEnvelope verifies syntax, key selection, authentication, and lifetime.
+// All malformed, future, expired, and unknown-key values fail closed.
+func ParseLoginEnvelope(r CSRFKeyRing, value string, now time.Time, origin string) (LoginEnvelope, error) {
+	if err := r.validate(); err != nil {
+		return LoginEnvelope{}, err
+	}
+	origin, err := CanonicalHTTPSOrigin(origin)
+	if err != nil {
+		return LoginEnvelope{}, err
+	}
+	if len(value) < 101 || len(value) > 132 {
+		return LoginEnvelope{}, errors.New("invalid login envelope")
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 || parts[0] != "v1" || !validKeyVersion(parts[1]) || len(parts[2]) != 96 {
+		return LoginEnvelope{}, errors.New("invalid login envelope")
+	}
+	key, exists := r.Keys[parts[1]]
+	if !exists {
+		return LoginEnvelope{}, errors.New("invalid login envelope")
+	}
+	payload, decodeErr := base64.RawURLEncoding.DecodeString(parts[2])
+	if decodeErr != nil || len(payload) != 72 || base64.RawURLEncoding.EncodeToString(payload) != parts[2] {
+		return LoginEnvelope{}, errors.New("invalid login envelope")
+	}
+	issuedSeconds := binary.BigEndian.Uint64(payload[:8])
+	if issuedSeconds > uint64(^uint64(0)>>1) {
+		return LoginEnvelope{}, errors.New("invalid login envelope")
+	}
+	issuedAt := time.Unix(int64(issuedSeconds), 0).UTC()
+	if !hmac.Equal(payload[40:], loginEnvelopeMAC(key, parts[0], parts[1], payload[:40], origin)) || issuedAt.After(now.UTC()) || now.UTC().Sub(issuedAt) > LoginEnvelopeMaxAge {
+		return LoginEnvelope{}, errors.New("invalid login envelope")
+	}
+	var nonce LoginNonce
+	copy(nonce[:], payload[8:40])
+	return LoginEnvelope{Nonce: nonce, IssuedAt: issuedAt}, nil
+}
+
+func loginEnvelopeMAC(key []byte, envelopeVersion, keyVersion string, payload []byte, origin string) []byte {
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte("autodeploy/login-envelope/v1"))
+	m.Write([]byte{0})
+	m.Write([]byte(envelopeVersion))
+	m.Write([]byte{0})
+	m.Write([]byte(keyVersion))
+	m.Write([]byte{0})
+	m.Write(payload[:8])
+	m.Write([]byte{0})
+	m.Write(payload[8:40])
+	m.Write([]byte{0})
+	m.Write([]byte(origin))
+	return m.Sum(nil)
+}
+
+// ThrottleDigest returns a domain-separated, keyed identifier digest. Inputs
+// are length-prefixed so distinct component sequences cannot collide.
+func ThrottleDigest(key []byte, domain string, components ...string) ([32]byte, error) {
+	var digest [32]byte
+	if len(key) != 32 || isZeroKey(key) || len(domain) == 0 || len(domain) > 64 || len(components) == 0 || len(components) > 3 {
+		return digest, errors.New("invalid throttle digest input")
+	}
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte("autodeploy/throttle/v1"))
+	m.Write([]byte{0})
+	m.Write([]byte(domain))
+	for _, component := range components {
+		if len(component) == 0 || len(component) > 256 {
+			return digest, errors.New("invalid throttle digest input")
+		}
+		var length [2]byte
+		binary.BigEndian.PutUint16(length[:], uint16(len(component)))
+		m.Write(length[:])
+		m.Write([]byte(component))
+	}
+	copy(digest[:], m.Sum(nil))
+	return digest, nil
 }

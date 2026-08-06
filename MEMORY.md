@@ -181,8 +181,8 @@
 
 ## Resume Point
 
-- Authentication persistence plus the operator/configuration boundary are complete and verified;
-  the current operator changes are ready to commit and push.
+- Authentication persistence plus the operator/configuration boundary are complete, verified,
+  committed as `74afc5c`, and synchronized with `origin/main`.
 - ADRs 0001-0006 are complete. ADR 0006 defines the approved administrator authentication slice.
 - Auth specifics: canonical usernames match `[a-z0-9][a-z0-9._-]{2,63}`; bootstrap calibrates and
   durably stores one Argon2 policy; sessions are digest-only, Strict, 30-minute idle/eight-hour
@@ -215,7 +215,16 @@
 - Migration 000003 deletes un-attributable pre-web pair rows and tags future known-user pairs by
   opaque user ID. Universal recovery lock order is throttle admission → user → sessions; reset
   preserves IP/invalid-forward/shared-overflow evidence.
-- Next task: minimal admin web boundary and control-plane wiring. No auth HTTP routes exist yet.
+- Minimal admin web work is in progress and uncommitted. Step 1 adds a signed ten-minute pre-login
+  envelope authenticated over envelope/key versions, issued-at, nonce, and origin; mounted CSRF
+  key-ring/public-origin/proxy/listener/throttle-cap config; and keyed request throttle digests.
+- Web Step 2 adds atomic `CompleteLogin`: throttle-admission → user → sessions, stale authority and
+  durable-policy revalidation, conditional rehash, session mint/cap/audit, and pair/username-only
+  clearing. Six non-skipped live PostgreSQL tests plus focused race/static checks pass.
+- Next task is Web Step 3 only: login/logout/protected landing/health HTTP handlers, strict browser
+  and proxy validation, control-plane server limits, readiness, and graceful shutdown. No auth HTTP
+  routes exist yet. A fresh implementation-specialist thread is required because this session's
+  subagent thread limit is exhausted; final independent QA/code review and commit/push remain.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons
