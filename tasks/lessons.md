@@ -27,3 +27,10 @@
   per-replica startup calibration creates divergent rehash behavior.
 - Invalid forwarding chains from trusted proxies need isolated accounting and rejection, not a
   fallback that merges all clients into the proxy's normal throttle bucket.
+- Reject stored password-policy revisions newer than the running policy; treating every mismatch
+  as rehashable lets stale replicas request a downgrade.
+- Build unknown-user dummy verifiers outside request handling and bind them to the exact current
+  password policy; the request API must never expose dummy credential validity.
+- Bound attacker-controlled strings before normalization, splitting, or base64 decoding; crypto
+  parameter ceilings alone do not prevent parser allocation abuse.
+- Digest-domain tests must use identical raw input in each domain or they do not prove separation.

@@ -187,10 +187,15 @@
   durably stores one Argon2 policy; sessions are digest-only, Strict, 30-minute idle/eight-hour
   absolute; proxy trust defaults empty; throttle key rotation/cardinality and public audit growth
   are bounded; GitHub uses a state-to-Strict-handoff flow.
-- Next task: delegate authentication domain primitives and their tests to an implementation
-  specialist; then proceed sequentially through PostgreSQL auth persistence, credential-file/admin
-  CLI, web security, and control-plane wiring.
-- No administrator-auth production code has been started.
+- Authentication domain primitives are implemented and verified in `internal/auth`: bounded
+  canonical usernames/passwords/Argon2id PHC; verifier policy revisions; policy-bound dummy work;
+  opaque session tokens/digests/policy/principals; versioned session/login CSRF; canonical HTTPS
+  origins; and exact-owner authorization. `x/crypto v0.54.0` was latest when selected.
+- Password verifier revisions newer than the running durable policy fail closed; older valid
+  revisions/parameters only signal rehash. Dummy verification never exposes success and uses the
+  exact policy bound during startup construction.
+- Next task: PostgreSQL authentication migration and typed persistence workflows. No auth schema,
+  repository, CLI, or web code has started.
 - Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons

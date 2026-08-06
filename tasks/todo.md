@@ -251,7 +251,10 @@ Approved by the user:
 - [x] ADR 0006 records administrator bootstrap/recovery, Argon2id password verification,
       server-side sessions, CSRF/origin protection, durable throttling, trusted-proxy handling,
       owner-scoped authorization, audit, and the Strict-cookie GitHub handoff boundary.
-- [ ] Next: implement and test administrator authentication domain primitives.
+- [x] Administrator authentication domain primitives implemented, race-tested, independently
+      QA-verified, and security-reviewed.
+- [ ] Next: implement the administrator-authentication PostgreSQL migration and typed persistence
+      workflows.
 
 ## Approved Administrator Authentication Slice
 
@@ -271,13 +274,13 @@ records carry explicit owner scope.
 
 ### Authentication domain
 
-- [ ] Implement canonical ASCII usernames and the 15-to-1,024-byte password policy.
-- [ ] Implement bounded Argon2id PHC parsing, hashing, verification, dummy verification, and
+- [x] Implement canonical ASCII usernames and the 15-to-1,024-byte password policy.
+- [x] Implement bounded Argon2id PHC parsing, hashing, verification, dummy verification, and
       rehash signaling using a currently supported stable dependency.
-- [ ] Implement versioned 32-byte opaque session tokens, domain-separated digesting, expiry
+- [x] Implement versioned 32-byte opaque session tokens, domain-separated digesting, expiry
       policy, and non-secret principal types.
-- [ ] Implement HMAC-derived session CSRF and independent reusable pre-authentication login CSRF.
-- [ ] Implement exact owner-scoped authorization helpers without a role-based global bypass.
+- [x] Implement HMAC-derived session CSRF and independent reusable pre-authentication login CSRF.
+- [x] Implement exact owner-scoped authorization helpers without a role-based global bypass.
 
 ### Operator and configuration boundary
 
@@ -305,12 +308,28 @@ records carry explicit owner scope.
 - [x] ADR 0006 passed independent security review after resolving CSRF provenance, malformed proxy
       chains, throttle-key rotation/cardinality, username syntax, durable Argon2 policy, login CSRF,
       bounded audit growth, and GitHub handoff test requirements.
+- [x] Authentication primitives pass unit/race/static checks and independent QA/security review;
+      strict parser bounds, policy downgrade rejection, policy-aligned dummy work, origin
+      canonicalization, digest separation, and exact-owner denial have persistent regression tests.
 - [ ] Add unit, race, PostgreSQL integration, concurrency, malformed-input, cross-owner, session,
       CSRF/origin, throttle, forwarded-address, audit, HTTP-limit, and shutdown coverage required by
       ADR 0006.
 - [ ] Run `make check`, `go test -race ./...`, the complete integration suite, and
       `git diff --check`.
 - [ ] Complete independent QA and zero-context security/code review; record findings and results.
+
+### Authentication domain result
+
+- Added `internal/auth` without HTTP, database, CLI, or deployment-handler coupling.
+- Pinned the latest verified Go cryptography module, `golang.org/x/crypto v0.54.0`.
+- Password verifiers carry their durable policy revision; future revisions fail closed and older
+  valid hashes authenticate only with a rehash signal.
+- Unknown-user Argon2 work is explicitly built outside the request path, bound to the exact current
+  policy, and cannot return an authentication-success result.
+- Untrusted username, PHC, origin, session, nonce, and CSRF inputs are size/canonicality checked
+  before expensive allocation or cryptographic work.
+- Independent QA passed with 88.0% statement coverage; full unit, race, vet, build, tidy-diff, and
+  whitespace checks pass.
 
 ## Approved Persistence Slice
 

@@ -237,7 +237,8 @@ A forward-only additive migration introduces:
 
 - `owners`
 - a singleton `installation_auth` bootstrap marker
-- `users` with canonical username, role, password PHC string, status, and authentication revision
+- `users` with canonical username, role, password PHC string, password-policy revision, status, and
+  authentication revision
 - `admin_sessions` with token digest, scope, revision, expiries, and revocation metadata
 - `auth_throttle_buckets`
 - append-only `auth_audit_events`
