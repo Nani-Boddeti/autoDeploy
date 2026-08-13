@@ -4,6 +4,9 @@ This directory contains the local/bootstrap skeleton. Production credentials are
 owner-readable files outside the repository; credential values are never supplied through process
 environment variables.
 
+For the privileged checkout helper deployment, isolation boundary, recovery procedure, and
+opt-in runtime verification, see [checkout isolation](../docs/checkout-isolation.md).
+
 Required database configuration:
 
 - `AUTODEPLOY_REPOSITORY_ROOT`: absolute source/workspace root that credential paths must not enter.

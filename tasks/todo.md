@@ -126,8 +126,8 @@ State transitions must be validated in the domain layer and committed transactio
   - [x] PostgreSQL queue leases.
   - [x] Release strategies.
 - [x] Implement PostgreSQL migrations and typed persistence repositories.
-- [ ] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
-- [ ] Implement envelope encryption, key rotation metadata, and centralized redaction.
+- [x] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
+- [x] Implement envelope encryption, key rotation metadata, and centralized redaction.
 - [ ] Implement GitHub App installation flow and short-lived clone authentication.
 - [ ] Implement raw-body webhook verification, delivery idempotency, repository/branch filtering,
       and durable job creation.
@@ -148,6 +148,171 @@ State transitions must be validated in the domain layer and committed transactio
       backup instructions, and disaster-recovery documentation.
 - [ ] Package the control plane, agent, PostgreSQL, and Traefik for installation on Hetzner.
 - [ ] Run unit, integration, security, failure-recovery, and end-to-end validation.
+
+## GitHub App installation and checkout slice — approved, in progress
+
+Scope: implement installation setup, explicit repository selection, single-repository checkout
+credential issuance, and the production exact-commit Git adapter. Raw webhook ingestion and durable
+job creation remain the following slice; authenticated agent transport remains in the agent slice.
+
+### Approval assumptions
+
+- Repository discovery may mint one control-plane-only installation token limited to metadata/read
+  discovery, paginate bounded repository metadata, then revoke it immediately. Checkout tokens stay
+  exact-repository `contents:read`, one checkout, short-lived, in memory, and immediately revoked.
+- Implement the real checkout issuer, one-use credential broker/askpass helper, and exact-commit Git
+  adapter now. Do not fake cross-process delivery; only authenticated agent transport is deferred.
+- Persist constrained opaque `project_id` bindings without a foreign key until the project aggregate
+  exists. Numeric GitHub IDs are authorization identity; mutable names are display/routing metadata.
+- Add only minimal server-rendered setup confirmation and repository-selection forms required for
+  same-origin POST/CSRF semantics. Coolify-inspired dashboard work remains a later UI slice.
+
+### Step 1 — ADR amendment, App identity, signer, and provider adapter
+
+- [x] Amend ADR 0002 for the temporary metadata-only discovery token, GitHub REST version
+      `2026-03-10`, App client ID as JWT issuer, and confidential future agent-response delivery as
+      the only token-delivery exception. Do not broaden checkout-token scope.
+- [x] Add `internal/githubapp` typed identities/errors plus hardened mounted RSA PKCS#1/PKCS#8 key
+      loading, RS256 App JWT generation (`iat` backdated 60 seconds; expiry within ten minutes), and
+      a fixed-origin `net/http` adapter with no redirects, bounded bodies/pages/counts, explicit API
+      headers, timeouts, rate-limit classification, and sanitized provider request IDs.
+- [x] Verify App ID/client ID/slug/owner and required permissions before installation operations.
+      Test fixed JWT vectors, malformed/weak/encrypted keys, exact headers/bodies, pagination,
+      redirects, opaque token formats, response scope/expiry, rate limits, and provider failures.
+
+#### Step 1 result
+
+- ADR 0002 now records the metadata-only discovery exception, current GitHub REST contract, client-ID
+  JWT issuer, and the future confidential agent-response delivery boundary without broadening
+  checkout-token scope.
+- Added hardened RSA PKCS#1/PKCS#8 mounted-key loading and signer-owned deep-copied key material;
+  canonical RS256 JWTs use a 60-second backdate and nine-minute lifetime.
+- Added the fixed-origin GitHub provider adapter with strict status/header/body/pagination/retry/rate
+  contracts, full App permission/event allowlists, installation identity checks, exact returned token
+  scope/lifetime validation, and best-effort revocation of every rejected or discovery token.
+- Full format/vet/unit/build/race and Windows cross-compilation checks pass. Independent QA and
+  zero-context security review return PASS; token/sentinel values remain absent from errors.
+
+### Step 2 — installation state, Strict handoff, repository discovery, and binding
+
+- [x] Add forward-only migrations `000005`/`000006` for App registration, bounded one-use setup states,
+      verified pending handoffs, installations, discovered repositories, explicit project bindings,
+      authorization revisions, and append-only sanitized audit; enforce composite owner-scoped FKs,
+      immutable numeric identities, cardinality/cleanup bounds, and no credential/provider-body data.
+- [x] Add typed repository/service. Authenticated CSRF POST creates setup state; the cross-site
+      callback validates and consumes state plus exact installation/owner identity but cannot grant
+      authorization; a separate Strict-cookie same-origin GET/POST handoff revalidates session/user/
+      owner/auth revision before atomic activation and audit.
+- [x] Discover repositories with the temporary metadata-only token, revoke it in every terminal path,
+      and require a separate authenticated CSRF POST to bind a numeric repository ID to an opaque
+      local project. Suspension/removal/permission loss disables bindings and increments revisions.
+- [x] Add only exact setup/callback/handoff/selection routes and forms. Test replay/expiry/races,
+      stale sessions, forbidden callback side effects, cross-owner corruption, cleanup caps, cookie/
+      CSRF/provenance, clean redirects, repository pagination/revocation, and suspension denial.
+
+#### Step 2 result
+
+- GitHub App setup uses digest-only bounded one-use states, callback leases, Strict handoff, exact
+  session/user/owner/revision and active-registration rechecks, composite session FKs, and explicit
+  numeric project bindings.
+- Complete discovery always revokes its metadata token and atomically refreshes/removes authority;
+  authenticated reconciliation fails closed on App/installation loss. Disable paths revise active
+  installation/repository/binding authority and append collision-safe sanitized audits.
+- Per-owner append-only audit admission is serialized and dynamically reserves future disable audit
+  capacity for all active installations/repositories; ordinary grants fail closed at capacity.
+- Fresh PostgreSQL 18.4 normal/race integration, full format/vet/unit/build/race checks, migration
+  checksum/drift, `git diff --check`, independent QA, and zero-context security review pass.
+
+### Step 3 — checkout authorization, token broker, and exact-commit Git adapter
+
+Current status: implementation and static validation are complete. The production runner now uses
+only reviewed local quota/spawn clients: helper-created XFS-project-quota workspaces, a distinct
+fixed checkout UID/GID, atomic cgroup-v2 admission, typed Git operations, pipe-only askpass,
+bounded redacted output, exact SHA/tree checks, resumable cleanup, and unconditional revocation.
+Unit/race, repository-wide checks, Linux amd64/arm64 builds, tagged integration compilation, and
+independent security reviews pass. Step 3 remains operationally incomplete until the explicit
+privileged Linux smoke runs on XFS `prjquota` with the installed root helpers and delegated cgroup v2.
+
+#### Preventive Linux execution boundary — approved 2026-08-13
+
+Privileged-helper boundary approved 2026-08-13: a root-owned quota service is fixed to one XFS mount,
+authenticates only the agent UID, creates root-inaccessible workspaces itself, owns a mount-bound
+non-reusing project-ID ledger, verifies hard byte/inode enforcement before granting the workspace to
+the distinct checkout UID/GID, and performs descriptor-relative resumable cleanup. It exposes no
+arbitrary path, device, project ID, command, or quota-disable operation.
+
+Phase 2 review finding: a payload running as the same UID that owns the delegated cgroup subtree can
+move itself or descendants into a sibling cgroup and escape leaf limits/kill authority. Production
+containment therefore requires a distinct fixed checkout payload UID with no write access to the
+delegated hierarchy. Granting the agent/launcher UID-switch authority or adding a privileged spawn
+service is a separate privilege expansion. Approved 2026-08-13: replace the unprivileged launcher
+with a root-owned local fixed-purpose spawn service. It may spawn only validated pre-opened Git and
+workspace descriptors under one configured checkout UID, with no supplementary groups/capabilities,
+an allowlisted environment, fixed/bounded Git arguments, and atomic cgroup-FD admission. It exposes
+no arbitrary path, executable, shell, UID, cgroup, or command selection and fails closed unless UID
+separation, capability removal, descriptor closure, and cgroup placement can be verified.
+
+- [x] Add a Linux-only checkout executor that requires cgroup v2 and an XFS checkout filesystem
+      mounted with project quotas; production checkout fails closed when either boundary is absent,
+      misconfigured, or cannot be verified.
+- [x] Allocate a unique XFS project ID per checkout, set the hard block/inode limits before Git can
+      write, attach the private workspace to that project, and remove quota/accounting state during
+      idempotent cleanup without following attacker-controlled links.
+- [x] Create a dedicated cgroup before process start with bounded memory, CPU, PIDs, and I/O policy;
+      place Git and descendants into it at spawn, kill the complete process group/cgroup on timeout,
+      cancellation, or authority invalidation, and verify termination before cleanup.
+- [x] Open and validate operator-controlled executables, checkout root, empty home, and required
+      control files through trusted descriptors. Execute through trusted descriptors where Linux
+      supports it and reject ownership, permissions, type, mount, or identity drift.
+- [x] Keep the existing anonymous-pipe-only token handoff, fixed Git environment, exact-SHA/tree
+      validation, LFS/submodule rejection, bounded redacted output, and unconditional revocation.
+- [ ] Add focused unit tests plus privileged Linux integration tests for quota exhaustion, inode/PID/
+      memory limits, descendant escape attempts, cancellation, cleanup, descriptor/path replacement,
+      unsupported filesystems, unavailable controllers, and secret-sentinel absence.
+- [x] Document the XFS `prjquota` and delegated cgroup v2 host prerequisites and recovery behavior.
+- [ ] Run format, vet, unit, race, Linux integration, migration drift, `git diff --check`, independent
+      QA, and zero-context security review before marking checkout Step 3 complete.
+
+Operational compatibility: this is an intentional production host requirement. Portable/unit test
+adapters may exercise the same interfaces, but production checkout must not fall back to post-write
+directory scans or an unbounded subprocess on unsupported hosts.
+
+- [x] Implement two-phase authorization: validate and capture binding revision; mint one exact-repo
+      `contents:read` token; validate token scope/permissions/expiry; re-lock and revalidate revision;
+      revoke and fail closed if stale. Never share/cache tokens across checkouts.
+- [x] Add a one-use anonymous-pipe credential broker and dedicated askpass executable. Tokens must
+      never enter URL, argv, Git config, ambient credential helpers, durable jobs, logs, errors, or
+      environment values; only a non-secret inherited FD/path may be passed to Git.
+- [x] Fetch the exact authorized SHA into a fresh directory, verify `FETCH_HEAD`, detached-checkout,
+      disable terminal prompts/helpers/LFS smudge, reject submodules and tracked LFS pointers, bound
+      output through centralized redaction, clean up all paths, and revoke the token on every exit.
+- [ ] Test sentinel-token absence from argv/environment/URL/config/logs/errors, one password delivery,
+      exact SHA, one bounded auth remint after lease/revision revalidation, cancellation/TLS/output/
+      cleanup/revocation, submodule/LFS rejection, and provider/checkout error classification.
+
+#### Step 3 static result
+
+- Root quota and fixed-UID spawn services, concrete production clients/factory, typed runner, tests,
+  operator guide, CI Linux cross-builds, and opt-in `make test-checkout-integration` are implemented.
+- `make check`, `go test -race ./...`, Linux amd64/arm64 helper/runner builds, tagged privileged-test
+  compilation, `git diff --check`, and independent reviews pass with no high/medium findings.
+- Pending proof: run the non-cached privileged smoke on a provisioned Linux host. It must allocate on
+  XFS `prjquota`, execute typed `GitInit` as the distinct checkout UID/GID inside delegated cgroup v2,
+  clean the project quota/workspace, and leave no cgroup leaf. No macOS fallback can prove this.
+
+### Validation and risks
+
+- [x] Step 2: format/vet/unit/build/race checks, fresh PostgreSQL 18.4 normal
+      and race integration where relevant, migration checksum/drift, `git diff --check`, independent
+      QA, and zero-context security review.
+- Callback-ID spoofing/replay: digest-only one-use state, exact App-authenticated installation lookup,
+  owner/session/revision binding, and a separate same-origin Strict handoff.
+- Token overreach/leakage: exact numeric repository scope, permission/expiry response validation,
+  two-phase revision recheck, no persistence/cache, pipe-only askpass delivery, redaction, and revoke.
+- Provider drift/outage: explicit API version, bounded contract parsing, typed rate/transient errors,
+  bounded GET retries only, and readiness based on local key/config—not continuous GitHub reachability.
+- Agent boundary: production issuer and clone adapter exist now; no insecure local simulator or fake
+  cross-process token transport is introduced before authenticated agent enrollment/transport.
 
 ## Required Tests
 
@@ -255,7 +420,8 @@ Approved by the user:
       QA-verified, and security-reviewed.
 - [x] Administrator-authentication PostgreSQL migration and typed persistence workflows are
       implemented, live-integration/race-tested, independently QA-verified, and security-reviewed.
-- [ ] Next: implement the minimal administrator web boundary and control-plane wiring.
+- Progress snapshot: 5/18 top-level implementation-sequence items complete (27.8%). This raw count
+  undercounts partial GitHub work; weighted evidence estimate is approximately 39%.
 
 ## Approved Administrator Authentication Slice
 
@@ -327,20 +493,58 @@ records carry explicit owner scope.
 - [x] Step 2 — atomic login persistence: add and test one `CompleteLogin` transaction that follows
       throttle-admission → user → session lock order, conditionally rehashes the password,
       creates/caps the session, writes audit state, and clears only pair/username throttle evidence.
-- [ ] Step 3 — HTTP/control-plane wiring: implement and test only `GET/POST /login`, `POST /logout`,
+- [x] Step 3 — HTTP/control-plane wiring: implement and test only `GET/POST /login`, `POST /logout`,
       protected `GET /`, `/livez`, and `/readyz`; strict routing/input/provenance/proxy validation;
       generic failures; security headers; bounded server timeouts; and graceful shutdown. Do not
       auto-run migrations or add deployment handlers.
-- [ ] Add only login, POST logout, a minimal protected landing page, and non-sensitive health
+
+#### Step 3 implementation plan — complete
+
+- [x] Add a transport-only `internal/web` boundary with a narrow repository interface over the
+      existing password-policy, user lookup, throttle reservation, atomic login, session
+      validation, and session revocation operations; keep authentication and PostgreSQL policy in
+      their current packages.
+- [x] Implement exact routes only: `GET /login`, `POST /login`, `POST /logout`, protected `GET /`,
+      `GET /livez`, and `GET /readyz`. Reject unsupported methods, non-empty query strings, unknown
+      paths, malformed bodies, duplicate/unexpected fields, and non-canonical provenance.
+- [x] Enforce the ADR 0006 browser boundary: escaped server-rendered HTML; Strict, Secure,
+      HttpOnly `__Host-` cookies; login/session CSRF; exact Origin/Referer validation; generic login
+      failures; fixed 303 redirects; no-store plus CSP/frame/nosniff/referrer security headers.
+- [x] Resolve client identity from the direct peer unless that peer is in configured trusted-proxy
+      CIDRs; validate trusted X-Forwarded-For chains right-to-left with bounded length and reject
+      malformed chains without trusting attacker-supplied forwarding headers.
+- [x] Wire `cmd/controlplane` to mounted database/config credentials, the durable password policy,
+      the startup-built dummy verifier, the PostgreSQL pool, and the HTTP handler. Never auto-run
+      migrations. Configure explicit header/read/write/idle limits and bounded graceful shutdown.
+- [x] Keep `/livez` process-only and make `/readyz` return generic 503 unless the database and all
+      startup-required credential/config state are ready; expose no diagnostic or secret detail.
+- [x] Add focused unit and HTTP tests for routing,
+      envelope reuse/expiry, cookie fixation, provenance/CSRF, malformed and oversized input,
+      generic failure equivalence, throttle ordering, proxy chains, session expiry/revision/logout,
+      readiness, server limits, and in-flight graceful shutdown.
+- [x] Rerun the live PostgreSQL normal and race-integration suites against an ephemeral loopback
+      PostgreSQL 18.4 service; all integration tests execute without skips and pass.
+- [x] Validate with `gofmt`, `make check`, `go test -race ./...`, live non-skipped integration and
+      race-integration suites, and `git diff --check`; then obtain independent QA and zero-context
+      security/code review before marking Step 3 complete.
+
+Approval assumptions: success redirects to `/`; login failure, logout, and unauthenticated landing
+redirect to `/login`; browser POST redirects use 303; health endpoints allow GET only with short
+plain-text bodies; authenticated `GET /login` redirects to `/`; startup validates snapshot
+credentials and readiness probes the database without periodic credential reload; existing keyed
+throttle configuration is reused with its domain-separated pair/username/IP digests. Concrete
+body/header/XFF/server/shutdown limits will be conservative named constants covered by boundary
+tests and constrained by existing configuration/ADR limits.
+- [x] Add only login, POST logout, a minimal protected landing page, and non-sensitive health
       endpoints.
-- [ ] Enforce Strict `__Host-` cookies, exact HTTPS origin/provenance, CSRF, content-type and body
+- [x] Enforce Strict `__Host-` cookies, exact HTTPS origin/provenance, CSRF, content-type and body
       bounds, fixed 303 redirects, security headers, timeouts, and graceful shutdown.
-- [ ] Persist replica-safe username/client and IP throttles before password verification; keep all
+- [x] Persist replica-safe username/client and IP throttles before password verification; keep all
       authentication failures generic.
-- [ ] Bound throttle/audit cardinality and preserve live limits across keyed-identifier rotation.
-- [ ] Trust forwarded client addresses only through explicitly configured proxy CIDRs; default to
+- [x] Bound throttle/audit cardinality and preserve live limits across keyed-identifier rotation.
+- [x] Trust forwarded client addresses only through explicitly configured proxy CIDRs; default to
       no trusted proxies.
-- [ ] Keep browser middleware separate from GitHub webhook and future agent API authentication.
+- [x] Keep browser middleware separate from GitHub webhook and future agent API authentication.
 
 ### Verification and handoff
 
@@ -350,12 +554,12 @@ records carry explicit owner scope.
 - [x] Authentication primitives pass unit/race/static checks and independent QA/security review;
       strict parser bounds, policy downgrade rejection, policy-aligned dummy work, origin
       canonicalization, digest separation, and exact-owner denial have persistent regression tests.
-- [ ] Add unit, race, PostgreSQL integration, concurrency, malformed-input, cross-owner, session,
+- [x] Add unit, race, PostgreSQL integration, concurrency, malformed-input, cross-owner, session,
       CSRF/origin, throttle, forwarded-address, audit, HTTP-limit, and shutdown coverage required by
       ADR 0006.
-- [ ] Run `make check`, `go test -race ./...`, the complete integration suite, and
+- [x] Run `make check`, `go test -race ./...`, the complete integration suite, and
       `git diff --check`.
-- [ ] Complete independent QA and zero-context security/code review; record findings and results.
+- [x] Complete independent QA and zero-context security/code review; record findings and results.
 
 ### Authentication domain result
 
@@ -432,6 +636,139 @@ records carry explicit owner scope.
 - Focused unit/race checks and six non-skipped live PostgreSQL integration tests pass, covering
   lock ordering, reset races, selective clearing, audit rollback, rehash, session cap, and the
   successful-login throttle input contract.
+
+### Web boundary Step 3 result
+
+- Added a transport-only HTTP boundary for exact login/logout/protected landing and health routes,
+  with generic failures, strict forms/provenance/CSRF/cookies, security headers, and bounded input.
+- Trusted forwarding defaults off; configured chains are canonicalized and walked right-to-left.
+  Ambiguous/malformed chains fail closed into proxy-scoped, rotation-safe durable throttle state.
+- The control plane now loads mounted credentials and durable policy, constructs the PostgreSQL
+  repository and dummy verifier, configures explicit HTTP limits, and performs bounded graceful
+  shutdown without running migrations.
+- Full unit/race/static/build checks and repeated security regressions pass. Independent QA and
+  zero-context security review return PASS with no findings. Verbose PostgreSQL 18.4 normal and
+  race-integration suites execute without skips and pass against an ephemeral loopback service.
+
+## Secret handling slice — complete
+
+Scope: complete the next implementation-sequence item as three sequential production substeps.
+Do not add GitHub, agent, Docker, routing, or UI behavior in this slice.
+
+### Proposed decisions
+
+- External KEK configuration uses one protected non-secret manifest containing the active key ID
+  and active/retiring key-file paths; each key file contains exactly one 32-byte AES-256 key.
+- Secret plaintext is bounded to 64 KiB. Empty values are valid because an explicitly empty runtime
+  or build value differs from an absent variable.
+- V1 purposes are `build`, `runtime`, and `provider`; immutable version lifecycle states are
+  `active`, `superseded`, and `revoked`. Ownership and opaque project/environment identifiers are
+  retained even before those domain tables exist.
+- Redaction uses the constant `[REDACTED]`, covers raw values plus standard padded/unpadded base64
+  encodings generated by AutoDeploy, and is bounded to 4,096 active patterns and 8 MiB total raw
+  pattern bytes per operation.
+- Rotation is an explicit operator command using stable keyset pagination in batches of 100. It is
+  restartable without a durable job table; CAS conflicts and failed attempts safely consume wrap
+  reservations. Old key removal remains external and is refused while live rows reference it.
+- Existing startup remains backward-compatible: KEK configuration is required only when the secret
+  subsystem is enabled. The local generation binding detects only a DB/manifest mismatch; it cannot
+  detect both being rolled back together. Production restore therefore requires an operator to install
+  a new active KEK ID; restored keys are decrypt-only. Automatic rollback detection requires a
+  separately approved non-rollbackable external authority.
+
+### Step 1 — crypto, key provider, and redaction primitives
+
+- [x] Add typed AAD, envelope, suite/version, key-provider, and streaming-redactor boundaries under
+      `internal/crypto`; use fresh DEKs, AES-256-GCM random nonces, domain-separated exact
+      length-prefixed AAD, and sanitized errors with no secret-bearing fields.
+- [x] Extend the hardened mounted-file credential boundary and config parsing for the manifest/key
+      ring; reject unsafe files, duplicate IDs/paths, invalid states, replacement races, and
+      malformed or oversized material.
+- [x] Test known-answer and randomized round trips, every AAD substitution, wrong/unknown keys,
+      malformed envelopes, suite/version rejection, error sanitization, and chunk-safe redaction at
+      every split point, including initialization/processing/downstream-write failure suppression.
+
+#### Step 1 result
+
+- Added mandatory exact-KEK pre-wrap reservation, independently fixed AAD vectors, bounded envelope
+  parsing, caller-owned key copies, best-effort key clearing, and fail-closed mounted manifest/key
+  loading with canonical unique paths and unsupported-platform stubs.
+- Added a compact stateful multi-pattern redactor with combined raw/encoded pattern, node, memory,
+  candidate-ring, and overflow-safe work bounds. Replacement output is safety-checked before release
+  so marker/context synthesis, short writes, and nested-prefix amplification fail closed.
+- Full format/vet/unit/build/race checks and Windows config/credential cross-compilation pass.
+  Independent QA returns PASS; zero-context security review returns PASS with its sole arithmetic
+  hardening note resolved and regression-tested.
+
+### Step 2 — durable ledger, immutable secrets, and audit
+
+- [x] Add forward-only migration `000004` for the per-KEK wrap-invocation ledger, logical secret
+      heads, immutable versions, and append-only sanitized audit events; PostgreSQL must not become
+      authoritative for active/retiring KEK state.
+- [x] Add typed PostgreSQL repositories and a secret service. Authorization precedes decryption;
+      wrap reservations commit independently before wrapping; secret mutation and audit commit
+      atomically; corruption, unknown key, AAD mismatch, and AEAD failure share one sanitized class.
+- [x] Test the `2^31` invocation boundary, consumed reservations after failed writes, concurrent
+      replicas, owner/scope isolation, immutable ciphertext, mutation/audit rollback, dump/DTO
+      plaintext exclusion, malformed rows, and migration checksum/idempotency behavior.
+
+#### Step 2 result
+
+- Added durable independently committed per-KEK wrap reservations with a hard `2^31` ceiling,
+  immutable secret heads/versions, CAS-only wrapped-DEK rewrap fields, and append-only sanitized
+  audit records with exact actor/service and deployment/lease correlation.
+- Exact version/reference authorization precedes retrieval and decryption. Frozen superseded
+  references can retry; new superseded or revoked access fails closed. Successful, denied, and
+  failed materialization outcomes are audited without exposing envelope or plaintext material.
+- Added operation-specific create/replace validation, coherent head/version/audit constraints,
+  metadata-only service results, sanitized error boundaries, immutable head scope, concurrent CAS,
+  and exact affected-row enforcement.
+- Full unit/race/static/build checks pass. Fresh PostgreSQL 18.4 normal and race integration suites
+  pass, including seven service-to-repository tests for materialization, audit failure suppression,
+  rewrap invariants, concurrent replacement, durable reservation consumption, tamper rejection,
+  and persisted timestamps. Independent QA and zero-context security review return PASS.
+
+### Step 3 — rotation and production wiring
+
+- [x] Add restartable bounded rewrap service and operator command. Rewrap changes only wrapped DEK,
+      KEK ID, and CAS revision; compromise recovery creates a wholly new immutable secret version.
+- [x] Wire opt-in startup/readiness validation and centralized control-plane redaction boundaries;
+      agent-side and persisted-log integration remain for their later approved slices.
+- [x] Test mixed-key reads, interrupted/idempotent batches, CAS conflicts, unchanged value
+      ciphertext/version, retirement guards, restore fail-closed behavior, and compromise recovery.
+- [x] Run formatting/static/unit/race checks, verbose non-skipped PostgreSQL 18.4 normal/race
+      integration, migration drift checks, `git diff --check`, and independent QA/security review
+      after each sequential step.
+
+#### Step 3 result
+
+- Added restartable keyset-paginated rewrap batches capped at 100. CAS conflicts stop before the
+  failed row so retry cannot skip old-key references; every attempted wrap consumes an independently
+  committed active-key reservation. Revoked versions are never rewrapped but still block retirement.
+- Added terminal-only `secret init-active-kek`, `secret rewrap`, and `secret can-retire` operations
+  with credential/DB preflight, no migration execution, fixed sanitized output, active-key
+  retirement refusal, and explicit generation-bound ledger initialization that never resets an ID.
+- Secret-enabled control-plane startup and every readiness probe reload the protected manifest and
+  verify active-key ledger/generation binding. The default-disabled path remains backward-compatible;
+  the HTTP server error logger uses the centralized redacting boundary.
+- Compromise recovery creates and audits a new immutable version, revokes the predecessor, and never
+  rewraps the compromised version. Fresh PostgreSQL 18.4 race integration verifies schema triggers,
+  rotation pagination/count, reservation ceiling, compromise handling, and all prior persistence.
+- Full format/vet/unit/build/race checks pass. Independent QA and zero-context security review pass
+  the local implementation. Generation binding detects DB/manifest mismatch only; joint rollback of
+  both cannot be detected locally. Restore procedure therefore requires a fresh active KEK ID.
+  Automatic rollback detection remains a separate decision requiring a non-rollbackable authority.
+
+### Risks and mitigations
+
+- Nonce/key reuse: durable pre-wrap reservations, hard invocation ceiling, fresh DEKs, and restored
+  databases requiring a new active KEK ID.
+- Plaintext leakage: secret-free error/DTO/log types, streaming fail-closed redaction, dump scans,
+  and dual agent/control-plane redaction at their respective integration slices.
+- Rotation interruption or key loss: immutable ciphertext, CAS/keyset batches, decrypt-only retiring
+  keys, usage checks before removal, and operator-controlled offline recovery copies.
+- Premature domain coupling: constrained opaque ownership/project/environment IDs now; add foreign
+  keys only when those domain aggregates exist.
 
 ## Approved Persistence Slice
 

@@ -18,6 +18,14 @@ type AuthRepository struct{ pool *pgxpool.Pool }
 
 func NewAuthRepository(pool *pgxpool.Pool) *AuthRepository { return &AuthRepository{pool: pool} }
 
+// Ping verifies that the configured PostgreSQL dependency is reachable.
+func (r *AuthRepository) Ping(ctx context.Context) error {
+	if r == nil || r.pool == nil {
+		return errors.New("authentication repository unavailable")
+	}
+	return r.pool.Ping(ctx)
+}
+
 type BootstrapInput struct {
 	OwnerID, UserID, Username, AuditID string
 	Verifier                           auth.PasswordVerifier

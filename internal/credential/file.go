@@ -4,6 +4,9 @@
 package credential
 
 import (
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,6 +18,12 @@ import (
 
 // MaxDatabaseURLBytes bounds database credential files. PostgreSQL URLs are normally far smaller.
 const MaxDatabaseURLBytes = 4096
+
+// MaxManifestBytes bounds non-secret mounted key manifests.
+const MaxManifestBytes = 16 << 10
+
+// MaxRSAPrivateKeyPEMBytes bounds mounted GitHub App private keys.
+const MaxRSAPrivateKeyPEMBytes = 16 << 10
 
 var (
 	ErrInvalidCredentialFile = errors.New("invalid credential file")
@@ -47,6 +56,48 @@ func LoadKey(path, workspaceRoot string, expectedUID int) ([]byte, error) {
 		return nil, ErrInvalidCredentialFile
 	}
 	return contents, nil
+}
+
+// LoadManifest loads an unmodified, bounded protected manifest. Parsing remains type-specific.
+func LoadManifest(path, workspaceRoot string, expectedUID int) ([]byte, error) {
+	contents, err := loadCredential(path, workspaceRoot, expectedUID, MaxManifestBytes)
+	if err != nil || len(contents) == 0 {
+		return nil, ErrInvalidCredentialFile
+	}
+	return contents, nil
+}
+
+// LoadRSAPrivateKey loads exactly one unencrypted RSA PKCS#1 or PKCS#8 PEM block.
+// The source bytes are cleared before this function returns.
+func LoadRSAPrivateKey(path, workspaceRoot string, expectedUID int) (*rsa.PrivateKey, error) {
+	contents, err := loadCredential(path, workspaceRoot, expectedUID, MaxRSAPrivateKeyPEMBytes)
+	if err != nil {
+		return nil, ErrInvalidCredentialFile
+	}
+	defer clear(contents)
+	block, rest := pem.Decode(contents)
+	if block == nil || len(rest) != 0 || block.Headers["Proc-Type"] != "" || block.Headers["DEK-Info"] != "" {
+		return nil, ErrInvalidCredentialFile
+	}
+	var key *rsa.PrivateKey
+	switch block.Type {
+	case "RSA PRIVATE KEY":
+		key, err = x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		var parsed any
+		parsed, err = x509.ParsePKCS8PrivateKey(block.Bytes)
+		if rsaKey, ok := parsed.(*rsa.PrivateKey); ok {
+			key = rsaKey
+		} else if err == nil {
+			err = errors.New("non-RSA private key")
+		}
+	default:
+		err = errors.New("unsupported private key encoding")
+	}
+	if err != nil || key == nil || key.N.BitLen() < 2048 || key.Validate() != nil {
+		return nil, ErrInvalidCredentialFile
+	}
+	return key, nil
 }
 
 func loadCredential(path, workspaceRoot string, expectedUID, limit int) ([]byte, error) {

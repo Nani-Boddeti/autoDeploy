@@ -35,6 +35,28 @@ func TestDatabaseURLFromEnvironmentRequiresOnlyCredentialFile(t *testing.T) {
 	}
 }
 
+func TestGitHubAppConfigFromEnvironmentIsOptInAndStrict(t *testing.T) {
+	if got, err := config.GitHubAppConfigFromEnvironment(); err != nil || got.Enabled {
+		t.Fatalf("default %#v err %v", got, err)
+	}
+	t.Setenv(config.GitHubAppEnabledEnv, "true")
+	t.Setenv(config.GitHubAppIDEnv, "17")
+	t.Setenv(config.GitHubAppClientIDEnv, "Iv1.client")
+	t.Setenv(config.GitHubAppSlugEnv, "auto-deploy")
+	t.Setenv(config.GitHubAppOwnerIDEnv, "21")
+	t.Setenv(config.GitHubAppOwnerTypeEnv, "Organization")
+	t.Setenv(config.GitHubAppInstallationURLEnv, "https://github.com/apps/auto-deploy/installations/new")
+	t.Setenv(config.GitHubAppPrivateKeyFileEnv, "/run/secrets/github-app.pem")
+	got, err := config.GitHubAppConfigFromEnvironment()
+	if err != nil || !got.Enabled || got.AppID != 17 || got.OwnerAccountID != 21 {
+		t.Fatalf("config %#v err %v", got, err)
+	}
+	t.Setenv(config.GitHubAppInstallationURLEnv, "http://github.com/apps/auto-deploy")
+	if _, err := config.GitHubAppConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+		t.Fatalf("unsafe URL err %v", err)
+	}
+}
+
 func TestUsernameThrottleKeyRingFromEnvironment(t *testing.T) {
 	root, outside := tempDir(t), tempDir(t)
 	active, retained := filepath.Join(outside, "active"), filepath.Join(outside, "retained")
@@ -83,6 +105,36 @@ func TestUsernameThrottleKeyRingFromEnvironment(t *testing.T) {
 	}
 	if _, err := config.UsernameThrottleKeyRingFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
 		t.Fatalf("zero key err %v", err)
+	}
+}
+
+func TestKEKRingFromEnvironment(t *testing.T) {
+	root, outside := tempDir(t), tempDir(t)
+	active, retiring := filepath.Join(outside, "kek-active"), filepath.Join(outside, "kek-retiring")
+	if err := os.WriteFile(active, append([]byte{7}, make([]byte, 31)...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(retiring, append([]byte{8}, make([]byte, 31)...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(outside, "kek-manifest.json")
+	contents := []byte(`{"active_key_id":"k2","database_generation_id":"0123456789abcdef","keys":[{"id":"k2","state":"active","path":"` + active + `"},{"id":"k1","state":"retiring","path":"` + retiring + `"}]}`)
+	if err := os.WriteFile(manifest, contents, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.RepositoryRootEnv, root)
+	t.Setenv(config.KEKManifestFileEnv, manifest)
+	ring, err := config.KEKRingFromEnvironment()
+	activeKey, activeErr := ring.Resolve("k2")
+	retainedKey, retainedErr := ring.Resolve("k1")
+	if err != nil || activeErr != nil || retainedErr != nil || len(activeKey) != 32 || len(retainedKey) != 32 {
+		t.Fatalf("ring %#v err %v", ring, err)
+	}
+	if err := os.WriteFile(manifest, []byte(`{"active_key_id":"k2","database_generation_id":"0123456789abcdef","keys":[{"id":"k2","state":"active","path":"`+active+`"},{"id":"k2","state":"retiring","path":"`+retiring+`"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.KEKRingFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+		t.Fatalf("duplicate manifest %v", err)
 	}
 }
 

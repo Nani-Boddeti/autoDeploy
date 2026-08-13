@@ -34,3 +34,8 @@ jobs:
         env:
           AUTODEPLOY_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/autodeploy_test?sslmode=disable
       - run: go build ./...
+      # Compile the Linux-only privileged services and production runner for
+      # both supported Linux architectures. This is not runtime isolation
+      # coverage; that requires an explicitly provisioned host.
+      - run: GOOS=linux GOARCH=amd64 go build ./cmd/checkout-quota-service ./cmd/checkout-exec ./internal/gitcheckout
+      - run: GOOS=linux GOARCH=arm64 go build ./cmd/checkout-quota-service ./cmd/checkout-exec ./internal/gitcheckout

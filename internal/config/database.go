@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,8 @@ import (
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/credential"
+	secretcrypto "autodeploy/internal/crypto"
+	"autodeploy/internal/githubapp"
 )
 
 const (
@@ -27,9 +30,93 @@ const (
 	TrustedProxyCIDRsEnv                = "AUTODEPLOY_TRUSTED_PROXY_CIDRS"
 	ListenAddressEnv                    = "AUTODEPLOY_LISTEN_ADDRESS"
 	AuthThrottleMaxRowsEnv              = "AUTODEPLOY_AUTH_THROTTLE_MAX_ROWS"
+	KEKManifestFileEnv                  = "AUTODEPLOY_KEK_MANIFEST_FILE"
+	SecretSubsystemEnabledEnv           = "AUTODEPLOY_SECRET_SUBSYSTEM_ENABLED"
+	GitHubAppEnabledEnv                 = "AUTODEPLOY_GITHUB_APP_ENABLED"
+	GitHubAppIDEnv                      = "AUTODEPLOY_GITHUB_APP_ID"
+	GitHubAppClientIDEnv                = "AUTODEPLOY_GITHUB_APP_CLIENT_ID"
+	GitHubAppSlugEnv                    = "AUTODEPLOY_GITHUB_APP_SLUG"
+	GitHubAppOwnerIDEnv                 = "AUTODEPLOY_GITHUB_APP_OWNER_ID"
+	GitHubAppOwnerTypeEnv               = "AUTODEPLOY_GITHUB_APP_OWNER_TYPE"
+	GitHubAppInstallationURLEnv         = "AUTODEPLOY_GITHUB_APP_INSTALLATION_URL"
+	GitHubAppPrivateKeyFileEnv          = "AUTODEPLOY_GITHUB_APP_PRIVATE_KEY_FILE"
 )
 
 var ErrInvalidEnvironment = errors.New("invalid database configuration")
+
+// GitHubAppConfig contains only non-secret GitHub App configuration. The private
+// key remains in a protected mounted file and is loaded separately.
+type GitHubAppConfig struct {
+	Enabled         bool
+	AppID           int64
+	ClientID        string
+	Slug            string
+	OwnerAccountID  int64
+	OwnerType       string
+	InstallationURL string
+	PrivateKeyFile  string
+}
+
+// GitHubAppSignerFromMountedKey loads the App key only after opt-in config has
+// passed strict validation. The key is never returned or persisted.
+func GitHubAppSignerFromMountedKey(c GitHubAppConfig) (*githubapp.Signer, error) {
+	if !c.Enabled {
+		return nil, ErrInvalidEnvironment
+	}
+	settings, err := credentialSettings()
+	if err != nil {
+		return nil, err
+	}
+	key, err := credential.LoadRSAPrivateKey(c.PrivateKeyFile, settings.path, settings.uid)
+	if err != nil {
+		return nil, credential.SanitizedError(err)
+	}
+	signer, err := githubapp.NewSigner(key, c.ClientID, nil, nil)
+	if err != nil {
+		return nil, ErrInvalidEnvironment
+	}
+	return signer, nil
+}
+
+// GitHubAppConfigFromEnvironment is opt-in, preserving existing installations.
+func GitHubAppConfigFromEnvironment() (GitHubAppConfig, error) {
+	raw := os.Getenv(GitHubAppEnabledEnv)
+	if raw == "" || raw == "false" {
+		return GitHubAppConfig{}, nil
+	}
+	if raw != "true" {
+		return GitHubAppConfig{}, ErrInvalidEnvironment
+	}
+	appID, err := strconv.ParseInt(os.Getenv(GitHubAppIDEnv), 10, 64)
+	if err != nil || appID <= 0 {
+		return GitHubAppConfig{}, ErrInvalidEnvironment
+	}
+	ownerID, err := strconv.ParseInt(os.Getenv(GitHubAppOwnerIDEnv), 10, 64)
+	if err != nil || ownerID <= 0 {
+		return GitHubAppConfig{}, ErrInvalidEnvironment
+	}
+	c := GitHubAppConfig{Enabled: true, AppID: appID, ClientID: os.Getenv(GitHubAppClientIDEnv), Slug: os.Getenv(GitHubAppSlugEnv), OwnerAccountID: ownerID, OwnerType: os.Getenv(GitHubAppOwnerTypeEnv), InstallationURL: os.Getenv(GitHubAppInstallationURLEnv), PrivateKeyFile: os.Getenv(GitHubAppPrivateKeyFileEnv)}
+	if !safeGitHubText(c.ClientID, 255) || !safeGitHubText(c.Slug, 100) || (c.OwnerType != "User" && c.OwnerType != "Organization") || !filepath.IsAbs(c.PrivateKeyFile) {
+		return GitHubAppConfig{}, ErrInvalidEnvironment
+	}
+	u, err := url.Parse(c.InstallationURL)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.Fragment != "" || len(c.InstallationURL) > 2048 {
+		return GitHubAppConfig{}, ErrInvalidEnvironment
+	}
+	return c, nil
+}
+
+func safeGitHubText(s string, max int) bool {
+	if s == "" || len(s) > max {
+		return false
+	}
+	for _, r := range s {
+		if r < '!' || r > '~' {
+			return false
+		}
+	}
+	return true
+}
 
 // DatabaseURLFromEnvironment reads a database URL only from the configured credential file.
 // AUTODEPLOY_REPOSITORY_ROOT is an explicit absolute repository/workspace root and is required
@@ -55,6 +142,71 @@ func DatabaseURLFromEnvironment() (string, error) {
 		return "", credential.SanitizedError(err)
 	}
 	return value, nil
+}
+
+// SecretSubsystemEnabled is deliberately opt-in so existing installations do
+// not begin requiring a KEK ring before secret storage is enabled.
+func SecretSubsystemEnabled() (bool, error) {
+	raw := os.Getenv(SecretSubsystemEnabledEnv)
+	if raw == "" || raw == "false" {
+		return false, nil
+	}
+	if raw == "true" {
+		return true, nil
+	}
+	return false, ErrInvalidEnvironment
+}
+
+// KEKRingFromEnvironment loads the opt-in mounted-file KEK manifest. It is intentionally
+// separate from normal startup so existing installations remain backward compatible.
+func KEKRingFromEnvironment() (secretcrypto.KeyRing, error) {
+	ring, _, err := KEKRingAndGenerationFromEnvironment()
+	return ring, err
+}
+
+// KEKRingAndGenerationFromEnvironment returns the externally protected
+// database binding alongside the ring. Secret writers must require both.
+func KEKRingAndGenerationFromEnvironment() (secretcrypto.KeyRing, string, error) {
+	root, err := credentialSettings()
+	if err != nil {
+		return secretcrypto.KeyRing{}, "", err
+	}
+	manifestPath := os.Getenv(KEKManifestFileEnv)
+	if manifestPath == "" || !filepath.IsAbs(manifestPath) {
+		return secretcrypto.KeyRing{}, "", ErrInvalidEnvironment
+	}
+	contents, err := credential.LoadManifest(manifestPath, root.path, root.uid)
+	if err != nil {
+		return secretcrypto.KeyRing{}, "", credential.SanitizedError(err)
+	}
+	manifest, err := secretcrypto.ParseKeyManifest(contents)
+	if err != nil {
+		return secretcrypto.KeyRing{}, "", ErrInvalidEnvironment
+	}
+	keys := make(map[string][]byte, len(manifest.Keys))
+	defer clearLoadedKeys(keys)
+	for _, entry := range manifest.Keys {
+		if !filepath.IsAbs(entry.Path) {
+			return secretcrypto.KeyRing{}, "", ErrInvalidEnvironment
+		}
+		key, loadErr := credential.LoadKey(filepath.Clean(entry.Path), root.path, root.uid)
+		if loadErr != nil {
+			return secretcrypto.KeyRing{}, "", credential.SanitizedError(loadErr)
+		}
+		keys[entry.ID] = key
+	}
+	ring, err := secretcrypto.NewKeyRing(manifest.ActiveKeyID, keys)
+	if err != nil {
+		return secretcrypto.KeyRing{}, "", ErrInvalidEnvironment
+	}
+	return ring, manifest.DatabaseGenerationID, nil
+}
+
+func clearLoadedKeys(keys map[string][]byte) {
+	for id, key := range keys {
+		clear(key)
+		keys[id] = nil
+	}
 }
 
 // UsernameThrottleKeyRingFromEnvironment loads only key-file paths from the

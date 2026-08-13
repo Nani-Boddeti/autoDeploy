@@ -77,9 +77,10 @@ webhook is evidence of origin, not continuing authorization.
 
 ## App and installation authentication
 
-The control plane signs RS256 App JSON Web Tokens in memory with the App private key. JWT issue
-time is backdated for clock skew and expiry remains within GitHub's maximum ten-minute window.
-JWTs are never persisted.
+The control plane signs RS256 App JSON Web Tokens in memory with the App private key. The JWT
+issuer is the GitHub App client ID (not the numeric App ID), issue time is backdated for clock
+skew, and expiry remains within GitHub's maximum ten-minute window. JWTs are never persisted.
+GitHub REST calls use the fixed `https://api.github.com` origin and version `2026-03-10`.
 
 For checkout, the control plane requests an installation access token narrowed to:
 
@@ -97,6 +98,12 @@ disabled certificate verification are forbidden. Proxies and intermediaries must
 authorization material. The agent uses a credential/askpass mechanism that avoids command-line
 exposure, clears the token after checkout, and requests best-effort revocation. The App private
 key and App JWT are never sent to an agent.
+
+Repository discovery may mint a separate, control-plane-only temporary installation token for
+bounded repository metadata/read discovery and revokes it immediately on every terminal path.
+It is never delivered to an agent and does not broaden checkout authorization. The authenticated
+agent-response channel above is the sole future exception to the rule that no provider token is
+delivered outside the control plane; it remains confidential and identity-verified.
 
 On checkout authentication failure:
 
@@ -183,6 +190,22 @@ V1 rejects private cross-repository submodules unless every referenced repositor
 explicitly bound, and independently authorized for credential use. Token forwarding across
 repositories is forbidden. Git LFS and submodule behavior require explicit checkout tests in the
 future Git adapter slice.
+
+## Checkout reservation and clone boundary
+
+Each checkout starts with one durable, short-lived, credential-free reservation scoped to an
+owner/project binding, canonical GitHub HTTPS clone route, exact lowercase commit SHA, and the
+binding/repository/installation authorization revisions. Only one live reservation exists for a
+binding. Minting and activation re-lock that full authority chain; disable or reconciliation
+invalidates live reservations. A token is minted only after reservation admission, is single-use,
+and is revoked on every exit. At most one remint is permitted after a safely classified GitHub
+401 and successful old-token revocation.
+
+The Git runner owns verified non-symlink executable paths, a private workspace root, and hard
+timeout/resource limits. It derives the clone URL from stored provider metadata; callers cannot
+supply URLs, credential helpers, askpass paths, or destination paths. The token crosses only an
+inherited anonymous descriptor for the authenticated fetch and is excluded from URLs, arguments,
+configuration, environment values, durable state, logs, and errors.
 
 ## Consequences
 

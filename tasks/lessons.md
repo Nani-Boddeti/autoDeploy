@@ -65,3 +65,16 @@
 - An integration command exiting zero is not proof that integration ran. Use verbose output or an
   explicit required-environment preflight and record non-skipped test names before claiming live
   database coverage.
+- Generic authentication redirects make status-only regression tests non-discriminating. Assert
+  forbidden side effects too: no repository calls, authority minting, revocation, or cookie change.
+- Streaming redaction bounds must cover derived-pattern expansion, candidate/output-link work, and
+  counter overflow—not only source-byte transitions or retained-buffer size.
+- Immutable bounded audit admission must dynamically reserve capacity for every currently active
+  authority's future revocation, not consume a fixed lifecycle reserve. Edit an uncommitted migration
+  only against a fresh database: checksum protection rejects changed already-applied migrations.
+- A process running under the UID that owns a delegated cgroup subtree can move into sibling cgroups;
+  use a distinct fixed payload UID/GID with no cgroup write access and atomic cgroup-FD admission.
+- Preventive project quotas require helper-created, root-inaccessible workspaces and a durable
+  mount-bound non-reusing ID ledger. Caller-created directories leave a pre-quota mutation window.
+- FD-based protocols need one explicit owner per descriptor, exact direction/count/uniqueness checks,
+  and durable indeterminate/replay states; compilation does not expose double-close or ACK-loss bugs.

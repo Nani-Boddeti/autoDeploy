@@ -8,6 +8,9 @@
 - Source: private GitHub repositories via GitHub App and verified push webhooks.
 - Stack approved: Go control plane and agent, PostgreSQL, Docker/BuildKit, Traefik, and a
   server-rendered UI with minimal JavaScript.
+- Use Coolify as product inspiration for project/environment hierarchy, deployment workflows,
+  status visibility, logs, domains, variables, and operational UX. Do not copy its code or let UI
+  similarity override AutoDeploy's approved security boundaries and architecture.
 - PostgreSQL is the durable queue; Redis is intentionally excluded from V1.
 - Agents initiate authenticated outbound communication. The public control plane must never
   receive Docker-socket or broad SSH access.
@@ -182,7 +185,8 @@
 ## Resume Point
 
 - Authentication persistence plus the operator/configuration boundary are complete, verified,
-  committed as `74afc5c`, and synchronized with `origin/main`.
+  committed as `74afc5c`, and synchronized with `origin/main`. All subsequently described web,
+  secret, and GitHub work remains uncommitted.
 - ADRs 0001-0006 are complete. ADR 0006 defines the approved administrator authentication slice.
 - Auth specifics: canonical usernames match `[a-z0-9][a-z0-9._-]{2,63}`; bootstrap calibrates and
   durably stores one Argon2 policy; sessions are digest-only, Strict, 30-minute idle/eight-hour
@@ -215,17 +219,43 @@
 - Migration 000003 deletes un-attributable pre-web pair rows and tags future known-user pairs by
   opaque user ID. Universal recovery lock order is throttle admission → user → sessions; reset
   preserves IP/invalid-forward/shared-overflow evidence.
-- Minimal admin web work is in progress and uncommitted. Step 1 adds a signed ten-minute pre-login
-  envelope authenticated over envelope/key versions, issued-at, nonce, and origin; mounted CSRF
-  key-ring/public-origin/proxy/listener/throttle-cap config; and keyed request throttle digests.
-- Web Step 2 adds atomic `CompleteLogin`: throttle-admission → user → sessions, stale authority and
-  durable-policy revalidation, conditional rehash, session mint/cap/audit, and pair/username-only
-  clearing. Six non-skipped live PostgreSQL tests plus focused race/static checks pass.
-- Next task is Web Step 3 only: login/logout/protected landing/health HTTP handlers, strict browser
-  and proxy validation, control-plane server limits, readiness, and graceful shutdown. No auth HTTP
-  routes exist yet. A fresh implementation-specialist thread is required because this session's
-  subagent thread limit is exhausted; final independent QA/code review and commit/push remain.
-- Do not start GitHub, agent, Docker, routing, or UI work before their dedicated approved slices.
+- Administrator web Steps 1–3 are complete but uncommitted: signed ten-minute pre-login envelope;
+  mounted CSRF/public-origin/proxy/listener/throttle config; atomic `CompleteLogin`; and
+  login/logout/protected landing/health wiring with strict browser/proxy validation, readiness, and
+  bounded shutdown. Full unit/race/static and non-skipped PostgreSQL 18.4 normal/race integration
+  pass; QA/security PASS.
+- Administrator authentication and the envelope-encryption/key-rotation/centralized-redaction slice
+  are complete but uncommitted. Secret Step 1 crypto,
+  mounted KEK provider, and bounded streaming-redaction primitives are implemented and independently
+  verified. Step 2 durable reservation ledger, immutable secret persistence, exact authorization,
+  CAS rewrap fields, and atomic sanitized audit are also implemented and verified by fresh
+  PostgreSQL 18.4 normal/race integration plus independent QA/security review.
+- Secret Step 3 is implemented and verified: bounded restartable rewrap, explicit terminal key-ledger
+  initialization, retirement guards, compromise replacement, opt-in per-probe readiness, and the
+  control-plane redacting error boundary. Full unit/race and fresh PostgreSQL 18.4 race integration
+  pass; independent QA/security review pass the local implementation.
+- Generation binding detects DB/manifest mismatch, not joint rollback. Every restore must install a
+  fresh active KEK ID; automatic joint-rollback detection needs a separately approved external
+  non-rollbackable authority. Agent/persisted-log integration remains deferred.
+- GitHub App slice is approved and in progress. Steps 1–2 are complete but uncommitted: strict
+  signer/provider; `000005`/`000006` setup
+  state → callback lease → Strict handoff, exact session/user/owner/revision + active-registration
+  rechecks, composite session FKs, owner-scoped discovery/reconciliation/disable/binding revisions,
+  token revocation, and dynamic per-owner audit admission reserving revocation capacity for active
+  installations/repos. Fresh PostgreSQL 18.4 normal/race, full checks, QA, and security PASS.
+- GitHub Step 3 implementation/static review is complete but operational validation is pending.
+  Production uses two reviewed root-owned local services: a mount-bound XFS project-quota helper
+  that authenticates the agent but grants active workspaces only to a distinct checkout UID/GID,
+  and a fixed-purpose spawn helper that admits typed Git operations atomically into cgroup v2 and
+  drops to that checkout identity with no supplementary groups. The runner has no path/os-exec
+  fallback; tokens remain pipe-only, output is bounded/redacted, cleanup is resumable, and exact
+  SHA/tree/LFS/submodule checks remain enforced. `make check`, full race, Linux amd64/arm64 builds,
+  tagged smoke compilation, and independent reviews pass. Still required: non-cached privileged
+  smoke on provisioned Linux XFS `prjquota` + delegated cgroup v2; macOS cannot provide this proof.
+- Progress: 5/18 top-level implementation-sequence items complete (27.8% raw); partial GitHub work
+  makes the weighted evidence estimate approximately 39%.
+- Commit/push accumulated work only with approval.
+- Do not start agent, Docker, routing, or UI work before their dedicated approved slices.
 
 ## Persistence Invariants and Lessons
 
