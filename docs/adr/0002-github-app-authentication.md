@@ -49,7 +49,10 @@ binding remains mandatory even if GitHub repository selection is later broadened
 
 - Persist GitHub installation, account, and repository numeric IDs as stable external identities.
 - Treat owner names, repository names, and full names as mutable display metadata.
-- Bind one active local project to an explicitly selected installation and repository ID.
+- Bind one active local project to an explicitly selected installation and repository ID. Automatic
+  deployment additionally requires an administrator-configured canonical full branch ref plus
+  opaque environment and server IDs. A legacy or incomplete binding remains checkout-compatible
+  but is ineligible for automatic deployment until all target fields are configured.
 - Record repository-selection, suspension, permission-snapshot, and reconciliation metadata.
 - Do not authorize a repository merely because the App installation can access it.
 - Do not authorize from the webhook sender identity.
@@ -117,7 +120,9 @@ On checkout authentication failure:
 
 ## Webhook verification and durable receipt
 
-- Accept webhook traffic only over HTTPS in production.
+- Accept webhook traffic only over HTTPS in production. Where TLS terminates at a reverse proxy,
+  accept forwarded HTTPS provenance only from a configured trusted proxy and only in its canonical
+  validated form; an untrusted peer cannot assert it through forwarding headers.
 - Read a bounded raw request body exactly once.
 - Require and validate the event and delivery headers.
 - Verify `X-Hub-Signature-256` with HMAC-SHA256 and constant-time comparison before JSON parsing.
@@ -130,6 +135,10 @@ On checkout authentication failure:
   same commit/ref twice; an administrator-requested redeploy is a separate authenticated intent.
 - Store the payload digest and safe normalized identifiers, event/action, verification status,
   processing status, and sanitized failure details.
+- A terminal rejected receipt may retain blank action and absent normalized installation,
+  repository, and owner IDs when rejection occurs before parsing. Its fixed App-registration FK
+  remains valid even after that registration is made inactive, so receipt auditing is retained;
+  only successful admission requires an active registration.
 - Treat the same delivery ID with a different payload digest as an integrity violation.
 - Commit the durable receipt and authorized normalized state change before returning success.
 - Return promptly after durable receipt and process asynchronous work through durable jobs.

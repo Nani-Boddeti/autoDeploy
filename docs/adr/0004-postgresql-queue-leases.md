@@ -159,12 +159,14 @@ this global row-lock hierarchy:
 
 1. Authorization rows in type order: owner, project binding, environment, server, credential;
    within each type, immutable ID ascending.
-2. Environment execution-slot rows by environment ID ascending.
-3. Logical job rows by job ID ascending.
-4. Attempt rows by attempt ID ascending.
-5. Deployment aggregate heads by deployment ID ascending.
-6. Secret-version and frozen-reference rows by secret/version ID ascending.
-7. Append-only event/audit inserts after all required existing rows are locked.
+2. Verified webhook delivery and automatic-intent rows by immutable App/delivery and binding/commit
+   keys, respectively; these rows are introduced only with the enqueue transaction.
+3. Environment execution-slot rows by environment ID ascending.
+4. Logical job rows by job ID ascending.
+5. Attempt rows by attempt ID ascending.
+6. Deployment aggregate heads by deployment ID ascending.
+7. Secret-version and frozen-reference rows by secret/version ID ascending.
+8. Append-only event/audit inserts after all required existing rows are locked.
 
 Claim uses shared/key-preserving locks on active authorization revisions; revocation uses
 conflicting update locks and increments those revisions before touching later row classes. Thus a

@@ -457,7 +457,7 @@ func (h *Handler) githubBind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 3 || len(v["csrf"]) != 1 || len(v["project_id"]) != 1 || len(v["repository_id"]) != 1 {
+	if err != nil || len(v) != 6 || len(v["csrf"]) != 1 || len(v["project_id"]) != 1 || len(v["repository_id"]) != 1 || len(v["ref"]) != 1 || len(v["environment_id"]) != 1 || len(v["server_id"]) != 1 {
 		badRequest(w)
 		return
 	}
@@ -467,7 +467,8 @@ func (h *Handler) githubBind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, e := strconv.ParseInt(v.Get("repository_id"), 10, 64)
-	if e != nil || id <= 0 || strconv.FormatInt(id, 10) != v.Get("repository_id") || len(v.Get("project_id")) == 0 || len(v.Get("project_id")) > 128 {
+	input := githubapp.BindingInput{ProjectID: v.Get("project_id"), RepositoryID: id, Ref: v.Get("ref"), EnvironmentID: v.Get("environment_id"), ServerID: v.Get("server_id")}
+	if e != nil || id <= 0 || strconv.FormatInt(id, 10) != v.Get("repository_id") || !input.Valid() {
 		badRequest(w)
 		return
 	}
@@ -476,7 +477,7 @@ func (h *Handler) githubBind(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	if h.config.GitHubSetup.Bind(r.Context(), p, v.Get("project_id"), id, audit) != nil {
+	if h.config.GitHubSetup.Bind(r.Context(), p, input, audit) != nil {
 		badRequest(w)
 		return
 	}

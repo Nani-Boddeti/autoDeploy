@@ -22,26 +22,55 @@ func NewDeploymentRepository(pool *pgxpool.Pool) *DeploymentRepository {
 
 // Create persists a new aggregate and its complete event history atomically.
 func (r *DeploymentRepository) Create(ctx context.Context, value deployment.Deployment) error {
-	snapshot, err := checkedSnapshot(value)
-	if err != nil {
-		return err
-	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin deployment create: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err = r.CreateTx(ctx, tx, value); err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit deployment create: %w", err)
+	}
+	return nil
+}
+
+// CreateTx persists a new deployment in a transaction owned by the caller.
+// It deliberately does not commit or roll back that transaction.
+func (r *DeploymentRepository) CreateTx(ctx context.Context, tx pgx.Tx, value deployment.Deployment) error {
+	return r.createTxWithHook(ctx, tx, value, nil)
+}
+
+// createTxWithHook is the repository-owned transaction seam used only by the
+// webhook unit of work. The callback runs after the deployment head and after
+// its initial event, so rollback tests exercise both real write stages.
+func (r *DeploymentRepository) createTxWithHook(ctx context.Context, tx pgx.Tx, value deployment.Deployment, hook func(string) error) error {
+	if tx == nil {
+		return errors.New("deployment transaction is required")
+	}
+	snapshot, err := checkedSnapshot(value)
+	if err != nil {
+		return err
+	}
 	if _, err = tx.Exec(ctx, `INSERT INTO deployments (id, project_id, environment_id, server_id, commit_sha, schema_version, status, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, snapshot.Identity.DeploymentID, snapshot.Identity.ProjectID, snapshot.Identity.EnvironmentID, snapshot.Identity.ServerID, snapshot.Identity.CommitSHA, int16(snapshot.Version), snapshot.Status, snapshot.CreatedAt, snapshot.UpdatedAt, int64(snapshot.Revision)); err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: %s", ErrAlreadyExists, snapshot.Identity.DeploymentID)
 		}
 		return fmt.Errorf("insert deployment: %w", err)
 	}
+	if hook != nil {
+		if err := hook("deployment"); err != nil {
+			return err
+		}
+	}
 	if err = appendEvents(ctx, tx, snapshot.Identity.DeploymentID, snapshot.Events); err != nil {
 		return err
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit deployment create: %w", err)
+	if hook != nil {
+		if err := hook("deployment_event"); err != nil {
+			return err
+		}
 	}
 	return nil
 }

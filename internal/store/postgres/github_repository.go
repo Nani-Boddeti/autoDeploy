@@ -421,8 +421,8 @@ func (r *GitHubRepository) CompleteHandoff(ctx context.Context, digest [32]byte,
 	return tx.Commit(ctx)
 }
 
-func (r *GitHubRepository) BindRepository(ctx context.Context, principal auth.Principal, projectID string, repositoryID int64, audit string) error {
-	if principal.Validate() != nil || len(projectID) == 0 || len(projectID) > 128 || repositoryID <= 0 || validID(audit) != nil {
+func (r *GitHubRepository) BindRepository(ctx context.Context, principal auth.Principal, input githubapp.BindingInput, audit string) error {
+	if principal.Validate() != nil || !input.Valid() || validID(audit) != nil {
 		return ErrGitHubDenied
 	}
 	tx, err := r.pool.Begin(ctx)
@@ -439,14 +439,14 @@ func (r *GitHubRepository) BindRepository(ctx context.Context, principal auth.Pr
 	}
 	var installID int64
 	var active, suspended bool
-	err = tx.QueryRow(ctx, `SELECT r.installation_id,r.active,i.suspended FROM github_repositories r JOIN github_installations i ON i.installation_id=r.installation_id AND i.owner_id=r.owner_id WHERE r.repository_id=$1 AND r.owner_id=$2 AND i.active=true FOR UPDATE OF r,i`, repositoryID, principal.OwnerID).Scan(&installID, &active, &suspended)
+	err = tx.QueryRow(ctx, `SELECT r.installation_id,r.active,i.suspended FROM github_repositories r JOIN github_installations i ON i.installation_id=r.installation_id AND i.owner_id=r.owner_id WHERE r.repository_id=$1 AND r.owner_id=$2 AND i.active=true FOR UPDATE OF r,i`, input.RepositoryID, principal.OwnerID).Scan(&installID, &active, &suspended)
 	if err != nil || !active || suspended {
 		return ErrGitHubDenied
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,active) VALUES($1,$2,$3,$4,true) ON CONFLICT(owner_id,project_id) DO UPDATE SET repository_id=EXCLUDED.repository_id,installation_id=EXCLUDED.installation_id,active=true,authorization_revision=github_project_bindings.authorization_revision+1,updated_at=clock_timestamp()`, principal.OwnerID, projectID, repositoryID, installID); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref,environment_id,server_id,active) VALUES($1,$2,$3,$4,$5,$6,$7,true) ON CONFLICT(owner_id,project_id) DO UPDATE SET repository_id=EXCLUDED.repository_id,installation_id=EXCLUDED.installation_id,deploy_ref=EXCLUDED.deploy_ref,environment_id=EXCLUDED.environment_id,server_id=EXCLUDED.server_id,active=true,authorization_revision=github_project_bindings.authorization_revision+1,updated_at=clock_timestamp()`, principal.OwnerID, input.ProjectID, input.RepositoryID, installID, input.Ref, input.EnvironmentID, input.ServerID); err != nil {
 		return fmt.Errorf("upsert binding: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO github_audit_events(id,owner_id,actor_user_id,action,result,installation_id,repository_id,project_id) VALUES($1,$2,$3,'repository_bound','success',$4,$5,$6)`, audit, principal.OwnerID, principal.UserID, installID, repositoryID, projectID); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO github_audit_events(id,owner_id,actor_user_id,action,result,installation_id,repository_id,project_id) VALUES($1,$2,$3,'repository_bound','success',$4,$5,$6)`, audit, principal.OwnerID, principal.UserID, installID, input.RepositoryID, input.ProjectID); err != nil {
 		return fmt.Errorf("audit binding: %w", err)
 	}
 	return tx.Commit(ctx)

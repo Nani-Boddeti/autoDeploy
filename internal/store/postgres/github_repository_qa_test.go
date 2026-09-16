@@ -28,7 +28,7 @@ func TestQAGitHubBindingRejectsRevokedSession(t *testing.T) {
 	if _, err := repo.pool.Exec(ctx, `UPDATE admin_sessions SET revoked_at=clock_timestamp(),revoked_reason='logout' WHERE id=$1`, p.SessionID); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.BindRepository(ctx, p, "revoked_session_project", 201, "qa-revoked-session"); !errors.Is(err, ErrGitHubDenied) {
+	if err := repo.BindRepository(ctx, p, binding("revoked_session_project"), "qa-revoked-session"); !errors.Is(err, ErrGitHubDenied) {
 		t.Fatalf("revoked session retained binding authority: %v", err)
 	}
 }
@@ -46,7 +46,7 @@ func TestQAGitHubRediscoveryDisablesRemovedRepositoryAndBinding(t *testing.T) {
 	if err := repo.CompleteHandoff(ctx, firstHandoff, p, installation(), repositories()); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.BindRepository(ctx, p, "removed_repo_project", 201, "qa-bind-before-removal"); err != nil {
+	if err := repo.BindRepository(ctx, p, binding("removed_repo_project"), "qa-bind-before-removal"); err != nil {
 		t.Fatal(err)
 	}
 

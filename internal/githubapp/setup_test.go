@@ -45,7 +45,7 @@ func (s *setupStoreStub) CompleteHandoff(_ context.Context, _ [32]byte, _ auth.P
 	s.completed++
 	return s.err
 }
-func (s *setupStoreStub) BindRepository(_ context.Context, _ auth.Principal, _ string, _ int64, _ string) error {
+func (s *setupStoreStub) BindRepository(_ context.Context, _ auth.Principal, _ BindingInput, _ string) error {
 	s.bound++
 	return s.err
 }

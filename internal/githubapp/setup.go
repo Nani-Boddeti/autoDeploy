@@ -7,6 +7,7 @@ import (
 	"io"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/github"
 )
 
 var ErrSetupUnavailable = errors.New("GitHub setup unavailable")
@@ -20,13 +21,27 @@ type SetupStore interface {
 	ReserveCallback(context.Context, [32]byte, [32]byte, Installation) error
 	PendingInstallation(context.Context, [32]byte, auth.Principal) (Installation, error)
 	CompleteHandoff(context.Context, [32]byte, auth.Principal, Installation, []Repository) error
-	BindRepository(context.Context, auth.Principal, string, int64, string) error
+	BindRepository(context.Context, auth.Principal, BindingInput, string) error
 	DisableInstallation(context.Context, auth.Principal, int64, string) error
 	ReconcileInstallation(context.Context, auth.Principal, Installation, []Repository, string) error
 }
 type SetupStateInput struct {
 	Digest    [32]byte
 	Principal auth.Principal
+}
+
+// BindingInput is administrator-selected authority for automatic deployment.
+// All IDs remain opaque until their aggregates are introduced.
+type BindingInput struct {
+	ProjectID     string
+	RepositoryID  int64
+	Ref           string
+	EnvironmentID string
+	ServerID      string
+}
+
+func (in BindingInput) Valid() bool {
+	return github.ValidOpaqueID(in.ProjectID) && in.RepositoryID > 0 && github.ValidBranchRef(in.Ref) && github.ValidOpaqueID(in.EnvironmentID) && github.ValidOpaqueID(in.ServerID)
 }
 
 type SetupService struct {
@@ -187,11 +202,11 @@ func (s *SetupService) HandoffValid(ctx context.Context, handoff string, p auth.
 	_, err = s.store.PendingInstallation(ctx, d, p)
 	return err == nil
 }
-func (s *SetupService) Bind(ctx context.Context, p auth.Principal, projectID string, repositoryID int64, auditID string) error {
-	if p.Validate() != nil {
+func (s *SetupService) Bind(ctx context.Context, p auth.Principal, input BindingInput, auditID string) error {
+	if p.Validate() != nil || !input.Valid() {
 		return ErrSetupUnavailable
 	}
-	if err := s.store.BindRepository(ctx, p, projectID, repositoryID, auditID); err != nil {
+	if err := s.store.BindRepository(ctx, p, input, auditID); err != nil {
 		return ErrSetupUnavailable
 	}
 	return nil

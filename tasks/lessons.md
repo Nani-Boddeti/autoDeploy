@@ -78,3 +78,19 @@
   mount-bound non-reusing ID ledger. Caller-created directories leave a pre-quota mutation window.
 - FD-based protocols need one explicit owner per descriptor, exact direction/count/uniqueness checks,
   and durable indeterminate/replay states; compilation does not expose double-close or ACK-loss bugs.
+- GitHub lifecycle payloads may carry repository arrays; normalize, bound, sort, and persist the full
+  set atomically. A child-table immutability trigger must lock and recheck the parent terminal state,
+  otherwise a concurrent insert can append after the receipt is sealed.
+- HMAC rejection must not cross the database boundary. For verified malformed input, persist the
+  sanitized rejection and return a retryable 5xx if that persistence fails so provider retry remains
+  possible.
+- Integration fixtures that derive identifiers from `t.Name()` need bounded deterministic IDs;
+  nested descriptive subtest names can exceed production identifier limits only at live runtime.
+- Never record "fresh PostgreSQL passed" evidence without the exact command output from a full
+  integration run of every tagged package; focused runs hid four failures (2026-09-16).
+- In standard (non-E) SQL strings backslashes are literal: write regex `\.`, not `\\.`. Prove every
+  regex CHECK with a positive canonical value, not only rejections.
+- Adding an FK to an existing table breaks other tests' TRUNCATE lists; grep all TRUNCATEs of the
+  referenced table when adding a referencing table.
+- Concurrency tests must force overlap after the real read (barrier that reads, then waits for both);
+  releasing on arrival still lets the scheduler serialize, especially under -race.

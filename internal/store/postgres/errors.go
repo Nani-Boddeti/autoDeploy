@@ -11,4 +11,10 @@ var (
 	ErrAlreadyBootstrapped = errors.New("administrator authentication already bootstrapped")
 	ErrUnauthenticated     = errors.New("unauthenticated")
 	ErrSessionRevoked      = errors.New("session already revoked")
+	// ErrWebhookIntegrity is a sanitized conflict between immutable webhook
+	// delivery, replay, intent, or job identities.
+	ErrWebhookIntegrity = errors.New("webhook integrity conflict")
+	// ErrWebhookUnauthorized reports an inactive or mismatched durable GitHub
+	// authority chain without exposing which authority record failed.
+	ErrWebhookUnauthorized = errors.New("webhook authorization denied")
 )

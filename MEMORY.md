@@ -184,6 +184,21 @@
 
 ## Resume Point
 
+- GitHub webhook ingestion and durable enqueue are complete but uncommitted. The isolated webhook
+  route verifies bounded raw bodies with active/retained mounted HMAC secrets before parsing or any
+  database call, trusts forwarded HTTPS only from configured proxies, and persists no raw payload,
+  signature, token, or secret. Binding authority now includes canonical ref/environment/server.
+- Verified pushes lock App/installation/repository/binding authority and atomically commit receipt,
+  automatic intent, deployment/event, immutable logical job/event, and processed state in one
+  `READ COMMITTED` transaction. Exact delivery/body/intent replay is idempotent; scope or digest
+  conflicts fail closed.
+- Installation deletion/suspension and bounded canonical multi-repository removals disable authority
+  and bindings transactionally; additions/unsuspension never reactivate bindings. Lifecycle
+  repository sets are sealed by a parent-locking database trigger and reject later insert/update/delete.
+- Fresh PostgreSQL 18 normal/race webhook integration and migrations pass, as do repository-wide
+  unit/race/vet/diff checks and independent QA/security review. Next queue work is claims, attempts,
+  leases, fencing, retries, agent transport, and transient checkout-token delivery.
+
 - Authentication persistence plus the operator/configuration boundary are complete, verified,
   committed as `74afc5c`, and synchronized with `origin/main`. All subsequently described web,
   secret, and GitHub work remains uncommitted.
@@ -252,8 +267,11 @@
   SHA/tree/LFS/submodule checks remain enforced. `make check`, full race, Linux amd64/arm64 builds,
   tagged smoke compilation, and independent reviews pass. Still required: non-cached privileged
   smoke on provisioned Linux XFS `prjquota` + delegated cgroup v2; macOS cannot provide this proof.
-- Progress: 5/18 top-level implementation-sequence items complete (27.8% raw); partial GitHub work
-  makes the weighted evidence estimate approximately 39%.
+- Progress: 7/18 top-level implementation-sequence items complete (38.9%, approximately 39%);
+  effort-weighted estimate remains 35–40%. The isolated-checkout top-level milestone stays
+  unchecked: implementation/static validation is complete, but privileged operational smoke on
+  provisioned Linux XFS `prjquota` + delegated cgroup v2 remains mandatory before agent use.
+- .tmp/ is untracked but not gitignored; manually exclude it and never use blanket git add.
 - Commit/push accumulated work only with approval.
 - Do not start agent, Docker, routing, or UI work before their dedicated approved slices.
 

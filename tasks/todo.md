@@ -128,8 +128,8 @@ State transitions must be validated in the domain layer and committed transactio
 - [x] Implement PostgreSQL migrations and typed persistence repositories.
 - [x] Implement admin bootstrap, secure session cookies, CSRF protection, and authorization.
 - [x] Implement envelope encryption, key rotation metadata, and centralized redaction.
-- [ ] Implement GitHub App installation flow and short-lived clone authentication.
-- [ ] Implement raw-body webhook verification, delivery idempotency, repository/branch filtering,
+- [x] Implement GitHub App installation flow and short-lived clone authentication.
+- [x] Implement raw-body webhook verification, delivery idempotency, repository/branch filtering,
       and durable job creation.
 - [ ] Implement server registration, scoped agent credentials, heartbeat, job leasing, renewal,
       cancellation, and recovery.
@@ -149,11 +149,12 @@ State transitions must be validated in the domain layer and committed transactio
 - [ ] Package the control plane, agent, PostgreSQL, and Traefik for installation on Hetzner.
 - [ ] Run unit, integration, security, failure-recovery, and end-to-end validation.
 
-## GitHub App installation and checkout slice — approved, in progress
+## GitHub App installation and checkout slice — implementation complete; privileged operational validation pending
 
-Scope: implement installation setup, explicit repository selection, single-repository checkout
+Scope completed: installation setup, explicit repository selection, single-repository checkout
 credential issuance, and the production exact-commit Git adapter. Raw webhook ingestion and durable
-job creation remain the following slice; authenticated agent transport remains in the agent slice.
+job creation are also complete in the following recorded slice; authenticated agent transport remains
+the next implementation boundary.
 
 ### Approval assumptions
 
@@ -420,8 +421,9 @@ Approved by the user:
       QA-verified, and security-reviewed.
 - [x] Administrator-authentication PostgreSQL migration and typed persistence workflows are
       implemented, live-integration/race-tested, independently QA-verified, and security-reviewed.
-- Progress snapshot: 5/18 top-level implementation-sequence items complete (27.8%). This raw count
-  undercounts partial GitHub work; weighted evidence estimate is approximately 39%.
+- Progress snapshot: 7/18 top-level implementation-sequence items complete (38.9%, approximately
+  39%). Weighted evidence estimate remains approximately 35–40%; the isolated-checkout top-level
+  milestone stays unchecked until its privileged Linux operational smoke passes.
 
 ## Approved Administrator Authentication Slice
 
@@ -827,3 +829,178 @@ other domains that are not implemented yet.
 - Head/event corruption must not be silently repaired: return domain snapshot validation errors.
 - Database status constraints duplicate domain values: update both through reviewed migrations
   whenever lifecycle states change.
+
+## Proposed GitHub Webhook and Durable Enqueue Slice
+
+Status: complete. This slice follows ADR 0002 and ADR 0004. It does not return a
+successful webhook response until verified receipt, deployment creation, and logical job enqueue
+have committed together. Agent authentication, claims, leases, attempts, fencing, retry recovery,
+and checkout-token delivery remain the next slice.
+
+### Approval assumptions
+
+- Add the smallest real deployment-target authority now: extend the active owner/project GitHub
+  binding with one canonical full branch ref, environment ID, and server ID. These remain
+  constrained opaque identifiers until the project/environment/server aggregates are implemented;
+  no local-only or placeholder target resolver is allowed.
+- Handle `push`, `installation`, and `installation_repositories` deliveries in this slice. Pushes
+  may enqueue work; lifecycle deliveries only apply verified, fail-closed authorization changes.
+- Continue terminating public TLS at the trusted reverse proxy. The webhook route accepts only a
+  request whose connection/validated trusted-proxy metadata proves the original HTTPS scheme; it
+  never trusts forwarding headers from an untrusted peer.
+- Load an active webhook secret plus optional retained overlap secret from protected mounted files.
+  Accept either during bounded operator-controlled rotation, identify which version verified the
+  delivery without persisting secret material, and do not automate retirement in this slice.
+- Store only bounded normalized identifiers, digests, states, and sanitized failure classes. Never
+  persist or log the raw payload, signature, secret, token, sender object, commit messages, or other
+  unrestricted GitHub content.
+
+### Step 1 — target authority, webhook domain, and queue domain
+
+- [x] Amend the accepted ADRs only where needed to place delivery/intent rows in the global lock
+      hierarchy and document the selected binding-target and trusted-proxy HTTPS contracts.
+- [x] Add strict typed webhook header, digest, normalized push/lifecycle event, verification-state,
+      processing-state, and sanitized failure models. Require positive numeric stable IDs, a
+      canonical `refs/heads/<branch>` ref, and a lowercase 40-hex nonzero commit SHA for pushes.
+- [x] Add a typed immutable logical deployment-execution job model with schema version, owner,
+      project, environment, server, deployment, repository, ref, commit, bounded priority,
+      availability, idempotency key, canonical payload digest, and queued state. It must contain no
+      credentials, raw JSON, arbitrary command, URL, or path supplied by the webhook.
+- [x] Extend repository binding creation/update so administrators configure one full ref,
+      environment ID, and server ID; preserve existing production behavior by leaving existing
+      rows inactive for automatic deploy until all target fields are explicitly configured.
+
+#### Step 1 result
+
+- Added strict, credential-free normalized webhook values and immutable deployment-execution job
+  values with focused validation tests; HTTP ingress, signature handling, and persistence remain
+  deferred.
+- Binding target authority now requires a canonical branch ref and opaque environment/server IDs
+  on new or updated bindings. Legacy rows intentionally retain null target fields and cannot
+  authorize automatic deployment when Step 2 persistence is introduced.
+- Migration `000009_github_binding_targets.sql` is Step 1 target-only authority. Migration `000010`
+  is reserved for the Step 2 webhook-delivery, intent, job, and event persistence transaction.
+
+### Step 2 — forward-only schema and transaction-aware persistence
+
+- [x] Binding target authority is complete in Step 1 migration
+      `000009_github_binding_targets.sql`. Add forward-only migration `000010` for durable webhook
+      deliveries, automatic deployment intents, logical agent jobs, and append-only job events.
+- [x] Enforce unique `(app_registration_id, delivery_id)`, independent per-App verified body-digest
+      replay protection, and unique automatic intent `(binding identity, repository ID, full ref,
+      commit SHA)`. Same-key/same-digest is idempotent; any scope/digest mismatch is an integrity
+      conflict with no state change.
+- [x] Enforce immutable typed job scope/payload digest, `UNIQUE (deployment_id, job_kind)`, legal
+      queued shape, bounded priority/timestamps, useful runnable/idempotency indexes, and append-only
+      initial enqueue events. Lease/attempt/slot tables remain deferred.
+- [x] Introduce a narrow caller-owned PostgreSQL Unit of Work. Add transaction-aware deployment
+      creation while preserving the existing standalone repository API, and explicitly commit or
+      roll back every transaction.
+- [x] In one short `READ COMMITTED` transaction, lock/revalidate App registration, installation,
+      repository, project binding, and target authority in deterministic order; resolve delivery
+      and automatic-intent idempotency; create the queued deployment/event and job/event; then mark
+      the normalized delivery processed before commit. Perform no GitHub/network call in this
+      transaction.
+
+#### Step 2 result
+
+- Added migration `000010_create_webhook_jobs.sql` with normalized terminal receipts, independent
+  verified-body replay protection, immutable automatic intents, queued deployment-execution jobs,
+  append-only enqueue events, canonical source/timestamp constraints, and runnable/idempotency
+  indexes. Claims, leases, attempts, environment slots, fences, and retries remain deferred.
+- Added one `READ COMMITTED` enqueue unit of work with deterministic App/installation/repository/
+  binding `FOR SHARE` authorization locks, exact immutable replay comparison, sanitized collision
+  handling, caller-owned deployment creation, and explicit rollback/commit. Successful lifecycle
+  receipt plus authority mutation remains an atomic Step 3 operation; only terminal pre-parse-safe
+  rejection receipts can commit independently.
+- Focused unit/race/vet/diff checks and integration compilation pass. Live PostgreSQL 18 normal and
+  race runs pass all focused webhook repository and migration tests, including exact/digest/intent
+  replay, concurrent distinct deliveries, every write-stage rollback, terminal rejection storage,
+  named schema constraints, immutable receipts/jobs/events, and authorization-lock fencing.
+
+### Step 3 — raw ingress, credential loading, lifecycle effects, and wiring
+
+- [x] Add a dedicated webhook handler outside browser session/CSRF middleware. Require one canonical
+      delivery header, one supported event header, one `sha256=` signature header, an exact path and
+      POST method, trusted HTTPS provenance, and a bounded body read exactly once.
+- [x] Verify HMAC-SHA256 over the unmodified bytes with constant-time comparison before JSON parsing
+      or database work. Support active/retained mounted-secret overlap using the existing hardened
+      credential-file boundary and sanitized configuration errors.
+- [x] Strictly parse only the normalized fields required for authorization. Reject unsupported
+      actions/events, deletion/zero SHA pushes, malformed/duplicate headers, trailing JSON, unknown
+      authority, wrong ref, suspended/removed repositories, and inconsistent numeric identities.
+- [x] Apply verified installation suspension/deletion and repository removal fail-closed by
+      revisioning/disabling the matching authority and bindings transactionally. Additions and
+      unsuspension refresh known authority only; they never create or reactivate a project binding.
+- [x] Compose the webhook route with the browser handler in the control-plane entrypoint, preserve
+      default-disabled GitHub behavior, readiness, security headers, timeouts, and fixed sanitized
+      process logging.
+
+### Files expected
+
+- Step 1 complete: `internal/github/webhook.go`, webhook tests, `internal/queue/job.go`, queue
+  tests, binding-target store/UI tests, and `migrations/000009_github_binding_targets.sql`.
+- Step 2 create: `internal/store/postgres/webhook_job_repository.go`, repository/integration
+  tests, and `migrations/000010_create_webhook_jobs.sql`.
+- Modify: ADR 0002/0004 as narrowly required, GitHub binding domain/store/UI tests,
+  `internal/deployment` persistence transaction seam, `internal/config/database.go`,
+  `cmd/controlplane/main.go`, migration tests, `MEMORY.md`, `tasks/todo.md`, and
+  `tasks/lessons.md` if implementation reveals a reusable correction.
+- Avoid modifying `internal/web/web.go` for webhook authentication; it remains the browser-only
+  boundary except for the minimal binding-target form fields required above.
+
+### Edge cases and validation
+
+- [x] Unit-test missing/duplicate/malformed headers, signature algorithm/hex/length mismatch,
+      oversized/short-read bodies, active/retained secret overlap, constant-time verification, and
+      proof that parsing/persistence never runs before verification.
+- [x] Test malformed JSON/trailing values, unsupported lifecycle actions, nonpositive stable IDs,
+      wrong installation/repository/owner scope, wrong ref, deletion SHA, uppercase/non-40-hex SHA,
+      delayed/out-of-order pushes, and sanitized error/log output.
+- [x] PostgreSQL integration-test concurrent exact redelivery, delivery-ID digest conflict,
+      same-body/new-ID replay, distinct deliveries for the same automatic intent, authority revision
+      races, and injected failure at every receipt/deployment/event/job/event stage to prove full
+      rollback.
+- [x] Test append-only/immutable constraints, migration checksum/idempotency, runnable indexes, and
+      that persisted rows/dumps contain no raw body, signature, secret, token, or unrestricted JSON.
+- [x] Test lifecycle disable/removal races and verify additions/unsuspension cannot silently
+      authorize deployment.
+- [x] Run `gofmt`, `go vet ./...`, `go test ./...`, `go test -race ./...`, Linux cross-builds where
+      platform-tagged code is affected, fresh PostgreSQL 18 integration tests with `-count=1`,
+      `git diff --check`, independent QA, and zero-context security review.
+
+#### Step 3 result
+
+- Added an isolated exact-path webhook boundary with trusted HTTPS provenance, bounded single-read
+  bodies, constant-time active/retained HMAC verification before parsing or persistence, strict
+  normalized push/lifecycle parsing, fixed public errors, and mounted-secret startup validation.
+- Push authorization, canonical time, deterministic deployment/job construction, durable receipt,
+  deployment/event, logical job/event, and processed state now commit in one `READ COMMITTED`
+  transaction. Installation and multi-repository removal effects lock authority deterministically,
+  disable fail-closed, never reactivate bindings, and persist a sealed immutable repository set.
+- Control-plane wiring remains opt-in with GitHub disabled by default. Fresh PostgreSQL 18 normal
+  and race integration, migration tests, repository-wide unit/race/vet/diff checks, independent QA,
+  and zero-context security review pass. Claims, leases, attempts, fencing, retries, agent transport,
+  and checkout-token delivery remain the next queue/agent slice.
+
+### Documentation handoff result
+
+- [x] Added README.md and docs/IMPLEMENTATION_STATUS.md as the compact authoritative handoff for
+      continuing implementation: current scope/branch/worktree, 7/18 progress estimate, trust
+      boundaries, completed invariants, migrations/configuration categories, validation evidence
+      and limits, next server-agent lease slice, risks, resume commands, git discipline, and
+      definition of done. .tmp/ is untracked but not gitignored, so it must be manually excluded
+      from commits; never use blanket git add.
+
+### Risks and mitigations
+
+- Premature target schema: use constrained opaque IDs on the binding only until real aggregates
+  exist; keep automatic deployment disabled for legacy/incomplete bindings.
+- Replay or split-brain idempotency: use independent delivery and body-digest constraints plus one
+  caller-owned transaction and deterministic lock order.
+- Secret exposure: mounted-file-only secret loading, bounded in-memory raw bytes, fixed public
+  errors, centralized redaction, and no raw payload persistence.
+- Proxy spoofing: accept forwarded scheme only from configured trusted proxy CIDRs and require one
+  canonical value; direct untrusted peers cannot assert HTTPS.
+- Queue overreach: implement immutable enqueue state/events only; claims, attempts, leases, slots,
+  fencing, retries, and agent transport remain explicitly deferred.

@@ -16,6 +16,7 @@ import (
 	"autodeploy/internal/auth"
 	"autodeploy/internal/config"
 	secretcrypto "autodeploy/internal/crypto"
+	githubhttp "autodeploy/internal/github/http"
 	"autodeploy/internal/githubapp"
 	"autodeploy/internal/store/postgres"
 	"autodeploy/internal/web"
@@ -104,7 +105,13 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var webhookHandler http.Handler
 	if githubConfig.Enabled {
+		webhookSecrets, webhookErr := config.GitHubWebhookSecretRingFromEnvironment()
+		if webhookErr != nil {
+			return errors.New("GitHub setup unavailable")
+		}
+		defer clearWebhookSecrets(&webhookSecrets)
 		signer, signerErr := config.GitHubAppSignerFromMountedKey(githubConfig)
 		if signerErr != nil {
 			return errors.New("GitHub setup unavailable")
@@ -124,14 +131,26 @@ func run(ctx context.Context) error {
 			return errors.New("GitHub setup unavailable")
 		}
 		webOptions.GitHubSetup, webOptions.GitHubInstallationURL = setup, githubConfig.InstallationURL
+		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
+		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
 	}
 	handler, err := web.New(repository, webOptions)
 	if err != nil {
 		return err
 	}
 	var httpHandler http.Handler = handler
+	if webhookHandler != nil {
+		browserHandler := httpHandler
+		httpHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL != nil && r.URL.Path == githubhttp.Path {
+				webhookHandler.ServeHTTP(w, r)
+				return
+			}
+			browserHandler.ServeHTTP(w, r)
+		})
+	}
 	if enabled {
-		httpHandler = secretReadyHandler(handler, func(requestContext context.Context) error {
+		httpHandler = secretReadyHandler(httpHandler, func(requestContext context.Context) error {
 			ring, generation, loadErr := config.KEKRingAndGenerationFromEnvironment()
 			if loadErr != nil {
 				return errors.New("secret subsystem unavailable")
@@ -160,6 +179,18 @@ func run(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func clearWebhookSecrets(ring *githubhttp.SecretRing) {
+	if ring == nil {
+		return
+	}
+	clear(ring.Active)
+	ring.Active = nil
+	for version, value := range ring.Retained {
+		clear(value)
+		ring.Retained[version] = nil
+	}
 }
 
 func secretLedgerReady(ctx context.Context, repository *postgres.KeyRepository, ring secretcrypto.KeyRing, generation string) error {

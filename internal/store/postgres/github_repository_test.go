@@ -5,13 +5,29 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"autodeploy/internal/auth"
 	"autodeploy/internal/githubapp"
 )
+
+// pgErrorCode extracts the PostgreSQL SQLSTATE from err, or "" if err does
+// not wrap a *pgconn.PgError. Tests use it to assert that an insert was
+// rejected by the specific constraint under test (e.g. a CHECK, "23514")
+// rather than incidentally by some other constraint such as a UNIQUE index.
+func pgErrorCode(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
+}
 
 func freshGitHubRepository(t *testing.T) (*GitHubRepository, *AuthRepository, auth.Principal) {
 	t.Helper()
@@ -41,6 +57,9 @@ func installation() githubapp.Installation {
 }
 func repositories() []githubapp.Repository {
 	return []githubapp.Repository{{ID: 201, OwnerID: 9, Name: "repo", FullName: "owner/repo", DefaultBranch: "main"}}
+}
+func binding(project string) githubapp.BindingInput {
+	return githubapp.BindingInput{ProjectID: project, RepositoryID: 201, Ref: "refs/heads/main", EnvironmentID: "environment", ServerID: "server"}
 }
 
 func TestGitHubRegistrationStateCallbackAndHandoffPersistence(t *testing.T) {
@@ -159,7 +178,7 @@ func TestGitHubDisableInstallationRevokesRepositoryAuthorityAtomically(t *testin
 	if err := repo.CompleteHandoff(ctx, handoff, p, installation(), repositories()); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.BindRepository(ctx, p, "lifecycle_project", 201, "lifecycle-bind"); err != nil {
+	if err := repo.BindRepository(ctx, p, binding("lifecycle_project"), "lifecycle-bind"); err != nil {
 		t.Fatal(err)
 	}
 	if err := repo.DisableInstallation(ctx, p, 101, "lifecycle-disable"); err != nil {
@@ -317,10 +336,10 @@ func TestGitHubBindingsOwnerForeignKeysRevisionAndAuditRollback(t *testing.T) {
 	if err := repo.CompleteHandoff(ctx, handoff, p, installation(), repositories()); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.BindRepository(ctx, p, "opaque_project", 201, "bind-one"); err != nil {
+	if err := repo.BindRepository(ctx, p, binding("opaque_project"), "bind-one"); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.BindRepository(ctx, p, "opaque_project", 201, "bind-two"); err != nil {
+	if err := repo.BindRepository(ctx, p, binding("opaque_project"), "bind-two"); err != nil {
 		t.Fatal(err)
 	}
 	var revision int64
@@ -333,12 +352,93 @@ func TestGitHubBindingsOwnerForeignKeysRevisionAndAuditRollback(t *testing.T) {
 	if _, err := repo.pool.Exec(ctx, `UPDATE github_audit_events SET result='failed' WHERE id='bind-one'`); err == nil {
 		t.Fatal("audit update accepted")
 	}
-	if err := repo.BindRepository(ctx, p, "other_project", 201, "bind-two"); err == nil {
+	if err := repo.BindRepository(ctx, p, binding("other_project"), "bind-two"); err == nil {
 		t.Fatal("duplicate audit accepted")
 	}
 	var bound int
 	if err := repo.pool.QueryRow(ctx, `SELECT count(*) FROM github_project_bindings WHERE owner_id=$1`, p.OwnerID).Scan(&bound); err != nil || bound != 1 {
 		t.Fatalf("audit failure did not rollback binding: %d %v", bound, err)
+	}
+}
+
+func TestGitHubBindingTargetsRoundTripAndLegacyRowsRemainIncomplete(t *testing.T) {
+	repo, _, p := freshGitHubRepository(t)
+	ctx := context.Background()
+	state, handoff := digest(81), digest(82)
+	if err := repo.CreateSetupState(ctx, githubapp.SetupStateInput{Digest: state, Principal: p}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReserveCallback(ctx, state, handoff, installation()); err != nil {
+		t.Fatal(err)
+	}
+	// Each github_project_bindings row consumes its owner's UNIQUE(owner_id,
+	// repository_id) slot, so every binding under test (legacy, the
+	// round-tripped target, and each rejected/accepted target-bounds probe)
+	// needs its own repository. Otherwise a CHECK-rejection assertion could
+	// pass vacuously because the UNIQUE constraint fired first instead of the
+	// intended CHECK.
+	repos := repositories()
+	for id := int64(202); id <= 212; id++ {
+		repos = append(repos, githubapp.Repository{ID: id, OwnerID: 9, Name: fmt.Sprintf("repo-%d", id), FullName: fmt.Sprintf("owner/repo-%d", id), DefaultBranch: "main"})
+	}
+	if err := repo.CompleteHandoff(ctx, handoff, p, installation(), repos); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.pool.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,active) VALUES($1,'legacy project / opaque',201,101,true)`, p.OwnerID); err != nil {
+		t.Fatal(err)
+	}
+	var ref, environment, server *string
+	if err := repo.pool.QueryRow(ctx, `SELECT deploy_ref,environment_id,server_id FROM github_project_bindings WHERE owner_id=$1 AND project_id='legacy project / opaque'`, p.OwnerID).Scan(&ref, &environment, &server); err != nil || ref != nil || environment != nil || server != nil {
+		t.Fatalf("legacy targets=%v/%v/%v err=%v", ref, environment, server, err)
+	}
+	if _, err := repo.CaptureCheckoutBinding(ctx, p.OwnerID, "legacy project / opaque"); err != nil {
+		t.Fatalf("legacy binding lost checkout authority: %v", err)
+	}
+	in := binding("configured project / opaque")
+	in.RepositoryID = 202
+	in.Ref, in.EnvironmentID, in.ServerID = "refs/heads/release/v1", "environment / opaque", "server / opaque"
+	if err := repo.BindRepository(ctx, p, in, "target-bind"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.pool.QueryRow(ctx, `SELECT deploy_ref,environment_id,server_id FROM github_project_bindings WHERE owner_id=$1 AND project_id=$2`, p.OwnerID, in.ProjectID).Scan(&ref, &environment, &server); err != nil || *ref != in.Ref || *environment != in.EnvironmentID || *server != in.ServerID {
+		t.Fatalf("target roundtrip=%v/%v/%v err=%v", ref, environment, server, err)
+	}
+	if _, err := repo.pool.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref,environment_id,server_id) VALUES($1,'bad target',203,101,'refs/heads/a..b','env','server')`, p.OwnerID); err == nil {
+		t.Fatal("Git-invalid target ref accepted")
+	} else if code := pgErrorCode(err); code != "23514" {
+		t.Fatalf("Git-invalid target ref rejected by unexpected constraint: code=%s err=%v", code, err)
+	}
+	if _, err := repo.pool.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref) VALUES($1,'partial target',204,101,'refs/heads/main')`, p.OwnerID); err == nil {
+		t.Fatal("partial target accepted")
+	} else if code := pgErrorCode(err); code != "23514" {
+		t.Fatalf("partial target rejected by unexpected constraint: code=%s err=%v", code, err)
+	}
+	for index, ref := range []string{"refs/heads/a" + string(rune(0x1f)) + "b", "refs/heads/a" + string(rune(0x7f)) + "b"} {
+		repoID := int64(205 + index)
+		if _, err := repo.pool.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref,environment_id,server_id) VALUES($1,$2,$3,101,$4,'env','server')`, p.OwnerID, fmt.Sprintf("control-target-%d", index), repoID, ref); err == nil {
+			t.Fatalf("ASCII control target ref accepted %q", ref)
+		} else if code := pgErrorCode(err); code != "23514" {
+			t.Fatalf("ASCII control target ref %q rejected by unexpected constraint: code=%s err=%v", ref, code, err)
+		}
+	}
+	maxRef := "refs/heads/" + strings.Repeat("a", 244)
+	maxOpaque := strings.Repeat("x", 128)
+	if _, err := repo.pool.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref,environment_id,server_id) VALUES($1,'max-target',207,101,$2,$3,$3)`, p.OwnerID, maxRef, maxOpaque); err != nil {
+		t.Fatalf("exact target bounds rejected: %v", err)
+	}
+	for index, target := range []struct{ ref, environment, server string }{
+		{"refs/heads/" + strings.Repeat("a", 245), "env", "server"},
+		{"refs/heads/main", strings.Repeat("e", 129), "server"},
+		{"refs/heads/main", "env", strings.Repeat("s", 129)},
+		{"refs/heads/main", "", "server"},
+		{"refs/heads/main", "env", ""},
+	} {
+		repoID := int64(208 + index)
+		if _, err := repo.pool.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref,environment_id,server_id) VALUES($1,$2,$3,101,$4,$5,$6)`, p.OwnerID, fmt.Sprintf("boundary-%d", index), repoID, target.ref, target.environment, target.server); err == nil {
+			t.Fatalf("invalid target bounds accepted %#v", target)
+		} else if code := pgErrorCode(err); code != "23514" {
+			t.Fatalf("invalid target bounds %#v rejected by unexpected constraint: code=%s err=%v", target, code, err)
+		}
 	}
 }
 

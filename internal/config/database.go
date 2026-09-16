@@ -13,6 +13,7 @@ import (
 	"autodeploy/internal/auth"
 	"autodeploy/internal/credential"
 	secretcrypto "autodeploy/internal/crypto"
+	githubhttp "autodeploy/internal/github/http"
 	"autodeploy/internal/githubapp"
 )
 
@@ -40,6 +41,9 @@ const (
 	GitHubAppOwnerTypeEnv               = "AUTODEPLOY_GITHUB_APP_OWNER_TYPE"
 	GitHubAppInstallationURLEnv         = "AUTODEPLOY_GITHUB_APP_INSTALLATION_URL"
 	GitHubAppPrivateKeyFileEnv          = "AUTODEPLOY_GITHUB_APP_PRIVATE_KEY_FILE"
+	GitHubWebhookActiveVersionEnv       = "AUTODEPLOY_GITHUB_WEBHOOK_ACTIVE_VERSION"
+	GitHubWebhookActiveSecretFileEnv    = "AUTODEPLOY_GITHUB_WEBHOOK_ACTIVE_SECRET_FILE"
+	GitHubWebhookRetainedSecretFilesEnv = "AUTODEPLOY_GITHUB_WEBHOOK_RETAINED_SECRET_FILES"
 )
 
 var ErrInvalidEnvironment = errors.New("invalid database configuration")
@@ -55,6 +59,45 @@ type GitHubAppConfig struct {
 	OwnerType       string
 	InstallationURL string
 	PrivateKeyFile  string
+}
+
+// GitHubWebhookSecretRingFromEnvironment reads webhook signing material only
+// from protected mounted files. It is deliberately separate from GitHub App
+// setup so disabled installations retain their existing startup behavior.
+func GitHubWebhookSecretRingFromEnvironment() (githubhttp.SecretRing, error) {
+	root, err := credentialSettings()
+	if err != nil {
+		return githubhttp.SecretRing{}, err
+	}
+	activeVersion, activePath := os.Getenv(GitHubWebhookActiveVersionEnv), os.Getenv(GitHubWebhookActiveSecretFileEnv)
+	if !validKeyFileEnvironment(activeVersion, activePath) {
+		return githubhttp.SecretRing{}, ErrInvalidEnvironment
+	}
+	entries, err := keyFileEntries(activeVersion, activePath, os.Getenv(GitHubWebhookRetainedSecretFilesEnv))
+	if err != nil {
+		return githubhttp.SecretRing{}, err
+	}
+	ring := githubhttp.SecretRing{ActiveVersion: entries[0].version, Retained: make(map[string][]byte, len(entries)-1)}
+	for index, entry := range entries {
+		value, loadErr := credential.LoadKey(entry.path, root.path, root.uid)
+		if loadErr != nil {
+			clear(ring.Active)
+			clearLoadedKeys(ring.Retained)
+			return githubhttp.SecretRing{}, credential.SanitizedError(loadErr)
+		}
+		if len(value) < 32 {
+			clear(value)
+			clear(ring.Active)
+			clearLoadedKeys(ring.Retained)
+			return githubhttp.SecretRing{}, ErrInvalidEnvironment
+		}
+		if index == 0 {
+			ring.Active = value
+		} else {
+			ring.Retained[entry.version] = value
+		}
+	}
+	return ring, nil
 }
 
 // GitHubAppSignerFromMountedKey loads the App key only after opt-in config has

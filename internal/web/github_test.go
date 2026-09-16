@@ -49,8 +49,8 @@ func (s *githubSetupStoreStub) CompleteHandoff(_ context.Context, digest [32]byt
 	s.completed++
 	return nil
 }
-func (s *githubSetupStoreStub) BindRepository(_ context.Context, p auth.Principal, project string, repository int64, _ string) error {
-	if p != s.principal || project != "project_opaque" || repository != 42 {
+func (s *githubSetupStoreStub) BindRepository(_ context.Context, p auth.Principal, input githubapp.BindingInput, _ string) error {
+	if p != s.principal || input.ProjectID != "project_opaque" || input.RepositoryID != 42 || input.Ref != "refs/heads/main" || input.EnvironmentID != "environment_opaque" || input.ServerID != "server_opaque" {
 		return errors.New("invalid")
 	}
 	s.bound++
@@ -179,13 +179,13 @@ func TestGitHubHandoffAndBindingRequireSessionCSRFAndAreOneUse(t *testing.T) {
 	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/" || store.completed != 1 {
 		t.Fatalf("complete=%d count=%d", rr.Code, store.completed)
 	}
-	bind := githubRequest(http.MethodPost, "/github/bindings", url.Values{"csrf": {githubCSRF(t, h, p)}, "project_id": {"project_opaque"}, "repository_id": {"42"}}, p, h)
+	bind := githubRequest(http.MethodPost, "/github/bindings", url.Values{"csrf": {githubCSRF(t, h, p)}, "project_id": {"project_opaque"}, "repository_id": {"42"}, "ref": {"refs/heads/main"}, "environment_id": {"environment_opaque"}, "server_id": {"server_opaque"}}, p, h)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, bind)
 	if rr.Code != http.StatusSeeOther || store.bound != 1 {
 		t.Fatalf("bind=%d count=%d", rr.Code, store.bound)
 	}
-	invalid := githubRequest(http.MethodPost, "/github/bindings", url.Values{"csrf": {githubCSRF(t, h, p)}, "project_id": {"project_opaque"}, "repository_id": {"042"}}, p, h)
+	invalid := githubRequest(http.MethodPost, "/github/bindings", url.Values{"csrf": {githubCSRF(t, h, p)}, "project_id": {"project_opaque"}, "repository_id": {"042"}, "ref": {"refs/heads/main"}, "environment_id": {"environment_opaque"}, "server_id": {"server_opaque"}}, p, h)
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, invalid)
 	if rr.Code != http.StatusBadRequest || store.bound != 1 {

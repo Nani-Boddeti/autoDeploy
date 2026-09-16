@@ -57,6 +57,33 @@ func TestGitHubAppConfigFromEnvironmentIsOptInAndStrict(t *testing.T) {
 	}
 }
 
+func TestGitHubWebhookSecretRingValidatesActiveMetadata(t *testing.T) {
+	root, outside := tempDir(t), tempDir(t)
+	active := filepath.Join(outside, "webhook-active")
+	if err := os.WriteFile(active, append([]byte{1}, make([]byte, 31)...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(config.RepositoryRootEnv, root)
+	t.Setenv(config.GitHubWebhookActiveVersionEnv, "v1")
+	t.Setenv(config.GitHubWebhookActiveSecretFileEnv, active)
+	if ring, err := config.GitHubWebhookSecretRingFromEnvironment(); err != nil || len(ring.Active) != 32 {
+		t.Fatalf("ring err=%v", err)
+	}
+	for _, setup := range []func(){
+		func() { t.Setenv(config.GitHubWebhookActiveVersionEnv, "") },
+		func() {
+			t.Setenv(config.GitHubWebhookActiveVersionEnv, "v1")
+			t.Setenv(config.GitHubWebhookActiveSecretFileEnv, "")
+		},
+		func() { t.Setenv(config.GitHubWebhookActiveSecretFileEnv, "relative") },
+	} {
+		setup()
+		if _, err := config.GitHubWebhookSecretRingFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+			t.Fatalf("invalid active metadata err=%v", err)
+		}
+	}
+}
+
 func TestUsernameThrottleKeyRingFromEnvironment(t *testing.T) {
 	root, outside := tempDir(t), tempDir(t)
 	active, retained := filepath.Join(outside, "active"), filepath.Join(outside, "retained")

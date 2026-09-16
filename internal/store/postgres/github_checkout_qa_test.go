@@ -23,7 +23,7 @@ func qaCheckoutBinding(t *testing.T) (*GitHubRepository, githubapp.CheckoutBindi
 	if err := repo.CompleteHandoff(ctx, handoff, principal, installation(), repositories()); err != nil {
 		t.Fatal(err)
 	}
-	if err := repo.BindRepository(ctx, principal, "qa_checkout_project", 201, "qa-checkout-bind"); err != nil {
+	if err := repo.BindRepository(ctx, principal, binding("qa_checkout_project"), "qa-checkout-bind"); err != nil {
 		t.Fatal(err)
 	}
 	binding, err := repo.CaptureCheckoutBinding(ctx, principal.OwnerID, "qa_checkout_project")
