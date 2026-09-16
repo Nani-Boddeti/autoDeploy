@@ -9,6 +9,7 @@ import (
 	"math"
 	"sync"
 	"testing"
+	"time"
 
 	"autodeploy/internal/crypto"
 	"autodeploy/internal/secret"
@@ -141,11 +142,47 @@ func TestSecretStep2RewrapCASPreservesValueAndScope(t *testing.T) {
 	}
 }
 
+// headReadBarrier returns the first two current-head reads only after both complete.
+type headReadBarrier struct {
+	*SecretRepository
+	mu      sync.Mutex
+	reads   int
+	release chan struct{}
+}
+
+func (b *headReadBarrier) GetVersion(ctx context.Context, scope secret.Scope, versionID string) (secret.Version, error) {
+	if versionID != "" {
+		return b.SecretRepository.GetVersion(ctx, scope, versionID)
+	}
+	// Read first, then wait: releasing on arrival alone lets one caller commit
+	// before the other's read runs.
+	v, err := b.SecretRepository.GetVersion(ctx, scope, versionID)
+	b.mu.Lock()
+	b.reads++
+	if b.reads == 2 {
+		close(b.release)
+	}
+	wait := b.reads <= 2
+	b.mu.Unlock()
+	if wait {
+		select {
+		case <-b.release:
+		case <-time.After(10 * time.Second):
+			return secret.Version{}, errors.New("head read barrier timed out")
+		}
+	}
+	return v, err
+}
+
 func TestSecretStep2ConcurrentReplaceHasOneWinnerAndLockedLineage(t *testing.T) {
 	repository, _ := freshSecretRepository(t)
 	scope := secretStep2Scope("replace-race")
 	service := secret.NewService(repository, secretStep2Ring(t, "kek-old"), secretStep2Authorizer{})
 	secretStep2Create(t, service, scope, "version-1", "create-audit")
+	// Both replacements must read the same head before either writes; otherwise
+	// scheduling (notably under -race) can serialize them into two valid replaces.
+	barrier := &headReadBarrier{SecretRepository: repository, release: make(chan struct{})}
+	service = secret.NewService(barrier, secretStep2Ring(t, "kek-old"), secretStep2Authorizer{})
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 2)
@@ -163,6 +200,8 @@ func TestSecretStep2ConcurrentReplaceHasOneWinnerAndLockedLineage(t *testing.T) 
 	for err := range errs {
 		if err == nil {
 			winners++
+		} else if !errors.Is(err, secret.ErrCorrupt) {
+			t.Fatalf("losing replace = %v, want conflict mapped to ErrCorrupt", err)
 		}
 	}
 	if winners != 1 {
