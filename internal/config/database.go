@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/credential"
@@ -44,6 +45,16 @@ const (
 	GitHubWebhookActiveVersionEnv       = "AUTODEPLOY_GITHUB_WEBHOOK_ACTIVE_VERSION"
 	GitHubWebhookActiveSecretFileEnv    = "AUTODEPLOY_GITHUB_WEBHOOK_ACTIVE_SECRET_FILE"
 	GitHubWebhookRetainedSecretFilesEnv = "AUTODEPLOY_GITHUB_WEBHOOK_RETAINED_SECRET_FILES"
+	AgentEnabledEnv                     = "AUTODEPLOY_AGENT_ENABLED"
+	AgentSweepIntervalEnv               = "AUTODEPLOY_AGENT_SWEEP_INTERVAL"
+)
+
+// defaultAgentSweepInterval matches ADR 0004's V1 sweeper default (Step 4).
+const defaultAgentSweepInterval = 15 * time.Second
+
+const (
+	minAgentSweepInterval = 5 * time.Second
+	maxAgentSweepInterval = 5 * time.Minute
 )
 
 var ErrInvalidEnvironment = errors.New("invalid database configuration")
@@ -159,6 +170,39 @@ func safeGitHubText(s string, max int) bool {
 		}
 	}
 	return true
+}
+
+// AgentConfig is opt-in, non-secret configuration for the /agent/v1/ HTTP
+// transport and its sweeper (tasks/todo.md Step 6a). The credential digests
+// and enrollment tokens it authenticates against never pass through this
+// package; only whether the routes/sweeper run, and how often the sweeper
+// ticks, is configured here.
+type AgentConfig struct {
+	Enabled       bool
+	SweepInterval time.Duration
+}
+
+// AgentConfigFromEnvironment mirrors GitHubAppConfigFromEnvironment's
+// opt-in/strict pattern: unset or "false" disables the agent protocol
+// (existing installations are unaffected), any other value besides "true"
+// is a startup error, and the sweep interval is always validated -- even
+// when disabled -- so a broken value fails fast instead of silently
+// applying a default once the operator later enables it.
+func AgentConfigFromEnvironment() (AgentConfig, error) {
+	raw := os.Getenv(AgentEnabledEnv)
+	if raw != "" && raw != "false" && raw != "true" {
+		return AgentConfig{}, ErrInvalidEnvironment
+	}
+	enabled := raw == "true"
+	interval := defaultAgentSweepInterval
+	if rawInterval := os.Getenv(AgentSweepIntervalEnv); rawInterval != "" {
+		parsed, err := time.ParseDuration(rawInterval)
+		if err != nil || parsed < minAgentSweepInterval || parsed > maxAgentSweepInterval {
+			return AgentConfig{}, ErrInvalidEnvironment
+		}
+		interval = parsed
+	}
+	return AgentConfig{Enabled: enabled, SweepInterval: interval}, nil
 }
 
 // DatabaseURLFromEnvironment reads a database URL only from the configured credential file.

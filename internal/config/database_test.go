@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"autodeploy/internal/config"
 )
@@ -54,6 +55,47 @@ func TestGitHubAppConfigFromEnvironmentIsOptInAndStrict(t *testing.T) {
 	t.Setenv(config.GitHubAppInstallationURLEnv, "http://github.com/apps/auto-deploy")
 	if _, err := config.GitHubAppConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
 		t.Fatalf("unsafe URL err %v", err)
+	}
+}
+
+func TestAgentConfigFromEnvironmentIsOptInAndStrict(t *testing.T) {
+	if got, err := config.AgentConfigFromEnvironment(); err != nil || got.Enabled || got.SweepInterval != 15*time.Second {
+		t.Fatalf("default %#v err %v", got, err)
+	}
+	t.Setenv(config.AgentEnabledEnv, "false")
+	if got, err := config.AgentConfigFromEnvironment(); err != nil || got.Enabled {
+		t.Fatalf("explicit false %#v err %v", got, err)
+	}
+	t.Setenv(config.AgentEnabledEnv, "true")
+	got, err := config.AgentConfigFromEnvironment()
+	if err != nil || !got.Enabled || got.SweepInterval != 15*time.Second {
+		t.Fatalf("enabled default interval %#v err %v", got, err)
+	}
+	t.Setenv(config.AgentSweepIntervalEnv, "30s")
+	if got, err := config.AgentConfigFromEnvironment(); err != nil || got.SweepInterval != 30*time.Second {
+		t.Fatalf("custom interval %#v err %v", got, err)
+	}
+	t.Setenv(config.AgentEnabledEnv, "yes")
+	if _, err := config.AgentConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+		t.Fatalf("invalid enabled value err %v", err)
+	}
+	t.Setenv(config.AgentEnabledEnv, "true")
+	for _, interval := range []string{"not-a-duration", "1s", "4s", "5m1s", "1h"} {
+		t.Setenv(config.AgentSweepIntervalEnv, interval)
+		if _, err := config.AgentConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+			t.Fatalf("interval %q err %v", interval, err)
+		}
+	}
+	for _, interval := range []string{"5s", "5m"} {
+		t.Setenv(config.AgentSweepIntervalEnv, interval)
+		if _, err := config.AgentConfigFromEnvironment(); err != nil {
+			t.Fatalf("boundary interval %q err %v", interval, err)
+		}
+	}
+	t.Setenv(config.AgentEnabledEnv, "")
+	t.Setenv(config.AgentSweepIntervalEnv, "bogus")
+	if _, err := config.AgentConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+		t.Fatalf("invalid interval while disabled err %v", err)
 	}
 }
 

@@ -10,6 +10,9 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	agenthttp "autodeploy/internal/agent/http"
+	githubhttp "autodeploy/internal/github/http"
 )
 
 func TestNewHTTPServerUsesProductionLimits(t *testing.T) {
@@ -44,6 +47,58 @@ func TestShutdownContextIsBounded(t *testing.T) {
 	remaining := time.Until(deadline)
 	if remaining <= 0 || remaining > shutdownTimeout || remaining < shutdownTimeout-time.Second {
 		t.Fatalf("unexpected shutdown bound: %s", remaining)
+	}
+}
+
+func namedHandler(name string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Handler", name)
+		w.WriteHeader(http.StatusOK)
+	})
+}
+
+func TestComposeHTTPHandlerRoutesAgentAndWebhookBeforeBrowser(t *testing.T) {
+	browser, webhook, agent := namedHandler("browser"), namedHandler("webhook"), namedHandler("agent")
+	composed := composeHTTPHandler(browser, webhook, agent)
+
+	cases := []struct {
+		path string
+		want string
+	}{
+		{githubhttp.Path, "webhook"},
+		{agenthttp.Prefix + "enroll", "agent"},
+		{agenthttp.Prefix + "jobs/claim", "agent"},
+		{"/login", "browser"},
+		{"/agent/v1", "browser"}, // no trailing slash: not the agent prefix
+		{"/agent/v1x/enroll", "browser"},
+	}
+	for _, tc := range cases {
+		request := httptest.NewRequest(http.MethodPost, "http://example.test"+tc.path, nil)
+		response := httptest.NewRecorder()
+		composed.ServeHTTP(response, request)
+		if got := response.Header().Get("X-Handler"); got != tc.want {
+			t.Fatalf("path %q routed to %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestComposeHTTPHandlerAgentDisabledLeavesBrowserBehaviorUnchanged(t *testing.T) {
+	browser := namedHandler("browser")
+	composed := composeHTTPHandler(browser, nil, nil)
+	for _, path := range []string{agenthttp.Prefix + "enroll", githubhttp.Path, "/login"} {
+		request := httptest.NewRequest(http.MethodPost, "http://example.test"+path, nil)
+		response := httptest.NewRecorder()
+		composed.ServeHTTP(response, request)
+		if got := response.Header().Get("X-Handler"); got != "browser" {
+			t.Fatalf("path %q routed to %q with agent/webhook disabled, want browser", path, got)
+		}
+	}
+}
+
+func TestServerAuthenticatorAdaptsAuthenticateToErrorOnly(t *testing.T) {
+	var a agenthttp.Authenticator = serverAuthenticator{repository: nil}
+	if a == nil {
+		t.Fatal("serverAuthenticator does not satisfy agenthttp.Authenticator")
 	}
 }
 

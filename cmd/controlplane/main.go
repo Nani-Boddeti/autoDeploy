@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	agenthttp "autodeploy/internal/agent/http"
 	"autodeploy/internal/auth"
 	"autodeploy/internal/config"
 	secretcrypto "autodeploy/internal/crypto"
@@ -134,21 +136,34 @@ func run(ctx context.Context) error {
 		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
 		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
 	}
+	agentConfig, err := config.AgentConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
+	var agentHandler http.Handler
+	var sweeper *postgres.AgentLeaseSweeper
+	if agentConfig.Enabled {
+		serverRepository := postgres.NewServerRepository(pool)
+		leaseRepository := postgres.NewAgentLeaseRepository(pool, postgres.NewDeploymentRepository(pool))
+		agentHandler = agenthttp.Handler{
+			Enroller:          serverRepository,
+			Authenticator:     serverAuthenticator{serverRepository},
+			Heartbeater:       serverRepository,
+			Claimer:           leaseRepository,
+			Renewer:           leaseRepository,
+			Completer:         leaseRepository,
+			Canceller:         leaseRepository,
+			Reconciler:        leaseRepository,
+			TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs,
+		}
+		sweepLogger, _ := controlplaneLogger(os.Stderr, nil)
+		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { sweepLogger.Print("agent lease sweep failed") })
+	}
 	handler, err := web.New(repository, webOptions)
 	if err != nil {
 		return err
 	}
-	var httpHandler http.Handler = handler
-	if webhookHandler != nil {
-		browserHandler := httpHandler
-		httpHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL != nil && r.URL.Path == githubhttp.Path {
-				webhookHandler.ServeHTTP(w, r)
-				return
-			}
-			browserHandler.ServeHTTP(w, r)
-		})
-	}
+	httpHandler := composeHTTPHandler(handler, webhookHandler, agentHandler)
 	if enabled {
 		httpHandler = secretReadyHandler(httpHandler, func(requestContext context.Context) error {
 			ring, generation, loadErr := config.KEKRingAndGenerationFromEnvironment()
@@ -161,6 +176,34 @@ func run(ctx context.Context) error {
 	server := newHTTPServer(webConfig.ListenAddress, httpHandler)
 	errorsChannel := make(chan error, 1)
 	go func() { errorsChannel <- server.ListenAndServe() }()
+
+	// The sweeper only runs when the agent protocol is enabled; its context
+	// is cancelled alongside the HTTP server's shutdown signal so it never
+	// outlives this process, and shutdown waits for it to stop within the
+	// same bounded shutdown window as the HTTP server.
+	var sweeperDone chan struct{}
+	var sweeperCancel context.CancelFunc
+	if sweeper != nil {
+		var sweeperContext context.Context
+		sweeperContext, sweeperCancel = context.WithCancel(context.Background())
+		sweeperDone = make(chan struct{})
+		go func() { defer close(sweeperDone); sweeper.Run(sweeperContext) }()
+	}
+	// Deferred after the pool close, so it runs first on every return path:
+	// the pool is never closed while a sweep may still be using it.
+	defer func() {
+		if sweeperCancel == nil {
+			return
+		}
+		sweeperCancel()
+		waitContext, cancelWait := newShutdownContext()
+		defer cancelWait()
+		select {
+		case <-sweeperDone:
+		case <-waitContext.Done():
+		}
+	}()
+
 	stopped := make(chan os.Signal, 1)
 	signal.Notify(stopped, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(stopped)
@@ -175,10 +218,54 @@ func run(ctx context.Context) error {
 	}
 	shutdownContext, cancel := newShutdownContext()
 	defer cancel()
-	if err = server.Shutdown(shutdownContext); err != nil {
-		return err
+	shutdownErr := server.Shutdown(shutdownContext)
+	if sweeperCancel != nil {
+		sweeperCancel()
+		select {
+		case <-sweeperDone:
+		case <-shutdownContext.Done():
+		}
+	}
+	if shutdownErr != nil {
+		return shutdownErr
 	}
 	return nil
+}
+
+// composeHTTPHandler mirrors the webhook route's mount point exactly for the
+// agent route: both are matched and dispatched before the browser
+// session/CSRF handler ever runs, and a nil handler (protocol disabled)
+// leaves that path/prefix routed to the browser handler exactly as before
+// this wiring existed. agentHandler is matched by prefix because it serves
+// multiple sub-paths (enroll, heartbeat, jobs/claim, ...); webhookHandler
+// keeps its single exact-path match.
+func composeHTTPHandler(browserHandler, webhookHandler, agentHandler http.Handler) http.Handler {
+	if webhookHandler == nil && agentHandler == nil {
+		return browserHandler
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if webhookHandler != nil && r.URL != nil && r.URL.Path == githubhttp.Path {
+			webhookHandler.ServeHTTP(w, r)
+			return
+		}
+		if agentHandler != nil && r.URL != nil && strings.HasPrefix(r.URL.Path, agenthttp.Prefix) {
+			agentHandler.ServeHTTP(w, r)
+			return
+		}
+		browserHandler.ServeHTTP(w, r)
+	})
+}
+
+// serverAuthenticator adapts (*postgres.ServerRepository).Authenticate, which
+// returns the authenticated server record, to agenthttp.Authenticator, which
+// only ever needs to know whether authentication succeeded.
+type serverAuthenticator struct {
+	repository *postgres.ServerRepository
+}
+
+func (a serverAuthenticator) Authenticate(ctx context.Context, serverID string, presentedDigest [32]byte) error {
+	_, err := a.repository.Authenticate(ctx, serverID, presentedDigest)
+	return err
 }
 
 func clearWebhookSecrets(ring *githubhttp.SecretRing) {

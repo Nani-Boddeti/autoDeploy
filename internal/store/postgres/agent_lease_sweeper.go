@@ -21,10 +21,11 @@ const agentLeaseSweeperAdvisoryLockKey = int64(0x61676e745f6c7332) // "agnt_ls2"
 // releasing it by committing/rolling back that transaction when the tick
 // ends -- a replica that loses the race simply skips that tick.
 type AgentLeaseSweeper struct {
-	pool  *pgxpool.Pool
-	lease *AgentLeaseRepository
-	tick  time.Duration
-	batch int
+	pool    *pgxpool.Pool
+	lease   *AgentLeaseRepository
+	tick    time.Duration
+	batch   int
+	onError func()
 }
 
 // NewAgentLeaseSweeper constructs a sweeper with the ADR 0004 V1 defaults:
@@ -52,9 +53,16 @@ func (s *AgentLeaseSweeper) WithBatch(n int) *AgentLeaseSweeper {
 	return s
 }
 
+// WithErrorHandler registers a callback for failed ticks. It receives no
+// error value so callers cannot log driver text that may carry connection
+// details; the next tick retries regardless.
+func (s *AgentLeaseSweeper) WithErrorHandler(onError func()) *AgentLeaseSweeper {
+	s.onError = onError
+	return s
+}
+
 // Run polls until ctx is cancelled. It never returns an error; a failed tick
-// (lock contention, a transient database error) is silently retried on the
-// next tick rather than stopping the sweeper.
+// is reported to the error handler, if any, and retried on the next tick.
 func (s *AgentLeaseSweeper) Run(ctx context.Context) {
 	ticker := time.NewTicker(s.tick)
 	defer ticker.Stop()
@@ -63,7 +71,9 @@ func (s *AgentLeaseSweeper) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_, _ = s.SweepOnce(ctx)
+			if _, err := s.SweepOnce(ctx); err != nil && ctx.Err() == nil && s.onError != nil {
+				s.onError()
+			}
 		}
 	}
 }

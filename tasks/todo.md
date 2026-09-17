@@ -1152,6 +1152,18 @@ and CI now run -p 1 ./internal/store/postgres ./internal/agent/http ./migrations
 race, agent HTTP alone on fresh DB, three fresh full runs normal + -race; security review PASS WITH NOTES.
 Follow-up: no rate limiting on /agent/v1 (low; credential required).
 
+Step 6 owner decision (2026-09-17): server administration (register + one-time enrollment token, rotate,
+revoke, mark-reconciled) lives in session+CSRF-protected web admin routes in internal/web, not cmd/admin.
+Sub-steps: 6a controlplane wiring/config (agent routes opt-in, sweeper); 6b web server admin pages;
+6c cmd/agent client (enroll, credential file, fence state, heartbeat, no executor); 6d docs/ADR amendments.
+
+Step 6a result (2026-09-17): done. AUTODEPLOY_AGENT_ENABLED (strict, default off) and
+AUTODEPLOY_AGENT_SWEEP_INTERVAL (15s default, 5s..5m); /agent/v1/ prefix routed before browser handler with
+webhook trusted proxies; disabled path unchanged; sweeper runs only when enabled, logs a fixed
+"agent lease sweep failed" line (no error text), and is stopped before the pool closes on every exit path.
+Review: shutdown race on listener failure fixed. 6b styling decision: plain HTML like existing pages,
+strict CSP unchanged; design system deferred to operations UI milestone.
+
 **Step 6 — CLI, wiring, agent client**
 - `cmd/admin`: server register/rotate/revoke, environment mark-reconciled (if approved).
 - `cmd/controlplane`: `AUTODEPLOY_AGENT_ENABLED` opt-in, mount routes, start sweeper.
