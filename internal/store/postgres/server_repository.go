@@ -431,6 +431,92 @@ func (r *ServerRepository) RevokeServer(ctx context.Context, principal auth.Prin
 	return nil
 }
 
+// EnrollmentState is a server's enrollment-token lifecycle as seen from the
+// web admin surface. It never carries the token digest itself.
+type EnrollmentState string
+
+const (
+	EnrollmentNone     EnrollmentState = "none"
+	EnrollmentPending  EnrollmentState = "pending"
+	EnrollmentConsumed EnrollmentState = "consumed"
+	EnrollmentExpired  EnrollmentState = "expired"
+)
+
+// ServerSummary is the owner-scoped, digest-free view of a registered server
+// the web admin server list renders: never a raw token or digest.
+type ServerSummary struct {
+	ID, Name                string
+	Status                  server.Status
+	CreatedAt               time.Time
+	LastHeartbeatAt         time.Time // zero when no heartbeat recorded
+	ActiveCredentialVersion int       // 0 when no credential is active
+	Enrollment              EnrollmentState
+}
+
+// ListServers returns every server owned by principal, newest first, for the
+// web admin /servers page. It never returns a credential or enrollment
+// digest -- only the active credential's version number and a derived
+// enrollment lifecycle state.
+func (r *ServerRepository) ListServers(ctx context.Context, principal auth.Principal) ([]ServerSummary, error) {
+	if r == nil || r.pool == nil || principal.Validate() != nil {
+		return nil, ErrServerAuthorizationDenied
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin list servers: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
+		return nil, err
+	}
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return nil, fmt.Errorf("list servers canonical time: %w", err)
+	}
+	rows, err := tx.Query(ctx, `SELECT s.id,s.name,s.status,s.created_at,s.last_heartbeat_at,sc.version,et.consumed_at,et.expires_at FROM servers s LEFT JOIN server_credentials sc ON sc.server_id=s.id AND sc.status='active' LEFT JOIN server_enrollment_tokens et ON et.server_id=s.id WHERE s.owner_id=$1 ORDER BY s.created_at DESC, s.id`, principal.OwnerID)
+	if err != nil {
+		return nil, fmt.Errorf("query servers: %w", err)
+	}
+	defer rows.Close()
+	var summaries []ServerSummary
+	for rows.Next() {
+		var summary ServerSummary
+		var status string
+		var lastHeartbeat *time.Time
+		var version *int
+		var consumedAt, expiresAt *time.Time
+		if err = rows.Scan(&summary.ID, &summary.Name, &status, &summary.CreatedAt, &lastHeartbeat, &version, &consumedAt, &expiresAt); err != nil {
+			return nil, fmt.Errorf("scan server row: %w", err)
+		}
+		summary.Status = server.Status(status)
+		if lastHeartbeat != nil {
+			summary.LastHeartbeatAt = *lastHeartbeat
+		}
+		if version != nil {
+			summary.ActiveCredentialVersion = *version
+		}
+		switch {
+		case expiresAt == nil:
+			summary.Enrollment = EnrollmentNone
+		case consumedAt != nil:
+			summary.Enrollment = EnrollmentConsumed
+		case now.Before(*expiresAt):
+			summary.Enrollment = EnrollmentPending
+		default:
+			summary.Enrollment = EnrollmentExpired
+		}
+		summaries = append(summaries, summary)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate servers: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit list servers: %w", err)
+	}
+	return summaries, nil
+}
+
 // AuthenticatedServer is the identity Authenticate returns on success.
 type AuthenticatedServer struct {
 	ServerID, OwnerID string

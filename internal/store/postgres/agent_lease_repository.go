@@ -1371,6 +1371,58 @@ func (r *AgentLeaseRepository) Reconcile(ctx context.Context, serverID string, p
 	return nil
 }
 
+// ReconcilingEnvironment is one environment currently blocked on
+// reconciliation, as the web admin /servers page renders it: the pending
+// attempt and job it is waiting on, the server that must reconcile it (or be
+// broken-glassed via MarkReconciled), and since (the slot's last update,
+// i.e. when reconciliation became required).
+type ReconcilingEnvironment struct {
+	EnvironmentID string
+	AttemptID     int64
+	JobID         int64
+	ServerID      string
+	Since         time.Time
+}
+
+// ListReconcilingEnvironments returns every environment currently requiring
+// reconciliation whose pending attempt's job belongs to principal.OwnerID --
+// the same ownership derivation MarkReconciled uses, so a caller can never
+// list (or later break-glass) an environment it could not already resolve.
+func (r *AgentLeaseRepository) ListReconcilingEnvironments(ctx context.Context, principal auth.Principal) ([]ReconcilingEnvironment, error) {
+	if r == nil || r.pool == nil || principal.Validate() != nil {
+		return nil, ErrServerAuthorizationDenied
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin list reconciling environments: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT es.environment_id, a.id, a.job_id, a.server_id, es.updated_at FROM environment_slots es JOIN agent_job_attempts a ON a.id = es.reconciliation_attempt_id JOIN agent_jobs j ON j.id = a.job_id WHERE es.reconciliation_required AND j.owner_id=$1 ORDER BY es.updated_at ASC, es.environment_id`, principal.OwnerID)
+	if err != nil {
+		return nil, fmt.Errorf("query reconciling environments: %w", err)
+	}
+	defer rows.Close()
+	var environments []ReconcilingEnvironment
+	for rows.Next() {
+		var e ReconcilingEnvironment
+		if err = rows.Scan(&e.EnvironmentID, &e.AttemptID, &e.JobID, &e.ServerID, &e.Since); err != nil {
+			return nil, fmt.Errorf("scan reconciling environment row: %w", err)
+		}
+		environments = append(environments, e)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate reconciling environments: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit list reconciling environments: %w", err)
+	}
+	return environments, nil
+}
+
 // MarkReconciled is the audited administrator break-glass path for a
 // wedged environment (ADR 0004 Decision 6 owner decisions). environment_slots
 // carries no owner column, so ownership is derived from the job that the

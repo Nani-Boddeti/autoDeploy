@@ -939,6 +939,83 @@ func TestValidReason(t *testing.T) {
 // since a valid principal already implies its owner row exists. The mapping
 // remains as defense-in-depth against any future caller that revalidates
 // the principal more loosely.
+// TestServerListServersOwnerScopedFieldsAndEnrollmentStates exercises the
+// web admin /servers page's read path directly against the repository:
+// every derived EnrollmentState, the active-credential version, and -- most
+// importantly -- that a server belonging to a different owner never appears
+// (cross-owner isolation).
+func TestServerListServersOwnerScopedFieldsAndEnrollmentStates(t *testing.T) {
+	pool, repo, authRepo, principal := freshServerRepository(t)
+	ctx := context.Background()
+
+	registerTestServer(t, repo, principal, "server_pending", 10)
+
+	enrollment, _ := registerTestServer(t, repo, principal, "server_consumed", 11)
+	credential, err := server.NewCredentialToken(bytes.NewReader(bytes.Repeat([]byte{12}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enrollmentDigest, err := server.EnrollmentTokenDigest(enrollment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialDigest, err := server.CredentialTokenDigest(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.Enroll(ctx, "server_consumed", enrollmentDigest, credentialDigest); err != nil {
+		t.Fatal(err)
+	}
+
+	registerTestServer(t, repo, principal, "server_expired", 13)
+	if _, err = pool.Exec(ctx, `UPDATE server_enrollment_tokens SET issued_at=clock_timestamp()-interval '1 hour', expires_at=clock_timestamp()-interval '1 minute' WHERE server_id='server_expired'`); err != nil {
+		t.Fatal(err)
+	}
+
+	registerTestServer(t, repo, principal, "server_revoked", 14)
+	if err = repo.RevokeServer(ctx, principal, "server_revoked", "decommissioned for test"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second owner's server must never leak into this owner's list.
+	otherPrincipal := secondOwnerPrincipal(t, pool, authRepo, 15)
+	registerTestServer(t, repo, otherPrincipal, "server_other_owner", 16)
+
+	summaries, err := repo.ListServers(ctx, principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]ServerSummary, len(summaries))
+	for _, s := range summaries {
+		byID[s.ID] = s
+	}
+	if len(summaries) != 4 {
+		t.Fatalf("expected 4 owner-scoped servers, got %d: %+v", len(summaries), summaries)
+	}
+	if _, ok := byID["server_other_owner"]; ok {
+		t.Fatal("cross-owner server leaked into ListServers")
+	}
+	if s := byID["server_pending"]; s.Enrollment != EnrollmentPending || s.Status != server.StatusActive || s.ActiveCredentialVersion != 0 {
+		t.Fatalf("server_pending=%+v", s)
+	}
+	if s := byID["server_consumed"]; s.Enrollment != EnrollmentConsumed || s.Status != server.StatusActive || s.ActiveCredentialVersion != 1 {
+		t.Fatalf("server_consumed=%+v", s)
+	}
+	if s := byID["server_expired"]; s.Enrollment != EnrollmentExpired || s.ActiveCredentialVersion != 0 {
+		t.Fatalf("server_expired=%+v", s)
+	}
+	if s := byID["server_revoked"]; s.Status != server.StatusRevoked || s.ActiveCredentialVersion != 0 {
+		t.Fatalf("server_revoked=%+v", s)
+	}
+}
+
+func TestServerListServersInvalidPrincipalDenied(t *testing.T) {
+	_, repo, _, _ := freshServerRepository(t)
+	if _, err := repo.ListServers(context.Background(), auth.Principal{}); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("invalid principal err=%v", err)
+	}
+}
+
 func TestServerPgErrorClassification(t *testing.T) {
 	fk := &pgconn.PgError{Code: "23503"}
 	unique := &pgconn.PgError{Code: "23505"}

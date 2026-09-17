@@ -20,6 +20,7 @@ import (
 	secretcrypto "autodeploy/internal/crypto"
 	githubhttp "autodeploy/internal/github/http"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
 	"autodeploy/internal/web"
 
@@ -136,6 +137,14 @@ func run(ctx context.Context) error {
 		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
 		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
 	}
+	// serverRepository and leaseRepository back the session/CSRF-protected
+	// web /servers and /environments/mark-reconciled admin routes (Step 6b);
+	// an administrator can register and manage servers whether or not the
+	// unauthenticated /agent/v1 protocol below is itself enabled, so these
+	// are constructed unconditionally, not gated by agentConfig.Enabled.
+	serverRepository := postgres.NewServerRepository(pool)
+	leaseRepository := postgres.NewAgentLeaseRepository(pool, postgres.NewDeploymentRepository(pool))
+	webOptions.ServerAdmin = serverAdmin{serverRepository, leaseRepository}
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {
 		return err
@@ -143,8 +152,6 @@ func run(ctx context.Context) error {
 	var agentHandler http.Handler
 	var sweeper *postgres.AgentLeaseSweeper
 	if agentConfig.Enabled {
-		serverRepository := postgres.NewServerRepository(pool)
-		leaseRepository := postgres.NewAgentLeaseRepository(pool, postgres.NewDeploymentRepository(pool))
 		agentHandler = agenthttp.Handler{
 			Enroller:          serverRepository,
 			Authenticator:     serverAuthenticator{serverRepository},
@@ -254,6 +261,33 @@ func composeHTTPHandler(browserHandler, webhookHandler, agentHandler http.Handle
 		}
 		browserHandler.ServeHTTP(w, r)
 	})
+}
+
+// serverAdmin composes ServerRepository (server register/enrollment/revoke)
+// and AgentLeaseRepository (reconciling-environment reads and break-glass)
+// into the single web.ServerAdmin surface the /servers routes use.
+type serverAdmin struct {
+	servers *postgres.ServerRepository
+	leases  *postgres.AgentLeaseRepository
+}
+
+func (a serverAdmin) ListServers(ctx context.Context, p auth.Principal) ([]postgres.ServerSummary, error) {
+	return a.servers.ListServers(ctx, p)
+}
+func (a serverAdmin) RegisterServer(ctx context.Context, p auth.Principal, in postgres.RegisterServerInput) (server.Server, time.Time, error) {
+	return a.servers.RegisterServer(ctx, p, in)
+}
+func (a serverAdmin) IssueEnrollment(ctx context.Context, p auth.Principal, serverID string, digest [32]byte, ttlSeconds int) (time.Time, error) {
+	return a.servers.IssueEnrollment(ctx, p, serverID, digest, ttlSeconds)
+}
+func (a serverAdmin) RevokeServer(ctx context.Context, p auth.Principal, serverID, reason string) error {
+	return a.servers.RevokeServer(ctx, p, serverID, reason)
+}
+func (a serverAdmin) ListReconcilingEnvironments(ctx context.Context, p auth.Principal) ([]postgres.ReconcilingEnvironment, error) {
+	return a.leases.ListReconcilingEnvironments(ctx, p)
+}
+func (a serverAdmin) MarkReconciled(ctx context.Context, p auth.Principal, environmentID, reason string) error {
+	return a.leases.MarkReconciled(ctx, p, environmentID, reason)
 }
 
 // serverAuthenticator adapts (*postgres.ServerRepository).Authenticate, which

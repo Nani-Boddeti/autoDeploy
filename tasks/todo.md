@@ -1164,6 +1164,13 @@ webhook trusted proxies; disabled path unchanged; sweeper runs only when enabled
 Review: shutdown race on listener failure fixed. 6b styling decision: plain HTML like existing pages,
 strict CSP unchanged; design system deferred to operations UI milestone.
 
+Step 6b result (2026-09-17): done. Session+CSRF web routes GET /servers, POST /servers/register,
+/servers/enrollment, /servers/revoke (reason + confirm), /environments/mark-reconciled; plain HTML, CSP
+unchanged. Enrollment token shown once in 200 body (no redirect/log/cache). Owner-scoped ListServers and
+ListReconcilingEnvironments. Server admin wired regardless of AUTODEPLOY_AGENT_ENABLED. Security review PASS.
+Follow-ups: credential rotation needs an agent-initiated protocol (agent owns raw credential; enrollment is
+single-use); register resubmission creates an orphan unenrolled server (add dedupe or cleanup).
+
 **Step 6 — CLI, wiring, agent client**
 - `cmd/admin`: server register/rotate/revoke, environment mark-reconciled (if approved).
 - `cmd/controlplane`: `AUTODEPLOY_AGENT_ENABLED` opt-in, mount routes, start sweeper.

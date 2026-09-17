@@ -18,7 +18,9 @@ import (
 	"time"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/github"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
 )
 
@@ -28,6 +30,9 @@ const (
 	handoffCookieName = "__Host-ad_github_handoff"
 	maxBodyBytes      = 8 << 10
 	maxForwardedFor   = 32
+	// enrollmentTTLSeconds is the single-use enrollment token lifetime the
+	// web admin surface always requests (Step 6 Decision 4: 15 minutes).
+	enrollmentTTLSeconds = 900
 )
 
 var errBadRequest = errors.New("bad request")
@@ -42,6 +47,21 @@ type Repository interface {
 	RevokeSession(context.Context, auth.SessionToken, auth.Principal, string) error
 }
 
+// ServerAdmin is the narrow deployment-agent server administration surface
+// the /servers and /environments/mark-reconciled routes use. Every method
+// takes the session principal and is owner-scoped by the repository itself;
+// this interface never exposes a credential or enrollment digest, only
+// caller-supplied digests going in. A nil ServerAdmin disables all of these
+// routes (same nil-disables convention as GitHubSetup below): they 404.
+type ServerAdmin interface {
+	ListServers(context.Context, auth.Principal) ([]postgres.ServerSummary, error)
+	RegisterServer(context.Context, auth.Principal, postgres.RegisterServerInput) (server.Server, time.Time, error)
+	IssueEnrollment(context.Context, auth.Principal, string, [32]byte, int) (time.Time, error)
+	RevokeServer(context.Context, auth.Principal, string, string) error
+	ListReconcilingEnvironments(context.Context, auth.Principal) ([]postgres.ReconcilingEnvironment, error)
+	MarkReconciled(context.Context, auth.Principal, string, string) error
+}
+
 type Config struct {
 	PublicOrigin          string
 	CSRFKeys              auth.CSRFKeyRing
@@ -52,6 +72,7 @@ type Config struct {
 	DummyPassword         auth.DummyPasswordVerifier
 	GitHubSetup           *githubapp.SetupService
 	GitHubInstallationURL string
+	ServerAdmin           ServerAdmin
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -149,6 +170,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.githubReconcile(w, r)
+	case "/servers":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.serversList(w, r)
+	case "/servers/register":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.serversRegister(w, r)
+	case "/servers/enrollment":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.serversEnrollment(w, r)
+	case "/servers/revoke":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.serversRevoke(w, r)
+	case "/environments/mark-reconciled":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.environmentsMarkReconciled(w, r)
 	case "/livez":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -506,6 +577,195 @@ func (h *Handler) githubReconcile(w http.ResponseWriter, r *http.Request) {
 	redirect(w, "/")
 }
 
+// serversList renders the registered-servers list, the registration form,
+// and any environments blocked on reconciliation. GET only; it mutates
+// nothing.
+func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
+	_, p, ok := h.session(r.Context(), r)
+	if !ok {
+		redirect(w, "/login")
+		return
+	}
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	summaries, err := h.config.ServerAdmin.ListServers(r.Context(), p)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	environments, err := h.config.ServerAdmin.ListReconcilingEnvironments(r.Context(), p)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	view := serversView{CSRF: csrf}
+	for _, s := range summaries {
+		view.Servers = append(view.Servers, serverRow{ID: s.ID, Name: s.Name, Status: string(s.Status), CreatedAt: formatTimestamp(s.CreatedAt), LastHeartbeatAt: formatTimestamp(s.LastHeartbeatAt), ActiveCredentialVersion: formatCredentialVersion(s.ActiveCredentialVersion), Enrollment: string(s.Enrollment)})
+	}
+	for _, e := range environments {
+		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since)})
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = serversTemplate.Execute(w, view)
+}
+
+// serversRegister mints a fresh server ID and single-use enrollment token
+// (crypto/rand via server.NewEnrollmentToken), stores only the token's
+// digest, and displays the raw token exactly once. It never redirects with
+// the token in a URL and never logs it; the response carries the process-
+// wide Cache-Control: no-store header set by securityHeaders above.
+func (h *Handler) serversRegister(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 2 || len(v["csrf"]) != 1 || len(v["name"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	name := v.Get("name")
+	if !server.ValidName(name) {
+		badRequest(w)
+		return
+	}
+	serverID, err := server.NewID(h.config.Random)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	token, digest, err := h.newEnrollmentToken()
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	registered, expiresAt, err := h.config.ServerAdmin.RegisterServer(r.Context(), p, postgres.RegisterServerInput{ServerID: serverID, Name: name, ProtocolVersion: server.ProtocolVersion, EnrollmentDigest: digest, EnrollmentTTLSeconds: enrollmentTTLSeconds})
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	renderEnrollmentToken(w, registered.ID, token, expiresAt)
+}
+
+// serversEnrollment reissues a fresh enrollment token for an existing,
+// not-yet-enrolled server, under the exact same one-time display rules as
+// serversRegister.
+func (h *Handler) serversEnrollment(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 2 || len(v["csrf"]) != 1 || len(v["server_id"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	serverID := v.Get("server_id")
+	if !github.ValidOpaqueID(serverID) {
+		badRequest(w)
+		return
+	}
+	token, digest, err := h.newEnrollmentToken()
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	expiresAt, err := h.config.ServerAdmin.IssueEnrollment(r.Context(), p, serverID, digest, enrollmentTTLSeconds)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	renderEnrollmentToken(w, serverID, token, expiresAt)
+}
+
+// serversRevoke revokes a server and its active credential. Revocation
+// requires an explicit confirmation field (a checkbox submitted as
+// confirm=revoke) in addition to CSRF and provenance, so a revoke can never
+// happen as a side effect of a forged form missing that field.
+func (h *Handler) serversRevoke(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 4 || len(v["csrf"]) != 1 || len(v["server_id"]) != 1 || len(v["reason"]) != 1 || len(v["confirm"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	if v.Get("confirm") != "revoke" || !github.ValidOpaqueID(v.Get("server_id")) {
+		badRequest(w)
+		return
+	}
+	if h.config.ServerAdmin.RevokeServer(r.Context(), p, v.Get("server_id"), v.Get("reason")) != nil {
+		badRequest(w)
+		return
+	}
+	redirect(w, "/servers")
+}
+
+// environmentsMarkReconciled is the audited administrator break-glass path
+// (ADR 0004 Decision 6) for an environment whose owning server cannot (or
+// has not) reconciled it itself.
+func (h *Handler) environmentsMarkReconciled(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 3 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["reason"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	if !github.ValidOpaqueID(v.Get("environment_id")) {
+		badRequest(w)
+		return
+	}
+	if h.config.ServerAdmin.MarkReconciled(r.Context(), p, v.Get("environment_id"), v.Get("reason")) != nil {
+		badRequest(w)
+		return
+	}
+	redirect(w, "/servers")
+}
+
+// newEnrollmentToken mints a fresh single-use enrollment token and its
+// digest together, so every caller mints and digests it the same way and
+// the raw token never touches anything but the one response that displays
+// it.
+func (h *Handler) newEnrollmentToken() (string, [32]byte, error) {
+	token, err := server.NewEnrollmentToken(h.config.Random)
+	if err != nil {
+		return "", [32]byte{}, err
+	}
+	digest, err := server.EnrollmentTokenDigest(token)
+	if err != nil {
+		return "", [32]byte{}, err
+	}
+	return token.String(), digest, nil
+}
+
 func (h *Handler) session(ctx context.Context, r *http.Request) (auth.SessionToken, auth.Principal, bool) {
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
@@ -807,10 +1067,73 @@ func methodNotAllowed(w http.ResponseWriter, methods ...string) {
 }
 
 var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy sign in</title></head><body><main><h1>AutoDeploy</h1><form method="post" action="/login"><label>Username <input name="username" autocomplete="username" required></label><label>Password <input name="password" type="password" autocomplete="current-password" required></label><input type="hidden" name="csrf" value="{{.}}"><button type="submit">Sign in</button></form></main></body></html>`))
-var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy</title></head><body><main><h1>AutoDeploy</h1><p>Control plane ready. Projects, environments, and deployments will appear here.</p><form method="post" action="/github/installations/reconcile"><label>GitHub installation ID <input name="installation_id" inputmode="numeric" required></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Refresh GitHub repositories</button></form><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Sign out</button></form></main></body></html>`))
+var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy</title></head><body><main><h1>AutoDeploy</h1><p>Control plane ready. Projects, environments, and deployments will appear here.</p><p><a href="/servers">Servers</a></p><form method="post" action="/github/installations/reconcile"><label>GitHub installation ID <input name="installation_id" inputmode="numeric" required></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Refresh GitHub repositories</button></form><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Sign out</button></form></main></body></html>`))
 var githubCompleteTemplate = template.Must(template.New("github-complete").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Confirm GitHub App</title></head><body><main><h1>Confirm GitHub App installation</h1><form method="post" action="/github/setup/complete"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Confirm</button></form></main></body></html>`))
 
 func renderLogin(w http.ResponseWriter, csrf string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = loginTemplate.Execute(w, csrf)
 }
+
+// serverRow, reconcilingRow, and serversView are pre-formatted (all
+// timestamps already rendered to text) so serversTemplate itself stays free
+// of template functions or logic, matching loginTemplate/landingTemplate/
+// githubCompleteTemplate above. html/template auto-escapes every field, so a
+// server name containing markup is rendered inert.
+type serverRow struct {
+	ID, Name, Status, CreatedAt, LastHeartbeatAt, ActiveCredentialVersion, Enrollment string
+}
+type reconcilingRow struct {
+	EnvironmentID, AttemptID, JobID, ServerID, Since string
+}
+type serversView struct {
+	CSRF                    string
+	Servers                 []serverRow
+	ReconcilingEnvironments []reconcilingRow
+}
+
+// formatTimestamp renders a possibly-zero time.Time as UTC RFC 3339, or "" -
+// e.g. a server with no heartbeat yet.
+func formatTimestamp(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// formatCredentialVersion renders "" for a server with no active credential
+// (revoked, or enrolled but somehow uncredentialed) instead of "0".
+func formatCredentialVersion(version int) string {
+	if version == 0 {
+		return ""
+	}
+	return strconv.Itoa(version)
+}
+
+// renderEnrollmentToken displays a freshly minted enrollment token exactly
+// once: this is the only place the raw token value is ever written, and it
+// goes only into this response body -- never a redirect Location, never a
+// log. Cache-Control: no-store is already set process-wide by
+// securityHeaders above.
+func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expiresAt time.Time) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = enrollmentTokenTemplate.Execute(w, struct{ ServerID, Token, ExpiresAt string }{serverID, token, formatTimestamp(expiresAt)})
+}
+
+// serversTemplate lists registered servers with a registration form, a
+// reissue-enrollment and revoke form per server, and reconciling
+// environments with a mark-reconciled form per environment. Rotate is
+// intentionally absent here: Step 6 Decision 4 changed credential issuance
+// so the agent, not the control plane, generates its own credential and
+// sends only its digest at enrollment (internal/agent/http Enroll); a
+// control-plane "rotate" can no longer hand back a usable credential.
+// Revoke-and-re-enroll is not a substitute either, since IssueEnrollment is
+// blocked once a server's enrollment token has been consumed (schema
+// 000012). Rotation is deferred to a follow-up agent-initiated rotation
+// protocol; this slice ships register, reissue-before-enrollment, and
+// revoke only.
+var serversTemplate = template.Must(template.New("servers").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy servers</title></head><body><main><h1>Servers</h1><form method="post" action="/servers/register"><label>Name <input name="name" required maxlength="128"></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Register server</button></form><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Last heartbeat</th><th>Active credential</th><th>Enrollment</th><th>Actions</th></tr></thead><tbody>{{range .Servers}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.CreatedAt}}</td><td>{{.LastHeartbeatAt}}</td><td>{{.ActiveCredentialVersion}}</td><td>{{.Enrollment}}</td><td><form method="post" action="/servers/enrollment"><input type="hidden" name="server_id" value="{{.ID}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Reissue enrollment token</button></form><form method="post" action="/servers/revoke"><input type="hidden" name="server_id" value="{{.ID}}"><label>Reason <input name="reason" required maxlength="512"></label><label><input type="checkbox" name="confirm" value="revoke" required> Confirm revoke</label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Revoke</button></form></td></tr>{{end}}</tbody></table><h2>Reconciling environments</h2><table><thead><tr><th>Environment</th><th>Attempt</th><th>Job</th><th>Server</th><th>Since</th><th>Actions</th></tr></thead><tbody>{{range .ReconcilingEnvironments}}<tr><td>{{.EnvironmentID}}</td><td>{{.AttemptID}}</td><td>{{.JobID}}</td><td>{{.ServerID}}</td><td>{{.Since}}</td><td><form method="post" action="/environments/mark-reconciled"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><label>Reason <input name="reason" required maxlength="512"></label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Mark reconciled</button></form></td></tr>{{end}}</tbody></table><p><a href="/">Back</a></p></main></body></html>`))
+
+// enrollmentTokenTemplate is rendered exactly once per register/reissue
+// response: the raw enrollment token appears here and nowhere else.
+var enrollmentTokenTemplate = template.Must(template.New("server-enrollment-token").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Server enrollment token</title></head><body><main><h1>Enrollment token issued</h1><p>This token is shown once and cannot be retrieved again. Copy it now.</p><p>Server ID: {{.ServerID}}</p><p>Token: {{.Token}}</p><p>Expires: {{.ExpiresAt}}</p><p>On the target host, run the agent enrollment command with this server ID and this token before it expires. If it expires or is lost, reissue a new one from the servers page.</p><p><a href="/servers">Back to servers</a></p></main></body></html>`))
