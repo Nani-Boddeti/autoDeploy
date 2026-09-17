@@ -1171,6 +1171,16 @@ ListReconcilingEnvironments. Server admin wired regardless of AUTODEPLOY_AGENT_E
 Follow-ups: credential rotation needs an agent-initiated protocol (agent owns raw credential; enrollment is
 single-use); register resubmission creates an orphan unenrolled server (add dedupe or cleanup).
 
+Step 6c result (2026-09-17): done. cmd/agent `enroll` (https base URL, token from protected file/stdin,
+credential generated locally, 0600 no-clobber atomic write, digest-only enrollment, removal on rejection) and
+`run` (credential file O_NOFOLLOW/0600/owner check, heartbeat with executor_available=false, no claims without
+an Executor). Fence state per environment plus .fence-index.json manifest; lost, unindexed, or corrupt state
+fails closed (a crash between file and index write also fails closed, requiring reconciliation). HTTP client:
+TLS only, never follows redirects (same-host https->http would resend Authorization), bounded bodies, retries
+only 503/network, claim never retried. Evidence: make check, race, Linux amd64/arm64 agent builds, three fresh
+full integration runs normal + -race; security review PASS WITH NOTES (redirect + claim retry fixed).
+Follow-up: server-side claim idempotency key so a lost claim response cannot orphan a lease until expiry.
+
 **Step 6 — CLI, wiring, agent client**
 - `cmd/admin`: server register/rotate/revoke, environment mark-reconciled (if approved).
 - `cmd/controlplane`: `AUTODEPLOY_AGENT_ENABLED` opt-in, mount routes, start sweeper.
