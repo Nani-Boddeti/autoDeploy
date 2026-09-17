@@ -294,7 +294,7 @@ func integrationPool(t *testing.T) *pgxpool.Pool {
 
 func reset(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `TRUNCATE agent_job_events, agent_jobs, automatic_deployment_intents, deployment_events, deployments`); err != nil {
+	if _, err := pool.Exec(context.Background(), `TRUNCATE frozen_secret_versions, agent_job_events, agent_job_attempts, environment_slots, agent_jobs, automatic_deployment_intents, deployment_events, deployments`); err != nil {
 		t.Fatal(err)
 	}
 }

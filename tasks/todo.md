@@ -1089,6 +1089,17 @@ call these methods directly; decide web-admin routes vs a CLI operator path befo
 - Tests: existing queued/enqueued rows remain valid; every illegal SQL transition rejected;
   fence decrease rejected; one occupant per slot.
 
+Step 2 result (2026-09-17): done (migration 000013 + 13 schema tests). Claim ordering fixed by insert
+trigger: bump slot fence -> job leased with attempt_count+1 -> insert attempt (fence = slot fence,
+attempt_number = attempt_count, server/environment = job). attempt_count counts started attempts, so
+expiry must NOT increment it again. Closure shapes: leased/expired none; succeeded result; failed
+class+result; cancelled result optional. Runnable index matches ADR incl. created_at. Evidence: make check,
+vet (incl. integration), go test -race, three fresh PG18 full runs normal and -race; review NEEDS CHANGES
+(closure CHECK, fence tie, index, cancel deadline) -> fixed -> re-review PASS.
+Step 4 carry-overs: set job cancel_requested_at and attempt cancel_deadline_at in the same tx (trigger reads
+job unlocked; add repository test); credential/server revocation must advance fence and mark
+reconciliation_required for in-flight environments (ADR 0004 revocation paragraph).
+
 **Step 3 — claim and renew repository**
 - Lock order per ADR 0004: server/credential (SHARE) -> environment slot (UPDATE) -> job
   (UPDATE SKIP LOCKED) -> attempt. Revalidate after locks; never act on discovery snapshot.

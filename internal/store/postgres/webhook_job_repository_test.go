@@ -558,7 +558,7 @@ func webhookAuthority(t *testing.T, audit string, stateByte, handoffByte byte) (
 
 func resetWebhookJobs(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), `TRUNCATE agent_job_events, agent_jobs, automatic_deployment_intents, webhook_lifecycle_repositories, webhook_deliveries, deployment_events, deployments RESTART IDENTITY`); err != nil {
+	if _, err := pool.Exec(context.Background(), `TRUNCATE frozen_secret_versions, agent_job_events, agent_job_attempts, environment_slots, agent_jobs, automatic_deployment_intents, webhook_lifecycle_repositories, webhook_deliveries, deployment_events, deployments RESTART IDENTITY`); err != nil {
 		t.Fatal(err)
 	}
 }
