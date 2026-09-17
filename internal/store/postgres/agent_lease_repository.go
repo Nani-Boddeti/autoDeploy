@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"autodeploy/internal/auth"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/github"
 	"autodeploy/internal/queue"
@@ -25,6 +26,27 @@ import (
 // "stop"; neither error exposes which specific check failed.
 var ErrAgentLeaseStale = errors.New("agent lease stale")
 
+// ErrAgentLeaseIntegrityConflict reports a completion/cancel-acknowledgement
+// replay whose operation ID, result digest, or outcome disagrees with the
+// terminal result already committed for that attempt (ADR 0004 completion
+// "conflicting digest/type/scope ... is rejected and audited as
+// stale/integrity failure").
+var ErrAgentLeaseIntegrityConflict = errors.New("agent lease integrity conflict")
+
+// ErrAgentLeaseInvalidInput reports a malformed request (bad outcome/
+// failure-class combination, oversized operation ID, etc.) rejected before
+// any row is read or locked.
+var ErrAgentLeaseInvalidInput = errors.New("agent lease invalid input")
+
+// ErrAgentJobTerminal reports a cancellation request against a job that is
+// already succeeded/failed/dead -- terminal jobs are never resurrected.
+var ErrAgentJobTerminal = errors.New("agent job already terminal")
+
+// ErrAgentJobActivating reports a cancellation request rejected because the
+// deployment already committed the activation linearization point (ADR 0004
+// "Cancellation while deployment status is activating is rejected").
+var ErrAgentJobActivating = errors.New("agent job deployment is activating")
+
 const (
 	// leaseDuration is the ADR 0004 V1 default lease/renewal-extension length.
 	leaseDuration = 90 * time.Second
@@ -35,6 +57,13 @@ const (
 	// job, so discovery reads a small multiple of the caller's limit.
 	claimDiscoveryPerJob = 5
 	claimDiscoveryMax    = 200
+	// cancellationGrace is the ADR 0004 V1 cancellation cleanup grace period:
+	// a leased attempt's lease/authority deadlines are capped at
+	// now+cancellationGrace the moment cancellation is requested.
+	cancellationGrace = 60 * time.Second
+	// expireBatchMaxLimit bounds one sweeper tick's work (ADR 0004 Step 4
+	// sweeper: "bounded batch of 100").
+	expireBatchMaxLimit = 100
 )
 
 // AgentLeaseRepository implements the claim and renew half of the ADR 0004
@@ -381,7 +410,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	}
 
 	if attemptNumber == 1 {
-		if err = r.transitionDeploymentAssigned(ctx, tx, deploymentID, now); err != nil {
+		if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusAssigned, now, r.inject); err != nil {
 			return queue.ClaimedLease{}, false, err
 		}
 		if err = r.inject("deployment"); err != nil {
@@ -411,24 +440,32 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	}, true, nil
 }
 
-// transitionDeploymentAssigned moves deployment_id queued->assigned inside
-// tx (ADR 0004 atomic claim boundary step 9, first claim only), reusing
+// transitionDeployment moves deploymentID to target inside tx, reusing
 // DeploymentRepository's own CAS/event-append logic instead of opening a
-// second transaction.
-func (r *AgentLeaseRepository) transitionDeploymentAssigned(ctx context.Context, tx pgx.Tx, deploymentID string, at time.Time) error {
+// second transaction (ADR 0004 atomic claim boundary step 9, and reused by
+// every later Step 4 transition that must commit atomically with a job/
+// attempt/slot mutation: cancellation, completion, expiry, and revocation).
+// If the deployment is already at target (Transition's documented no-op for
+// repeating the current status), nothing is persisted -- calling this twice
+// for the same terminal effect, e.g. a completion racing an expiry sweep, is
+// idempotent rather than a spurious revision conflict.
+func transitionDeployment(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, deploymentID string, target deployment.Status, at time.Time, hook func(string) error) error {
 	snapshot, err := readSnapshot(ctx, tx, deployment.ID(deploymentID))
 	if err != nil {
-		return fmt.Errorf("load deployment for assignment: %w", err)
+		return fmt.Errorf("load deployment for transition: %w", err)
 	}
 	current, err := deployment.Rehydrate(snapshot)
 	if err != nil {
-		return fmt.Errorf("rehydrate deployment for assignment: %w", err)
+		return fmt.Errorf("rehydrate deployment for transition: %w", err)
 	}
-	next, err := current.Transition(deployment.StatusAssigned, at)
+	next, err := current.Transition(target, at)
 	if err != nil {
-		return fmt.Errorf("transition deployment to assigned: %w", err)
+		return fmt.Errorf("transition deployment to %s: %w", target, err)
 	}
-	return r.deployments.saveTxWithHook(ctx, tx, next, r.inject)
+	if next.Revision() == current.Revision() {
+		return nil
+	}
+	return deployments.saveTxWithHook(ctx, tx, next, hook)
 }
 
 // freezeSecretVersions durably freezes the exact secret-version set required
@@ -570,4 +607,905 @@ func (r *AgentLeaseRepository) Renew(ctx context.Context, serverID string, prese
 func isCheckViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23514"
+}
+
+// validOperationID mirrors agent_job_attempts.result_operation_id's CHECK
+// (octet_length BETWEEN 1 AND 128).
+func validOperationID(id string) bool {
+	n := len(id)
+	return n >= 1 && n <= 128
+}
+
+// closeExpiredOrRevokedAttempt closes a leased attempt whose authority has
+// ended for a reason the agent never reported: it either authority-expired
+// (the sweeper/expireOne) or its server's credential/identity was just
+// revoked (ADR 0004's revocation paragraph, called from
+// revokeInFlightLeases). Both cases get identical effects: the attempt
+// closes as cancelled (if the job's cancellation was already requested) or
+// expired; the environment fence advances and the slot is marked
+// reconciliation_required with its occupant cleared (an already-executing
+// host syscall cannot be preempted, so no new work may use the slot until
+// the agent reconciles); and the job is terminalized/retried/dead-lettered
+// exactly as ADR 0004's expiry section specifies -- attempt_count is never
+// incremented here, since it counts started attempts, not closures.
+//
+// The caller must already hold FOR UPDATE locks (in ADR order: slot, job,
+// attempt) and have revalidated that the attempt is still leased and still
+// the slot's current occupant; this function only writes.
+func closeExpiredOrRevokedAttempt(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, inject func(string) error, jobID, attemptID int64, environmentID string, attemptNumber int, deploymentID string, cancelRequested bool, now time.Time) error {
+	closedState := "expired"
+	if cancelRequested {
+		closedState = "cancelled"
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agent_job_attempts SET state=$2, closed_at=$3 WHERE id=$1`, attemptID, closedState, now); err != nil {
+		return fmt.Errorf("close agent job attempt: %w", err)
+	}
+	if err := inject("attempt_close"); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE environment_slots SET fence=fence+1, current_attempt_id=NULL, reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=$3 WHERE environment_id=$1`,
+		environmentID, attemptID, now); err != nil {
+		return fmt.Errorf("advance environment slot for closed attempt: %w", err)
+	}
+	if err := inject("slot_reconcile"); err != nil {
+		return err
+	}
+
+	var jobState string
+	var retryAvailableAt time.Time
+	switch {
+	case cancelRequested:
+		jobState = "cancelled"
+	case attemptNumber >= queue.MaxAttempts:
+		jobState = "dead"
+	default:
+		jobState = "retry_wait"
+		retryAvailableAt = now.Add(queue.FullJitterDelay(attemptNumber))
+	}
+	if jobState == "retry_wait" {
+		if _, err := tx.Exec(ctx, `UPDATE agent_jobs SET state='retry_wait', available_at=$2, updated_at=$3 WHERE id=$1 AND state='leased'`, jobID, retryAvailableAt, now); err != nil {
+			return fmt.Errorf("schedule agent job retry: %w", err)
+		}
+	} else {
+		if _, err := tx.Exec(ctx, `UPDATE agent_jobs SET state=$2, updated_at=$3 WHERE id=$1 AND state='leased'`, jobID, jobState, now); err != nil {
+			return fmt.Errorf("close agent job: %w", err)
+		}
+	}
+	if err := inject("job_close"); err != nil {
+		return err
+	}
+
+	if jobState == "cancelled" || jobState == "dead" {
+		target := deployment.StatusCancelled
+		if jobState == "dead" {
+			target = deployment.StatusFailed
+		}
+		if err := transitionDeployment(ctx, tx, deployments, deploymentID, target, now, inject); err != nil {
+			return err
+		}
+		if err := inject("deployment"); err != nil {
+			return err
+		}
+	}
+
+	eventType := "expired"
+	if cancelRequested {
+		eventType = "cancelled"
+	}
+	if err := appendAgentJobEvent(ctx, tx, jobID, &attemptID, eventType); err != nil {
+		return err
+	}
+	if !cancelRequested {
+		switch jobState {
+		case "retry_wait":
+			if err := appendAgentJobEvent(ctx, tx, jobID, &attemptID, "retry_scheduled"); err != nil {
+				return err
+			}
+		case "dead":
+			if err := appendAgentJobEvent(ctx, tx, jobID, &attemptID, "dead"); err != nil {
+				return err
+			}
+		}
+	}
+	return inject("job_event")
+}
+
+// Complete records the first terminal success/failure result for attemptID,
+// or -- if the attempt is already closed -- replays the stored terminal
+// result when operationID/resultDigest/outcome/failureClass exactly match
+// what was already committed (ADR 0004 "Terminal retry uses a separate
+// read-only replay branch ... An exact replay returns the stored terminal
+// response without reacquiring a slot, extending a lease, or mutating
+// state"). A replay is accepted even after authority_expires_at has passed,
+// since it never touches authority. A closed attempt with no stored result
+// (expired or a cancellation closed by the sweeper without an
+// acknowledgement) has nothing to replay against and is rejected as stale --
+// this is the "late completion from an expired attempt" case; a closed
+// attempt whose stored result disagrees with this request is rejected as an
+// integrity conflict. Lock order: authorization (SHARE) -> environment slot
+// (UPDATE) -> job (UPDATE) -> attempt (UPDATE), matching Renew.
+func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, outcome queue.CompletionOutcome, failureClass queue.FailureClass, operationID string, resultDigest [32]byte) error {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 || !validOperationID(operationID) {
+		return ErrAgentLeaseInvalidInput
+	}
+	switch outcome {
+	case queue.CompletionSucceeded:
+		if failureClass != "" {
+			return ErrAgentLeaseInvalidInput
+		}
+	case queue.CompletionFailed:
+		if !failureClass.Valid() {
+			return ErrAgentLeaseInvalidInput
+		}
+	default:
+		return ErrAgentLeaseInvalidInput
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin agent lease complete: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return err
+	}
+
+	var jobID int64
+	var environmentID, ownerServerID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id, server_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID, &ownerServerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("locate agent job attempt: %w", err)
+	}
+	if ownerServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotFence, &slotCurrentAttemptID); err != nil {
+		return fmt.Errorf("lock environment slot for complete: %w", err)
+	}
+
+	var deploymentID string
+	if err = tx.QueryRow(ctx, `SELECT deployment_id FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID); err != nil {
+		return fmt.Errorf("lock agent job for complete: %w", err)
+	}
+
+	var attemptState, attemptServerID string
+	var attemptFence int64
+	var attemptNumber int
+	var authorityExpiresAt time.Time
+	var storedFailureClass, storedOperationID *string
+	var storedResultDigest []byte
+	if err = tx.QueryRow(ctx, `SELECT state, server_id, fence, attempt_number, authority_expires_at, failure_class, result_operation_id, result_digest FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).
+		Scan(&attemptState, &attemptServerID, &attemptFence, &attemptNumber, &authorityExpiresAt, &storedFailureClass, &storedOperationID, &storedResultDigest); err != nil {
+		return fmt.Errorf("lock agent job attempt for complete: %w", err)
+	}
+	if attemptServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("agent lease complete canonical time: %w", err)
+	}
+
+	if attemptState != "leased" {
+		if storedOperationID == nil {
+			return ErrAgentLeaseStale
+		}
+		expectedState := "succeeded"
+		var expectedFailureClass *string
+		if outcome == queue.CompletionFailed {
+			expectedState = "failed"
+			fc := string(failureClass)
+			expectedFailureClass = &fc
+		}
+		classMatches := (storedFailureClass == nil && expectedFailureClass == nil) ||
+			(storedFailureClass != nil && expectedFailureClass != nil && *storedFailureClass == *expectedFailureClass)
+		digestMatches := len(storedResultDigest) == 32 && [32]byte(storedResultDigest) == resultDigest
+		if attemptState != expectedState || *storedOperationID != operationID || !digestMatches || !classMatches {
+			return ErrAgentLeaseIntegrityConflict
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent lease complete replay: %w", err)
+		}
+		return nil
+	}
+
+	if attemptFence != fence || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID || !authorityExpiresAt.After(now) {
+		return ErrAgentLeaseStale
+	}
+
+	var failureClassParam *string
+	closedState := "succeeded"
+	if outcome == queue.CompletionFailed {
+		closedState = "failed"
+		fc := string(failureClass)
+		failureClassParam = &fc
+	}
+	if _, err = tx.Exec(ctx, `UPDATE agent_job_attempts SET state=$2, closed_at=$3, failure_class=$4, result_operation_id=$5, result_digest=$6 WHERE id=$1`,
+		attemptID, closedState, now, failureClassParam, operationID, resultDigest[:]); err != nil {
+		return fmt.Errorf("close agent job attempt: %w", err)
+	}
+	if err = r.inject("attempt_close"); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET current_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1 AND current_attempt_id=$3`, environmentID, now, attemptID); err != nil {
+		return fmt.Errorf("free environment slot: %w", err)
+	}
+	if err = r.inject("slot_free"); err != nil {
+		return err
+	}
+
+	var newJobState string
+	var retryAvailableAt time.Time
+	switch {
+	case outcome == queue.CompletionSucceeded:
+		newJobState = "succeeded"
+	case failureClass.Retryable() && attemptNumber < queue.MaxAttempts:
+		newJobState = "retry_wait"
+		retryAvailableAt = now.Add(queue.FullJitterDelay(attemptNumber))
+	case failureClass.Retryable():
+		newJobState = "dead"
+	default:
+		newJobState = "failed"
+	}
+	if newJobState == "retry_wait" {
+		if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='retry_wait', available_at=$2, updated_at=$3 WHERE id=$1 AND state='leased'`, jobID, retryAvailableAt, now); err != nil {
+			return fmt.Errorf("schedule agent job retry: %w", err)
+		}
+	} else {
+		if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state=$2, updated_at=$3 WHERE id=$1 AND state='leased'`, jobID, newJobState, now); err != nil {
+			return fmt.Errorf("close agent job: %w", err)
+		}
+	}
+	if err = r.inject("job_close"); err != nil {
+		return err
+	}
+
+	if newJobState == "dead" || newJobState == "failed" {
+		if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusFailed, now, r.inject); err != nil {
+			return err
+		}
+		if err = r.inject("deployment"); err != nil {
+			return err
+		}
+	}
+
+	eventType := "succeeded"
+	switch newJobState {
+	case "failed":
+		eventType = "failed"
+	case "retry_wait":
+		eventType = "retry_scheduled"
+	case "dead":
+		eventType = "dead"
+	}
+	if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, eventType); err != nil {
+		return err
+	}
+	if err = r.inject("job_event"); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit agent lease complete: %w", err)
+	}
+	return nil
+}
+
+// RequestCancellation cancels jobID on behalf of an owner-scoped, live
+// administrator session (ADR 0004 cancellation). Queued/retry-wait
+// cancellation is immediate. Leased cancellation is cooperative: it sets
+// cancel_requested_at and caps the current attempt's lease/authority
+// deadlines at now+60s in the same transaction (Step 3's carry-over fix --
+// previously these could be set in separate transactions, letting a renewal
+// race between them observe an uncapped deadline), and is rejected outright
+// if the deployment already committed the activating linearization point.
+// Requesting cancellation twice, or against an already-cancelled job, is
+// idempotent; requesting it against any other terminal job is an error.
+func (r *AgentLeaseRepository) RequestCancellation(ctx context.Context, principal auth.Principal, jobID int64) error {
+	if r == nil || r.pool == nil || principal.Validate() != nil || jobID <= 0 {
+		return ErrServerAuthorizationDenied
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin agent job cancellation request: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
+		return err
+	}
+
+	// Non-locking peek at the job's environment purely so the slot can be
+	// locked before the job below, per the ADR hierarchy, even on the
+	// immediate queued/retry_wait path that never touches an attempt. A
+	// never-claimed environment has no slot row yet; locking zero rows is a
+	// harmless no-op.
+	var peekEnvironmentID string
+	if err = tx.QueryRow(ctx, `SELECT environment_id FROM agent_jobs WHERE id=$1`, jobID).Scan(&peekEnvironmentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("locate agent job for cancellation: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, peekEnvironmentID); err != nil {
+		return fmt.Errorf("lock environment slot for cancellation: %w", err)
+	}
+
+	var ownerID, jobState, environmentID, deploymentID string
+	var cancelRequestedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT owner_id, state, environment_id, deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).
+		Scan(&ownerID, &jobState, &environmentID, &deploymentID, &cancelRequestedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("lock agent job for cancellation: %w", err)
+	}
+	if ownerID != principal.OwnerID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("agent job cancellation canonical time: %w", err)
+	}
+
+	switch jobState {
+	case "cancelled":
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent job cancellation no-op: %w", err)
+		}
+		return nil
+	case "succeeded", "failed", "dead":
+		return ErrAgentJobTerminal
+	case "queued", "retry_wait":
+		if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='cancelled', cancel_requested_at=$2, updated_at=$2 WHERE id=$1`, jobID, now); err != nil {
+			return fmt.Errorf("cancel agent job: %w", err)
+		}
+		if err = r.inject("job_cancel"); err != nil {
+			return err
+		}
+		if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusCancelled, now, r.inject); err != nil {
+			return err
+		}
+		if err = r.inject("deployment"); err != nil {
+			return err
+		}
+		if err = appendAgentJobEvent(ctx, tx, jobID, nil, "cancelled"); err != nil {
+			return err
+		}
+		if err = r.inject("job_event"); err != nil {
+			return err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent job cancellation: %w", err)
+		}
+		return nil
+	case "leased":
+		if cancelRequestedAt != nil {
+			// Idempotent: the first request already capped the attempt's
+			// deadlines; a second request mutates nothing further.
+			if err = tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit agent job cancellation no-op: %w", err)
+			}
+			return nil
+		}
+		var attemptID int64
+		if err = tx.QueryRow(ctx, `SELECT id FROM agent_job_attempts WHERE job_id=$1 AND state='leased' FOR UPDATE`, jobID).Scan(&attemptID); err != nil {
+			return fmt.Errorf("lock leased agent job attempt for cancellation: %w", err)
+		}
+		var deploymentStatus string
+		if err = tx.QueryRow(ctx, `SELECT status FROM deployments WHERE id=$1 FOR UPDATE`, deploymentID).Scan(&deploymentStatus); err != nil {
+			return fmt.Errorf("lock deployment for cancellation: %w", err)
+		}
+		if deploymentStatus == string(deployment.StatusActivating) {
+			return ErrAgentJobActivating
+		}
+		deadline := now.Add(cancellationGrace)
+		if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET cancel_requested_at=$2, updated_at=$2 WHERE id=$1`, jobID, now); err != nil {
+			return fmt.Errorf("mark agent job cancel requested: %w", err)
+		}
+		if err = r.inject("job_cancel_request"); err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `UPDATE agent_job_attempts SET cancel_deadline_at=$2, lease_expires_at=LEAST(lease_expires_at,$2), authority_expires_at=LEAST(authority_expires_at,$2) WHERE id=$1`, attemptID, deadline); err != nil {
+			return fmt.Errorf("cap agent job attempt deadlines: %w", err)
+		}
+		if err = r.inject("attempt_cancel_cap"); err != nil {
+			return err
+		}
+		if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, "cancel_requested"); err != nil {
+			return err
+		}
+		if err = r.inject("job_event"); err != nil {
+			return err
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent job cancellation request: %w", err)
+		}
+		return nil
+	default:
+		return ErrServerAuthorizationDenied
+	}
+}
+
+// AcknowledgeCancellation closes attemptID as cancelled once the agent
+// reports its cleanup outcome (ADR 0004 cancellation step 4). It is
+// replay-safe exactly like Complete: an identical replay against an
+// already-closed attempt returns success without mutation, a mismatch is an
+// integrity conflict, and a closed attempt with no stored result (e.g. the
+// sweeper already closed it as cancelled/expired without ever recording an
+// acknowledgement) is stale.
+func (r *AgentLeaseRepository) AcknowledgeCancellation(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, resultDigest [32]byte) error {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 || !validOperationID(operationID) {
+		return ErrAgentLeaseInvalidInput
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin agent lease cancel acknowledge: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return err
+	}
+
+	var jobID int64
+	var environmentID, ownerServerID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id, server_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID, &ownerServerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("locate agent job attempt: %w", err)
+	}
+	if ownerServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotFence, &slotCurrentAttemptID); err != nil {
+		return fmt.Errorf("lock environment slot for cancel acknowledge: %w", err)
+	}
+
+	var deploymentID string
+	var jobCancelRequestedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID, &jobCancelRequestedAt); err != nil {
+		return fmt.Errorf("lock agent job for cancel acknowledge: %w", err)
+	}
+
+	var attemptState, attemptServerID string
+	var attemptFence int64
+	var authorityExpiresAt time.Time
+	var storedOperationID *string
+	var storedResultDigest []byte
+	if err = tx.QueryRow(ctx, `SELECT state, server_id, fence, authority_expires_at, result_operation_id, result_digest FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).
+		Scan(&attemptState, &attemptServerID, &attemptFence, &authorityExpiresAt, &storedOperationID, &storedResultDigest); err != nil {
+		return fmt.Errorf("lock agent job attempt for cancel acknowledge: %w", err)
+	}
+	if attemptServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("agent lease cancel acknowledge canonical time: %w", err)
+	}
+
+	if attemptState != "leased" {
+		if storedOperationID == nil {
+			return ErrAgentLeaseStale
+		}
+		digestMatches := len(storedResultDigest) == 32 && [32]byte(storedResultDigest) == resultDigest
+		if attemptState != "cancelled" || *storedOperationID != operationID || !digestMatches {
+			return ErrAgentLeaseIntegrityConflict
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent lease cancel acknowledge replay: %w", err)
+		}
+		return nil
+	}
+
+	if jobCancelRequestedAt == nil {
+		return ErrAgentLeaseInvalidInput
+	}
+	if attemptFence != fence || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID || !authorityExpiresAt.After(now) {
+		return ErrAgentLeaseStale
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE agent_job_attempts SET state='cancelled', closed_at=$2, result_operation_id=$3, result_digest=$4 WHERE id=$1`,
+		attemptID, now, operationID, resultDigest[:]); err != nil {
+		return fmt.Errorf("close agent job attempt as cancelled: %w", err)
+	}
+	if err = r.inject("attempt_close"); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET current_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1 AND current_attempt_id=$3`, environmentID, now, attemptID); err != nil {
+		return fmt.Errorf("free environment slot: %w", err)
+	}
+	if err = r.inject("slot_free"); err != nil {
+		return err
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='cancelled', updated_at=$2 WHERE id=$1 AND state='leased'`, jobID, now); err != nil {
+		return fmt.Errorf("cancel agent job: %w", err)
+	}
+	if err = r.inject("job_close"); err != nil {
+		return err
+	}
+
+	if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusCancelled, now, r.inject); err != nil {
+		return err
+	}
+	if err = r.inject("deployment"); err != nil {
+		return err
+	}
+
+	if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, "cancelled"); err != nil {
+		return err
+	}
+	if err = r.inject("job_event"); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit agent lease cancel acknowledge: %w", err)
+	}
+	return nil
+}
+
+// ExpireBatch recovers up to limit (capped at 100) authority-expired leases
+// (ADR 0004 recovery): a non-locking ordered discovery followed by one
+// short, independently committed transaction per candidate that locks
+// slot -> job -> attempt with SKIP LOCKED and revalidates before closing
+// anything. It returns the number of attempts actually closed; a candidate
+// that a concurrent renewal, completion, or another sweeper run already
+// resolved is silently skipped, not counted, and not an error.
+func (r *AgentLeaseRepository) ExpireBatch(ctx context.Context, limit int) (int, error) {
+	if r == nil || r.pool == nil || limit <= 0 {
+		return 0, nil
+	}
+	if limit > expireBatchMaxLimit {
+		limit = expireBatchMaxLimit
+	}
+
+	rows, err := r.pool.Query(ctx, `SELECT id FROM agent_job_attempts WHERE state='leased' AND authority_expires_at <= clock_timestamp() ORDER BY authority_expires_at, id LIMIT $1`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("discover expired agent job attempts: %w", err)
+	}
+	var candidates []int64
+	for rows.Next() {
+		var id int64
+		if err = rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan expired agent job attempt: %w", err)
+		}
+		candidates = append(candidates, id)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("discover expired agent job attempts: %w", err)
+	}
+	rows.Close()
+
+	processed := 0
+	for _, attemptID := range candidates {
+		ok, err := r.expireOne(ctx, attemptID)
+		if err != nil {
+			return processed, err
+		}
+		if ok {
+			processed++
+		}
+	}
+	return processed, nil
+}
+
+// expireOne is ExpireBatch's per-candidate short transaction.
+func (r *AgentLeaseRepository) expireOne(ctx context.Context, attemptID int64) (bool, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin agent lease expiry: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var jobID int64
+	var environmentID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("locate expiring agent job attempt: %w", err)
+	}
+
+	var slotCurrentAttemptID *int64
+	err = tx.QueryRow(ctx, `SELECT current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE SKIP LOCKED`, environmentID).Scan(&slotCurrentAttemptID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock environment slot for expiry: %w", err)
+	}
+	if slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+		return false, nil
+	}
+
+	var jobState, deploymentID string
+	var jobCancelRequestedAt *time.Time
+	err = tx.QueryRow(ctx, `SELECT state, deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE SKIP LOCKED`, jobID).Scan(&jobState, &deploymentID, &jobCancelRequestedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock agent job for expiry: %w", err)
+	}
+	if jobState != "leased" {
+		return false, nil
+	}
+
+	var attemptState string
+	var attemptNumber int
+	var authorityExpiresAt time.Time
+	err = tx.QueryRow(ctx, `SELECT state, attempt_number, authority_expires_at FROM agent_job_attempts WHERE id=$1 FOR UPDATE SKIP LOCKED`, attemptID).Scan(&attemptState, &attemptNumber, &authorityExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock expiring agent job attempt: %w", err)
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return false, fmt.Errorf("agent lease expiry canonical time: %w", err)
+	}
+	if attemptState != "leased" || authorityExpiresAt.After(now) {
+		return false, nil
+	}
+
+	cancelRequested := jobCancelRequestedAt != nil
+	if err = closeExpiredOrRevokedAttempt(ctx, tx, r.deployments, r.inject, jobID, attemptID, environmentID, attemptNumber, deploymentID, cancelRequested, now); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("commit agent lease expiry: %w", err)
+	}
+	return true, nil
+}
+
+// Reconcile clears environmentID's reconciliation flag once the owning
+// server reports the closed reconciliation attempt's outcome (ADR 0004
+// Decision 6). Only the server that holds attemptID, at the exact fence it
+// closed with, may clear the flag it left behind; any other caller is
+// denied generically. outcomeDigest is accepted as the sanitized-outcome
+// input the wire protocol (Step 5) will carry, but this schema slice has no
+// column to durably record it without a new migration -- reconciliation
+// itself is proven by the attempt already being closed, and the outcome
+// digest is validated shape-only here.
+//
+// Idempotency: once cleared, environment_slots.reconciliation_attempt_id no
+// longer names this attempt, so a second call cannot re-check "is this still
+// the pending attempt". Instead it is detected by the durable 'reconciled'
+// job event this call appends the first time: if one already exists for
+// this exact attempt, the call is an idempotent no-op; otherwise a caller
+// naming an attempt that was never the pending one is denied.
+func (r *AgentLeaseRepository) Reconcile(ctx context.Context, serverID string, presentedDigest [32]byte, environmentID string, attemptID, fence int64, outcomeDigest [32]byte) error {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || !github.ValidOpaqueID(environmentID) || attemptID <= 0 || fence <= 0 {
+		return ErrAgentLeaseInvalidInput
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin agent lease reconcile: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return err
+	}
+
+	var slotReconciliationAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT reconciliation_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotReconciliationAttemptID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("lock environment slot for reconcile: %w", err)
+	}
+
+	var attemptJobID int64
+	var attemptServerID, attemptEnvironmentID string
+	var attemptFence int64
+	var attemptState string
+	var closedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT job_id, server_id, environment_id, fence, state, closed_at FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).
+		Scan(&attemptJobID, &attemptServerID, &attemptEnvironmentID, &attemptFence, &attemptState, &closedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("lock agent job attempt for reconcile: %w", err)
+	}
+	if attemptServerID != serverID || attemptEnvironmentID != environmentID || attemptFence != fence || attemptState == "leased" || closedAt == nil {
+		return ErrServerAuthorizationDenied
+	}
+
+	if slotReconciliationAttemptID == nil || *slotReconciliationAttemptID != attemptID {
+		var alreadyReconciled bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_job_events WHERE job_id=$1 AND attempt_id=$2 AND event_type='reconciled')`, attemptJobID, attemptID).Scan(&alreadyReconciled); err != nil {
+			return fmt.Errorf("check prior agent lease reconciliation: %w", err)
+		}
+		if !alreadyReconciled {
+			return ErrServerAuthorizationDenied
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent lease reconcile no-op: %w", err)
+		}
+		return nil
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("agent lease reconcile canonical time: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1`, environmentID, now); err != nil {
+		return fmt.Errorf("clear environment slot reconciliation: %w", err)
+	}
+	if err = r.inject("slot_reconcile_clear"); err != nil {
+		return err
+	}
+	if err = appendAgentJobEvent(ctx, tx, attemptJobID, &attemptID, "reconciled"); err != nil {
+		return err
+	}
+	if err = r.inject("job_event"); err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit agent lease reconcile: %w", err)
+	}
+	return nil
+}
+
+// MarkReconciled is the audited administrator break-glass path for a
+// wedged environment (ADR 0004 Decision 6 owner decisions). environment_slots
+// carries no owner column, so ownership is derived from the job that the
+// pending reconciliation attempt belongs to; an environment with nothing
+// pending, or whose pending attempt's job belongs to a different owner, is
+// denied generically either way.
+func (r *AgentLeaseRepository) MarkReconciled(ctx context.Context, principal auth.Principal, environmentID, reason string) error {
+	if r == nil || r.pool == nil || principal.Validate() != nil || !github.ValidOpaqueID(environmentID) || !validReason(reason) {
+		return ErrServerAuthorizationDenied
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin environment mark-reconciled: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
+		return err
+	}
+
+	var reconciliationAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT reconciliation_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&reconciliationAttemptID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("lock environment slot for mark-reconciled: %w", err)
+	}
+	if reconciliationAttemptID == nil {
+		return ErrServerAuthorizationDenied
+	}
+
+	var attemptJobID int64
+	var jobOwnerID string
+	if err = tx.QueryRow(ctx, `SELECT a.job_id, j.owner_id FROM agent_job_attempts a JOIN agent_jobs j ON j.id = a.job_id WHERE a.id=$1`, *reconciliationAttemptID).Scan(&attemptJobID, &jobOwnerID); err != nil {
+		return fmt.Errorf("locate agent lease reconciliation attempt job: %w", err)
+	}
+	if jobOwnerID != principal.OwnerID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("environment mark-reconciled canonical time: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1`, environmentID, now); err != nil {
+		return fmt.Errorf("clear environment slot reconciliation: %w", err)
+	}
+	if err = r.inject("slot_reconcile_clear"); err != nil {
+		return err
+	}
+
+	actor := administratorActor(principal)
+	if err = insertServerAuditEvent(ctx, tx, actor, "environment_mark_reconciled", nil, nil, "success", reason); err != nil {
+		return err
+	}
+	if err = r.inject("audit_insert"); err != nil {
+		return err
+	}
+
+	if err = appendAgentJobEvent(ctx, tx, attemptJobID, reconciliationAttemptID, "reconciled"); err != nil {
+		return err
+	}
+	if err = r.inject("job_event"); err != nil {
+		return err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit environment mark-reconciled: %w", err)
+	}
+	return nil
+}
+
+// revokeInFlightLeases closes every currently leased attempt of serverID
+// inside RevokeServer's own transaction (ADR 0004's revocation paragraph):
+// an already-executing host syscall cannot be preempted, so each affected
+// environment gets exactly the same fence/reconciliation/job/deployment
+// effects ExpireBatch would give it, and the environment cannot accept new
+// work until the agent (or break-glass) reconciles. Lock order matches
+// Claim/Renew/the sweeper -- slot, then job, then attempt, environments
+// visited in ascending ID order -- so this can never deadlock against them;
+// RevokeServer has already locked the servers row first, ahead of all of
+// these per the global hierarchy. Decision 3: RotateCredential never calls
+// this, only RevokeServer -- rotation must not strand in-flight work.
+func revokeInFlightLeases(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, inject func(string) error, serverID string, now time.Time) error {
+	rows, err := tx.Query(ctx, `SELECT id, job_id, environment_id FROM agent_job_attempts WHERE server_id=$1 AND state='leased' ORDER BY environment_id, id`, serverID)
+	if err != nil {
+		return fmt.Errorf("discover in-flight agent job attempts: %w", err)
+	}
+	type inFlightAttempt struct {
+		attemptID, jobID int64
+		environmentID    string
+	}
+	var candidates []inFlightAttempt
+	for rows.Next() {
+		var c inFlightAttempt
+		if err = rows.Scan(&c.attemptID, &c.jobID, &c.environmentID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan in-flight agent job attempt: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("discover in-flight agent job attempts: %w", err)
+	}
+	rows.Close()
+
+	for _, c := range candidates {
+		var slotCurrentAttemptID *int64
+		if err = tx.QueryRow(ctx, `SELECT current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, c.environmentID).Scan(&slotCurrentAttemptID); err != nil {
+			return fmt.Errorf("lock environment slot for revocation: %w", err)
+		}
+		if slotCurrentAttemptID == nil || *slotCurrentAttemptID != c.attemptID {
+			continue // already closed/reassigned by a concurrent completion or expiry
+		}
+		var jobState, deploymentID string
+		var jobCancelRequestedAt *time.Time
+		if err = tx.QueryRow(ctx, `SELECT state, deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, c.jobID).Scan(&jobState, &deploymentID, &jobCancelRequestedAt); err != nil {
+			return fmt.Errorf("lock agent job for revocation: %w", err)
+		}
+		if jobState != "leased" {
+			continue
+		}
+		var attemptState string
+		var attemptNumber int
+		if err = tx.QueryRow(ctx, `SELECT state, attempt_number FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, c.attemptID).Scan(&attemptState, &attemptNumber); err != nil {
+			return fmt.Errorf("lock agent job attempt for revocation: %w", err)
+		}
+		if attemptState != "leased" {
+			continue
+		}
+		cancelRequested := jobCancelRequestedAt != nil
+		if err = closeExpiredOrRevokedAttempt(ctx, tx, deployments, inject, c.jobID, c.attemptID, c.environmentID, attemptNumber, deploymentID, cancelRequested, now); err != nil {
+			return err
+		}
+	}
+	return nil
 }

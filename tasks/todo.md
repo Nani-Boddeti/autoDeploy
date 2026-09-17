@@ -1126,6 +1126,17 @@ PG18 runs normal + -race, claim tests -race x20; reviews -> deadlock, occupant c
 - Reconcile: owning server + matching closed attempt/fence clears flag; idempotent.
 - Sweeper with advisory lock and bounded batch; graceful shutdown.
 
+Step 4 result (2026-09-17): done. Complete/AcknowledgeCancellation replay-safe (exact stored result
+match, even after expiry; mismatch integrity error; expiry-closed attempts stale). Retry full jitter from
+DB time, dead at attempt_count 5, expiry never increments. RequestCancellation owner-scoped, same-tx
+cancel marker + deadline cap, rejects activating under deployment row lock. ExpireBatch SKIP LOCKED;
+sweeper uses pg_try_advisory_xact_lock. Reconcile: owning server + attempt fence (not advanced slot fence);
+replay detected via durable reconciled event. MarkReconciled derives owner from pending attempt's job.
+Only RevokeServer (not rotation) closes in-flight attempts (Decision 3). Evidence: make check, vet, race,
+three fresh full PG18 runs normal + -race, concurrency tests -race x20; review PASS.
+Follow-ups: persist reconcile outcome digest when a consumer exists (needs migration); a revoked server
+cannot reconcile, so its environments need MarkReconciled; amend ADR 0004 (no per-renew event) in Step 6.
+
 **Step 5 — HTTP transport**
 - `internal/agent/http`: enroll, heartbeat, claim, renew, complete, cancel-ack, reconcile. Strict
   JSON (`DisallowUnknownFields`), bounded bodies, fixed-schema capability struct (<= 1 KiB), one

@@ -405,6 +405,22 @@ func (r *ServerRepository) RevokeServer(ctx context.Context, principal auth.Prin
 	if err = r.inject("credential_revoke_on_server_revoke"); err != nil {
 		return err
 	}
+
+	// ADR 0004 revocation paragraph: revocation (unlike rotation, Decision 3)
+	// must not leave a leased attempt believing it still holds authority.
+	// Lock order continues the hierarchy already begun by lockActiveServer
+	// above: servers row first, then environment slots/jobs/attempts.
+	var revokedAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&revokedAt); err != nil {
+		return fmt.Errorf("server revoke canonical time: %w", err)
+	}
+	if err = revokeInFlightLeases(ctx, tx, NewDeploymentRepository(r.pool), r.inject, serverID, revokedAt); err != nil {
+		return err
+	}
+	if err = r.inject("revoke_in_flight_leases"); err != nil {
+		return err
+	}
+
 	if err = insertServerAuditEvent(ctx, tx, actor, "server_revoked", &serverID, nil, "success", reason); err != nil {
 		return err
 	}

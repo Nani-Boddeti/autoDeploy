@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"autodeploy/internal/auth"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -17,11 +19,12 @@ import (
 // It resets every lease-related table first so tests do not see each other's
 // rows.
 type leaseFixture struct {
-	pool     *pgxpool.Pool
-	ownerID  string
-	jobID    int64
-	serverID string
-	envID    string
+	pool      *pgxpool.Pool
+	ownerID   string
+	principal auth.Principal
+	jobID     int64
+	serverID  string
+	envID     string
 }
 
 func newLeaseFixture(t *testing.T, seed byte) leaseFixture {
@@ -38,7 +41,7 @@ func newLeaseFixture(t *testing.T, seed byte) leaseFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return leaseFixture{pool: githubRepo.pool, ownerID: principal.OwnerID, jobID: result.JobID, serverID: "server", envID: "environment"}
+	return leaseFixture{pool: githubRepo.pool, ownerID: principal.OwnerID, principal: principal, jobID: result.JobID, serverID: "server", envID: "environment"}
 }
 
 // insertSlot creates an environment_slots row for f.envID if one is not
