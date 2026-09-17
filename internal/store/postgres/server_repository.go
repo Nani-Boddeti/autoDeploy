@@ -278,15 +278,16 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 	}
 	match := server.ConstantTimeEqualDigest(stored, enrollmentDigest)
 	if !foundServer || !foundToken || consumedAt != nil || !now.Before(expiresAt) || !match {
-		if foundServer {
-			// Audit rows are kept for known servers only: server_id
-			// FK-references servers(id), so auditing an unknown server would
-			// itself fail, and the transaction rolls back regardless.
-			_ = insertServerAuditEvent(ctx, tx, actor, "enrollment_rejected", &serverID, nil, "failure", "invalid enrollment token")
-			if err = tx.Commit(ctx); err != nil {
-				return 0, fmt.Errorf("commit server enrollment rejection: %w", err)
-			}
-		}
+		// No audit row and no commit here: an unauthenticated caller who
+		// merely knows (or guesses) a server ID can call Enroll an unbounded
+		// number of times, and every prior version of this branch wrote one
+		// server_audit_events row per rejected attempt for a known server --
+		// an unauthenticated write-amplification path with no rate limit.
+		// The transaction rolls back via the deferred Rollback above, so
+		// this rejection mutates nothing at all. "enrollment_rejected"
+		// remains a legal server_audit_events.action value (migration
+		// 000012, committed) but nothing in this repository writes it
+		// anymore.
 		return 0, ErrServerAuthorizationDenied
 	}
 
@@ -489,6 +490,67 @@ func (r *ServerRepository) Authenticate(ctx context.Context, serverID string, pr
 		return AuthenticatedServer{}, fmt.Errorf("commit server authenticate: %w", err)
 	}
 	return AuthenticatedServer{ServerID: serverID, OwnerID: ownerID, CredentialVersion: version}, nil
+}
+
+// Heartbeat authenticates a presented credential digest exactly like
+// Authenticate and, only on success, advances servers.last_heartbeat_at to
+// the greater of its current value and PostgreSQL's own clock -- never
+// backward, and never trusting an agent's own wall clock. Unlike
+// Authenticate, it locks the servers row FOR UPDATE (not FOR SHARE) because
+// it writes to it. A rejected heartbeat writes no audit row and mutates
+// nothing: anyone who merely knows (or guesses) a server ID can call
+// Heartbeat with a wrong credential an unbounded number of times, and an
+// unauthenticated caller must never be able to grow durable storage (an
+// audited "heartbeat_rejected" row) at will with no rate limit. The
+// transaction rolls back via the deferred Rollback below. Heartbeat never
+// persists any capability field the agent reports (agent version, OS/arch,
+// resources, executor availability): this slice durably records liveness
+// only. "heartbeat_rejected" remains a legal server_audit_events.action
+// value (migration 000012, committed) but nothing in this repository writes
+// it anymore.
+func (r *ServerRepository) Heartbeat(ctx context.Context, serverID string, presentedDigest [32]byte) error {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) {
+		return ErrServerAuthorizationDenied
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin server heartbeat: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var status string
+	foundServer := true
+	if err = tx.QueryRow(ctx, `SELECT status FROM servers WHERE id=$1 FOR UPDATE`, serverID).Scan(&status); err != nil || status != "active" {
+		foundServer = false
+	}
+	var storedDigest []byte
+	foundCredential := false
+	if foundServer {
+		if err = tx.QueryRow(ctx, `SELECT digest FROM server_credentials WHERE server_id=$1 AND status='active' FOR SHARE`, serverID).Scan(&storedDigest); err == nil {
+			foundCredential = true
+		}
+	}
+	var stored [32]byte
+	if foundCredential {
+		copy(stored[:], storedDigest)
+	} else {
+		stored = dummyCredentialDigest
+	}
+	match := server.ConstantTimeEqualDigest(stored, presentedDigest)
+	if !foundServer || !foundCredential || !match {
+		return ErrServerAuthorizationDenied
+	}
+
+	if _, err = tx.Exec(ctx, `UPDATE servers SET last_heartbeat_at=GREATEST(COALESCE(last_heartbeat_at,clock_timestamp()),clock_timestamp()) WHERE id=$1`, serverID); err != nil {
+		return fmt.Errorf("record server heartbeat: %w", err)
+	}
+	if err = r.inject("heartbeat_update"); err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit server heartbeat: %w", err)
+	}
+	return nil
 }
 
 // lockActiveServer locks the servers row scoped to ownerID (owner-of-lock-

@@ -1142,6 +1142,16 @@ cannot reconcile, so its environments need MarkReconciled; amend ADR 0004 (no pe
   JSON (`DisallowUnknownFields`), bounded bodies, fixed-schema capability struct (<= 1 KiB), one
   generic auth failure response, authorization re-derived from locked rows inside each tx.
 
+Step 5 result (2026-09-17): done. internal/agent/http (package agenthttp), POST-only /agent/v1/{enroll,
+heartbeat,jobs/claim,leases/renew,leases/complete,leases/cancel-ack,environments/reconcile}; webhook-identical
+HTTPS provenance; strict bounded JSON; Bearer srv.v1 + X-AutoDeploy-Server-ID; repositories re-validate in
+tx. Enrollment: agent generates credential locally, sends digest only. Claim gated on executor_available.
+Errors: 401 generic, 409 stale_lease/integrity_conflict, 400, 413, 503; nothing echoed. Security fix:
+unauthenticated Enroll/Heartbeat rejections write no audit rows (write amplification). Integration target
+and CI now run -p 1 ./internal/store/postgres ./internal/agent/http ./migrations. Evidence: make check, vet,
+race, agent HTTP alone on fresh DB, three fresh full runs normal + -race; security review PASS WITH NOTES.
+Follow-up: no rate limiting on /agent/v1 (low; credential required).
+
 **Step 6 — CLI, wiring, agent client**
 - `cmd/admin`: server register/rotate/revoke, environment mark-reconciled (if approved).
 - `cmd/controlplane`: `AUTODEPLOY_AGENT_ENABLED` opt-in, mount routes, start sweeper.

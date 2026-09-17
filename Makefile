@@ -9,7 +9,7 @@ test:
 	go test ./...
 
 test-integration:
-	AUTODEPLOY_TEST_DATABASE_URL="$${AUTODEPLOY_TEST_DATABASE_URL:?set AUTODEPLOY_TEST_DATABASE_URL}" go test -tags=integration ./internal/store/postgres ./migrations
+	AUTODEPLOY_TEST_DATABASE_URL="$${AUTODEPLOY_TEST_DATABASE_URL:?set AUTODEPLOY_TEST_DATABASE_URL}" go test -p 1 -tags=integration ./internal/store/postgres ./internal/agent/http ./migrations
 
 # This runs against installed privileged helpers, never the normal test suite.
 # It is deliberately Linux-only and requires an explicit operator opt-in.

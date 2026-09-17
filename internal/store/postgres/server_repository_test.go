@@ -161,6 +161,14 @@ func TestServerEnrollRejectsDigestMismatchWithoutMutation(t *testing.T) {
 	if err = pool.QueryRow(ctx, `SELECT consumed_at FROM server_enrollment_tokens WHERE server_id='server_b'`).Scan(&consumedAt); err != nil || consumedAt != nil {
 		t.Fatalf("token consumed after rejection consumedAt=%v err=%v", consumedAt, err)
 	}
+	// A rejected Enroll must write zero audit rows: an unauthenticated
+	// caller who only knows (or guesses) a server ID could otherwise grow
+	// server_audit_events without bound by retrying with a wrong enrollment
+	// digest. Only registerTestServer's own "register" row exists.
+	var events int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM server_audit_events WHERE server_id='server_b'`).Scan(&events); err != nil || events != 1 {
+		t.Fatalf("audit events after rejected enroll=%d err=%v", events, err)
+	}
 }
 
 func TestServerEnrollRejectsExpiredToken(t *testing.T) {
@@ -258,6 +266,93 @@ func TestServerIssueEnrollmentReissueInvalidatesPriorToken(t *testing.T) {
 	}
 	if _, err = repo.Enroll(ctx, "server_e", newDigest, credentialDigest); err != nil {
 		t.Fatalf("reissued enrollment token rejected: %v", err)
+	}
+}
+
+func TestServerHeartbeatSucceedsAndAdvancesLastHeartbeatAt(t *testing.T) {
+	pool, repo, _, principal := freshServerRepository(t)
+	ctx := context.Background()
+	enrollment, _ := registerTestServer(t, repo, principal, "server_h1", 40)
+	enrollmentDigest, err := server.EnrollmentTokenDigest(enrollment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := server.NewCredentialToken(bytes.NewReader(bytes.Repeat([]byte{41}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialDigest, err := server.CredentialTokenDigest(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.Enroll(ctx, "server_h1", enrollmentDigest, credentialDigest); err != nil {
+		t.Fatal(err)
+	}
+	var before *time.Time
+	if err = pool.QueryRow(ctx, `SELECT last_heartbeat_at FROM servers WHERE id='server_h1'`).Scan(&before); err != nil || before != nil {
+		t.Fatalf("last_heartbeat_at before first heartbeat=%v err=%v", before, err)
+	}
+	if err = repo.Heartbeat(ctx, "server_h1", credentialDigest); err != nil {
+		t.Fatalf("heartbeat=%v", err)
+	}
+	var first *time.Time
+	if err = pool.QueryRow(ctx, `SELECT last_heartbeat_at FROM servers WHERE id='server_h1'`).Scan(&first); err != nil || first == nil {
+		t.Fatalf("last_heartbeat_at after first heartbeat=%v err=%v", first, err)
+	}
+	if err = repo.Heartbeat(ctx, "server_h1", credentialDigest); err != nil {
+		t.Fatalf("second heartbeat=%v", err)
+	}
+	var second *time.Time
+	if err = pool.QueryRow(ctx, `SELECT last_heartbeat_at FROM servers WHERE id='server_h1'`).Scan(&second); err != nil || second == nil || second.Before(*first) {
+		t.Fatalf("last_heartbeat_at not monotonic: first=%v second=%v err=%v", first, second, err)
+	}
+}
+
+// TestServerHeartbeatRejectsInvalidCredentialWithoutMutation proves a
+// rejected Heartbeat call -- unknown server, wrong credential digest, or a
+// revoked/absent active credential -- writes zero audit rows and mutates
+// nothing (not even last_heartbeat_at). Before this fix, every rejected
+// heartbeat wrote a "heartbeat_rejected" server_audit_events row; since
+// Heartbeat takes no principal and is reachable by anyone who merely knows
+// a server ID, that was an unauthenticated, unrate-limited write-
+// amplification path.
+func TestServerHeartbeatRejectsInvalidCredentialWithoutMutation(t *testing.T) {
+	pool, repo, _, principal := freshServerRepository(t)
+	ctx := context.Background()
+	enrollment, _ := registerTestServer(t, repo, principal, "server_h2", 42)
+	enrollmentDigest, err := server.EnrollmentTokenDigest(enrollment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := server.NewCredentialToken(bytes.NewReader(bytes.Repeat([]byte{43}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentialDigest, err := server.CredentialTokenDigest(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = repo.Enroll(ctx, "server_h2", enrollmentDigest, credentialDigest); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongDigest := credentialDigest
+	wrongDigest[0] ^= 0xFF
+	if err = repo.Heartbeat(ctx, "server_h2", wrongDigest); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("wrong credential heartbeat=%v", err)
+	}
+	if err = repo.Heartbeat(ctx, "server_unknown_h2", credentialDigest); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("unknown server heartbeat=%v", err)
+	}
+
+	var lastHeartbeat *time.Time
+	if err = pool.QueryRow(ctx, `SELECT last_heartbeat_at FROM servers WHERE id='server_h2'`).Scan(&lastHeartbeat); err != nil || lastHeartbeat != nil {
+		t.Fatalf("last_heartbeat_at mutated by rejected heartbeat=%v err=%v", lastHeartbeat, err)
+	}
+	var events int
+	if err = pool.QueryRow(ctx, `SELECT count(*) FROM server_audit_events WHERE server_id='server_h2'`).Scan(&events); err != nil || events != 2 {
+		// register + enrolled only; no heartbeat_rejected rows.
+		t.Fatalf("audit events after rejected heartbeats=%d err=%v", events, err)
 	}
 }
 
