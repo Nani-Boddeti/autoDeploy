@@ -102,15 +102,31 @@ func (r *DeploymentRepository) GetByID(ctx context.Context, id deployment.ID) (d
 // Save conditionally replaces a deployment head and appends only events not already persisted.
 // It returns ErrRevisionConflict when another writer has saved first.
 func (r *DeploymentRepository) Save(ctx context.Context, value deployment.Deployment) error {
-	snapshot, err := checkedSnapshot(value)
-	if err != nil {
-		return err
-	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin deployment save: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err = r.saveTxWithHook(ctx, tx, value, nil); err != nil {
+		return err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit deployment save: %w", err)
+	}
+	return nil
+}
+
+// saveTxWithHook is Save's transaction-aware core, reused by the agent lease
+// claim transaction's queued->assigned transition so that mutation shares
+// the claim transaction's atomicity instead of opening a private one (ADR
+// 0004 atomic claim boundary step 9). It deliberately does not commit or
+// roll back tx. The optional hook runs after the head update and after its
+// appended event, mirroring createTxWithHook's rollback-test seam.
+func (r *DeploymentRepository) saveTxWithHook(ctx context.Context, tx pgx.Tx, value deployment.Deployment, hook func(string) error) error {
+	snapshot, err := checkedSnapshot(value)
+	if err != nil {
+		return err
+	}
 	var lockedID deployment.ID
 	if err := tx.QueryRow(ctx, `SELECT id FROM deployments WHERE id=$1 FOR UPDATE`, snapshot.Identity.DeploymentID).Scan(&lockedID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -143,11 +159,18 @@ func (r *DeploymentRepository) Save(ctx context.Context, value deployment.Deploy
 	if command.RowsAffected() != 1 {
 		return fmt.Errorf("%w: %s", ErrRevisionConflict, snapshot.Identity.DeploymentID)
 	}
+	if hook != nil {
+		if err := hook("deployment_update"); err != nil {
+			return err
+		}
+	}
 	if err = appendEvents(ctx, tx, snapshot.Identity.DeploymentID, snapshot.Events[stored.Revision:]); err != nil {
 		return err
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit deployment save: %w", err)
+	if hook != nil {
+		if err := hook("deployment_update_event"); err != nil {
+			return err
+		}
 	}
 	return nil
 }

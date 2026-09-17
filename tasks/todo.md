@@ -1108,6 +1108,15 @@ reconciliation_required for in-flight environments (ADR 0004 revocation paragrap
 - Renew: same sequence => return stored deadlines; sequence+1 => extend to min(now+90s, cancel cap);
   otherwise reject. Returns cancel_requested.
 
+Step 3 result (2026-09-17): done. Claim: non-locking pre-auth -> discovery -> slot rows pre-created in one
+sorted committed statement (avoids opposite-order insert deadlock) -> tx: FOR SHARE re-auth, slot and job
+FOR UPDATE SKIP LOCKED (priority order; skip never waits), revalidate job incl. environment/server,
+fence+1, job leased, attempt, slot occupant, deployment assigned on attempt 1, claimed event. limit<=0 is a
+no-op. Renew: auth -> slot -> job -> attempt; requires occupant == attempt and fence match; expired
+authority fails even for replayed sequence; cancel cap applies to both deadlines. No per-renew event
+(Decision 9; amend ADR 0004 wording in Step 6 docs). Evidence: make check, vet, race, three fresh full
+PG18 runs normal + -race, claim tests -race x20; reviews -> deadlock, occupant check, pre-auth, limit fixes.
+
 **Step 4 — complete, cancel, expire, reconcile repository + sweeper**
 - Complete: first call closes attempt, frees slot if still owned, job -> succeeded|retry_wait|failed|
   dead; identical replay returns stored result; mismatched digest => integrity error, no mutation.

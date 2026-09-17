@@ -58,7 +58,9 @@ func (f leaseFixture) insertSlot(t *testing.T) {
 // the row: (1) advance the environment slot's fence to the caller-chosen
 // value, (2) transition the job into 'leased' with attempt_count
 // incremented, (3) insert the attempt carrying that fence and the job's
-// now-current attempt_count.
+// now-current attempt_count, (4) occupy the slot with that attempt's id --
+// the same order Step 3's real Claim uses, so Renew's slot-occupant check
+// sees a consistent fixture.
 func (f leaseFixture) leaseJob(t *testing.T, fence int64, leaseSeconds int) int64 {
 	t.Helper()
 	f.insertSlot(t)
@@ -75,6 +77,9 @@ func (f leaseFixture) leaseJob(t *testing.T, fence int64, leaseSeconds int) int6
 		INSERT INTO agent_job_attempts(job_id, attempt_number, server_id, environment_id, fence, state, lease_expires_at, authority_expires_at)
 		SELECT $1, $2, $3, $4, $5, 'leased', t.deadline, t.deadline FROM t RETURNING id`,
 		f.jobID, attemptNumber, f.serverID, f.envID, fence, leaseSeconds).Scan(&attemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE environment_slots SET current_attempt_id=$2 WHERE environment_id=$1`, f.envID, attemptID); err != nil {
 		t.Fatal(err)
 	}
 	return attemptID
