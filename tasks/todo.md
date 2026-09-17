@@ -1007,7 +1007,7 @@ and checkout-token delivery remain the next slice.
 
 ## Proposed Server Agent, Credentials, and Leases Slice
 
-Status: **approved 2026-09-16** (bearer+digest auth; break-glass included; opt-in routes). Constrained by ADR 0001, 0003, 0004.
+Status: **complete 2026-09-17** (approved 2026-09-16; bearer+digest auth; break-glass included; opt-in routes). Constrained by ADR 0001, 0003, 0004. Committed 89d01b7..8105a85; docs/ADR amendments done in Step 6d.
 No Docker/BuildKit, Traefik, checkout invocation, or release activation in this slice.
 
 ### Understanding
@@ -1180,6 +1180,17 @@ TLS only, never follows redirects (same-host https->http would resend Authorizat
 only 503/network, claim never retried. Evidence: make check, race, Linux amd64/arm64 agent builds, three fresh
 full integration runs normal + -race; security review PASS WITH NOTES (redirect + claim retry fixed).
 Follow-up: server-side claim idempotency key so a lost claim response cannot orphan a lease until expiry.
+
+Step 6d result (2026-09-17): done. docs/IMPLEMENTATION_STATUS.md updated to 8/18 outcomes; new
+"servers/credentials", "leases/fencing", "agent HTTP", "agent client/state", and "server admin web"
+subsystem rows; schema section covers 000012/000013; next-slice section replaced with host execution
+(checkout invocation, BuildKit build, container start/health checks) with follow-ups from Steps 4, 5,
+6b, 6c listed. ADR 0004 gets a dated "Amendments (2026-09-17)" section (renewal produces no event,
+attempt_count semantics, claim slot pre-creation/lock order, reconciliation ownership, revocation-only
+attempt closure, sweeper try-lock) plus a minimal line-75 fix referencing it. ADR 0001 gets a dated
+amendment on single-use enrollment tokens, agent-generated/digest-only credentials, web-admin-only
+server administration, and deferred agent-initiated rotation. MEMORY.md and tasks/lessons.md updated;
+no code changed.
 
 **Step 6 — CLI, wiring, agent client**
 - `cmd/admin`: server register/rotate/revoke, environment mark-reconciled (if approved).

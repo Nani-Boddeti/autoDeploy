@@ -94,3 +94,27 @@
   referenced table when adding a referencing table.
 - Concurrency tests must force overlap after the real read (barrier that reads, then waits for both);
   releasing on arrival still lets the scheduler serialize, especially under -race.
+
+## Server agent, credentials, and leases
+
+- A same-host `https://` -> `http://` redirect still resends the `Authorization` header; an HTTP
+  client used for bearer-credential requests must refuse to follow any redirect, not just
+  cross-host ones.
+- Auditing unauthenticated-request rejections (bad/missing/expired credential or token) gives an
+  unauthenticated caller a way to drive unbounded audit-row write amplification; audit only
+  authenticated mutations and authenticated-but-invalid operations, not failed authentication itself.
+- Integration test packages that share one database must run with `go test -p 1` across every
+  tagged package, and each package must apply/own its own migrations; running them as separate
+  concurrent test binaries against the same live database produces nondeterministic failures.
+- A per-key local state file is not enough to detect loss: without a separate manifest
+  (`.fence-index.json`) recording which keys should exist, a missing file is indistinguishable from
+  "never claimed anything for this environment," which silently defeats fail-closed fence recovery.
+  A crash between writing the file and updating the manifest must also fail closed.
+- A trigger that must be monotonic (e.g., a never-decreasing fence) cannot read a volatile
+  `DEFAULT`/`now()`-style column for its comparison value; it must use the same captured
+  transaction-time value the surrounding statement used, or concurrent rows can compare against
+  different instants and let the monotonic guarantee slip.
+- `SKIP LOCKED` only applies to explicit row locking clauses (`SELECT ... FOR UPDATE SKIP LOCKED`);
+  it does not apply to `INSERT ... ON CONFLICT`, so slot/row pre-creation that might race on insert
+  needs its own separate, deterministically ordered statement rather than relying on `SKIP LOCKED`
+  semantics during the insert.

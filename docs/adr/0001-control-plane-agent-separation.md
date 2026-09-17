@@ -123,6 +123,28 @@ Costs:
 These details require dedicated approved implementation slices and must preserve this ADR's trust
 and ownership boundaries.
 
+## Amendment (2026-09-17)
+
+The server agent, credentials, and leases slice implemented registration and credential issuance as
+follows, refining "Agent registration, credential issuance, rotation, revocation, and protocol
+versioning" from Deferred decisions above:
+
+- Enrollment uses a single-use, administrator-issued enrollment token (15-minute TTL), not a shared
+  installation secret. An administrator registers the server and receives the token once; the agent
+  exchanges it for its durable credential during `cmd/agent enroll`.
+- The agent generates its own bearer credential locally and sends the control plane only its
+  SHA-256 digest; the control plane stores digest-only and can never reconstruct or display the raw
+  credential.
+- Server administration (register, issue enrollment, rotate, revoke, break-glass mark-reconciled)
+  happens through the session- and CSRF-protected web admin, not a separate CLI, because it requires
+  an authenticated administrator identity that a local CLI cannot itself assert.
+- A `RotateCredential` repository method exists but is intentionally not exposed through the web
+  admin: since the agent, not the control plane, generates the credential, the control plane cannot
+  hand back a usable rotated credential, and revoke-then-re-enroll is not a substitute because an
+  enrollment token is single-use. Rotation therefore needs a future agent-initiated protocol (the
+  agent generates a new credential and submits its digest while authenticated); this slice ships
+  register, enrollment-token reissue, and revoke only.
+
 ## Validation criteria
 
 - The control-plane process can run without Docker or SSH credentials.

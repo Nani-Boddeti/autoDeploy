@@ -181,6 +181,82 @@
     administrator assignment and DNS readiness is not ownership proof;
   - each environment/release is pinned to one server; TCP/UDP, HTTP-only, canary, replicas, and
     cross-host/global switching remain deferred.
+- Server agent, credentials, and leases slice (committed 89d01b7..8105a85) implements ADR 0001/0004
+  registration and queue coordination end to end, over the existing 000010 `agent_jobs`:
+  - **transport**: HTTPS/1.1 JSON polling under `/agent/v1/`, mounted like the webhook route
+    (outside session/CSRF, same trusted-HTTPS provenance). Rejected gRPC (second listener/proto
+    tooling) and mTLS (new PKI subsystem);
+  - **credential**: opaque bearer `srv.v1.<32 random bytes base64url>`; the agent generates it
+    locally and sends only its SHA-256 digest at enrollment (`internal/agent/http` Enroll) — the
+    control plane stores digest-only and can never reconstruct or display it. Rejected HMAC signing
+    keyed by the raw credential (unverifiable when only the digest is stored) and keying by the
+    digest itself (a DB read becomes equal to impersonation). Replay safety comes from fence +
+    attempt + monotonic renewal sequence + completion operation-id/digest idempotency, not a nonce
+    table;
+  - **enrollment**: single-use, administrator-issued `enr.` token (15-minute TTL, distinct prefix
+    from the credential to prevent cross-use), minted by session+CSRF-protected web admin
+    (`/servers/register`, `/servers/enrollment`), consumed atomically by `cmd/agent enroll`. Shared
+    installation secrets were rejected;
+  - **why web admin and not `cmd/admin`**: server administration needs a live authenticated admin
+    session (parity with GitHub repository binding), which a local CLI on the deployment host cannot
+    itself assert; a break-glass CLI path was considered and rejected in favor of the same web
+    routes plus mandatory audit reason;
+  - **credential rotation is not implemented**: a `RotateCredential` repository method exists but
+    isn't wired to any route, because the control plane can no longer hand back a usable rotated
+    credential (the agent, not the control plane, generates it) and revoke-then-re-enroll doesn't
+    substitute (enrollment tokens are single-use). This needs a future agent-initiated rotation
+    protocol;
+  - **agent-local fence state**: one file per environment (write temp, fsync, rename) holding
+    highest accepted fence, renewal sequence, reconciliation flag, plus a `.fence-index.json`
+    manifest; missing/unindexed/corrupt state (including a crash between file and index write) fails
+    closed — claim nothing, require reconcile, never reset locally;
+  - **reconciliation**: expiry or a cancel-deadline miss on a leased attempt increments the
+    environment fence and sets `reconciliation_required`; claim refuses an occupied or reconciling
+    environment. Only `POST /agent/v1/environments/reconcile` from the owning server, carrying
+    the matching closed attempt/fence, clears it (idempotent), or an audited administrator
+    `mark-reconciled` break-glass (a revoked server can never satisfy the owning-server predicate);
+  - **sweeper**: control-plane goroutine, 15s tick (`AUTODEPLOY_AGENT_SWEEP_INTERVAL`, 5s..5m),
+    `pg_try_advisory_xact_lock` (skip the tick rather than block), bounded batch of 100, one short
+    tx per expired attempt; claim/renew/complete also check authority deadlines inline;
+  - **no-op executor rejected**: `cmd/agent` never reports a fabricated success in this slice;
+    heartbeat reports `executor_available=false` and claim returns nothing to such agents — the
+    protocol is exercised end to end only by integration tests with a test executor;
+  - **claim ordering fix**: environment slot rows are pre-created in a separate, ID-sorted, already
+    committed statement before the claiming transaction, so the claim transaction only ever locks
+    (never inserts) slot rows with `SKIP LOCKED` in candidate priority order — this avoids a
+    deadlock where two claimers could lock a slot and a job in opposite order, and `SKIP LOCKED`
+    never waits;
+  - **renewal produces no event**: only the attempt row's sequence/deadlines update; recording one
+    event per 30s renewal over a long attempt was rejected as unbounded event growth for no audit
+    value (claim/completion/cancellation/expiry already produce events). ADR 0004 amended
+    (2026-09-17) to match;
+  - **`attempt_count` counts started attempts**: incremented once at claim; expiry of that same
+    attempt must not increment it again, or one attempt would consume two of the five permitted
+    tries;
+  - **only server revocation, not credential rotation, closes in-flight attempts** — rotation lets
+    the agent keep working under its new credential; revocation is what requires closing whatever a
+    server currently holds a lease on;
+  - **feature is opt-in**: `AUTODEPLOY_AGENT_ENABLED` (default off) gates mounting `/agent/v1/` and
+    starting the sweeper; the agent HTTP handler and lease repository are still constructed
+    unconditionally, and server admin web routes work regardless of the flag;
+  - **unauthenticated `/agent/v1/` rejections are not audited** — a security fix from Step 5 review:
+    auditing every bad/missing/expired credential or enrollment-token attempt would let an
+    unauthenticated caller drive unbounded audit-row write amplification;
+  - **rejected alternatives**: HMAC-signed requests (see credential decision above); mTLS (new PKI);
+    a no-op/fabricated-success executor (violates "never claim fabricated success"); `cmd/admin`
+    server subcommands (no live admin session available on a CLI); building a design system for the
+    server admin pages now (deferred to the operations UI milestone — plain HTML, same strict CSP,
+    matches existing pages' styling decision).
+- Progress: 8/18 top-level implementation-sequence items complete (44.4%, approximately 44%);
+  effort-weighted estimate 40-45%. Next outcome is host execution: invoke the existing checkout
+  adapter from the agent, Docker/BuildKit build, and container start/health-check — no release
+  activation or Traefik routing yet.
+- Known follow-ups (see docs/IMPLEMENTATION_STATUS.md for full list): agent-initiated credential
+  rotation protocol; server-side claim idempotency key (a lost claim response can otherwise orphan a
+  lease until expiry); register-resubmission orphan-server dedupe/cleanup; persisting the reconcile
+  outcome digest once a consumer exists (needs a migration); a revoked server's environments need
+  administrator `mark-reconciled` since the server itself can never reconcile them; no rate limiting
+  on `/agent/v1/` yet (low severity, credential still required).
 
 ## Resume Point
 
@@ -267,13 +343,14 @@
   SHA/tree/LFS/submodule checks remain enforced. `make check`, full race, Linux amd64/arm64 builds,
   tagged smoke compilation, and independent reviews pass. Still required: non-cached privileged
   smoke on provisioned Linux XFS `prjquota` + delegated cgroup v2; macOS cannot provide this proof.
-- Progress: 7/18 top-level implementation-sequence items complete (38.9%, approximately 39%);
-  effort-weighted estimate remains 35–40%. The isolated-checkout top-level milestone stays
-  unchecked: implementation/static validation is complete, but privileged operational smoke on
-  provisioned Linux XFS `prjquota` + delegated cgroup v2 remains mandatory before agent use.
+- The isolated-checkout top-level milestone stays unchecked: implementation/static validation is
+  complete, but privileged operational smoke on provisioned Linux XFS `prjquota` + delegated
+  cgroup v2 remains mandatory before agent use.
 - .tmp/ is untracked but not gitignored; manually exclude it and never use blanket git add.
 - Commit/push accumulated work only with approval.
-- Do not start agent, Docker, routing, or UI work before their dedicated approved slices.
+- Do not start Docker/BuildKit, routing, or UI work before their dedicated approved slices. The
+  agent transport/credentials/leases slice is now complete (see the dedicated section above); the
+  agent still has no executor, so it never invokes checkout, Docker, or routing.
 
 ## Persistence Invariants and Lessons
 

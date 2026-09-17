@@ -72,9 +72,10 @@ Every lease creates one immutable numbered attempt. Attempt states are:
 leased -> succeeded | failed | expired | cancelled
 ```
 
-Append-only job events record enqueue, claim, renew, retry scheduling, cancellation request and
+Append-only job events record enqueue, claim, retry scheduling, cancellation request and
 acknowledgement, expiry, stale rejection, completion, permanent failure, and dead-lettering.
-Attempt/event corrections are new events rather than updates or deletes.
+Attempt/event corrections are new events rather than updates or deletes. See "Amendments
+(2026-09-17)" below: renewal updates only the attempt row and does not append an event.
 
 ## Enqueue idempotency and atomicity
 
@@ -552,6 +553,39 @@ Costs:
   requires reconciliation.
 - Representative PostgreSQL 18 `EXPLAIN` plans use runnable and expiry indexes at backlog scale.
 - Queue rows, events, metrics, traces, and logs contain no secret material.
+
+## Amendments (2026-09-17)
+
+The server agent, credentials, and leases slice (migrations 000012-000013; `internal/store/postgres`
+`server_repository.go`, `agent_lease_repository.go`, `agent_lease_sweeper.go`) implemented this ADR
+with the following clarifications. They refine, and do not reverse, the accepted decision above.
+
+- **Renewal does not append an event.** A renewal updates only the attempt row's sequence and
+  deadlines. Recording one event per 30-second renewal would grow `agent_job_events` unboundedly
+  over a long-running attempt for no additional audit value; claim, completion, cancellation, and
+  expiry already produce durable events for the same attempt.
+- **`attempt_count` counts started attempts, not renewals or expiries of the same attempt.** It is
+  incremented once when an attempt is created (at claim). Expiring that attempt must not increment
+  it again, or a single attempt would consume two of the five permitted tries.
+- **Claim pre-creates environment slot rows separately, then locks without waiting.** Missing slot
+  rows are inserted in one committed, environment-ID-sorted statement before the claiming transaction
+  begins. Inserting them inside the claim transaction let two claimers hold uncommitted inserts for
+  the same new environments in opposite order and deadlock (`INSERT ... ON CONFLICT` cannot skip
+  locks). The transaction then locks slot and job rows with `FOR UPDATE SKIP LOCKED` in candidate
+  priority order rather than environment-ID order; because those locks never wait, no cycle forms.
+- **Reconciliation clears only through the owning server's matching attempt/fence, or an audited
+  administrator break-glass.** `POST /agent/v1/environments/reconcile` must come from the
+  server that owns the environment's pending reconciliation and must carry the closed attempt whose
+  fence matches. The session-authenticated web route `POST /environments/mark-reconciled` (mandatory audit reason) is the only
+  other path; it exists because a revoked server can never satisfy the owning-server predicate.
+- **Only server revocation closes in-flight attempts.** Attempts bind to the server, and every request
+  re-checks the currently active credential, so a planned credential change must not strand leased
+  work. Repository-level rotation therefore leaves attempts open; it is not exposed to administrators
+  yet because the agent generates its own credential (see ADR 0001 amendment). Revoking the server
+  closes every attempt it holds, advances fences, and requires reconciliation.
+- **The sweeper uses `pg_try_advisory_xact_lock`, not a blocking lock.** A sweeper instance that
+  cannot immediately acquire the advisory lock skips this tick rather than queuing behind another
+  replica, keeping each tick short and bounded.
 
 ## References
 
