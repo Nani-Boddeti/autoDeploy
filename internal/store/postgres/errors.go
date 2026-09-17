@@ -17,4 +17,8 @@ var (
 	// ErrWebhookUnauthorized reports an inactive or mismatched durable GitHub
 	// authority chain without exposing which authority record failed.
 	ErrWebhookUnauthorized = errors.New("webhook authorization denied")
+	// ErrServerAuthorizationDenied reports a denied server registration,
+	// enrollment, rotation, revocation, or authentication without exposing
+	// which specific check failed.
+	ErrServerAuthorizationDenied = errors.New("server authorization denied")
 )

@@ -1004,3 +1004,161 @@ and checkout-token delivery remain the next slice.
   canonical value; direct untrusted peers cannot assert HTTPS.
 - Queue overreach: implement immutable enqueue state/events only; claims, attempts, leases, slots,
   fencing, retries, and agent transport remain explicitly deferred.
+
+## Proposed Server Agent, Credentials, and Leases Slice
+
+Status: **approved 2026-09-16** (bearer+digest auth; break-glass included; opt-in routes). Constrained by ADR 0001, 0003, 0004.
+No Docker/BuildKit, Traefik, checkout invocation, or release activation in this slice.
+
+### Understanding
+- Add durable server identity, scoped agent credentials, heartbeat, and the full lease lifecycle
+  (claim, renew, complete, cancel, expire, reconcile) over existing `agent_jobs` from 000010.
+- Agents talk only to the control plane over authenticated outbound HTTPS; never PostgreSQL or App keys.
+- Deployment aggregate moves only `queued -> assigned` (first claim), `-> cancelled`, `-> failed`.
+  Success does not advance the deployment; the execution slice owns `fetching` onward.
+
+### Decisions (recommended; owner-reviewable)
+1. **Transport**: HTTPS/1.1 JSON polling under `/agent/v1/` on the existing public origin, mounted
+   like the webhook route (outside session/CSRF, same trusted-HTTPS provenance). No gRPC/streaming.
+   Rejected: gRPC (second listener, HTTP/2 via Traefik, proto tooling); mTLS (new PKI subsystem).
+2. **Credential**: opaque bearer `srv.v1.<32 random bytes base64url>`; store SHA-256 digest + version
+   only. Rejected in draft review: HMAC signing keyed by the raw credential is unverifiable when only
+   the digest is stored, and keying by the digest makes a DB read equal impersonation. Replay safety
+   comes from the protocol itself: fence + attempt + monotonic renewal sequence + completion
+   operation-id/digest idempotency. No nonce table.
+3. **Credential binding**: attempts bind to `server_id`; every request requires the *currently active*
+   credential. Revocation stops all mutation immediately; rotation (revoke+issue in one tx) does not
+   strand leased work. Server revocation stops everything for that server.
+4. **Enrollment**: `cmd/admin server register` creates the server (system-generated opaque ID) and
+   prints a single-use enrollment token (`enr.` prefix, 15 min TTL) once. `cmd/agent enroll`
+   exchanges it for the durable credential, written by the agent to a 0600 file. Distinct prefixes
+   prevent cross-use. Shared installation secrets rejected.
+5. **Agent-local fence state**: per-environment file (write temp, fsync, rename):
+   highest accepted fence, renewal sequence, reconciliation flag. Missing/corrupt => fail closed,
+   claim nothing, require reconcile. Never reset locally.
+6. **Reconciliation (ADR 0004 §fencing)**: expiry/cancel-deadline of a leased attempt increments the
+   environment fence and sets `reconciliation_required`. Claim refuses any environment that is
+   occupied or requires reconciliation. Only `POST /agent/v1/environments/{id}/reconcile` from the
+   owning server, carrying the closed attempt/fence and sanitized outcome, clears it (idempotent).
+   Owner break-glass `cmd/admin environment mark-reconciled` with mandatory audit reason: see owner
+   decisions.
+7. **Sweeper**: control-plane goroutine, 15 s tick, `pg_try_advisory_xact_lock`, bounded batch of 100,
+   one short tx per expired attempt. Claim/renew/complete also check authority deadlines inline.
+8. **Retry**: exactly ADR 0004 (full jitter `uniform(0, min(5m, 5s*2^(n-1)))`, 5 attempts, fixed
+   non-retryable classes). Closed failure-class enum; unknown classes are non-retryable.
+9. **Events**: widen `agent_job_events` vocabulary (claimed, cancel_requested, cancelled, expired,
+   retry_scheduled, succeeded, failed, dead, reconciled). Renewals update the attempt row only; no
+   per-renewal event. New append-only `server_audit_events` for register/enroll/rotate/revoke/
+   heartbeat-rejection/break-glass. No raw credential, digest, or token in any event or log.
+10. **No-op executor rejected**: `cmd/agent` in this slice never reports a fabricated success.
+    Heartbeat reports `executor_available=false`; claim returns nothing to such agents. Protocol
+    end-to-end is exercised by integration tests with a test executor only.
+11. **Existing rows**: `agent_jobs.server_id` has no FK (bindings predate `servers`). Jobs for unknown
+    servers remain queued and are simply unclaimable; attempts FK to `servers`.
+
+### Steps (one subagent each; peer review before next)
+**Step 1 — server domain + migration 000012**
+- `internal/server`: `Server`, `CredentialToken`/`EnrollmentToken` parse/digest (mirror
+  `auth.SessionToken`), validation.
+- 000012: `servers` (immutable id/owner/created_at; status active|revoked; `last_heartbeat_at`),
+  `server_credentials` (version, digest 32 bytes, one-active partial unique index, only
+  active->revoked update), `server_enrollment_tokens` (digest, issued_at, expires_at, consumed_at,
+  single use), `server_audit_events` (append-only triggers).
+- Postgres repository: register, issue enrollment, enroll (consume + credential v1 atomically),
+  rotate, revoke, authenticate (FOR SHARE server + active credential, constant-time digest compare).
+- Tests: token cross-prefix confusion, expired/consumed/replayed enrollment, concurrent double enroll
+  (one winner), rotation atomicity, revoked server/credential rejection, audit rollback.
+
+Step 1 result (2026-09-17): done. Admin methods take `auth.Principal`, re-lock live admin session/user
+(parity with GitHub repository) and scope server locks by owner; Enroll/Authenticate compare against a
+dummy digest on not-found paths (residual audit round-trip timing accepted). Evidence: make check, vet
+(incl. integration tag), go test -race, three fresh PG18 full integration runs normal and -race,
+concurrency/cross-owner tests -race x20; correctness review PASS WITH NOTES (fixed), security review
+FAIL (owner scope) -> fixed -> re-review PASS.
+Step 6 open question: server administration needs a live admin session, so `cmd/admin server ...` cannot
+call these methods directly; decide web-admin routes vs a CLI operator path before Step 6.
+
+**Step 2 — lease schema migration 000013**
+- Replace `agent_jobs_no_update` with a transition-validating trigger; widen state CHECK to
+  queued|leased|retry_wait|succeeded|failed|cancelled|dead; add attempt_count, cancel_requested_at.
+- `environment_slots` (fence BIGINT, never-decrease trigger, current attempt, reconciliation_required).
+- `agent_job_attempts` (job, attempt_number, server, environment, fence, state, renewal_sequence,
+  lease/authority deadlines, result operation id + digest, closed_at; legal transitions only).
+- `frozen_secret_versions` (attempt, secret version; append-only; empty until execution slice).
+- Widen `agent_job_events`; claimable and authority-expiry partial indexes per ADR 0004.
+- Tests: existing queued/enqueued rows remain valid; every illegal SQL transition rejected;
+  fence decrease rejected; one occupant per slot.
+
+**Step 3 — claim and renew repository**
+- Lock order per ADR 0004: server/credential (SHARE) -> environment slot (UPDATE) -> job
+  (UPDATE SKIP LOCKED) -> attempt. Revalidate after locks; never act on discovery snapshot.
+- Claim: slot must be free and not reconciling; increment fence; attempt with 90 s deadlines;
+  job -> leased; deployment queued->assigned on attempt 1 only; event.
+- Renew: same sequence => return stored deadlines; sequence+1 => extend to min(now+90s, cancel cap);
+  otherwise reject. Returns cancel_requested.
+
+**Step 4 — complete, cancel, expire, reconcile repository + sweeper**
+- Complete: first call closes attempt, frees slot if still owned, job -> succeeded|retry_wait|failed|
+  dead; identical replay returns stored result; mismatched digest => integrity error, no mutation.
+- Cancel: queued/retry_wait terminal immediately; leased sets cancel_requested and caps deadlines at
+  now+60 s; ack closes as cancelled. Rejected once deployment is `activating` (domain rule).
+- Expire: close attempt expired/cancelled, fence++, reconciliation_required, schedule retry/dead.
+- Reconcile: owning server + matching closed attempt/fence clears flag; idempotent.
+- Sweeper with advisory lock and bounded batch; graceful shutdown.
+
+**Step 5 — HTTP transport**
+- `internal/agent/http`: enroll, heartbeat, claim, renew, complete, cancel-ack, reconcile. Strict
+  JSON (`DisallowUnknownFields`), bounded bodies, fixed-schema capability struct (<= 1 KiB), one
+  generic auth failure response, authorization re-derived from locked rows inside each tx.
+
+**Step 6 — CLI, wiring, agent client**
+- `cmd/admin`: server register/rotate/revoke, environment mark-reconciled (if approved).
+- `cmd/controlplane`: `AUTODEPLOY_AGENT_ENABLED` opt-in, mount routes, start sweeper.
+- `cmd/agent`: enroll, credential file load, fence-state files, heartbeat, renew loop; claims only
+  when an executor is registered (none in production this slice).
+- Docs: IMPLEMENTATION_STATUS, ADR 0004 amendment only if needed, MEMORY.
+
+### Must-prove tests (live PostgreSQL 18, normal and -race, three fresh full runs)
+1. Simultaneous claims: one winner per job and per environment slot.
+2. Agent replay: duplicate renew/complete idempotent; mismatched digest rejected without mutation.
+3. Revoked credential or server after claim: renew/complete/reconcile rejected.
+4. Clock uncertainty: deadlines only from PostgreSQL time; boundary accept/reject deterministic.
+5. Lost completion response: identical retry through HTTP returns original result.
+6. Expired lease with late success: stale fence completion rejected; slot stays reconciling.
+7. Cancellation vs activation: cancel after `activating` rejected; cancel during lease caps deadline.
+8. Lost agent fence state: agent fails closed; lower fence rejected client-side.
+9. No cross-server/environment mutation: wrong server or substituted IDs rejected at auth lock step.
+10. Renewal sequence gaps/out-of-order handled exactly as specified.
+11. Concurrent sweepers: one processes each attempt.
+12. Reconciliation gate: no claim on a reconciling environment until owning server reconciles.
+13. No credential/token/digest in logs, events, errors, or job payloads.
+
+### Owner decisions (defaults assumed unless changed)
+- Break-glass admin `mark-reconciled` command: **include** (audited, reason required).
+- Agent routes: **opt-in** `AUTODEPLOY_AGENT_ENABLED`, default off.
+- Heartbeat 20 s; capability fields: agent version, OS/arch, CPU count, memory, disk free,
+  Docker/BuildKit versions (reported as absent until execution slice).
+
+### Risks and mitigations
+- New public trust boundary: isolated route, generic errors, locked-row authorization, security review.
+- Relaxing 000010 immutability triggers: replaced by transition-validating triggers + SQL tests.
+- Environment wedged by reconciliation: agent reconcile path + audited break-glass.
+- Scope size: six sequential steps, each reviewed and verified before the next.
+
+### Rollback
+- Forward-only migrations; defects fixed by new migrations. Every repository method commits once
+  with deferred rollback; injected-failure tests prove no partial writes. Feature off by default.
+
+### Definition of done
+- Per docs/IMPLEMENTATION_STATUS.md next-slice definition; all must-prove tests pass fresh three
+  times normal and -race; make check, go test -race ./..., Linux cross-build, git diff --check,
+  independent QA, zero-context security review; docs updated to 8/18.
+
+### Resume notes (2026-09-17)
+- Committed: b015ea5 webhook slice, 3766be5 migration 000011 clone URL CHECK fix, 3b92c22 secret race test fix.
+- Step 1 finished by subagent (internal/server, migration 000012, server_repository.go + 11 integration
+  tests, ErrServerAuthorizationDenied); uncommitted; subagent reports all checks green, NOT yet independently
+  verified. Tomorrow: inspect `git status`; rerun gofmt, vet
+  (incl. -tags=integration), `go test -race ./...`, full fresh PG18 integration normal + -race; then
+  independent review before Step 2.
+- Integration DB: throwaway `postgres:18` container via Docker Desktop, AUTODEPLOY_TEST_DATABASE_URL.
