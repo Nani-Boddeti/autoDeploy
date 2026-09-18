@@ -1243,3 +1243,259 @@ no code changed.
   (incl. -tags=integration), `go test -race ./...`, full fresh PG18 integration normal + -race; then
   independent review before Step 2.
 - Integration DB: throwaway `postgres:18` container via Docker Desktop, AUTODEPLOY_TEST_DATABASE_URL.
+
+## Approved Host Execution Slice 9a (control plane) and 9b (agent) — approved 2026-09-18
+
+### Context
+
+Progress is 8/18 outcomes. The queue, leases, fencing, agent protocol, and host agent client are
+done, but **no lease has ever done real work**: `cmd/agent` registers no `Executor`, heartbeats
+`executor_available=false`, and the control plane refuses to hand leases to such an agent. The next
+approved outcome is host execution — checkout the exact commit, build the image, start the
+container, health-gate it — with no release activation or Traefik routing.
+
+Two blockers make this impossible as a single agent-side slice, both confirmed in code:
+
+1. **No execution configuration exists anywhere.** There are no `projects`/`environments` tables;
+   `project_id`/`environment_id` are free TEXT. Nothing records a container port, scheme, release
+   strategy, resource limits, restart policy, or env-var/secret bindings. `frozen_secret_versions`
+   exists but `freezeSecretVersions(ctx, tx, attemptID, nil)`
+   (`internal/store/postgres/agent_lease_repository.go:421`) is called with `nil` — it has never
+   written a row. ADR 0003 requires the exact secret-version set to be frozen *in the claim
+   transaction*, so this is control-plane work, not agent work.
+2. **The agent cannot mint a checkout credential.** `gitcheckout.Runner.Checkout` takes a concrete
+   `*githubapp.CheckoutLease`, constructible only via `CheckoutService.Activate`, which needs the App
+   signer and the reservation store — both forbidden on the agent by ADR 0001.
+
+So the work splits: **9a** makes a claimed lease carry everything execution needs (frozen config,
+frozen secret versions, materialization, progress reporting, a checkout credential seam); **9b**
+implements the host side against that contract. Outcome of 9b: a real container from a real commit,
+health-gated, with the deployment resting at `health_checking` — `activating -> healthy` belongs to
+the activation slice.
+
+### Owner decisions already taken
+
+- Split into 9a then 9b; minimal release model introduced now (`candidate|ready|failed|removing|removed` only).
+- Docker via **Engine API over the unix socket using stdlib `net/http` + `encoding/json`**, builds via
+  **`docker buildx build --secret id=…,env=…`**. No moby/buildkit Go SDK — go.mod keeps its 4 lean
+  direct dependencies, matching how `checkoutquota`/`checkoutcontain` already speak raw protocols.
+- Checkout seam: **narrow interface in `gitcheckout`**, not an exported agent-side `CheckoutLease`
+  constructor. `*githubapp.CheckoutLease` already satisfies the method set, so the control plane is unchanged.
+- The pending privileged Linux checkout smoke is assumed correct; it stays a gate before the first
+  real Hetzner deployment, not a blocker on writing this code.
+
+### Slice 9a — control plane: configuration, freeze, materialization
+
+#### Step 1 — migration 000014 (schema only, no Go)
+
+Style follows 000012/000013: explicit CHECKs, one purpose-specific trigger function per table, no
+shared generic trigger.
+
+- `environment_runtime_configs` — PK `environment_id` (no FK; matches the `agent_jobs.server_id`
+  precedent). `container_port` 1..65535, `container_scheme` http|https, `release_strategy`
+  blue_green|stop_then_start, `drain_seconds` 1..300, `cpu_millis`, `memory_bytes`,
+  `restart_policy` unless-stopped|on-failure, `health_policy_revision` (pin only — V1 hard-codes
+  ADR 0005's default gate), `revision` for CAS, `updated_at`. Mutable desired state, CAS'd like
+  `secret_heads.revision`; never deleted.
+- `environment_runtime_bindings` — `(environment_id, variable_name)`, `binding_kind`
+  secret|literal_nonsecret, `secret_head_id` REFERENCES `secret_heads` ON DELETE RESTRICT (NULL iff
+  literal), `delivery_scope` build|runtime, CHECK that kind and head presence agree.
+- Widen `frozen_secret_versions` with immutable `variable_name` and `delivery_scope`; PK becomes
+  `(attempt_id, secret_version_id, variable_name)`. Existing no-update/no-delete triggers retained.
+- `agent_job_attempt_execution` — PK `attempt_id` REFERENCES `agent_job_attempts`. Frozen copies of
+  port, scheme, strategy, health_policy_revision, cpu/memory, restart policy, plus
+  `environment_runtime_config_revision` so an operator can prove what an attempt actually ran with.
+  Insert-once, no-update trigger.
+- `releases` — immutable identity, `UNIQUE(deployment_id)` (one release per deployment),
+  `environment_id`, `image_digest`, `config_digest`, `commit_sha`, frozen `strategy`, `state`.
+  Trigger allows only `candidate->ready|failed|removing`, `ready->failed|removing`,
+  `removing->removed`. **No `active`/`retained` edges** — the activation slice adds them.
+- `release_runtime_instances` — `release_id`, `job_id`, `attempt_id`, `fence`, `container_name`,
+  `observed_state` created|running|stopped|exited|missing. Immutable except `observed_state`, which
+  only a write carrying the attempt's own fence may change.
+- `release_operations` — append-only `prepare|activate|rollback|retire|cleanup` (only `prepare` is
+  reachable in 9a/9b), with `job_id`, `attempt_id`, `fence`, `digest`, `state`, sanitized
+  `outcome_summary`, `closed_at`. Update only `state`/`closed_at`; never delete.
+
+Must prove (live PG 18): every immutability and CAS trigger positively and negatively — updating a
+frozen column, skipping a `releases` state edge, deleting an append-only row, a stale-fence
+`observed_state` write. Must not touch: any Go file.
+
+Step 1 result (2026-09-18): done, uncommitted at time of writing then committed as its own atomic
+commit. `migrations/000014_create_release_execution.sql` + `migrations/000014_release_execution_test.go`.
+Corrections made to the plan's spec during implementation, all proven by tests:
+- `releases.image_digest` is **nullable and write-once**, not NOT NULL: a release row must exist
+  before the build runs (the prepare operation references its id) and the digest only exists after
+  BuildKit finishes. `candidate -> ready` is refused while it is NULL; once set it can never change
+  or be cleared.
+- `release_operations.outcome_summary` is written **on the close transition**, not at insert. An
+  outcome is not known when the operation opens.
+- The release transition trigger permits same-state updates (that is how the digest is set) but
+  freezes a terminal release (`failed`/`removed`) against any update at all.
+- `agent_job_attempt_execution` also freezes `drain_seconds` (ADR 0005 line 335: the drain duration is
+  environment-configurable and frozen into the operation). Review caught this omission.
+- BEFORE INSERT triggers on `release_runtime_instances` and `release_operations` validate `fence` and
+  `job_id` against the referenced `agent_job_attempts` row. Without them a wrong fence is accepted and
+  only surfaces later as a fence-gated UPDATE silently matching zero rows. No row lock is taken: 000013's
+  `validate_agent_job_attempt_update` makes `fence`/`job_id` immutable for the row's lifetime, so an
+  unlocked read cannot go stale, and locking would add an edge to the ADR 0004 lock hierarchy for
+  nothing.
+- `environment_runtime_bindings` gets a scope trigger: a binding's `secret_head_id` must belong to the
+  same `environment_id`, must agree on `delivery_scope`, and must not be a `provider`-purpose head.
+  ADR 0003 names cross-environment materialization as an explicit threat. This is bind-time defense in
+  depth and does **not** relieve Step 3a from re-checking scope immediately before decryption.
+Collateral fixes outside migrations (required by the additive schema): two `TRUNCATE` fixture lists
+(`deployment_repository_test.go`, `webhook_job_repository_test.go`) must name the new referencing
+tables, and `agent_lease_schema_test.go`'s `frozen_secret_versions` insert must supply the new columns.
+Evidence: `make check`, `go vet -tags=integration ./...`, `go test -race ./...`, three fresh PG18
+integration runs normal **and** three fresh `-race` (store/postgres, agent/http, migrations, `-p 1`),
+Linux amd64+arm64 builds, `git diff --check`. Independent zero-context review: PASS with three medium
+findings, all three fixed and re-verified above.
+Follow-ups recorded, not fixed here:
+- `TRUNCATE` bypasses `BEFORE DELETE` triggers, so every "append-only"/"retained" table in 000012-000014
+  is only as append-only as the app role's grants. No migration currently withholds `TRUNCATE` from the
+  application role; it should.
+- The two new mutable config tables are absent from the fixture `TRUNCATE` lists. Harmless today (tests
+  use random-suffixed environment ids) but it will leak across tests once a fixed-name row appears.
+
+#### Step 2 — claim-time freeze
+
+Inside `tryClaim`, after the attempt row exists and before the existing `freezeSecretVersions` call:
+
+- `SELECT … FROM environment_runtime_configs WHERE environment_id=$1 FOR SHARE`. **SHARE**, because
+  freeze only reads; an administrator config edit must neither block nor be blocked by a claim.
+  Lock-order position: **step 1b, after authorization rows, before the environment slot** — so a
+  claim never holds the slot's UPDATE lock while waiting on a config lock. Administrator config
+  updates must lock in the same order.
+- **Missing config, missing binding target, or a non-active secret version fails only that
+  candidate** (`ok=false`, like an occupied slot), never the whole `Claim` call. One misconfigured
+  environment cannot stop claiming for every other environment on the server. No default fallback.
+- Resolve bindings to exact `secret_versions.id` via `secret_heads.current_version_id`, then write
+  `agent_job_attempt_execution` and real `frozen_secret_versions` rows in the same transaction.
+- **Retry rule (ADR 0003):** for attempt N>1 of the same job, copy attempt N−1's frozen rows
+  verbatim — both the secret versions and the execution config — rather than re-resolving against
+  current heads. Re-resolving would silently adopt a version rotated mid-job, exactly what ADR 0003
+  forbids. Freezing config forward too keeps one attempt = one provable snapshot.
+- `queue.ClaimedLease` and the wire `leaseView`/`Lease` gain port, scheme, strategy,
+  health-policy revision, cpu/memory, restart policy, and `SecretBindings` of
+  `{VariableName, DeliveryScope, SecretVersionID}` — **version references only, never values**.
+
+Must prove (live PG 18 + `-race`): claim racing a config update in both orders; attempt 2 freezing
+the *same* versions after a rotation between attempts; attempt 2 not observing a config change;
+missing config / missing active version failing one candidate while another still claims.
+
+#### Step 3a — `POST /agent/v1/leases/materialize-secrets`
+
+Request `{attempt_id, fence}` — no variable list; the server decides what the attempt froze, so
+"the deployment requires each requested value" stays a server-side check. Re-locks in `Complete`'s
+order (credential SHARE -> slot UPDATE -> job -> attempt), confirms `leased`, fence match, unexpired
+authority, then rechecks each frozen version is still eligible. The transaction returns eligible
+version IDs; **KEK decryption happens after commit**, so no row locks are held across crypto.
+Stale fence or expired authority returns the existing generic 401/stale shape — no new error class.
+Must prove: version revoked between claim and materialize is refused; expired authority refused;
+stale fence refused; a log-capture test asserting no plaintext in logs or audit rows.
+
+#### Step 3b — `POST /agent/v1/leases/progress`
+
+Request `{attempt_id, fence, phase}` with phase in `fetching|building|starting|health_checking` —
+all already legal `deployment.Status` values. Reuses `transitionDeployment`.
+
+**Correction to note:** `canTransition(X, X)` is `false` (`internal/deployment/deployment.go:283`),
+so a repeated or backward phase is *rejected*, not absorbed. The handler must read the current status
+inside the transaction and return success without transitioning when the deployment is already at or
+past the reported phase. Duplicate progress after a network retry must never fail a build.
+
+**No `agent_job_events` row per progress call** — same reasoning ADR 0004 gives for renewals; a long
+build would otherwise write unbounded events. Phase history lives in the deployment's own
+append-only event log. Must prove: progress racing `Complete` never moves a terminal deployment
+backward; duplicate/backward phase is a no-op; row-count assertion that `agent_job_events` gains
+nothing.
+
+#### Step 3c — checkout credential seam
+
+- Extract the method set `Checkout` actually uses (`Binding`, `SetCancel`, `Start`,
+  `NewAskPassBroker`, `RedactingWriter`, `Close`) as an interface in `gitcheckout`.
+  `*githubapp.CheckoutLease` satisfies it unchanged — add a compile-time assertion.
+- Agent-side implementation fed by `POST /agent/v1/leases/checkout-token`, which calls
+  `CheckoutService.Activate` server-side and returns `{binding, token, expires_at}`. This is the one
+  point where a token crosses the boundary, which ADR 0003 permits over the authenticated channel.
+- `Start`/`Close` delegate to thin RPCs that call the existing unmodified `CheckoutService` paths, so
+  **the agent never calls GitHub's revoke API and never needs the App key**.
+- **Blocker to fix or accept explicitly:** `HTTPProvider.RevokeToken`
+  (`internal/githubapp/http.go:218`) calls `p.signer.Token()` via `doJSON` even though revoke
+  authenticates with the installation token. Harmless today (the control plane has the signer) but it
+  is why revoke cannot move to the agent. Keeping revoke server-side sidesteps it; the latent
+  coupling should be recorded as a follow-up rather than silently routed around.
+
+Must prove: control-plane path compiles and behaves unchanged; agent-side type drives the same
+`Checkout` code path against a fake transport; `CheckoutLease`'s one-use/invalidate semantics intact.
+
+#### Step 3d — runtime configuration admin pages
+
+Session+CSRF-protected, owner-scoped pages in `internal/web`, following the existing
+`/servers` pages: plain HTML, CSP unchanged, no design system (deferred to the operations UI
+milestone). Routes for viewing and updating an environment's runtime config (CAS on `revision`, so a
+concurrent edit is rejected rather than silently overwriting) and for adding/removing variable
+bindings. Selecting a secret head shows only its identity and version number — never a value.
+Every mutation is audited with the owner principal and the resulting revision.
+Must prove: CSRF/origin rules and owner scoping match the server pages; a stale-revision update is
+rejected; invalid port/scheme/strategy/limit values are refused before any write; no secret value
+reaches the response, logs, or audit rows.
+
+### Slice 9b — agent host execution
+
+- **Step 4** — `internal/runtime/docker`: Engine API client over the unix socket (stdlib only),
+  typed label builder (one function per resource kind — the single place ADR 0005's
+  cleanup-by-exact-label invariant is enforced), `//go:build linux` implementation plus a `!linux`
+  stub whose constructors return an unsupported-platform error, mirroring `checkoutcontain`. No
+  executor wiring yet. Prove: `go build ./...` and `go vet` on darwin and linux.
+- **Step 5** — build: `docker buildx build` with `--secret id=<opaque>,env=<var>` so values travel
+  the BuildKit session, never argv, ARG, context files, or layers. Missing BuildKit fails closed.
+  Build output streams through `crypto.RedactingWriter` before it leaves the agent. Prove on Linux
+  (skipped elsewhere): a fixture image's history, layers, and provenance contain no secret;
+  BuildKit-unavailable fails closed; redaction failure suppresses output.
+- **Step 6** — run and gate: create/start by image digest, no published ports, joined only to the
+  stable environment network (network creation is environment provisioning, not per-deployment),
+  resource limits, restart policy, immutable release/runtime-instance/attempt/fence labels. Health
+  gate is ADR 0005's default shape hard-coded: exact host/path/port, 2xx, redirects off, 3
+  consecutive successes, 2s interval and timeout, 60s deadline, container must stay running, bounded
+  body discarded. Retry looks up prior-attempt resources by exact label match before creating
+  anything. Then register the `Executor` in `cmd/agent` and flip `executor_available=true`.
+  `FailureClass` mapping: Docker/network blips -> `transient`; bad Dockerfile or failed health gate
+  with the container still running -> `permanent_configuration`; inconsistent local label/fence state
+  -> `corrupt_state`. No new enum values.
+
+
+### Verification
+
+Per step, the bar the completed slices already met: `make check`, `go vet` including
+`-tags=integration`, `go test -race ./...`, and three fresh PostgreSQL 18 integration runs (normal
+and `-race`) via the CI `AUTODEPLOY_TEST_DATABASE_URL` contract with `-p 1` across
+`internal/store/postgres`, `internal/agent/http`, `migrations`; concurrency-sensitive tests repeated
+`-race -count=20`. Linux amd64/arm64 cross-builds where tagged code changes. Independent
+zero-context correctness and security review after every step, findings fixed before the next step.
+Finish with `git diff --check` and a status/doc update to 9/18.
+
+End-to-end proof for 9b on the Hetzner host (after the privileged checkout smoke): push to a
+configured repo, watch the deployment walk `assigned -> fetching -> building -> starting ->
+health_checking`, confirm the container runs by digest with correct labels and no published ports,
+then confirm a forced failure leaves no resources labeled as a successful attempt.
+
+### Risks and rollback
+
+- Nothing here has run live; every prior step's review found real security or concurrency bugs, so
+  per-step independent review is not optional.
+- The attempt-1-resolves / attempt-N-copies split must be tested explicitly or it will silently
+  degrade to re-resolving, reopening the ADR 0003 violation it exists to prevent.
+- Engine API over raw HTTP means we own the small slice of JSON we use, and buildx must be installed
+  on the host — add a startup capability probe so a missing buildx fails closed at enrollment rather
+  than mid-deployment.
+- 000014 is additive; rollback is a new forward migration dropping the added tables/columns, safe
+  because nothing writes them until Step 2. Steps 2–6 are code reverts. 9b never touches routing or
+  activation, so no currently-healthy release can be disturbed by construction.
+
+### Step order
+
+1 (migration) -> 2 (claim freeze) -> 3a (materialize) -> 3b (progress) -> 3c (checkout seam) ->
+3d (admin pages) -> 4 (docker skeleton) -> 5 (build) -> 6 (run + gate + executor wiring).
+One subagent per step, independent review between steps, atomic commit per step.

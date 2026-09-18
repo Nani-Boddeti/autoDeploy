@@ -828,7 +828,7 @@ func TestFrozenSecretVersionsAppendOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := f.pool.Exec(ctx, `INSERT INTO frozen_secret_versions(attempt_id, secret_version_id) VALUES ($1,'secret-version-1')`, attemptID); err != nil {
+	if _, err := f.pool.Exec(ctx, `INSERT INTO frozen_secret_versions(attempt_id, secret_version_id, variable_name, delivery_scope) VALUES ($1,'secret-version-1','BUILD_TOKEN','build')`, attemptID); err != nil {
 		t.Fatal(err)
 	}
 
