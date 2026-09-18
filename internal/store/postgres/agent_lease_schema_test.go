@@ -41,7 +41,24 @@ func newLeaseFixture(t *testing.T, seed byte) leaseFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return leaseFixture{pool: githubRepo.pool, ownerID: principal.OwnerID, principal: principal, jobID: result.JobID, serverID: "server", envID: "environment"}
+	f := leaseFixture{pool: githubRepo.pool, ownerID: principal.OwnerID, principal: principal, jobID: result.JobID, serverID: "server", envID: "environment"}
+	f.insertRuntimeConfig(t, f.envID)
+	return f
+}
+
+// insertRuntimeConfig ensures environmentID has an environment_runtime_configs
+// row, with fixed, arbitrary-but-valid defaults (migration 000014's
+// claim-time freeze fails a candidate whose environment has none). Callers
+// that need a specific config value, or that want to exercise a
+// concurrent administrator edit, use a dedicated environment id rather than
+// mutating this shared default -- resetWebhookJobs truncates this table, but
+// only at the *start* of the next newLeaseFixture/insertJobAt call, not
+// between assertions within one test.
+func (f leaseFixture) insertRuntimeConfig(t *testing.T, environmentID string) {
+	t.Helper()
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision) VALUES ($1,8080,'http','stop_then_start',30,500,268435456,'unless-stopped',1) ON CONFLICT DO NOTHING`, environmentID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // insertSlot creates an environment_slots row for f.envID if one is not

@@ -168,15 +168,21 @@ type agentLeaseCandidate struct {
 
 // Claim atomically leases up to limit runnable jobs scoped to serverID,
 // following the ADR 0004 atomic claim boundary and global lock hierarchy:
-// authorization (SHARE) -> environment slot (UPDATE) -> job
-// (UPDATE ... SKIP LOCKED) -> attempt (INSERT) -> deployment head (UPDATE,
-// first attempt only) -> frozen secret versions (INSERT, empty in this
-// slice) -> events (INSERT). V1 claims at most one job per environment;
-// limit caps the total number of leases returned. Candidate discovery is a
-// non-locking ordered read outside any transaction; every predicate is
-// rechecked after the relevant row is locked inside the claim transaction,
-// and a candidate that no longer qualifies is skipped rather than failing
-// the whole call.
+// authorization (SHARE) -> environment runtime config (SHARE, new position
+// "1b" added by migration 000014's claim-time freeze -- see
+// lockEnvironmentRuntimeConfig's doc comment) -> environment slot (UPDATE)
+// -> job (UPDATE ... SKIP LOCKED) -> attempt (INSERT) -> deployment head
+// (UPDATE, first attempt only) -> frozen execution config and secret
+// versions (INSERT: resolved fresh on attempt 1, copied forward verbatim on
+// a retry per ADR 0003) -> release (INSERT on attempt 1, reused and
+// digest-verified on a retry) -> events (INSERT). V1 claims at most one job
+// per environment; limit caps the total number of leases returned.
+// Candidate discovery is a non-locking ordered read outside any
+// transaction; every predicate is rechecked after the relevant row is
+// locked inside the claim transaction, and a candidate that no longer
+// qualifies -- including one whose environment has no runtime config, or
+// whose bindings include a secret head with no active version -- is
+// skipped rather than failing the whole call.
 func (r *AgentLeaseRepository) Claim(ctx context.Context, serverID string, presentedDigest [32]byte, limit int) ([]queue.ClaimedLease, error) {
 	if limit <= 0 {
 		// No clamp to 1: a non-positive limit asks for nothing, and asking
@@ -314,6 +320,23 @@ func sortedDistinctEnvironments(candidates []agentLeaseCandidate) []string {
 // Claim moves on to its next candidate rather than failing the whole call. A
 // non-nil error is reserved for a genuine database failure.
 func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID string, jobID int64, environmentID string, now, leaseExpiresAt time.Time) (queue.ClaimedLease, bool, error) {
+	// Migration 000014 claim-time freeze, ADR 0004 lock hierarchy position
+	// "1b" (see lockEnvironmentRuntimeConfig's doc comment for the full
+	// deadlock argument): SHARE-lock this environment's runtime config
+	// before anything else tryClaim does, including the slot's UPDATE lock
+	// immediately below. A missing config row fails only this candidate,
+	// exactly like an occupied slot -- never the whole Claim call, never a
+	// default. The row's values are used below only if this turns out to be
+	// attempt 1; a retry never reads them (see the copy-forward branch
+	// after the attempt is inserted).
+	runtimeConfig, runtimeConfigFound, err := lockEnvironmentRuntimeConfig(ctx, tx, environmentID)
+	if err != nil {
+		return queue.ClaimedLease{}, false, err
+	}
+	if !runtimeConfigFound {
+		return queue.ClaimedLease{}, false, nil
+	}
+
 	// The slot row itself is never inserted here -- Claim pre-creates every
 	// discovered candidate's environment_slots row, in sorted order, as its
 	// own committed statement before this transaction even begins (see the
@@ -329,7 +352,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	var slotFence int64
 	var currentAttemptID *int64
 	var reconciling bool
-	err := tx.QueryRow(ctx, `SELECT fence, current_attempt_id, reconciliation_required FROM environment_slots WHERE environment_id=$1 FOR UPDATE SKIP LOCKED`, environmentID).Scan(&slotFence, &currentAttemptID, &reconciling)
+	err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id, reconciliation_required FROM environment_slots WHERE environment_id=$1 FOR UPDATE SKIP LOCKED`, environmentID).Scan(&slotFence, &currentAttemptID, &reconciling)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return queue.ClaimedLease{}, false, nil
 	}
@@ -342,10 +365,11 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 
 	var ownerID, projectID, deploymentID, ref, commitSHA, jobState, jobEnvironmentID, jobServerID string
 	var repositoryID int64
+	var priorAttemptCount int
 	var jobAvailableAt time.Time
 	var cancelRequestedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT owner_id, project_id, environment_id, server_id, deployment_id, repository_id, full_ref, commit_sha, state, available_at, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE SKIP LOCKED`, jobID).
-		Scan(&ownerID, &projectID, &jobEnvironmentID, &jobServerID, &deploymentID, &repositoryID, &ref, &commitSHA, &jobState, &jobAvailableAt, &cancelRequestedAt)
+	err = tx.QueryRow(ctx, `SELECT owner_id, project_id, environment_id, server_id, deployment_id, repository_id, full_ref, commit_sha, state, available_at, cancel_requested_at, attempt_count FROM agent_jobs WHERE id=$1 FOR UPDATE SKIP LOCKED`, jobID).
+		Scan(&ownerID, &projectID, &jobEnvironmentID, &jobServerID, &deploymentID, &repositoryID, &ref, &commitSHA, &jobState, &jobAvailableAt, &cancelRequestedAt, &priorAttemptCount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return queue.ClaimedLease{}, false, nil
 	}
@@ -362,6 +386,48 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	}
 	if (jobState != "queued" && jobState != "retry_wait") || jobAvailableAt.After(now) || cancelRequestedAt != nil {
 		return queue.ClaimedLease{}, false, nil
+	}
+
+	// plannedAttemptNumber is known now, with the job row locked (so nobody
+	// else can advance attempt_count before this transaction commits or
+	// rolls back), strictly before any mutation below -- fence advance, job
+	// lease, or attempt insert. This is what lets the freeze-viability
+	// check below fail cleanly (ok=false, no error) without ever leaving a
+	// partial write behind: for attempt 1, an unusable binding or missing
+	// config is detected here, before this candidate has touched anything.
+	// For a retry (attemptNumber>1), current environment_runtime_bindings
+	// state is never consulted at all (ADR 0003): only the previous
+	// attempt's own already-frozen rows will be read, later, after this
+	// candidate's attempt row exists.
+	plannedAttemptNumber := priorAttemptCount + 1
+	var freshBindings []frozenBinding
+	var prevAttemptID int64
+	if plannedAttemptNumber == 1 {
+		var bindingsOK bool
+		freshBindings, bindingsOK, err = resolveRuntimeSecretBindings(ctx, tx, environmentID)
+		if err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+		if !bindingsOK {
+			return queue.ClaimedLease{}, false, nil
+		}
+	} else {
+		err = tx.QueryRow(ctx, `SELECT id FROM agent_job_attempts WHERE job_id=$1 AND attempt_number=$2`, jobID, plannedAttemptNumber-1).Scan(&prevAttemptID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A job whose attempt_count is N>0 must have an attempt row for
+			// every number up to N: the attempt insert and the attempt_count
+			// bump happen in one transaction, and both tables reject deletes.
+			// A gap therefore is not a losable race to skip past but a durable
+			// inconsistency, and it must never be answered by re-resolving
+			// current secret heads (ADR 0003 forbids adopting a version
+			// rotated mid-job). Classify it so a caller can tell integrity
+			// failure from a transient database error, exactly as
+			// ensureRelease does for a digest mismatch.
+			return queue.ClaimedLease{}, false, fmt.Errorf("%w: job %d attempt_count implies attempt %d but no such attempt row exists", ErrAgentLeaseCorruptState, jobID, plannedAttemptNumber-1)
+		}
+		if err != nil {
+			return queue.ClaimedLease{}, false, fmt.Errorf("locate previous attempt %d for retry freeze copy-forward: %w", plannedAttemptNumber-1, err)
+		}
 	}
 
 	// Claim ordering per migration 000013's attempt-insert trigger: bump the
@@ -418,10 +484,50 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		}
 	}
 
-	if err = freezeSecretVersions(ctx, tx, attemptID, nil); err != nil {
-		return queue.ClaimedLease{}, false, err
+	// Migration 000014 claim-time freeze, ADR 0004 lock hierarchy position
+	// 7 ("secret-version and frozen-reference rows"): attempt 1 durably
+	// freezes the execution config and secret-version set just resolved
+	// above; a retry copies attempt N-1's own frozen rows forward verbatim
+	// (ADR 0003) instead of re-resolving anything. Either branch produces
+	// the same frozenExecutionSnapshot/[]frozenBinding shape that
+	// computeConfigDigest and the ClaimedLease below consume identically.
+	var frozenConfig frozenExecutionSnapshot
+	var frozenBindings []frozenBinding
+	if plannedAttemptNumber == 1 {
+		frozenConfig = runtimeConfig
+		frozenBindings = freshBindings
+		if err = insertAttemptExecution(ctx, tx, attemptID, frozenConfig); err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+		if err = insertFrozenSecretVersions(ctx, tx, attemptID, frozenBindings); err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+	} else {
+		frozenConfig, err = copyPreviousAttemptExecution(ctx, tx, attemptID, prevAttemptID)
+		if err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+		frozenBindings, err = copyPreviousFrozenSecretVersions(ctx, tx, attemptID, prevAttemptID)
+		if err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
 	}
 	if err = r.inject("secret_freeze"); err != nil {
+		return queue.ClaimedLease{}, false, err
+	}
+
+	// Also create (attempt 1) or reuse-and-verify (a retry) this
+	// deployment's one release row. configDigest is recomputed from
+	// frozenConfig/frozenBindings every time -- on a retry that recomputes
+	// the exact same digest attempt 1 stored, since both were just copied
+	// forward verbatim; any disagreement is ErrAgentLeaseCorruptState, not
+	// a silently accepted overwrite.
+	configDigest := computeConfigDigest(frozenConfig, frozenBindings)
+	releaseID, err := ensureRelease(ctx, tx, deploymentID, environmentID, commitSHA, frozenConfig.ReleaseStrategy, configDigest)
+	if err != nil {
+		return queue.ClaimedLease{}, false, err
+	}
+	if err = r.inject("release"); err != nil {
 		return queue.ClaimedLease{}, false, err
 	}
 
@@ -436,6 +542,11 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		JobID: jobID, AttemptID: attemptID, AttemptNumber: attemptNumber, Fence: newFence,
 		OwnerID: ownerID, ProjectID: projectID, EnvironmentID: environmentID, DeploymentID: deploymentID,
 		RepositoryID: repositoryID, Ref: ref, CommitSHA: commitSHA,
+		ContainerPort: frozenConfig.ContainerPort, ContainerScheme: frozenConfig.ContainerScheme,
+		ReleaseStrategy: frozenConfig.ReleaseStrategy, HealthPolicyRevision: frozenConfig.HealthPolicyRevision,
+		CPUMillis: frozenConfig.CPUMillis, MemoryBytes: frozenConfig.MemoryBytes,
+		RestartPolicy: frozenConfig.RestartPolicy, DrainSeconds: frozenConfig.DrainSeconds,
+		ReleaseID: releaseID, SecretBindings: toQueueSecretBindings(frozenBindings),
 		LeaseExpiresAt: leaseExpiresAt, AuthorityExpiresAt: leaseExpiresAt,
 	}, true, nil
 }
@@ -466,20 +577,6 @@ func transitionDeployment(ctx context.Context, tx pgx.Tx, deployments *Deploymen
 		return nil
 	}
 	return deployments.saveTxWithHook(ctx, tx, next, hook)
-}
-
-// freezeSecretVersions durably freezes the exact secret-version set required
-// by this attempt (ADR 0003/0004 atomic claim boundary step 7). No secret
-// materialization exists yet in this slice, so versionIDs is always empty
-// today; the write path still runs so this call site needs no change when
-// the execution slice starts passing real versions.
-func freezeSecretVersions(ctx context.Context, tx pgx.Tx, attemptID int64, versionIDs []string) error {
-	for _, versionID := range versionIDs {
-		if _, err := tx.Exec(ctx, `INSERT INTO frozen_secret_versions(attempt_id, secret_version_id) VALUES ($1,$2)`, attemptID, versionID); err != nil {
-			return fmt.Errorf("freeze secret version: %w", err)
-		}
-	}
-	return nil
 }
 
 // appendAgentJobEvent appends the next sequenced event for jobID. The caller

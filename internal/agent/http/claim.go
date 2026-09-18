@@ -23,9 +23,21 @@ type claimResponse struct {
 	Leases []leaseView `json:"leases"`
 }
 
+// secretBindingView is the wire shape of one queue.SecretBinding: a
+// version reference only. ADR 0003 forbids a secret value from ever
+// appearing here.
+type secretBindingView struct {
+	VariableName    string `json:"variable_name"`
+	DeliveryScope   string `json:"delivery_scope"`
+	SecretVersionID string `json:"secret_version_id"`
+}
+
 // leaseView is the wire shape of one queue.ClaimedLease: job, attempt,
-// fence, environment, deployment, repository, ref, commit, and both
-// deadlines, RFC3339Nano UTC (tasks/todo.md Step 5).
+// fence, environment, deployment, repository, ref, commit, both deadlines
+// (RFC3339Nano UTC, tasks/todo.md Step 5), and -- migration 000014's
+// claim-time freeze, Slice 9a Step 2 -- the frozen execution configuration,
+// release id, and secret-version bindings an agent needs to run the
+// container. Never a secret value.
 type leaseView struct {
 	JobID              int64  `json:"job_id"`
 	AttemptID          int64  `json:"attempt_id"`
@@ -39,11 +51,26 @@ type leaseView struct {
 	CommitSHA          string `json:"commit_sha"`
 	LeaseExpiresAt     string `json:"lease_expires_at"`
 	AuthorityExpiresAt string `json:"authority_expires_at"`
+
+	ContainerPort        int                 `json:"container_port"`
+	ContainerScheme      string              `json:"container_scheme"`
+	ReleaseStrategy      string              `json:"release_strategy"`
+	HealthPolicyRevision int                 `json:"health_policy_revision"`
+	CPUMillis            int                 `json:"cpu_millis"`
+	MemoryBytes          int64               `json:"memory_bytes"`
+	RestartPolicy        string              `json:"restart_policy"`
+	DrainSeconds         int                 `json:"drain_seconds"`
+	ReleaseID            string              `json:"release_id"`
+	SecretBindings       []secretBindingView `json:"secret_bindings"`
 }
 
 func formatDeadline(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
 func newLeaseView(l queue.ClaimedLease) leaseView {
+	bindings := make([]secretBindingView, 0, len(l.SecretBindings))
+	for _, b := range l.SecretBindings {
+		bindings = append(bindings, secretBindingView{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, SecretVersionID: b.SecretVersionID})
+	}
 	return leaseView{
 		JobID:              l.JobID,
 		AttemptID:          l.AttemptID,
@@ -57,6 +84,17 @@ func newLeaseView(l queue.ClaimedLease) leaseView {
 		CommitSHA:          l.CommitSHA,
 		LeaseExpiresAt:     formatDeadline(l.LeaseExpiresAt),
 		AuthorityExpiresAt: formatDeadline(l.AuthorityExpiresAt),
+
+		ContainerPort:        l.ContainerPort,
+		ContainerScheme:      l.ContainerScheme,
+		ReleaseStrategy:      l.ReleaseStrategy,
+		HealthPolicyRevision: l.HealthPolicyRevision,
+		CPUMillis:            l.CPUMillis,
+		MemoryBytes:          l.MemoryBytes,
+		RestartPolicy:        l.RestartPolicy,
+		DrainSeconds:         l.DrainSeconds,
+		ReleaseID:            l.ReleaseID,
+		SecretBindings:       bindings,
 	}
 }
 

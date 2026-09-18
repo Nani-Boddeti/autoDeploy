@@ -1384,6 +1384,44 @@ Must prove (live PG 18 + `-race`): claim racing a config update in both orders; 
 the *same* versions after a rotation between attempts; attempt 2 not observing a config change;
 missing config / missing active version failing one candidate while another still claims.
 
+Step 2 result (2026-09-18): done. `internal/store/postgres/agent_lease_execution.go` (new) plus
+`tryClaim`, `internal/queue/lease.go`, `internal/agent/http/claim.go`, `internal/agent/client/api.go`.
+- Config is SHARE-locked as ADR 0004 position **1b**, the first lock `tryClaim` takes, before the slot.
+  Deadlock freedom rests on the administrator config update being a single-statement, single-row
+  transaction that holds nothing else while waiting. That premise is a comment today, not enforced
+  code: **Step 3d must keep its config write single-statement**, and should carry a test that fails if
+  it ever becomes multi-statement.
+- Fresh-vs-copy-forward decision is deferred until after the job row is locked (that is where
+  `attempt_count` lives, at hierarchy position 4, later than the config lock) but strictly before any
+  mutation, so a misconfigured candidate fails with `ok=false` and zero partial writes.
+- Attempt N>1 copies attempt N-1's frozen rows verbatim; since each attempt copied its own
+  predecessor, attempt N is byte-identical to attempt 1's original resolution by induction. A missing
+  predecessor row is classified `ErrAgentLeaseCorruptState`, never answered by re-resolving current
+  secret heads.
+- `config_digest`: sha256 over a length-prefixed encoding mirroring `internal/queue/job.go`'s
+  `payloadDigest`, over the frozen config plus the binding set sorted by variable name.
+- `releases.id` reuses `deployment_id` (already 1:1 via UNIQUE(deployment_id)). If a future slice ever
+  needs more than one release per deployment this needs a real generated id and a schema change.
+Evidence: three fresh PG18 integration runs normal and three fresh `-race`, plus `-race -count=20` on
+the three concurrency tests, `make check`, `go vet -tags=integration ./...`, `go test -race ./...`,
+`git diff --check`. Independent review: NEEDS CHANGES -> one medium fixed here (corrupt attempt chain
+classified), one high deferred to Step 2b below, two lows recorded.
+Lows recorded, not fixed: one Claim transaction can hold up to `claimDiscoveryMax` (200) config SHARE
+locks until commit, which lengthens the worst-case wait an administrator config update can see under a
+large backlog; worth a representative-scale check per ADR 0004.
+
+#### Step 2b — literal binding values (required before Step 3d ships admin pages)
+
+`environment_runtime_bindings.binding_kind` accepts `literal_nonsecret`, but 000014 gave it **no column
+to hold a value**, and the freeze resolves only `binding_kind='secret'`. A literal binding is therefore
+a silent no-op: an administrator sets `NODE_ENV=production`, Claim succeeds, and the variable simply
+never exists — exactly the silent-default failure the rest of this design refuses. Close it before any
+admin-facing path can create one: migration 000015 adds a bounded `literal_value` (present iff the kind
+is literal, no control characters, and never logged), an append-only per-attempt frozen literal table
+alongside `frozen_secret_versions`, copy-forward on retry, inclusion in `config_digest`, and the claim
+DTO carries literals separately from secret references. Literal values are non-secret by classification
+but still belong to the frozen snapshot, so one attempt remains one provable snapshot.
+
 #### Step 3a — `POST /agent/v1/leases/materialize-secrets`
 
 Request `{attempt_id, fence}` — no variable list; the server decides what the attempt froze, so

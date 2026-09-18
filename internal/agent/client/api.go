@@ -67,8 +67,18 @@ func (c *Client) Heartbeat(ctx context.Context, capability Capability, executorA
 	return HeartbeatResult{ServerStatus: resp.ServerStatus, HeartbeatIntervalSeconds: resp.HeartbeatIntervalSeconds}, nil
 }
 
+// SecretBinding is the agent-side typed view of one queue.SecretBinding: a
+// version reference only, never a value (ADR 0003).
+type SecretBinding struct {
+	VariableName    string
+	DeliveryScope   string
+	SecretVersionID string
+}
+
 // Lease is the agent-side typed view of one claimed lease: the wire
-// timestamps of internal/agent/http's leaseView, parsed.
+// timestamps of internal/agent/http's leaseView, parsed, plus migration
+// 000014's claim-time freeze -- the frozen execution configuration, release
+// id, and secret-version bindings needed to run the container.
 type Lease struct {
 	JobID              int64
 	AttemptID          int64
@@ -82,6 +92,23 @@ type Lease struct {
 	CommitSHA          string
 	LeaseExpiresAt     time.Time
 	AuthorityExpiresAt time.Time
+
+	ContainerPort        int
+	ContainerScheme      string
+	ReleaseStrategy      string
+	HealthPolicyRevision int
+	CPUMillis            int
+	MemoryBytes          int64
+	RestartPolicy        string
+	DrainSeconds         int
+	ReleaseID            string
+	SecretBindings       []SecretBinding
+}
+
+type secretBindingWire struct {
+	VariableName    string `json:"variable_name"`
+	DeliveryScope   string `json:"delivery_scope"`
+	SecretVersionID string `json:"secret_version_id"`
 }
 
 type leaseWire struct {
@@ -97,6 +124,17 @@ type leaseWire struct {
 	CommitSHA          string `json:"commit_sha"`
 	LeaseExpiresAt     string `json:"lease_expires_at"`
 	AuthorityExpiresAt string `json:"authority_expires_at"`
+
+	ContainerPort        int                 `json:"container_port"`
+	ContainerScheme      string              `json:"container_scheme"`
+	ReleaseStrategy      string              `json:"release_strategy"`
+	HealthPolicyRevision int                 `json:"health_policy_revision"`
+	CPUMillis            int                 `json:"cpu_millis"`
+	MemoryBytes          int64               `json:"memory_bytes"`
+	RestartPolicy        string              `json:"restart_policy"`
+	DrainSeconds         int                 `json:"drain_seconds"`
+	ReleaseID            string              `json:"release_id"`
+	SecretBindings       []secretBindingWire `json:"secret_bindings"`
 }
 
 func (w leaseWire) parse() (Lease, error) {
@@ -108,11 +146,26 @@ func (w leaseWire) parse() (Lease, error) {
 	if err != nil {
 		return Lease{}, err
 	}
+	bindings := make([]SecretBinding, 0, len(w.SecretBindings))
+	for _, b := range w.SecretBindings {
+		bindings = append(bindings, SecretBinding{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, SecretVersionID: b.SecretVersionID})
+	}
 	return Lease{
 		JobID: w.JobID, AttemptID: w.AttemptID, AttemptNumber: w.AttemptNumber, Fence: w.Fence,
 		ProjectID: w.ProjectID, EnvironmentID: w.EnvironmentID, DeploymentID: w.DeploymentID,
 		RepositoryID: w.RepositoryID, Ref: w.Ref, CommitSHA: w.CommitSHA,
 		LeaseExpiresAt: leaseExpires, AuthorityExpiresAt: authorityExpires,
+
+		ContainerPort:        w.ContainerPort,
+		ContainerScheme:      w.ContainerScheme,
+		ReleaseStrategy:      w.ReleaseStrategy,
+		HealthPolicyRevision: w.HealthPolicyRevision,
+		CPUMillis:            w.CPUMillis,
+		MemoryBytes:          w.MemoryBytes,
+		RestartPolicy:        w.RestartPolicy,
+		DrainSeconds:         w.DrainSeconds,
+		ReleaseID:            w.ReleaseID,
+		SecretBindings:       bindings,
 	}, nil
 }
 

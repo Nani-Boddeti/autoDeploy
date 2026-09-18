@@ -139,6 +139,15 @@ func newAgentHTTPFixture(t *testing.T) agentHTTPFixture {
 		t.Fatal(err)
 	}
 
+	// Migration 000014's claim-time freeze (Slice 9a Step 2) fails a
+	// candidate whose environment has no environment_runtime_configs row,
+	// so this fresh envID needs one before Claim can ever succeed against
+	// it. Fixed, arbitrary-but-valid defaults; nothing here asserts on
+	// their values.
+	if _, err := pool.Exec(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision) VALUES ($1,8080,'http','stop_then_start',30,500,268435456,'unless-stopped',1)`, envID); err != nil {
+		t.Fatal(err)
+	}
+
 	return agentHTTPFixture{pool: pool, ownerID: owner, serverID: serverID, jobID: jobID, envID: envID}
 }
 

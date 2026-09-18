@@ -45,6 +45,11 @@ func (f leaseFixture) insertServer(t *testing.T, id string) {
 func (f leaseFixture) insertJobAt(t *testing.T, serverID, environmentID, key string, priority int16, availableAtExpr string) int64 {
 	t.Helper()
 	ctx := context.Background()
+	// This environment may be brand new to the fixture (insertJobAt is how
+	// tests place jobs on environments other than f.envID), so it needs its
+	// own environment_runtime_configs row before Claim can ever succeed
+	// against it -- see insertRuntimeConfig.
+	f.insertRuntimeConfig(t, environmentID)
 	deploymentID := "deployment-" + key
 	// Deployment creation uses PostgreSQL's clock, not Go's time.Now(): Claim
 	// later transitions this deployment using clock_timestamp(), and any
@@ -357,7 +362,7 @@ func TestAgentLeaseClaimDeadlinesFromPostgresTime(t *testing.T) {
 }
 
 func TestAgentLeaseClaimInjectedFailureRollsBackEveryStage(t *testing.T) {
-	stages := []string{"slot_fence", "job_leased", "attempt_insert", "slot_occupy", "deployment", "secret_freeze", "job_event"}
+	stages := []string{"slot_fence", "job_leased", "attempt_insert", "slot_occupy", "deployment", "secret_freeze", "release", "job_event"}
 	for i, stage := range stages {
 		t.Run(stage, func(t *testing.T) {
 			f := newLeaseFixture(t, byte(60+i))
