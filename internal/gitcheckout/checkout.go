@@ -14,6 +14,7 @@ import (
 
 	"autodeploy/internal/checkoutcontain"
 	"autodeploy/internal/checkoutquota"
+	"autodeploy/internal/crypto"
 	"autodeploy/internal/githubapp"
 
 	"golang.org/x/sys/unix"
@@ -115,10 +116,52 @@ func (e *CleanupError) Unwrap() []error {
 	return []error{e.Cause, e.Cleanup}
 }
 
+// Lease is the capability set Checkout actually needs from an authorized
+// checkout lease. It exists so the agent can drive a checkout using a
+// short-lived token fetched over its authenticated channel while the GitHub
+// App private key stays control-plane-only (ADR 0001): the control plane's
+// *githubapp.CheckoutLease satisfies this unchanged, and an agent-side
+// implementation can delegate the durable state transitions back over
+// /agent/v1 without this package knowing anything about transport.
+//
+// Checkout still accepts no URL, revision, destination, executable, or
+// credential from a caller: every source identity comes from Binding(), and
+// the credential reaches Git only through NewAskPassBroker's one-use pipe.
+type Lease interface {
+	// Binding is the authorized source identity: owner, project, repository,
+	// clone URL, and exact commit.
+	Binding() githubapp.CheckoutBinding
+	// SetCancel installs the hook that stops Git if the lease is invalidated
+	// while it runs.
+	SetCancel(context.CancelFunc)
+	// Start marks the durable lease running immediately before the credential
+	// is delivered, and fails closed if authority was withdrawn meanwhile.
+	Start(context.Context) error
+	// NewAskPassBroker transfers the credential through a one-use pipe. A
+	// lease can only do this once.
+	NewAskPassBroker() (*githubapp.AskPassBroker, error)
+	// RedactingWriter wraps command output so the credential cannot appear in
+	// it. This is the only output boundary that sees the credential.
+	RedactingWriter(io.Writer) (*crypto.RedactingWriter, error)
+	// Close consumes the lease: it releases the durable reservation and
+	// revokes the credential, and is called even after a successful checkout.
+	Close(context.Context) error
+}
+
+// The control plane's own lease type must keep satisfying this interface; a
+// change to either side that breaks the pairing fails the build here rather
+// than at a call site.
+var _ Lease = (*githubapp.CheckoutLease)(nil)
+
 // Checkout derives every source identity from the activated lease. It never
 // accepts a URL, revision, destination, executable, or credential from a caller.
-func (r *Runner) Checkout(ctx context.Context, lease *githubapp.CheckoutLease) (result *Result, err error) {
-	if r == nil || lease == nil || nilCapability(r.config.Quota) || nilCapability(r.config.Spawn) {
+func (r *Runner) Checkout(ctx context.Context, lease Lease) (result *Result, err error) {
+	// nilCapability, not lease == nil: now that this is an interface, a typed
+	// nil (for example a (*githubapp.CheckoutLease)(nil) passed by a caller
+	// whose own construction failed) is a non-nil interface holding a nil
+	// pointer, and the first method call on it would dereference nil instead
+	// of failing closed here.
+	if r == nil || nilCapability(lease) || nilCapability(r.config.Quota) || nilCapability(r.config.Spawn) {
 		return nil, ErrInvalidConfig
 	}
 	checkoutCtx, cancelCheckout := context.WithTimeout(ctx, time.Duration(r.config.SpawnLimits.TimeoutSeconds)*time.Second)
@@ -242,14 +285,14 @@ func (r *Runner) Checkout(ctx context.Context, lease *githubapp.CheckoutLease) (
 	return result, nil
 }
 
-func (r *Runner) run(ctx context.Context, lease *githubapp.CheckoutLease, workspace int, op checkoutcontain.GitOperation, arg, remote string, askpass int, capture bool) error {
+func (r *Runner) run(ctx context.Context, lease Lease, workspace int, op checkoutcontain.GitOperation, arg, remote string, askpass int, capture bool) error {
 	_, err := r.execute(ctx, lease, workspace, op, arg, remote, askpass, capture)
 	return err
 }
-func (r *Runner) output(ctx context.Context, lease *githubapp.CheckoutLease, workspace int, op checkoutcontain.GitOperation) (string, error) {
+func (r *Runner) output(ctx context.Context, lease Lease, workspace int, op checkoutcontain.GitOperation) (string, error) {
 	return r.execute(ctx, lease, workspace, op, "", "", -1, true)
 }
-func (r *Runner) execute(ctx context.Context, lease *githubapp.CheckoutLease, workspace int, op checkoutcontain.GitOperation, arg, remote string, askpass int, capture bool) (string, error) {
+func (r *Runner) execute(ctx context.Context, lease Lease, workspace int, op checkoutcontain.GitOperation, arg, remote string, askpass int, capture bool) (string, error) {
 	askpassOwned := askpass >= 0
 	defer func() {
 		if askpassOwned {

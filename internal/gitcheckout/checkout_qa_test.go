@@ -236,3 +236,38 @@ func TestPendingCleanupRetryKeepsLeaseErrorChain(t *testing.T) {
 		t.Fatalf("cleanup wrapper survived successful retry: %v", err)
 	}
 }
+
+// TestLeaseInterfaceIsSatisfiedByControlPlaneLease documents why the Lease
+// interface exists: the control plane's own lease must keep working unchanged,
+// while an agent-side implementation can satisfy the same contract without the
+// GitHub App private key. The assertion in checkout.go fails the build if the
+// pairing breaks; this test states the intent for a reader.
+func TestLeaseInterfaceIsSatisfiedByControlPlaneLease(t *testing.T) {
+	var lease Lease = (*githubapp.CheckoutLease)(nil)
+	if lease == nil {
+		t.Fatal("a typed nil lease must not compare equal to nil")
+	}
+}
+
+// TestCheckoutRejectsNilLease proves the narrowed signature keeps rejecting a
+// nil lease: a nil interface and a typed-nil concrete value must both fail
+// closed rather than dereference.
+func TestCheckoutRejectsNilLease(t *testing.T) {
+	quota := &fakeQuota{}
+	runner, err := NewRunner(RunnerConfig{
+		Quota: quota, Spawn: &fakeSpawn{quota: quota},
+		QuotaLimits: checkoutquota.Limits{Bytes: 1 << 20, Inodes: 100},
+		SpawnLimits: checkoutcontain.SpawnLimits{TimeoutSeconds: 5, MaxOutput: 1024},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Checkout(context.Background(), nil); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("nil interface: err=%v, want ErrInvalidConfig", err)
+	}
+	// A typed nil is a non-nil interface holding a nil pointer: the guard must
+	// reject it rather than dereference it on the first method call.
+	if _, err := runner.Checkout(context.Background(), (*githubapp.CheckoutLease)(nil)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("typed-nil lease: err=%v, want ErrInvalidConfig", err)
+	}
+}

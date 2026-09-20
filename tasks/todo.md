@@ -1546,6 +1546,45 @@ Not yet done: independent review of Steps 3a and 3b (delegation still blocked by
 Must prove: control-plane path compiles and behaves unchanged; agent-side type drives the same
 `Checkout` code path against a fake transport; `CheckoutLease`'s one-use/invalidate semantics intact.
 
+Step 3c part 1 result (2026-09-20): interface narrowing done. `gitcheckout.Lease` captures the six
+methods `Checkout` actually uses (Binding, SetCancel, Start, NewAskPassBroker, RedactingWriter, Close);
+`*githubapp.CheckoutLease` satisfies it unchanged, pinned by a `var _ Lease = ...` assertion so a break
+on either side fails the build rather than a call site. Zero behaviour change; the existing checkout
+suite passes untouched.
+**Regression I introduced and caught:** with an interface parameter, `lease == nil` no longer rejects a
+typed nil — `(*githubapp.CheckoutLease)(nil)` is a non-nil interface holding a nil pointer, so the guard
+passed and `SetCancel` dereferenced nil. Now guarded by the package's existing `nilCapability` helper,
+with a test for both the nil interface and the typed nil. Worth remembering for every other
+concrete->interface conversion in this codebase.
+Evidence: `make check`, `go test -race ./...`, `go vet -tags=integration ./...`, `GOOS=linux` vet with
+`-tags='integration checkout_integration'` for the checkout packages, Linux amd64+arm64 builds, one full
+fresh PG18 integration sweep, `git diff --check`.
+
+Step 3c part 2 (next): the three-RPC token lifecycle. Planned shape, chosen to preserve the existing
+invariant that the durable lease is marked running *immediately before* the credential is delivered:
+- `POST /agent/v1/checkout/begin` {attempt_id, fence} -> reserve only, returns reservation id + binding,
+  **no token**.
+- `POST /agent/v1/checkout/start` {attempt_id, fence, reservation_id} -> Activate + StartCheckout, and
+  only then return {token, expires_at}, so the credential and the durable running state ship together.
+- `POST /agent/v1/checkout/close` -> CloseCheckout + RevokeToken.
+All three must repeat materialization's four occupancy checks (slot occupant, current fence, not
+cancelled, not reconciliation-pending) before minting anything. The App private key must never cross into
+the agent-facing factory — only the derived short-lived installation token does. Known wrinkle to design
+around: the activated lease is a process-local object, so start/close need a registry keyed by
+reservation id, and a control-plane restart between them leaves revocation to token expiry.
+
+Independent review of Steps 3a and 3b (2026-09-20): **PASS with notes**, no blocking issues.
+- Low: `ReportProgress` reads `deployments` `FOR UPDATE` and then `transitionDeployment` locks the same
+  row again in the same transaction. Safe (row locks are reentrant within a transaction) but a redundant
+  round trip; not worth touching shared helper code for.
+- Low, verified safe rather than a gap: authorization commits before decryption, so a version could in
+  principle be revoked in that window. `secret.Service.MaterializeAuthorized` re-reads the version fresh
+  and rechecks its state, so a revocation in the gap is caught at decrypt time.
+- Reviewer confirmed: no cross-scope plaintext path, no lock-order inversion (every path that touches
+  both the lease tables and `deployments` locks `deployments` last), no secret in logs/audit/error
+  bodies, `SetAuthorizer` cannot be widened including via `Frozen`, and the KEK-load failure is
+  fail-closed.
+
 #### Step 3d — runtime configuration admin pages
 
 Session+CSRF-protected, owner-scoped pages in `internal/web`, following the existing
