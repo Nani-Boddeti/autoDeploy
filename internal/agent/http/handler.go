@@ -29,16 +29,17 @@ const (
 	// Prefix is the mount point for every route this handler serves.
 	Prefix = "/agent/v1/"
 
-	pathEnroll     = "/agent/v1/enroll"
-	pathHeartbeat  = "/agent/v1/heartbeat"
-	pathClaim      = "/agent/v1/jobs/claim"
-	pathRenew      = "/agent/v1/leases/renew"
-	pathComplete   = "/agent/v1/leases/complete"
-	pathCancelAck  = "/agent/v1/leases/cancel-ack"
-	pathReconcile  = "/agent/v1/environments/reconcile"
-	authHeaderName = "Authorization"
-	serverIDHeader = "X-AutoDeploy-Server-ID"
-	bearerPrefix   = "Bearer "
+	pathEnroll      = "/agent/v1/enroll"
+	pathHeartbeat   = "/agent/v1/heartbeat"
+	pathClaim       = "/agent/v1/jobs/claim"
+	pathRenew       = "/agent/v1/leases/renew"
+	pathComplete    = "/agent/v1/leases/complete"
+	pathCancelAck   = "/agent/v1/leases/cancel-ack"
+	pathReconcile   = "/agent/v1/environments/reconcile"
+	pathMaterialize = "/agent/v1/leases/materialize-secrets"
+	authHeaderName  = "Authorization"
+	serverIDHeader  = "X-AutoDeploy-Server-ID"
+	bearerPrefix    = "Bearer "
 
 	// MaxBodyBytes bounds every request body except heartbeat, which is
 	// tighter because its fixed-schema capability struct never needs more.
@@ -109,17 +110,19 @@ type EnvironmentReconciler interface {
 // constructed with fakes in tests. A nil dependency makes its route return
 // 503 rather than panicking.
 type Handler struct {
-	Enroller          Enroller
-	Authenticator     Authenticator
-	Heartbeater       Heartbeater
-	Claimer           LeaseClaimer
-	Renewer           LeaseRenewer
-	Completer         LeaseCompleter
-	Canceller         LeaseCanceller
-	Reconciler        EnvironmentReconciler
-	TrustedProxyCIDRs []netip.Prefix
-	Clock             Clock
-	RequestTimeout    time.Duration
+	Enroller                  Enroller
+	Authenticator             Authenticator
+	Heartbeater               Heartbeater
+	Claimer                   LeaseClaimer
+	Renewer                   LeaseRenewer
+	Completer                 LeaseCompleter
+	Canceller                 LeaseCanceller
+	Reconciler                EnvironmentReconciler
+	MaterializationAuthorizer MaterializationAuthorizer
+	SecretMaterializerFactory SecretMaterializerFactory
+	TrustedProxyCIDRs         []netip.Prefix
+	Clock                     Clock
+	RequestTimeout            time.Duration
 }
 
 func (h Handler) clock() Clock {
@@ -175,6 +178,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleCancelAck(w, r)
 	case pathReconcile:
 		h.handleReconcile(w, r)
+	case pathMaterialize:
+		h.handleMaterializeSecrets(w, r)
 	default:
 		h.writeError(w, http.StatusNotFound, "not_found")
 	}

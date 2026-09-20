@@ -24,13 +24,14 @@ import (
 )
 
 const (
-	pathEnroll    = "/agent/v1/enroll"
-	pathHeartbeat = "/agent/v1/heartbeat"
-	pathClaim     = "/agent/v1/jobs/claim"
-	pathRenew     = "/agent/v1/leases/renew"
-	pathComplete  = "/agent/v1/leases/complete"
-	pathCancelAck = "/agent/v1/leases/cancel-ack"
-	pathReconcile = "/agent/v1/environments/reconcile"
+	pathEnroll      = "/agent/v1/enroll"
+	pathHeartbeat   = "/agent/v1/heartbeat"
+	pathClaim       = "/agent/v1/jobs/claim"
+	pathRenew       = "/agent/v1/leases/renew"
+	pathComplete    = "/agent/v1/leases/complete"
+	pathCancelAck   = "/agent/v1/leases/cancel-ack"
+	pathReconcile   = "/agent/v1/environments/reconcile"
+	pathMaterialize = "/agent/v1/leases/materialize-secrets"
 
 	requestTimeout   = 10 * time.Second
 	maxResponseBytes = 64 * 1024

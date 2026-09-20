@@ -1457,6 +1457,35 @@ Stale fence or expired authority returns the existing generic 401/stale shape �
 Must prove: version revoked between claim and materialize is refused; expired authority refused;
 stale fence refused; a log-capture test asserting no plaintext in logs or audit rows.
 
+Step 3a result (2026-09-20): done. `internal/store/postgres/agent_lease_materialize.go`,
+`internal/agent/http/materialize.go`, `internal/secret/setauthorizer.go`, client `MaterializeSecrets`,
+control-plane wiring.
+- Authorization and decryption are separate steps on purpose: `AuthorizeMaterialization` re-derives the
+  right to decrypt from locked rows in Complete's exact lock order (credential -> slot -> job ->
+  attempt, all `FOR SHARE` since it mutates nothing) and returns references; decryption happens after
+  that transaction commits, so no KEK operation ever runs while holding a row lock.
+- The request names no variable and no version. The frozen set is the authority, so an agent cannot
+  widen its own request.
+- Refused: stale/ahead fence, non-occupant attempt, environment awaiting reconciliation, closed attempt,
+  expired authority, cancelled job, another server's attempt, revoked credential, and a revoked secret
+  version — all as the same generic 401 so an agent cannot tell the cases apart.
+- **Superseded frozen versions still materialize** (ADR 0003: executing work keeps its frozen versions,
+  so rotating a secret must not break an in-flight deployment); revoked ones do not, because that is
+  compromise handling.
+- `secret.Service` requires an `Authorizer` and an always-allow implementation would let any code path
+  decrypt anything, so `secret.SetAuthorizer` admits exactly the keys the database just authorized, built
+  per request. Empty/nil admits nothing. `Frozen` is deliberately not part of the key, so flipping it
+  cannot reach a different secret.
+- The KEK ring is loaded per request rather than held resident, matching `/readyz`; a load failure or a
+  disabled secret subsystem answers 503 rather than an empty set an agent could mistake for "no secrets".
+- A refusal partway through a set returns no plaintext at all: a container with some variables silently
+  missing is worse than a failed deployment.
+Evidence (full output captured to files, not tailed, per Step 2b's lesson): 10 new repository integration
+tests, 6 handler tests, 3 set-authorizer tests; three fresh PG18 sweeps normal and three fresh `-race`,
+all 3/3; `make check`, `go vet -tags=integration ./...`, `go test -race ./...`, Linux amd64+arm64,
+`git diff --check`. The Step 2b single unexplained failure did not recur in any of these six sweeps.
+Not yet done: independent review of this step (delegation was blocked by the account spend limit).
+
 #### Step 3b — `POST /agent/v1/leases/progress`
 
 Request `{attempt_id, fence, phase}` with phase in `fetching|building|starting|health_checking` —

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"autodeploy/internal/queue"
+	"autodeploy/internal/secret"
 	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
 )
@@ -532,4 +533,193 @@ func TestCompleteRequestShapes(t *testing.T) {
 			t.Fatalf("status=%d seen=%+v", w.Code, fc.seen)
 		}
 	})
+}
+
+// --- materialization ----------------------------------------------------
+
+type fakeMaterializationAuthorizer struct {
+	calls  int
+	result queue.MaterializationAuthorization
+	err    error
+	gotID  string
+	gotAtt int64
+	gotFen int64
+}
+
+func (f *fakeMaterializationAuthorizer) AuthorizeMaterialization(_ context.Context, serverID string, _ [32]byte, attemptID, fence int64) (queue.MaterializationAuthorization, error) {
+	f.calls++
+	f.gotID, f.gotAtt, f.gotFen = serverID, attemptID, fence
+	return f.result, f.err
+}
+
+type fakeMaterializer struct {
+	values   map[string]string
+	requests []secret.AuthorizationRequest
+	err      error
+}
+
+func (f *fakeMaterializer) MaterializeAuthorized(_ context.Context, request secret.AuthorizationRequest, auditID string) ([]byte, error) {
+	f.requests = append(f.requests, request)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if auditID == "" {
+		return nil, errors.New("audit id required")
+	}
+	value, ok := f.values[request.VersionID]
+	if !ok {
+		return nil, secret.ErrUnauthorized
+	}
+	return []byte(value), nil
+}
+
+type fakeMaterializerFactory struct {
+	materializer SecretMaterializer
+	gotKeys      []secret.AuthorizationKey
+	calls        int
+}
+
+func (f *fakeMaterializerFactory) MaterializerForFrozenSet(keys []secret.AuthorizationKey) SecretMaterializer {
+	f.calls++
+	f.gotKeys = keys
+	return f.materializer
+}
+
+func materializeHandler(a *fakeMaterializationAuthorizer, factory *fakeMaterializerFactory) Handler {
+	return Handler{MaterializationAuthorizer: a, SecretMaterializerFactory: factory}
+}
+
+func materializeRequestBody(t *testing.T, attemptID, fence int64) string {
+	t.Helper()
+	body, err := json.Marshal(materializeRequest{AttemptID: attemptID, Fence: fence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestMaterializeReturnsOnlyTheFrozenSet(t *testing.T) {
+	authorizer := &fakeMaterializationAuthorizer{result: queue.MaterializationAuthorization{
+		AttemptID: 7, Fence: 3, OwnerID: "owner", ProjectID: "project", EnvironmentID: "env", DeploymentID: "dep",
+		Secrets: []queue.FrozenSecretReference{
+			{VariableName: "APP_TOKEN", DeliveryScope: "runtime", SecretVersionID: "v1", SecretID: "head1", Purpose: "runtime"},
+		},
+	}}
+	materializer := &fakeMaterializer{values: map[string]string{"v1": "s3cret"}}
+	factory := &fakeMaterializerFactory{materializer: materializer}
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	r := newRequestTLS(newRequest(t, pathMaterialize, materializeRequestBody(t, 7, 3), bearerPrefix+string(tok), "server_1"))
+	w := do(materializeHandler(authorizer, factory), r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	var resp materializeResponse
+	decodeBody(t, w, &resp)
+	if len(resp.Secrets) != 1 || resp.Secrets[0].VariableName != "APP_TOKEN" || resp.Secrets[0].Value != "s3cret" {
+		t.Fatalf("secrets=%+v", resp.Secrets)
+	}
+	if authorizer.gotAtt != 7 || authorizer.gotFen != 3 || authorizer.gotID != "server_1" {
+		t.Fatalf("authorizer got attempt=%d fence=%d server=%s", authorizer.gotAtt, authorizer.gotFen, authorizer.gotID)
+	}
+	// The decrypting materializer is built with exactly the authorized keys,
+	// so a bug in this handler's loop cannot widen what may be decrypted.
+	if len(factory.gotKeys) != 1 || factory.gotKeys[0].VersionID != "v1" || factory.gotKeys[0].Scope.SecretID != "head1" {
+		t.Fatalf("factory keys=%+v", factory.gotKeys)
+	}
+	if len(materializer.requests) != 1 || !materializer.requests[0].Frozen {
+		t.Fatalf("requests=%+v, want one frozen request", materializer.requests)
+	}
+	if materializer.requests[0].ServiceID != "server_1" || materializer.requests[0].DeploymentID != "dep" {
+		t.Fatalf("audit attribution=%+v", materializer.requests[0])
+	}
+}
+
+// TestMaterializeFailsClosedWithoutSecretSubsystem proves an agent never gets
+// an empty secret set it could mistake for "this deployment has no secrets".
+func TestMaterializeFailsClosedWithoutSecretSubsystem(t *testing.T) {
+	authorizer := &fakeMaterializationAuthorizer{}
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	h := Handler{MaterializationAuthorizer: authorizer}
+	r := newRequestTLS(newRequest(t, pathMaterialize, materializeRequestBody(t, 1, 1), bearerPrefix+string(tok), "server_1"))
+	w := do(h, r)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", w.Code)
+	}
+	if authorizer.calls != 0 {
+		t.Fatalf("authorizer calls=%d, want 0 before the dependency check", authorizer.calls)
+	}
+}
+
+func TestMaterializeRejectsUnauthorizedLease(t *testing.T) {
+	authorizer := &fakeMaterializationAuthorizer{err: postgres.ErrServerAuthorizationDenied}
+	factory := &fakeMaterializerFactory{materializer: &fakeMaterializer{}}
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	r := newRequestTLS(newRequest(t, pathMaterialize, materializeRequestBody(t, 5, 2), bearerPrefix+string(tok), "server_1"))
+	w := do(materializeHandler(authorizer, factory), r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401", w.Code)
+	}
+	if factory.calls != 0 {
+		t.Fatalf("factory calls=%d, want 0 when authorization failed", factory.calls)
+	}
+}
+
+// TestMaterializeReturnsNoPartialSetOnFailure proves a refusal mid-set yields
+// no plaintext at all: a container built with some variables silently missing
+// is worse than a failed deployment.
+func TestMaterializeReturnsNoPartialSetOnFailure(t *testing.T) {
+	authorizer := &fakeMaterializationAuthorizer{result: queue.MaterializationAuthorization{
+		AttemptID: 7, Fence: 3, OwnerID: "owner", ProjectID: "project", EnvironmentID: "env", DeploymentID: "dep",
+		Secrets: []queue.FrozenSecretReference{
+			{VariableName: "FIRST", DeliveryScope: "runtime", SecretVersionID: "v1", SecretID: "head1", Purpose: "runtime"},
+			{VariableName: "SECOND", DeliveryScope: "runtime", SecretVersionID: "missing", SecretID: "head2", Purpose: "runtime"},
+		},
+	}}
+	// Only the first version resolves; the second is refused.
+	materializer := &fakeMaterializer{values: map[string]string{"v1": "first-value"}}
+	factory := &fakeMaterializerFactory{materializer: materializer}
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	r := newRequestTLS(newRequest(t, pathMaterialize, materializeRequestBody(t, 7, 3), bearerPrefix+string(tok), "server_1"))
+	w := do(materializeHandler(authorizer, factory), r)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "first-value") {
+		t.Fatalf("partial plaintext leaked in failure response: %s", w.Body.String())
+	}
+}
+
+func TestMaterializeRejectsInvalidRequest(t *testing.T) {
+	authorizer := &fakeMaterializationAuthorizer{}
+	factory := &fakeMaterializerFactory{materializer: &fakeMaterializer{}}
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	for _, body := range []string{
+		`{"attempt_id":0,"fence":1}`,
+		`{"attempt_id":1,"fence":0}`,
+		`{"attempt_id":1,"fence":1,"variable_name":"APP_TOKEN"}`,
+	} {
+		r := newRequestTLS(newRequest(t, pathMaterialize, body, bearerPrefix+string(tok), "server_1"))
+		w := do(materializeHandler(authorizer, factory), r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d, want 400", body, w.Code)
+		}
+	}
+	if authorizer.calls != 0 {
+		t.Fatalf("authorizer calls=%d, want 0 for rejected requests", authorizer.calls)
+	}
+}
+
+func TestMaterializeRequiresCredential(t *testing.T) {
+	authorizer := &fakeMaterializationAuthorizer{}
+	factory := &fakeMaterializerFactory{materializer: &fakeMaterializer{}}
+	r := newRequestTLS(newRequest(t, pathMaterialize, materializeRequestBody(t, 1, 1), "", ""))
+	w := do(materializeHandler(authorizer, factory), r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401", w.Code)
+	}
+	if authorizer.calls != 0 {
+		t.Fatalf("authorizer calls=%d, want 0 without a credential", authorizer.calls)
+	}
 }

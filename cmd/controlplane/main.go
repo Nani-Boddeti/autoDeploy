@@ -20,6 +20,7 @@ import (
 	secretcrypto "autodeploy/internal/crypto"
 	githubhttp "autodeploy/internal/github/http"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/secret"
 	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
 	"autodeploy/internal/web"
@@ -162,6 +163,17 @@ func run(ctx context.Context) error {
 			Canceller:         leaseRepository,
 			Reconciler:        leaseRepository,
 			TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs,
+		}
+		if handler, ok := agentHandler.(agenthttp.Handler); ok {
+			// Secret materialization is wired only when the secret subsystem
+			// is enabled. Left nil, the route answers 503 rather than an empty
+			// secret set an agent could mistake for "this deployment has no
+			// secrets" (agenthttp.handleMaterializeSecrets fails closed).
+			handler.MaterializationAuthorizer = leaseRepository
+			if enabled {
+				handler.SecretMaterializerFactory = secretMaterializerFactory{postgres.NewSecretRepository(pool)}
+			}
+			agentHandler = handler
 		}
 		sweepLogger, _ := controlplaneLogger(os.Stderr, nil)
 		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { sweepLogger.Print("agent lease sweep failed") })
@@ -334,6 +346,28 @@ func newShutdownContext() (context.Context, context.CancelFunc) {
 func newHTTPServer(address string, handler http.Handler) *http.Server {
 	logger, _ := controlplaneLogger(os.Stderr, nil)
 	return &http.Server{Addr: address, Handler: handler, ErrorLog: logger, ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout, MaxHeaderBytes: maxHeaderBytes}
+}
+
+// secretMaterializerFactory builds one request-scoped secret service whose
+// authorizer admits exactly the frozen set the agent lease repository just
+// authorized, so no long-lived object in this process can decrypt anything
+// wider.
+//
+// The KEK ring is loaded per request rather than held resident, matching how
+// the readiness probe reloads it: this control plane deliberately keeps no
+// KEK material in memory between operations, and materialization is rare and
+// bounded enough to pay a file read for that property. A load failure returns
+// nil, which the route turns into a fail-closed 503.
+type secretMaterializerFactory struct {
+	repository *postgres.SecretRepository
+}
+
+func (f secretMaterializerFactory) MaterializerForFrozenSet(keys []secret.AuthorizationKey) agenthttp.SecretMaterializer {
+	ring, _, err := config.KEKRingAndGenerationFromEnvironment()
+	if err != nil {
+		return nil
+	}
+	return secret.NewService(f.repository, ring, secret.NewSetAuthorizer(keys))
 }
 
 func secretReadyHandler(next http.Handler, ready func(context.Context) error) http.Handler {

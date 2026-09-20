@@ -90,3 +90,33 @@ type RenewalResult struct {
 	AuthorityExpiresAt time.Time
 	CancelRequested    bool
 }
+
+// FrozenSecretReference is one frozen secret this attempt is authorized to
+// materialize, resolved from locked rows: the variable it binds, its
+// delivery scope, the exact version id, and the scope fields decryption
+// needs. Never a value.
+type FrozenSecretReference struct {
+	VariableName    string
+	DeliveryScope   string
+	SecretVersionID string
+	SecretID        string
+	Purpose         string
+}
+
+// MaterializationAuthorization is the result of re-deriving, from locked
+// rows immediately before decryption, that one attempt may materialize its
+// frozen secret set (ADR 0003 "Agent authorization and materialization").
+// The agent never names variables or versions: the frozen set is the
+// authority on what may be decrypted, so an agent cannot widen its own
+// request. Carries references only; plaintext exists solely in the
+// caller's bounded, short-lived memory after this authorization succeeds.
+type MaterializationAuthorization struct {
+	AttemptID     int64
+	Fence         int64
+	JobID         int64
+	OwnerID       string
+	ProjectID     string
+	EnvironmentID string
+	DeploymentID  string
+	Secrets       []FrozenSecretReference
+}

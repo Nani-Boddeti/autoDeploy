@@ -298,3 +298,46 @@ func (c *Client) Reconcile(ctx context.Context, environmentID string, attemptID,
 	}{EnvironmentID: environmentID, AttemptID: attemptID, Fence: fence, OutcomeDigest: hex.EncodeToString(outcomeDigest[:])}
 	return c.post(ctx, pathReconcile, req, nil, true)
 }
+
+// MaterializedSecret is one decrypted value for this attempt. It exists only
+// in the agent's memory for as long as the executor needs it: ADR 0003
+// forbids writing it to a durable job, a persistent temporary file, or a log
+// line, and the agent installs its redactor before invoking any build or
+// runtime tool so the value cannot escape through tool output either.
+type MaterializedSecret struct {
+	VariableName  string
+	DeliveryScope string
+	Value         string
+}
+
+// MaterializeSecrets fetches the decrypted values for the frozen secret set
+// of attemptID/fence. The request names no variable: the control plane
+// decides what this attempt froze, so the agent cannot widen its own
+// request. A stale fence, closed attempt, expired authority, cancelled job,
+// or revoked version is refused with the same generic error every other
+// agent route returns.
+//
+// This call is never retried on anything but a network/503 failure (the
+// post helper's own rule), because a refusal here is an authorization
+// decision rather than a transient condition.
+func (c *Client) MaterializeSecrets(ctx context.Context, attemptID, fence int64) ([]MaterializedSecret, error) {
+	req := struct {
+		AttemptID int64 `json:"attempt_id"`
+		Fence     int64 `json:"fence"`
+	}{AttemptID: attemptID, Fence: fence}
+	var resp struct {
+		Secrets []struct {
+			VariableName  string `json:"variable_name"`
+			DeliveryScope string `json:"delivery_scope"`
+			Value         string `json:"value"`
+		} `json:"secrets"`
+	}
+	if err := c.post(ctx, pathMaterialize, req, &resp, true); err != nil {
+		return nil, err
+	}
+	secrets := make([]MaterializedSecret, 0, len(resp.Secrets))
+	for _, s := range resp.Secrets {
+		secrets = append(secrets, MaterializedSecret{VariableName: s.VariableName, DeliveryScope: s.DeliveryScope, Value: s.Value})
+	}
+	return secrets, nil
+}
