@@ -1422,6 +1422,30 @@ alongside `frozen_secret_versions`, copy-forward on retry, inclusion in `config_
 DTO carries literals separately from secret references. Literal values are non-secret by classification
 but still belong to the frozen snapshot, so one attempt remains one provable snapshot.
 
+Step 2b result (2026-09-20): done. Migration 000015 plus the freeze/DTO wiring. A literal binding now
+carries a bounded (1..4096 byte), control-character-free `literal_value`, required exactly when the kind
+is `literal_nonsecret` and forbidden otherwise; `frozen_literal_values` is the append-only per-attempt
+frozen copy, one value per variable per attempt, with its own no-update/no-delete triggers rather than
+sharing `frozen_secret_versions`'. Literals are resolved on attempt 1, copied forward verbatim on retry
+(an administrator edit between attempts is not observed), and included in `config_digest`, whose version
+tag is bumped "1" -> "2" because the hashed shape changed. Literal values do cross the wire on the claim
+response, which is safe only because ADR 0003 classifies them as non-secret protected metadata; secret
+values still travel only as version references.
+Newline-containing values are deliberately rejected: that shape belongs in a secret record, not a
+literal binding.
+Evidence: five new repository tests plus two migration tests, all observed passing; `make check`,
+`go vet -tags=integration ./...`, `go test -race ./...`, Linux amd64+arm64 builds, `git diff --check`,
+`gofmt` clean; three fresh PG18 `-race` sweeps and, in total, 22 consecutive fresh normal/race sweeps.
+Collateral: `frozen_literal_values` had to join the fixture `TRUNCATE` lists (the same additive-schema
+breakage Step 1 hit), and 000014's binding test now supplies a literal value.
+**Unexplained single failure, recorded rather than buried:** during the first three-run sweep of this
+step, run 2 reported FAIL for `internal/store/postgres` while `agent/http` and `migrations` passed. The
+failing test name was lost because the command captured only the last three lines. It has NOT reproduced
+in 22 subsequent fresh runs (normal and `-race`, including 6 consecutive postgres-only runs). Root cause
+unknown, so this step's evidence is strong but not clean. Capture full output, never `tail`, on future
+sweeps; if it recurs, suspect an ordering/timing assumption in a claim test rather than the schema, and
+note this project has already been burned once (2026-09-16) by recorded evidence that did not reproduce.
+
 #### Step 3a — `POST /agent/v1/leases/materialize-secrets`
 
 Request `{attempt_id, fence}` — no variable list; the server decides what the attempt froze, so

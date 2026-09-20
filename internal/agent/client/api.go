@@ -103,12 +103,29 @@ type Lease struct {
 	DrainSeconds         int
 	ReleaseID            string
 	SecretBindings       []SecretBinding
+	LiteralBindings      []LiteralBinding
+}
+
+// LiteralBinding is one variable's frozen non-secret value. It carries the
+// value itself, unlike SecretBinding, because a literal_nonsecret binding is
+// non-secret by ADR 0003's classification. A secret value never arrives this
+// way; it reaches the agent only through fenced materialization.
+type LiteralBinding struct {
+	VariableName  string
+	DeliveryScope string
+	Value         string
 }
 
 type secretBindingWire struct {
 	VariableName    string `json:"variable_name"`
 	DeliveryScope   string `json:"delivery_scope"`
 	SecretVersionID string `json:"secret_version_id"`
+}
+
+type literalBindingWire struct {
+	VariableName  string `json:"variable_name"`
+	DeliveryScope string `json:"delivery_scope"`
+	Value         string `json:"value"`
 }
 
 type leaseWire struct {
@@ -125,16 +142,17 @@ type leaseWire struct {
 	LeaseExpiresAt     string `json:"lease_expires_at"`
 	AuthorityExpiresAt string `json:"authority_expires_at"`
 
-	ContainerPort        int                 `json:"container_port"`
-	ContainerScheme      string              `json:"container_scheme"`
-	ReleaseStrategy      string              `json:"release_strategy"`
-	HealthPolicyRevision int                 `json:"health_policy_revision"`
-	CPUMillis            int                 `json:"cpu_millis"`
-	MemoryBytes          int64               `json:"memory_bytes"`
-	RestartPolicy        string              `json:"restart_policy"`
-	DrainSeconds         int                 `json:"drain_seconds"`
-	ReleaseID            string              `json:"release_id"`
-	SecretBindings       []secretBindingWire `json:"secret_bindings"`
+	ContainerPort        int                  `json:"container_port"`
+	ContainerScheme      string               `json:"container_scheme"`
+	ReleaseStrategy      string               `json:"release_strategy"`
+	HealthPolicyRevision int                  `json:"health_policy_revision"`
+	CPUMillis            int                  `json:"cpu_millis"`
+	MemoryBytes          int64                `json:"memory_bytes"`
+	RestartPolicy        string               `json:"restart_policy"`
+	DrainSeconds         int                  `json:"drain_seconds"`
+	ReleaseID            string               `json:"release_id"`
+	SecretBindings       []secretBindingWire  `json:"secret_bindings"`
+	LiteralBindings      []literalBindingWire `json:"literal_bindings"`
 }
 
 func (w leaseWire) parse() (Lease, error) {
@@ -149,6 +167,10 @@ func (w leaseWire) parse() (Lease, error) {
 	bindings := make([]SecretBinding, 0, len(w.SecretBindings))
 	for _, b := range w.SecretBindings {
 		bindings = append(bindings, SecretBinding{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, SecretVersionID: b.SecretVersionID})
+	}
+	literals := make([]LiteralBinding, 0, len(w.LiteralBindings))
+	for _, b := range w.LiteralBindings {
+		literals = append(literals, LiteralBinding{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, Value: b.Value})
 	}
 	return Lease{
 		JobID: w.JobID, AttemptID: w.AttemptID, AttemptNumber: w.AttemptNumber, Fence: w.Fence,
@@ -166,6 +188,7 @@ func (w leaseWire) parse() (Lease, error) {
 		DrainSeconds:         w.DrainSeconds,
 		ReleaseID:            w.ReleaseID,
 		SecretBindings:       bindings,
+		LiteralBindings:      literals,
 	}, nil
 }
 

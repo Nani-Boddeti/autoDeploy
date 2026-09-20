@@ -401,6 +401,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	// candidate's attempt row exists.
 	plannedAttemptNumber := priorAttemptCount + 1
 	var freshBindings []frozenBinding
+	var freshLiterals []frozenLiteral
 	var prevAttemptID int64
 	if plannedAttemptNumber == 1 {
 		var bindingsOK bool
@@ -409,6 +410,14 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 			return queue.ClaimedLease{}, false, err
 		}
 		if !bindingsOK {
+			return queue.ClaimedLease{}, false, nil
+		}
+		var literalsOK bool
+		freshLiterals, literalsOK, err = resolveRuntimeLiteralBindings(ctx, tx, environmentID)
+		if err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+		if !literalsOK {
 			return queue.ClaimedLease{}, false, nil
 		}
 	} else {
@@ -493,13 +502,18 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	// computeConfigDigest and the ClaimedLease below consume identically.
 	var frozenConfig frozenExecutionSnapshot
 	var frozenBindings []frozenBinding
+	var frozenLiterals []frozenLiteral
 	if plannedAttemptNumber == 1 {
 		frozenConfig = runtimeConfig
 		frozenBindings = freshBindings
+		frozenLiterals = freshLiterals
 		if err = insertAttemptExecution(ctx, tx, attemptID, frozenConfig); err != nil {
 			return queue.ClaimedLease{}, false, err
 		}
 		if err = insertFrozenSecretVersions(ctx, tx, attemptID, frozenBindings); err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+		if err = insertFrozenLiteralValues(ctx, tx, attemptID, frozenLiterals); err != nil {
 			return queue.ClaimedLease{}, false, err
 		}
 	} else {
@@ -508,6 +522,10 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 			return queue.ClaimedLease{}, false, err
 		}
 		frozenBindings, err = copyPreviousFrozenSecretVersions(ctx, tx, attemptID, prevAttemptID)
+		if err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
+		frozenLiterals, err = copyPreviousFrozenLiteralValues(ctx, tx, attemptID, prevAttemptID)
 		if err != nil {
 			return queue.ClaimedLease{}, false, err
 		}
@@ -522,7 +540,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	// the exact same digest attempt 1 stored, since both were just copied
 	// forward verbatim; any disagreement is ErrAgentLeaseCorruptState, not
 	// a silently accepted overwrite.
-	configDigest := computeConfigDigest(frozenConfig, frozenBindings)
+	configDigest := computeConfigDigest(frozenConfig, frozenBindings, frozenLiterals)
 	releaseID, err := ensureRelease(ctx, tx, deploymentID, environmentID, commitSHA, frozenConfig.ReleaseStrategy, configDigest)
 	if err != nil {
 		return queue.ClaimedLease{}, false, err
@@ -547,7 +565,8 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		CPUMillis: frozenConfig.CPUMillis, MemoryBytes: frozenConfig.MemoryBytes,
 		RestartPolicy: frozenConfig.RestartPolicy, DrainSeconds: frozenConfig.DrainSeconds,
 		ReleaseID: releaseID, SecretBindings: toQueueSecretBindings(frozenBindings),
-		LeaseExpiresAt: leaseExpiresAt, AuthorityExpiresAt: leaseExpiresAt,
+		LiteralBindings: toQueueLiteralBindings(frozenLiterals),
+		LeaseExpiresAt:  leaseExpiresAt, AuthorityExpiresAt: leaseExpiresAt,
 	}, true, nil
 }
 

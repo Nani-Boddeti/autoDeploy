@@ -217,9 +217,10 @@ func TestEnvironmentRuntimeBindingsCheck(t *testing.T) {
 		t.Fatalf("expected secret binding to succeed: %v", err)
 	}
 
-	// literal kind with no secret head: allowed.
-	if _, err := tx.Exec(ctx, `INSERT INTO environment_runtime_bindings (environment_id, variable_name, binding_kind, secret_head_id, delivery_scope)
-	      VALUES ($1,'PORT','literal_nonsecret',NULL,'runtime')`, f.environmentID); err != nil {
+	// literal kind with no secret head: allowed. It must carry a
+	// literal_value, which migration 000015 added and requires for this kind.
+	if _, err := tx.Exec(ctx, `INSERT INTO environment_runtime_bindings (environment_id, variable_name, binding_kind, secret_head_id, delivery_scope, literal_value)
+	      VALUES ($1,'PORT','literal_nonsecret',NULL,'runtime','8080')`, f.environmentID); err != nil {
 		t.Fatalf("expected literal binding to succeed: %v", err)
 	}
 
@@ -230,8 +231,8 @@ func TestEnvironmentRuntimeBindingsCheck(t *testing.T) {
 
 	// literal kind with a secret head set: rejected.
 	mustFail(t, ctx, tx, "expected rejection of literal binding with a secret_head_id",
-		`INSERT INTO environment_runtime_bindings (environment_id, variable_name, binding_kind, secret_head_id, delivery_scope)
-	      VALUES ($1,'SPURIOUS_HEAD','literal_nonsecret',$2,'runtime')`, f.environmentID, f.secretHeadID)
+		`INSERT INTO environment_runtime_bindings (environment_id, variable_name, binding_kind, secret_head_id, delivery_scope, literal_value)
+	      VALUES ($1,'SPURIOUS_HEAD','literal_nonsecret',$2,'runtime','x')`, f.environmentID, f.secretHeadID)
 }
 
 func TestFrozenSecretVersionsWidenedPrimaryKeyAndAppendOnly(t *testing.T) {

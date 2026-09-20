@@ -32,6 +32,16 @@ type secretBindingView struct {
 	SecretVersionID string `json:"secret_version_id"`
 }
 
+// literalBindingView is the wire shape of one queue.LiteralBinding. This
+// one does carry a value, which is safe only because a literal_nonsecret
+// binding is non-secret by ADR 0003's classification; a secret value reaches
+// the agent solely through fenced materialization, never here.
+type literalBindingView struct {
+	VariableName  string `json:"variable_name"`
+	DeliveryScope string `json:"delivery_scope"`
+	Value         string `json:"value"`
+}
+
 // leaseView is the wire shape of one queue.ClaimedLease: job, attempt,
 // fence, environment, deployment, repository, ref, commit, both deadlines
 // (RFC3339Nano UTC, tasks/todo.md Step 5), and -- migration 000014's
@@ -52,16 +62,17 @@ type leaseView struct {
 	LeaseExpiresAt     string `json:"lease_expires_at"`
 	AuthorityExpiresAt string `json:"authority_expires_at"`
 
-	ContainerPort        int                 `json:"container_port"`
-	ContainerScheme      string              `json:"container_scheme"`
-	ReleaseStrategy      string              `json:"release_strategy"`
-	HealthPolicyRevision int                 `json:"health_policy_revision"`
-	CPUMillis            int                 `json:"cpu_millis"`
-	MemoryBytes          int64               `json:"memory_bytes"`
-	RestartPolicy        string              `json:"restart_policy"`
-	DrainSeconds         int                 `json:"drain_seconds"`
-	ReleaseID            string              `json:"release_id"`
-	SecretBindings       []secretBindingView `json:"secret_bindings"`
+	ContainerPort        int                  `json:"container_port"`
+	ContainerScheme      string               `json:"container_scheme"`
+	ReleaseStrategy      string               `json:"release_strategy"`
+	HealthPolicyRevision int                  `json:"health_policy_revision"`
+	CPUMillis            int                  `json:"cpu_millis"`
+	MemoryBytes          int64                `json:"memory_bytes"`
+	RestartPolicy        string               `json:"restart_policy"`
+	DrainSeconds         int                  `json:"drain_seconds"`
+	ReleaseID            string               `json:"release_id"`
+	SecretBindings       []secretBindingView  `json:"secret_bindings"`
+	LiteralBindings      []literalBindingView `json:"literal_bindings"`
 }
 
 func formatDeadline(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
@@ -70,6 +81,10 @@ func newLeaseView(l queue.ClaimedLease) leaseView {
 	bindings := make([]secretBindingView, 0, len(l.SecretBindings))
 	for _, b := range l.SecretBindings {
 		bindings = append(bindings, secretBindingView{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, SecretVersionID: b.SecretVersionID})
+	}
+	literals := make([]literalBindingView, 0, len(l.LiteralBindings))
+	for _, b := range l.LiteralBindings {
+		literals = append(literals, literalBindingView{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, Value: b.Value})
 	}
 	return leaseView{
 		JobID:              l.JobID,
@@ -95,6 +110,7 @@ func newLeaseView(l queue.ClaimedLease) leaseView {
 		DrainSeconds:         l.DrainSeconds,
 		ReleaseID:            l.ReleaseID,
 		SecretBindings:       bindings,
+		LiteralBindings:      literals,
 	}
 }
 

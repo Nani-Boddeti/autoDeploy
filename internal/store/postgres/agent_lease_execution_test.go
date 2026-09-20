@@ -593,3 +593,154 @@ func TestAgentLeaseClaimNoSecretValueInClaimedLease(t *testing.T) {
 		t.Fatalf("secret version id leaks ciphertext material: %s", b.SecretVersionID)
 	}
 }
+
+// insertLiteralBinding adds a literal_nonsecret binding, the kind migration
+// 000015 gave a value column so it stops being a silent no-op.
+func (f leaseFixture) insertLiteralBinding(t *testing.T, environmentID, variableName, deliveryScope, value string) {
+	t.Helper()
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO environment_runtime_bindings(environment_id, variable_name, binding_kind, delivery_scope, literal_value) VALUES ($1,$2,'literal_nonsecret',$3,$4)`, environmentID, variableName, deliveryScope, value); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentLeaseClaimFreezesLiteralBinding(t *testing.T) {
+	f := newLeaseFixture(t, 181)
+	d := f.withCredential(t, 251)
+	f.insertLiteralBinding(t, f.envID, "NODE_ENV", "runtime", "production")
+	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
+	ctx := context.Background()
+
+	leases, err := repo.Claim(ctx, f.serverID, d, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("leases=%+v", leases)
+	}
+	if len(leases[0].LiteralBindings) != 1 {
+		t.Fatalf("literal bindings=%+v, want exactly one", leases[0].LiteralBindings)
+	}
+	got := leases[0].LiteralBindings[0]
+	if got.VariableName != "NODE_ENV" || got.DeliveryScope != "runtime" || got.Value != "production" {
+		t.Fatalf("literal binding=%+v", got)
+	}
+
+	var value, scope string
+	if err := f.pool.QueryRow(ctx, `SELECT literal_value, delivery_scope FROM frozen_literal_values WHERE attempt_id=$1 AND variable_name='NODE_ENV'`, leases[0].AttemptID).Scan(&value, &scope); err != nil {
+		t.Fatal(err)
+	}
+	if value != "production" || scope != "runtime" {
+		t.Fatalf("frozen literal = %s/%s", value, scope)
+	}
+}
+
+// TestAgentLeaseClaimRetryDoesNotObserveLiteralChange is the literal
+// counterpart of the secret-rotation and config-change retry tests: an
+// administrator editing a literal between attempts must not change what a
+// retry executes, so one attempt stays one provable snapshot.
+func TestAgentLeaseClaimRetryDoesNotObserveLiteralChange(t *testing.T) {
+	f := newLeaseFixture(t, 182)
+	d := f.withCredential(t, 252)
+	f.insertLiteralBinding(t, f.envID, "FEATURE_FLAGS", "runtime", "alpha")
+	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
+	ctx := context.Background()
+
+	first, err := repo.Claim(ctx, f.serverID, d, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 1 || len(first[0].LiteralBindings) != 1 || first[0].LiteralBindings[0].Value != "alpha" {
+		t.Fatalf("first=%+v", first)
+	}
+
+	if _, err := f.pool.Exec(ctx, `UPDATE environment_runtime_bindings SET literal_value='beta' WHERE environment_id=$1 AND variable_name='FEATURE_FLAGS'`, f.envID); err != nil {
+		t.Fatal(err)
+	}
+
+	f.forceRetry(t, f.jobID, first[0].AttemptID, f.envID)
+
+	second, err := repo.Claim(ctx, f.serverID, d, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 1 || second[0].AttemptNumber != 2 {
+		t.Fatalf("second=%+v", second)
+	}
+	if len(second[0].LiteralBindings) != 1 || second[0].LiteralBindings[0].Value != "alpha" {
+		t.Fatalf("attempt 2 observed %+v, want the pre-edit value alpha", second[0].LiteralBindings)
+	}
+	var frozen string
+	if err := f.pool.QueryRow(ctx, `SELECT literal_value FROM frozen_literal_values WHERE attempt_id=$1 AND variable_name='FEATURE_FLAGS'`, second[0].AttemptID).Scan(&frozen); err != nil {
+		t.Fatal(err)
+	}
+	if frozen != "alpha" {
+		t.Fatalf("frozen literal for attempt 2 = %s, want alpha", frozen)
+	}
+	if second[0].ReleaseID != first[0].ReleaseID {
+		t.Fatalf("release id changed across retry: %s -> %s", first[0].ReleaseID, second[0].ReleaseID)
+	}
+}
+
+func TestAgentLeaseClaimFreezesMixedSecretAndLiteralBindings(t *testing.T) {
+	f := newLeaseFixture(t, 183)
+	d := f.withCredential(t, 253)
+	headID := "secret-head-" + t.Name()
+	versionID := "secret-version-" + t.Name()
+	f.insertSecretHeadWithActiveVersion(t, headID, f.envID, "APP_TOKEN", "runtime", versionID, 1)
+	f.insertLiteralBinding(t, f.envID, "LOG_LEVEL", "runtime", "info")
+	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
+
+	leases, err := repo.Claim(context.Background(), f.serverID, d, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("leases=%+v", leases)
+	}
+	if len(leases[0].SecretBindings) != 1 || leases[0].SecretBindings[0].SecretVersionID != versionID {
+		t.Fatalf("secret bindings=%+v", leases[0].SecretBindings)
+	}
+	if len(leases[0].LiteralBindings) != 1 || leases[0].LiteralBindings[0].Value != "info" {
+		t.Fatalf("literal bindings=%+v", leases[0].LiteralBindings)
+	}
+}
+
+// TestAgentLeaseClaimLiteralValueChangesConfigDigest proves a literal is
+// genuinely part of the release's config_digest: two environments identical
+// except for one literal value must not produce the same digest, or a later
+// slice could not tell two different frozen configurations apart.
+func TestAgentLeaseClaimLiteralValueChangesConfigDigest(t *testing.T) {
+	f := newLeaseFixture(t, 184)
+	d := f.withCredential(t, 254)
+	f.insertLiteralBinding(t, f.envID, "TUNABLE", "runtime", "one")
+
+	otherEnv := f.envID + "-other"
+	f.insertRuntimeConfig(t, otherEnv)
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO environment_slots(environment_id) VALUES ($1) ON CONFLICT DO NOTHING`, otherEnv); err != nil {
+		t.Fatal(err)
+	}
+	f.insertLiteralBinding(t, otherEnv, "TUNABLE", "runtime", "two")
+	otherJobID := f.insertJob(t, f.serverID, otherEnv, "job-other-"+t.Name(), 0)
+	_ = otherJobID
+
+	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
+	ctx := context.Background()
+	leases, err := repo.Claim(ctx, f.serverID, d, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 2 {
+		t.Fatalf("expected both environments claimed, got %d", len(leases))
+	}
+	digests := make(map[string]struct{})
+	for _, l := range leases {
+		var digest []byte
+		if err := f.pool.QueryRow(ctx, `SELECT config_digest FROM releases WHERE id=$1`, l.ReleaseID).Scan(&digest); err != nil {
+			t.Fatal(err)
+		}
+		digests[string(digest)] = struct{}{}
+	}
+	if len(digests) != 2 {
+		t.Fatal("two environments differing only in one literal value produced the same config_digest")
+	}
+}

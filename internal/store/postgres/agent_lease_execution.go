@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
@@ -50,6 +51,19 @@ type frozenBinding struct {
 	VariableName    string
 	DeliveryScope   string
 	SecretVersionID string
+}
+
+// frozenLiteral is one resolved (or copied-forward) literal_nonsecret
+// binding value. Unlike frozenBinding, this carries the actual value: per
+// ADR 0003 ("Secret classification" -> "Non-secret protected metadata"), an
+// ordinary literal environment value (e.g. NODE_ENV=production) is not a
+// secret at all, so freezing and later transmitting it is not a version
+// reference indirection like frozenBinding -- there is nothing else to
+// reference.
+type frozenLiteral struct {
+	VariableName  string
+	DeliveryScope string
+	LiteralValue  string
 }
 
 // lockEnvironmentRuntimeConfig SHARE-locks environmentID's runtime config
@@ -130,6 +144,49 @@ func resolveRuntimeSecretBindings(ctx context.Context, tx pgx.Tx, environmentID 
 	return bindings, true, nil
 }
 
+// resolveRuntimeLiteralBindings resolves every binding_kind='literal_nonsecret'
+// row of environmentID's environment_runtime_bindings to its frozen value.
+// Mirrors resolveRuntimeSecretBindings's ok=false discipline: a NULL
+// literal_value would violate migration 000015's presence CHECK and should
+// therefore be unreachable, but this is Claim's fail-closed boundary, not a
+// place to trust that invariant blindly -- Step 2b's spec is explicit that
+// an encountered NULL must fail the candidate exactly like a missing active
+// secret version (ok=false), never be silently skipped while other bindings
+// for the same environment are frozen. literal_value is scanned into
+// sql.NullString rather than string precisely so that case is observable
+// instead of surfacing as an opaque Scan error.
+func resolveRuntimeLiteralBindings(ctx context.Context, tx pgx.Tx, environmentID string) ([]frozenLiteral, bool, error) {
+	var totalLiteralBindings int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM environment_runtime_bindings WHERE environment_id=$1 AND binding_kind='literal_nonsecret'`, environmentID).Scan(&totalLiteralBindings); err != nil {
+		return nil, false, fmt.Errorf("count environment runtime literal bindings: %w", err)
+	}
+	rows, err := tx.Query(ctx, `SELECT variable_name, delivery_scope, literal_value FROM environment_runtime_bindings WHERE environment_id=$1 AND binding_kind='literal_nonsecret' ORDER BY variable_name`, environmentID)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve environment runtime literal bindings: %w", err)
+	}
+	defer rows.Close()
+	literals := make([]frozenLiteral, 0, totalLiteralBindings)
+	for rows.Next() {
+		var l frozenLiteral
+		var value sql.NullString
+		if err := rows.Scan(&l.VariableName, &l.DeliveryScope, &value); err != nil {
+			return nil, false, fmt.Errorf("scan environment runtime literal binding: %w", err)
+		}
+		if !value.Valid {
+			return nil, false, nil
+		}
+		l.LiteralValue = value.String
+		literals = append(literals, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("resolve environment runtime literal bindings: %w", err)
+	}
+	if len(literals) != totalLiteralBindings {
+		return nil, false, nil
+	}
+	return literals, true, nil
+}
+
 // insertAttemptExecution durably freezes cfg as attemptID's
 // agent_job_attempt_execution row (insert-once per migration 000014).
 func insertAttemptExecution(ctx context.Context, tx pgx.Tx, attemptID int64, cfg frozenExecutionSnapshot) error {
@@ -153,6 +210,49 @@ func insertFrozenSecretVersions(ctx context.Context, tx pgx.Tx, attemptID int64,
 		}
 	}
 	return nil
+}
+
+// insertFrozenLiteralValues durably freezes literals as attemptID's
+// frozen_literal_values rows (append-only per migration 000015). A literal
+// value is frozen for the same reason a secret version reference is: a retry
+// must execute what attempt 1 resolved, not what an administrator has since
+// edited, so one attempt stays one provable snapshot.
+func insertFrozenLiteralValues(ctx context.Context, tx pgx.Tx, attemptID int64, literals []frozenLiteral) error {
+	for _, l := range literals {
+		if _, err := tx.Exec(ctx, `INSERT INTO frozen_literal_values(attempt_id, variable_name, delivery_scope, literal_value) VALUES ($1,$2,$3,$4)`, attemptID, l.VariableName, l.DeliveryScope, l.LiteralValue); err != nil {
+			return fmt.Errorf("freeze literal value: %w", err)
+		}
+	}
+	return nil
+}
+
+// copyPreviousFrozenLiteralValues is the literal counterpart of
+// copyPreviousFrozenSecretVersions: attempt N>1 copies attempt N-1's frozen
+// literal rows verbatim rather than re-reading environment_runtime_bindings,
+// so an administrator editing a literal mid-job is not observed by the retry.
+// No lock is needed on the source rows because frozen_literal_values is
+// append-only.
+func copyPreviousFrozenLiteralValues(ctx context.Context, tx pgx.Tx, newAttemptID, prevAttemptID int64) ([]frozenLiteral, error) {
+	rows, err := tx.Query(ctx, `SELECT variable_name, delivery_scope, literal_value FROM frozen_literal_values WHERE attempt_id=$1 ORDER BY variable_name`, prevAttemptID)
+	if err != nil {
+		return nil, fmt.Errorf("load previous frozen literal values for copy-forward: %w", err)
+	}
+	defer rows.Close()
+	var literals []frozenLiteral
+	for rows.Next() {
+		var l frozenLiteral
+		if err := rows.Scan(&l.VariableName, &l.DeliveryScope, &l.LiteralValue); err != nil {
+			return nil, fmt.Errorf("scan previous frozen literal value: %w", err)
+		}
+		literals = append(literals, l)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load previous frozen literal values for copy-forward: %w", err)
+	}
+	if err := insertFrozenLiteralValues(ctx, tx, newAttemptID, literals); err != nil {
+		return nil, fmt.Errorf("copy frozen literal values forward: %w", err)
+	}
+	return literals, nil
 }
 
 // copyPreviousAttemptExecution implements the ADR 0003 retry rule: attempt
@@ -214,13 +314,22 @@ func copyPreviousFrozenSecretVersions(ctx context.Context, tx pgx.Tx, newAttempt
 // with its byte length and a ':' separator before concatenating, so no
 // field's content can ever be reinterpreted as a boundary between fields --
 // rather than inventing a second canonicalization scheme in the same
-// codebase. Bumping the leading "1" tag is how a future incompatible change
-// to this encoding would be distinguished from today's.
-func computeConfigDigest(cfg frozenExecutionSnapshot, bindings []frozenBinding) [32]byte {
+// codebase.
+//
+// The leading tag is "2": step 2b appended the frozen literal set to this
+// encoding, which changes the shape of what is hashed, so a digest computed
+// by the "1" encoding is not comparable to one computed here. Nothing has
+// ever stored a release row outside throwaway test databases, so no existing
+// digest is invalidated by the bump -- it exists so that if this encoding
+// ever changes again against real data, the two can be told apart instead of
+// silently disagreeing through ensureRelease's corrupt-state path.
+func computeConfigDigest(cfg frozenExecutionSnapshot, bindings []frozenBinding, literals []frozenLiteral) [32]byte {
 	sorted := append([]frozenBinding(nil), bindings...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].VariableName < sorted[j].VariableName })
+	sortedLiterals := append([]frozenLiteral(nil), literals...)
+	sort.Slice(sortedLiterals, func(i, j int) bool { return sortedLiterals[i].VariableName < sortedLiterals[j].VariableName })
 	parts := []string{
-		"1",
+		"2",
 		strconv.Itoa(cfg.ContainerPort),
 		cfg.ContainerScheme,
 		cfg.ReleaseStrategy,
@@ -234,6 +343,10 @@ func computeConfigDigest(cfg frozenExecutionSnapshot, bindings []frozenBinding) 
 	}
 	for _, b := range sorted {
 		parts = append(parts, b.VariableName, b.DeliveryScope, b.SecretVersionID)
+	}
+	parts = append(parts, strconv.Itoa(len(sortedLiterals)))
+	for _, l := range sortedLiterals {
+		parts = append(parts, l.VariableName, l.DeliveryScope, l.LiteralValue)
 	}
 	buf := make([]byte, 0, 512)
 	for _, part := range parts {
@@ -285,6 +398,19 @@ func toQueueSecretBindings(bindings []frozenBinding) []queue.SecretBinding {
 	out := make([]queue.SecretBinding, 0, len(bindings))
 	for _, b := range bindings {
 		out = append(out, queue.SecretBinding{VariableName: b.VariableName, DeliveryScope: b.DeliveryScope, SecretVersionID: b.SecretVersionID})
+	}
+	return out
+}
+
+// toQueueLiteralBindings converts the internal frozenLiteral shape into the
+// exported queue.LiteralBinding the ClaimedLease wire path carries. These
+// carry real values rather than references, which is safe only because a
+// literal_nonsecret binding is non-secret by ADR 0003's classification; a
+// secret value must never be routed through this type.
+func toQueueLiteralBindings(literals []frozenLiteral) []queue.LiteralBinding {
+	out := make([]queue.LiteralBinding, 0, len(literals))
+	for _, l := range literals {
+		out = append(out, queue.LiteralBinding{VariableName: l.VariableName, DeliveryScope: l.DeliveryScope, Value: l.LiteralValue})
 	}
 	return out
 }
