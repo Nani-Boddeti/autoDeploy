@@ -158,6 +158,99 @@ func (r *AgentLeaseRepository) AuthorizeMaterialization(ctx context.Context, ser
 	}, nil
 }
 
+// AuthorizeCheckout re-derives, from locked rows only, whether serverID may
+// right now reserve or mint a checkout credential for the exact commit
+// attemptID's job was enqueued for, and returns the authority a checkout
+// needs if so. It performs no mutation, mints nothing, and matches
+// AuthorizeMaterialization's lock order and occupancy checks exactly
+// (credential -> slot -> job -> attempt, every lock FOR SHARE): a checkout
+// credential is exactly as sensitive as a decrypted secret value (ADR 0003
+// "Agent authorization and materialization" draws no distinction), so the
+// same re-authorization discipline applies immediately before either is
+// minted.
+//
+// RepositoryID and CommitSHA are read from the job row itself, never
+// accepted from the caller: the frozen job is the sole authority on what
+// commit this attempt may check out, exactly as the frozen secret set is the
+// sole authority on what a materialization request may decrypt.
+//
+// Every failure returns ErrServerAuthorizationDenied, mapped by the
+// transport to the same generic 401 every other agent route uses.
+func (r *AgentLeaseRepository) AuthorizeCheckout(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64) (queue.CheckoutAuthorization, error) {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 {
+		return queue.CheckoutAuthorization{}, ErrAgentLeaseInvalidInput
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return queue.CheckoutAuthorization{}, fmt.Errorf("begin checkout authorization: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return queue.CheckoutAuthorization{}, err
+	}
+
+	var jobID int64
+	var environmentID, attemptServerID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id, server_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID, &attemptServerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return queue.CheckoutAuthorization{}, ErrServerAuthorizationDenied
+		}
+		return queue.CheckoutAuthorization{}, fmt.Errorf("locate agent job attempt for checkout: %w", err)
+	}
+	if attemptServerID != serverID {
+		return queue.CheckoutAuthorization{}, ErrServerAuthorizationDenied
+	}
+
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	var reconciliationRequired bool
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id, reconciliation_required FROM environment_slots WHERE environment_id=$1 FOR SHARE`, environmentID).
+		Scan(&slotFence, &slotCurrentAttemptID, &reconciliationRequired); err != nil {
+		return queue.CheckoutAuthorization{}, fmt.Errorf("lock environment slot for checkout: %w", err)
+	}
+	if slotFence != fence || reconciliationRequired || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+		return queue.CheckoutAuthorization{}, ErrServerAuthorizationDenied
+	}
+
+	var ownerID, projectID, deploymentID string
+	var repositoryID int64
+	var commitSHA string
+	var cancelRequestedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT owner_id, project_id, deployment_id, repository_id, commit_sha, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR SHARE`, jobID).
+		Scan(&ownerID, &projectID, &deploymentID, &repositoryID, &commitSHA, &cancelRequestedAt); err != nil {
+		return queue.CheckoutAuthorization{}, fmt.Errorf("lock agent job for checkout: %w", err)
+	}
+	if cancelRequestedAt != nil {
+		return queue.CheckoutAuthorization{}, ErrServerAuthorizationDenied
+	}
+
+	var attemptState string
+	var attemptFence int64
+	var authorityExpiresAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT state, fence, authority_expires_at FROM agent_job_attempts WHERE id=$1 FOR SHARE`, attemptID).
+		Scan(&attemptState, &attemptFence, &authorityExpiresAt); err != nil {
+		return queue.CheckoutAuthorization{}, fmt.Errorf("lock agent job attempt for checkout: %w", err)
+	}
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return queue.CheckoutAuthorization{}, fmt.Errorf("read checkout clock: %w", err)
+	}
+	if attemptState != string(queue.AttemptLeased) || attemptFence != fence || !authorityExpiresAt.After(now) {
+		return queue.CheckoutAuthorization{}, ErrServerAuthorizationDenied
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return queue.CheckoutAuthorization{}, fmt.Errorf("commit checkout authorization: %w", err)
+	}
+	return queue.CheckoutAuthorization{
+		AttemptID: attemptID, Fence: fence, JobID: jobID,
+		OwnerID: ownerID, ProjectID: projectID, EnvironmentID: environmentID, DeploymentID: deploymentID,
+		RepositoryID: repositoryID, CommitSHA: commitSHA,
+	}, nil
+}
+
 // ReportProgress records that attemptID has entered phase, advancing the
 // deployment's own status so an operator can see where a running deployment
 // is. It is the only way an agent influences deployment status short of

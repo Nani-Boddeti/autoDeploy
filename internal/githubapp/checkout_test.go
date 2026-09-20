@@ -125,3 +125,73 @@ func TestCheckoutRejectsWrongScopeAndRevokes(t *testing.T) {
 		t.Fatal("invalid token not revoked")
 	}
 }
+
+// newDeliverableLease builds an activated lease over stubs, for the delivery
+// tests below.
+func newDeliverableLease(t *testing.T, secret string) (*CheckoutLease, *checkoutProviderStub) {
+	t.Helper()
+	provider := &checkoutProviderStub{token: Token{Value: secret, ExpiresAt: time.Now().Add(time.Minute), RepositoryIDs: []int64{2}, Contents: "read", Permissions: map[string]string{"contents": "read"}}}
+	store := &checkoutStoreStub{binding: CheckoutBinding{OwnerID: "owner", ProjectID: "project", InstallationID: 1, RepositoryID: 2, AuthorizationRevision: 3, CloneURL: "https://github.com/owner/repo.git", CommitSHA: "0123456789abcdef0123456789abcdef01234567", ReservationID: "reservation"}}
+	s, err := NewCheckoutService(store, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := s.Activate(context.Background(), "reservation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lease, provider
+}
+
+// TestDeliverTokenIsOneUseAndSharesTheDeliveryFlag proves a lease either feeds
+// a local Git through the pipe or is delivered once to one agent, never both
+// and never twice: a remote checkout must not be able to obtain the credential
+// again, and a delivered lease must not also be able to mint a local pipe.
+func TestDeliverTokenIsOneUseAndSharesTheDeliveryFlag(t *testing.T) {
+	secret := "deliver-test-sentinel"
+	lease, provider := newDeliverableLease(t, secret)
+
+	token, err := lease.DeliverToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != secret {
+		t.Fatalf("token=%q", token)
+	}
+	if _, err := lease.DeliverToken(); !errors.Is(err, ErrCheckoutUnavailable) {
+		t.Fatalf("second delivery: %v", err)
+	}
+	if _, err := lease.NewAskPassBroker(); !errors.Is(err, ErrCheckoutUnavailable) {
+		t.Fatalf("pipe after delivery: %v", err)
+	}
+	if err := lease.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.revoked) != 1 || provider.revoked[0] != secret {
+		t.Fatal("delivered token was not revoked on close")
+	}
+}
+
+func TestDeliverTokenRefusedAfterPipeDelivery(t *testing.T) {
+	lease, _ := newDeliverableLease(t, "pipe-first-sentinel")
+	if _, err := lease.NewAskPassBroker(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease.DeliverToken(); !errors.Is(err, ErrCheckoutUnavailable) {
+		t.Fatalf("delivery after pipe: %v", err)
+	}
+}
+
+func TestDeliverTokenRefusedAfterRevokeAndOnNilLease(t *testing.T) {
+	lease, _ := newDeliverableLease(t, "revoked-sentinel")
+	if err := lease.Revoke(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lease.DeliverToken(); !errors.Is(err, ErrCheckoutUnavailable) {
+		t.Fatalf("delivery after revoke: %v", err)
+	}
+	var nilLease *CheckoutLease
+	if _, err := nilLease.DeliverToken(); !errors.Is(err, ErrCheckoutUnavailable) {
+		t.Fatalf("nil lease delivery: %v", err)
+	}
+}

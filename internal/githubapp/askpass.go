@@ -13,6 +13,19 @@ type AskPassBroker struct {
 	writer *os.File
 }
 
+// NewAskPassBrokerFromToken builds a broker around a checkout token
+// presented as a plain value, rather than one this process minted itself.
+// It exists so an agent-side gitcheckout.Lease implementation (which fetches
+// its token from POST /agent/v1/checkout/start, over the authenticated
+// channel ADR 0003 permits it to cross) can feed Git the same one-use pipe
+// discipline CheckoutLease.NewAskPassBroker uses, without the agent ever
+// gaining any capability to mint or revoke a token itself: this constructor
+// wraps an already-issued value and nothing else. It never touches a
+// Provider, a Signer, or an App private key.
+func NewAskPassBrokerFromToken(token string) (*AskPassBroker, error) {
+	return newAskPassBroker(token)
+}
+
 func newAskPassBroker(token string) (*AskPassBroker, error) {
 	if token == "" {
 		return nil, errors.New("empty checkout token")

@@ -208,6 +208,29 @@ func withCleanupContext(ctx context.Context, fn func(context.Context) error) err
 	return fn(cleanupCtx)
 }
 
+// DeliverToken hands this lease's token to the caller for transfer over the
+// control plane's authenticated, confidentiality-protected agent channel,
+// which ADR 0003 permits for transient material once the lease is running. It
+// is the deliberate counterpart to NewAskPassBroker: a local checkout feeds
+// Git through the one-use pipe, while a remote checkout on the agent host
+// needs the token itself so it can build that pipe on its own side.
+//
+// Delivery is one-use and shares the same flag as the pipe, so a lease can
+// either feed a local Git or be delivered once to one agent, never both and
+// never twice. An invalidated or already-revoked lease delivers nothing.
+func (l *CheckoutLease) DeliverToken() (string, error) {
+	if l == nil {
+		return "", ErrCheckoutUnavailable
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.token == "" || l.delivered || l.invalidated {
+		return "", ErrCheckoutUnavailable
+	}
+	l.delivered = true
+	return l.token, nil
+}
+
 // NewAskPassBroker transfers this lease's token through a one-use pipe. The
 // lease becomes incapable of creating another broker after transfer.
 func (l *CheckoutLease) NewAskPassBroker() (*AskPassBroker, error) {

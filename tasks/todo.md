@@ -1585,6 +1585,41 @@ Independent review of Steps 3a and 3b (2026-09-20): **PASS with notes**, no bloc
   bodies, `SetAuthorizer` cannot be widened including via `Frozen`, and the KEK-load failure is
   fail-closed.
 
+Step 3c part 2 result (2026-09-20): done. `AuthorizeCheckout` + `queue.CheckoutAuthorization`,
+`internal/agent/http/checkout.go` (begin/start/close + registry), `internal/agent/checkout` (agent-side
+`gitcheckout.Lease`), `githubapp.NewAskPassBrokerFromToken`, `githubapp.CheckoutLease.DeliverToken`,
+client methods, control-plane wiring.
+- `AuthorizeCheckout` repeats materialization's four occupancy checks; repository id and commit SHA come
+  from the locked job row, never from caller input. Begin also cross-checks the reservation's resolved
+  repository/commit against the job's and closes the reservation immediately on mismatch.
+- Invariant preserved: begin reserves and returns **no token**; start activates, marks the durable lease
+  running, and only then returns the credential; a failed Start closes the activated lease so no minted
+  token is left live.
+- The registry binds each reservation to the server, attempt and fence that created it, and an unknown
+  reservation is indistinguishable from a mismatched one. 30-minute TTL, swept lazily, comfortably
+  exceeding the store's 10-minute reservation window. A control-plane restart between start and close
+  loses the registry, so revocation degrades to token expiry — deliberate and documented in the type.
+Three corrections I made to the delegated work:
+1. **Token delivery was draining the one-use askpass pipe** — functional, but a misuse of a mechanism
+   built to feed a local Git subprocess. Replaced with `CheckoutLease.DeliverToken`, one-use and sharing
+   the pipe's own `delivered` flag, so a lease either feeds a local Git or is delivered once to one
+   agent, never both and never twice. ADR 0003 permits delivering transient material over the
+   authenticated channel; what must never be exported is *minting*.
+2. **Data race:** `match` returned the mutable registry entry, so a handler read `lease`/`closed` while
+   another request wrote them through `setLease`/`markClosed`. Now returns an immutable snapshot taken
+   under the lock.
+3. **Double-mint:** two concurrent starts for one reservation both passed the ownership check, both
+   activated, and the loser's token stayed live until expiry with nothing able to close it. Start is now
+   a one-shot claim (`claimStart`/`releaseStart`), and a retried or concurrent start is refused.
+   Neither 2 nor 3 was caught by the delegated tests because none drove one reservation concurrently;
+   added tests do, including an 8-goroutine start race asserting exactly one token is minted.
+Evidence: 10 repository integration tests, ~25 handler tests, 9 agent-lease tests, 3 new `DeliverToken`
+tests; three fresh PG18 sweeps normal and three `-race`, 6/6; `make check`, `go vet -tags=integration
+./...`, `go test -race ./...`, Linux amd64+arm64, `git diff --check`, gofmt.
+Fixture gotcha recorded by the implementer: `environment_slots` requires `reconciliation_attempt_id`
+whenever `reconciliation_required` is true (000013 CHECK), so set both together in tests.
+Not wired into `cmd/agent` yet — that is Slice 9b's job.
+
 #### Step 3d — runtime configuration admin pages
 
 Session+CSRF-protected, owner-scoped pages in `internal/web`, following the existing

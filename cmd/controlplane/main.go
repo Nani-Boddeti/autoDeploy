@@ -110,6 +110,15 @@ func run(ctx context.Context) error {
 		return err
 	}
 	var webhookHandler http.Handler
+	// checkoutStore and checkoutService back the agent-facing checkout routes
+	// (Step 3c part 2). Both are only ever non-nil when the GitHub App
+	// subsystem itself is enabled: those routes need it unconditionally, and
+	// must answer 503 rather than a partial success when it is not
+	// configured. Neither leaks the App signer or its private key past this
+	// function -- only the provider's already-derived, short-lived
+	// installation-token minting is reachable through checkoutService.
+	var checkoutStore agenthttp.CheckoutReservationStore
+	var checkoutService *githubapp.CheckoutService
 	if githubConfig.Enabled {
 		webhookSecrets, webhookErr := config.GitHubWebhookSecretRingFromEnvironment()
 		if webhookErr != nil {
@@ -137,6 +146,11 @@ func run(ctx context.Context) error {
 		webOptions.GitHubSetup, webOptions.GitHubInstallationURL = setup, githubConfig.InstallationURL
 		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
 		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
+		checkoutService, err = githubapp.NewCheckoutService(githubRepository, provider)
+		if err != nil {
+			return errors.New("GitHub setup unavailable")
+		}
+		checkoutStore = githubRepository
 	}
 	// serverRepository and leaseRepository back the session/CSRF-protected
 	// web /servers and /environments/mark-reconciled admin routes (Step 6b);
@@ -173,6 +187,16 @@ func run(ctx context.Context) error {
 			handler.ProgressReporter = leaseRepository
 			if enabled {
 				handler.SecretMaterializerFactory = secretMaterializerFactory{postgres.NewSecretRepository(pool)}
+			}
+			// The checkout routes need the GitHub App subsystem in addition to
+			// the agent protocol; leaving any one of these four nil answers
+			// 503, never a partial success (agenthttp's own dependency-nil
+			// discipline), so all four are wired together or not at all.
+			if checkoutService != nil && checkoutStore != nil {
+				handler.CheckoutAuthorizer = leaseRepository
+				handler.CheckoutStore = checkoutStore
+				handler.CheckoutActivator = checkoutService
+				handler.CheckoutRegistry = agenthttp.NewCheckoutRegistry()
 			}
 			agentHandler = handler
 		}

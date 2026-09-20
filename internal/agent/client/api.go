@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"time"
 
+	agentcheckout "autodeploy/internal/agent/checkout"
 	"autodeploy/internal/deployment"
+	"autodeploy/internal/githubapp"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/server"
 )
@@ -360,4 +362,78 @@ func (c *Client) ReportProgress(ctx context.Context, attemptID, fence int64, pha
 		Phase     string `json:"phase"`
 	}{AttemptID: attemptID, Fence: fence, Phase: string(phase)}
 	return c.post(ctx, pathProgress, req, nil, true)
+}
+
+type checkoutBindingWire struct {
+	OwnerID        string `json:"owner_id"`
+	ProjectID      string `json:"project_id"`
+	InstallationID int64  `json:"installation_id"`
+	RepositoryID   int64  `json:"repository_id"`
+	CloneURL       string `json:"clone_url"`
+	CommitSHA      string `json:"commit_sha"`
+	ReservationID  string `json:"reservation_id"`
+}
+
+// CheckoutBegin reserves a checkout credential for attemptID/fence. No token
+// is minted or returned here (internal/agent/checkout.Begin).
+func (c *Client) CheckoutBegin(ctx context.Context, attemptID, fence int64) (agentcheckout.Reservation, error) {
+	req := struct {
+		AttemptID int64 `json:"attempt_id"`
+		Fence     int64 `json:"fence"`
+	}{AttemptID: attemptID, Fence: fence}
+	var resp struct {
+		ReservationID string              `json:"reservation_id"`
+		Binding       checkoutBindingWire `json:"binding"`
+	}
+	if err := c.post(ctx, pathCheckoutBegin, req, &resp, true); err != nil {
+		return agentcheckout.Reservation{}, err
+	}
+	return agentcheckout.Reservation{
+		ReservationID: resp.ReservationID,
+		Binding: githubapp.CheckoutBinding{
+			OwnerID:        resp.Binding.OwnerID,
+			ProjectID:      resp.Binding.ProjectID,
+			InstallationID: resp.Binding.InstallationID,
+			RepositoryID:   resp.Binding.RepositoryID,
+			CloneURL:       resp.Binding.CloneURL,
+			CommitSHA:      resp.Binding.CommitSHA,
+			ReservationID:  resp.Binding.ReservationID,
+		},
+	}, nil
+}
+
+// CheckoutStart activates reservationID and returns the minted credential.
+// The control plane marks the durable lease running before this response is
+// ever written, so a caller that receives a token here also knows the
+// running state was recorded first.
+func (c *Client) CheckoutStart(ctx context.Context, attemptID, fence int64, reservationID string) (agentcheckout.Credential, error) {
+	req := struct {
+		AttemptID     int64  `json:"attempt_id"`
+		Fence         int64  `json:"fence"`
+		ReservationID string `json:"reservation_id"`
+	}{AttemptID: attemptID, Fence: fence, ReservationID: reservationID}
+	var resp struct {
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := c.post(ctx, pathCheckoutStart, req, &resp, true); err != nil {
+		return agentcheckout.Credential{}, err
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, resp.ExpiresAt)
+	if err != nil {
+		return agentcheckout.Credential{}, fmt.Errorf("%w: malformed checkout start response", ErrTransportFailure)
+	}
+	return agentcheckout.Credential{Token: resp.Token, ExpiresAt: expiresAt}, nil
+}
+
+// CheckoutClose releases reservationID and revokes its credential if one was
+// ever minted. It is safe to call on a reservation that was begun but never
+// started, and safe to retry.
+func (c *Client) CheckoutClose(ctx context.Context, attemptID, fence int64, reservationID string) error {
+	req := struct {
+		AttemptID     int64  `json:"attempt_id"`
+		Fence         int64  `json:"fence"`
+		ReservationID string `json:"reservation_id"`
+	}{AttemptID: attemptID, Fence: fence, ReservationID: reservationID}
+	return c.post(ctx, pathCheckoutClose, req, nil, true)
 }

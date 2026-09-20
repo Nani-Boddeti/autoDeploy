@@ -29,18 +29,21 @@ const (
 	// Prefix is the mount point for every route this handler serves.
 	Prefix = "/agent/v1/"
 
-	pathEnroll      = "/agent/v1/enroll"
-	pathHeartbeat   = "/agent/v1/heartbeat"
-	pathClaim       = "/agent/v1/jobs/claim"
-	pathRenew       = "/agent/v1/leases/renew"
-	pathComplete    = "/agent/v1/leases/complete"
-	pathCancelAck   = "/agent/v1/leases/cancel-ack"
-	pathReconcile   = "/agent/v1/environments/reconcile"
-	pathMaterialize = "/agent/v1/leases/materialize-secrets"
-	pathProgress    = "/agent/v1/leases/progress"
-	authHeaderName  = "Authorization"
-	serverIDHeader  = "X-AutoDeploy-Server-ID"
-	bearerPrefix    = "Bearer "
+	pathEnroll        = "/agent/v1/enroll"
+	pathHeartbeat     = "/agent/v1/heartbeat"
+	pathClaim         = "/agent/v1/jobs/claim"
+	pathRenew         = "/agent/v1/leases/renew"
+	pathComplete      = "/agent/v1/leases/complete"
+	pathCancelAck     = "/agent/v1/leases/cancel-ack"
+	pathReconcile     = "/agent/v1/environments/reconcile"
+	pathMaterialize   = "/agent/v1/leases/materialize-secrets"
+	pathProgress      = "/agent/v1/leases/progress"
+	pathCheckoutBegin = "/agent/v1/checkout/begin"
+	pathCheckoutStart = "/agent/v1/checkout/start"
+	pathCheckoutClose = "/agent/v1/checkout/close"
+	authHeaderName    = "Authorization"
+	serverIDHeader    = "X-AutoDeploy-Server-ID"
+	bearerPrefix      = "Bearer "
 
 	// MaxBodyBytes bounds every request body except heartbeat, which is
 	// tighter because its fixed-schema capability struct never needs more.
@@ -122,6 +125,10 @@ type Handler struct {
 	MaterializationAuthorizer MaterializationAuthorizer
 	SecretMaterializerFactory SecretMaterializerFactory
 	ProgressReporter          ProgressReporter
+	CheckoutAuthorizer        CheckoutAuthorizer
+	CheckoutStore             CheckoutReservationStore
+	CheckoutActivator         CheckoutActivator
+	CheckoutRegistry          *CheckoutRegistry
 	TrustedProxyCIDRs         []netip.Prefix
 	Clock                     Clock
 	RequestTimeout            time.Duration
@@ -184,6 +191,12 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleMaterializeSecrets(w, r)
 	case pathProgress:
 		h.handleProgress(w, r)
+	case pathCheckoutBegin:
+		h.handleCheckoutBegin(w, r)
+	case pathCheckoutStart:
+		h.handleCheckoutStart(w, r)
+	case pathCheckoutClose:
+		h.handleCheckoutClose(w, r)
 	default:
 		h.writeError(w, http.StatusNotFound, "not_found")
 	}

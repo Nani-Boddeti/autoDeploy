@@ -120,3 +120,24 @@ type MaterializationAuthorization struct {
 	DeploymentID  string
 	Secrets       []FrozenSecretReference
 }
+
+// CheckoutAuthorization is the result of re-deriving, from locked rows
+// immediately before a checkout credential is reserved or minted, that one
+// attempt may check out its job's exact commit (tasks/todo.md Step 3c part
+// 2). It mirrors MaterializationAuthorization's shape and the same four
+// occupancy checks (server ownership, slot fence/occupant, no pending
+// reconciliation, no cancellation) plus attempt state and authority expiry.
+// RepositoryID and CommitSHA come from the frozen agent_jobs row, never from
+// caller input, so an agent cannot ask to check out anything but the exact
+// commit its job was enqueued for.
+type CheckoutAuthorization struct {
+	AttemptID     int64
+	Fence         int64
+	JobID         int64
+	OwnerID       string
+	ProjectID     string
+	EnvironmentID string
+	DeploymentID  string
+	RepositoryID  int64
+	CommitSHA     string
+}
