@@ -170,6 +170,7 @@ func run(ctx context.Context) error {
 			// secret set an agent could mistake for "this deployment has no
 			// secrets" (agenthttp.handleMaterializeSecrets fails closed).
 			handler.MaterializationAuthorizer = leaseRepository
+			handler.ProgressReporter = leaseRepository
 			if enabled {
 				handler.SecretMaterializerFactory = secretMaterializerFactory{postgres.NewSecretRepository(pool)}
 			}

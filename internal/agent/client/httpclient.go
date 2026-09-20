@@ -32,6 +32,7 @@ const (
 	pathCancelAck   = "/agent/v1/leases/cancel-ack"
 	pathReconcile   = "/agent/v1/environments/reconcile"
 	pathMaterialize = "/agent/v1/leases/materialize-secrets"
+	pathProgress    = "/agent/v1/leases/progress"
 
 	requestTimeout   = 10 * time.Second
 	maxResponseBytes = 64 * 1024

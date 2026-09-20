@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"autodeploy/internal/deployment"
 )
 
 // authorizeFirstClaim claims once and returns the authorization inputs a
@@ -226,5 +228,167 @@ func TestAuthorizeMaterializationPerformsNoMutation(t *testing.T) {
 	}
 	if after := read(); after != before {
 		t.Fatalf("authorization mutated lease state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestReportProgressAdvancesDeploymentThroughPhases(t *testing.T) {
+	f := newLeaseFixture(t, 200)
+	d := f.withCredential(t, 110)
+	repo, attemptID, fence := authorizeFirstClaim(t, f, d)
+	ctx := context.Background()
+
+	status := func() string {
+		var s string
+		if err := f.pool.QueryRow(ctx, `SELECT status FROM deployments WHERE id=(SELECT deployment_id FROM agent_jobs WHERE id=$1)`, f.jobID).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if status() != "assigned" {
+		t.Fatalf("status after claim=%s, want assigned", status())
+	}
+	for _, phase := range []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusStarting, deployment.StatusHealthChecking} {
+		if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, phase); err != nil {
+			t.Fatalf("report %s: %v", phase, err)
+		}
+		if status() != string(phase) {
+			t.Fatalf("status=%s after reporting %s", status(), phase)
+		}
+	}
+
+	// The deployment's own event log records each phase.
+	var events int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM deployment_events WHERE deployment_id=(SELECT deployment_id FROM agent_jobs WHERE id=$1) AND to_status IN ('fetching','building','starting','health_checking')`, f.jobID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 4 {
+		t.Fatalf("deployment phase events=%d, want 4", events)
+	}
+}
+
+// TestReportProgressAbsorbsDuplicateAndStalePhases is why ExecutionOrder
+// exists: canTransition rejects a same-status transition, so without an
+// explicit order comparison a progress report retried after a network failure
+// would fail a build that is otherwise fine.
+func TestReportProgressAbsorbsDuplicateAndStalePhases(t *testing.T) {
+	f := newLeaseFixture(t, 201)
+	d := f.withCredential(t, 112)
+	repo, attemptID, fence := authorizeFirstClaim(t, f, d)
+	ctx := context.Background()
+
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusFetching); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusBuilding); err != nil {
+		t.Fatal(err)
+	}
+	// Duplicate of the current phase, and a stale report about an earlier one.
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusBuilding); err != nil {
+		t.Fatalf("duplicate phase must be absorbed: %v", err)
+	}
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusFetching); err != nil {
+		t.Fatalf("stale earlier phase must be absorbed: %v", err)
+	}
+	var status string
+	if err := f.pool.QueryRow(ctx, `SELECT status FROM deployments WHERE id=(SELECT deployment_id FROM agent_jobs WHERE id=$1)`, f.jobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "building" {
+		t.Fatalf("status=%s, want building (a stale report must not move it back)", status)
+	}
+	// No extra event rows were appended by the absorbed reports.
+	var events int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM deployment_events WHERE deployment_id=(SELECT deployment_id FROM agent_jobs WHERE id=$1) AND to_status IN ('fetching','building')`, f.jobID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 2 {
+		t.Fatalf("events=%d, want 2: an absorbed report must append nothing", events)
+	}
+}
+
+// TestReportProgressRefusesSkippedPhase proves a phase that never happened
+// cannot be claimed: inventing the intermediate transitions would forge
+// history in an append-only log.
+func TestReportProgressRefusesSkippedPhase(t *testing.T) {
+	f := newLeaseFixture(t, 202)
+	d := f.withCredential(t, 114)
+	repo, attemptID, fence := authorizeFirstClaim(t, f, d)
+	ctx := context.Background()
+
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusStarting); !errors.Is(err, ErrAgentLeaseInvalidInput) {
+		t.Fatalf("err=%v, want ErrAgentLeaseInvalidInput for a skipped phase", err)
+	}
+	var status string
+	if err := f.pool.QueryRow(ctx, `SELECT status FROM deployments WHERE id=(SELECT deployment_id FROM agent_jobs WHERE id=$1)`, f.jobID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "assigned" {
+		t.Fatalf("status=%s, want assigned: a refused report must change nothing", status)
+	}
+}
+
+// TestReportProgressAppendsNoAgentJobEvent is ADR 0004's bounded-events rule:
+// a long build would otherwise write unbounded agent_job_events rows.
+func TestReportProgressAppendsNoAgentJobEvent(t *testing.T) {
+	f := newLeaseFixture(t, 203)
+	d := f.withCredential(t, 116)
+	repo, attemptID, fence := authorizeFirstClaim(t, f, d)
+	ctx := context.Background()
+
+	count := func() int {
+		var n int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM agent_job_events WHERE job_id=$1`, f.jobID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	before := count()
+	for _, phase := range []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusBuilding, deployment.StatusStarting} {
+		if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if after := count(); after != before {
+		t.Fatalf("agent_job_events grew from %d to %d", before, after)
+	}
+}
+
+func TestReportProgressRefusesUnauthorizedCallers(t *testing.T) {
+	f := newLeaseFixture(t, 204)
+	d := f.withCredential(t, 118)
+	repo, attemptID, fence := authorizeFirstClaim(t, f, d)
+	ctx := context.Background()
+
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence+1, deployment.StatusFetching); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("stale fence err=%v", err)
+	}
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusActivating); !errors.Is(err, ErrAgentLeaseInvalidInput) {
+		t.Fatalf("activating must not be reportable by an agent: err=%v", err)
+	}
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusHealthy); !errors.Is(err, ErrAgentLeaseInvalidInput) {
+		t.Fatalf("healthy must not be reportable by an agent: err=%v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE agent_job_attempts SET authority_expires_at=clock_timestamp() - interval '1 second' WHERE id=$1`, attemptID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusFetching); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("expired authority err=%v", err)
+	}
+}
+
+// TestReportProgressRefusesTerminalDeployment proves a deployment that has
+// left the execution path cannot have its history rewritten by work that is
+// winding down.
+func TestReportProgressRefusesTerminalDeployment(t *testing.T) {
+	f := newLeaseFixture(t, 205)
+	d := f.withCredential(t, 120)
+	repo, attemptID, fence := authorizeFirstClaim(t, f, d)
+	ctx := context.Background()
+
+	if err := repo.RequestCancellation(ctx, f.principal, f.jobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReportProgress(ctx, f.serverID, d, attemptID, fence, deployment.StatusFetching); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("err=%v, want denial once the deployment is terminal", err)
 	}
 }

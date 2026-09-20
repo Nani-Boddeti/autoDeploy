@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"autodeploy/internal/deployment"
 	"autodeploy/internal/github"
 	"autodeploy/internal/queue"
 
@@ -155,4 +156,122 @@ func (r *AgentLeaseRepository) AuthorizeMaterialization(ctx context.Context, ser
 		OwnerID: ownerID, ProjectID: projectID, EnvironmentID: environmentID, DeploymentID: deploymentID,
 		Secrets: refs,
 	}, nil
+}
+
+// ReportProgress records that attemptID has entered phase, advancing the
+// deployment's own status so an operator can see where a running deployment
+// is. It is the only way an agent influences deployment status short of
+// completing, and it can only move forward along the execution path.
+//
+// Authorization is the same re-derivation from locked rows that
+// AuthorizeMaterialization performs, in the same ADR 0004 order (credential ->
+// slot -> job -> attempt); the job is locked FOR UPDATE because this path does
+// mutate the deployment, which serializes concurrent progress reports for one
+// job against each other and against Complete.
+//
+// Deliberately appends no agent_job_events row. ADR 0004's amendment gives the
+// same reasoning for renewals: a long build would otherwise write unbounded
+// rows. Phase history already lives in the deployment's own append-only event
+// log.
+func (r *AgentLeaseRepository) ReportProgress(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, phase deployment.Status) error {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 || !deployment.AgentReportablePhase(phase) {
+		return ErrAgentLeaseInvalidInput
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin agent lease progress: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return err
+	}
+
+	var jobID int64
+	var environmentID, attemptServerID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id, server_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID, &attemptServerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("locate agent job attempt for progress: %w", err)
+	}
+	if attemptServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	var reconciliationRequired bool
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id, reconciliation_required FROM environment_slots WHERE environment_id=$1 FOR SHARE`, environmentID).
+		Scan(&slotFence, &slotCurrentAttemptID, &reconciliationRequired); err != nil {
+		return fmt.Errorf("lock environment slot for progress: %w", err)
+	}
+	if slotFence != fence || reconciliationRequired || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var deploymentID string
+	var cancelRequestedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID, &cancelRequestedAt); err != nil {
+		return fmt.Errorf("lock agent job for progress: %w", err)
+	}
+	// Cancellation of a leased job is cooperative: the attempt stays leased
+	// and the deployment stays on the execution path until the agent
+	// acknowledges. Progress must still be refused from that moment, both for
+	// consistency with materialization and because advancing a deployment's
+	// visible status toward healthy while it is being cancelled would tell an
+	// operator the opposite of what is happening.
+	if cancelRequestedAt != nil {
+		return ErrServerAuthorizationDenied
+	}
+
+	var attemptState string
+	var attemptFence int64
+	var authorityExpiresAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT state, fence, authority_expires_at FROM agent_job_attempts WHERE id=$1 FOR SHARE`, attemptID).
+		Scan(&attemptState, &attemptFence, &authorityExpiresAt); err != nil {
+		return fmt.Errorf("lock agent job attempt for progress: %w", err)
+	}
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("read progress clock: %w", err)
+	}
+	if attemptState != string(queue.AttemptLeased) || attemptFence != fence || !authorityExpiresAt.After(now) {
+		return ErrServerAuthorizationDenied
+	}
+
+	var currentStatus string
+	if err = tx.QueryRow(ctx, `SELECT status FROM deployments WHERE id=$1 FOR UPDATE`, deploymentID).Scan(&currentStatus); err != nil {
+		return fmt.Errorf("lock deployment for progress: %w", err)
+	}
+	current := deployment.Status(currentStatus)
+	currentOrder, onPath := deployment.ExecutionOrder(current)
+	if !onPath {
+		// The deployment already left the execution path (cancelled, failed,
+		// superseded, rolled back). Its history must not be rewritten by a
+		// report from work that is winding down.
+		return ErrServerAuthorizationDenied
+	}
+	targetOrder, _ := deployment.ExecutionOrder(phase)
+	switch {
+	case targetOrder <= currentOrder:
+		// Already at or past this phase: absorb the duplicate. A progress
+		// report retried after a network failure, or a phase re-entered by a
+		// resumed executor, must not fail a build that is otherwise fine.
+		return tx.Commit(ctx)
+	case targetOrder > currentOrder+1:
+		// A skip would claim a phase that never happened. The executor reports
+		// each phase as it enters it, so this is a caller bug, not a race, and
+		// inventing the intermediate transitions would forge history in an
+		// append-only event log.
+		return ErrAgentLeaseInvalidInput
+	}
+	if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, phase, now, r.inject); err != nil {
+		return err
+	}
+	if err = r.inject("progress"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

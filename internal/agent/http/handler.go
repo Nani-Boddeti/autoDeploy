@@ -37,6 +37,7 @@ const (
 	pathCancelAck   = "/agent/v1/leases/cancel-ack"
 	pathReconcile   = "/agent/v1/environments/reconcile"
 	pathMaterialize = "/agent/v1/leases/materialize-secrets"
+	pathProgress    = "/agent/v1/leases/progress"
 	authHeaderName  = "Authorization"
 	serverIDHeader  = "X-AutoDeploy-Server-ID"
 	bearerPrefix    = "Bearer "
@@ -120,6 +121,7 @@ type Handler struct {
 	Reconciler                EnvironmentReconciler
 	MaterializationAuthorizer MaterializationAuthorizer
 	SecretMaterializerFactory SecretMaterializerFactory
+	ProgressReporter          ProgressReporter
 	TrustedProxyCIDRs         []netip.Prefix
 	Clock                     Clock
 	RequestTimeout            time.Duration
@@ -180,6 +182,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleReconcile(w, r)
 	case pathMaterialize:
 		h.handleMaterializeSecrets(w, r)
+	case pathProgress:
+		h.handleProgress(w, r)
 	default:
 		h.writeError(w, http.StatusNotFound, "not_found")
 	}

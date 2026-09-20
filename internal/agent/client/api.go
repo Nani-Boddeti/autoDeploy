@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"autodeploy/internal/deployment"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/server"
 )
@@ -340,4 +341,23 @@ func (c *Client) MaterializeSecrets(ctx context.Context, attemptID, fence int64)
 		secrets = append(secrets, MaterializedSecret{VariableName: s.VariableName, DeliveryScope: s.DeliveryScope, Value: s.Value})
 	}
 	return secrets, nil
+}
+
+// ReportProgress tells the control plane that this attempt has entered phase,
+// so an operator can watch a deployment move through checkout, build, start,
+// and the health gate. Phase must be one of deployment.StatusFetching,
+// StatusBuilding, StatusStarting, or StatusHealthChecking; activation and the
+// healthy verdict belong to the control plane.
+//
+// Progress is observability, so a caller should not abort execution because a
+// report failed: a duplicate or already-passed phase is accepted by the
+// control plane, and a genuine authorization failure will surface again on the
+// next renewal.
+func (c *Client) ReportProgress(ctx context.Context, attemptID, fence int64, phase deployment.Status) error {
+	req := struct {
+		AttemptID int64  `json:"attempt_id"`
+		Fence     int64  `json:"fence"`
+		Phase     string `json:"phase"`
+	}{AttemptID: attemptID, Fence: fence, Phase: string(phase)}
+	return c.post(ctx, pathProgress, req, nil, true)
 }

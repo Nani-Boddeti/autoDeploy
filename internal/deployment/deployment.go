@@ -302,3 +302,51 @@ func canTransition(from, to Status) bool {
 		return false
 	}
 }
+
+// AgentReportablePhase reports whether status is one of the execution phases
+// a deployment agent may report progress for. Activation and health are
+// deliberately excluded: an agent runs checkout, build, start, and the direct
+// health gate, while `activating` and `healthy` belong to the control plane's
+// own route switching (ADR 0005), so an agent must not be able to claim them.
+func AgentReportablePhase(status Status) bool {
+	switch status {
+	case StatusFetching, StatusBuilding, StatusStarting, StatusHealthChecking:
+		return true
+	default:
+		return false
+	}
+}
+
+// ExecutionOrder returns status's position along the linear execution path
+// queued -> assigned -> fetching -> building -> starting -> health_checking ->
+// activating -> healthy, and whether status is on that path at all (every
+// terminal status is not).
+//
+// It exists because canTransition deliberately rejects a transition to the
+// same status, so a caller reporting progress cannot ask "is this a repeat or
+// a real advance?" through the transition rules alone: a duplicate progress
+// report after a network retry must be absorbed, not treated as an error.
+// Comparing order also distinguishes a stale report about an earlier phase
+// from an illegal skip over one that never happened.
+func ExecutionOrder(status Status) (int, bool) {
+	switch status {
+	case StatusQueued:
+		return 0, true
+	case StatusAssigned:
+		return 1, true
+	case StatusFetching:
+		return 2, true
+	case StatusBuilding:
+		return 3, true
+	case StatusStarting:
+		return 4, true
+	case StatusHealthChecking:
+		return 5, true
+	case StatusActivating:
+		return 6, true
+	case StatusHealthy:
+		return 7, true
+	default:
+		return 0, false
+	}
+}

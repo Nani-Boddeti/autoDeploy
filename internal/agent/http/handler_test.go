@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"autodeploy/internal/deployment"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/secret"
 	"autodeploy/internal/server"
@@ -721,5 +722,103 @@ func TestMaterializeRequiresCredential(t *testing.T) {
 	}
 	if authorizer.calls != 0 {
 		t.Fatalf("authorizer calls=%d, want 0 without a credential", authorizer.calls)
+	}
+}
+
+// --- progress -----------------------------------------------------------
+
+type fakeProgressReporter struct {
+	calls    int
+	err      error
+	gotID    string
+	gotAtt   int64
+	gotFence int64
+	gotPhase deployment.Status
+}
+
+func (f *fakeProgressReporter) ReportProgress(_ context.Context, serverID string, _ [32]byte, attemptID, fence int64, phase deployment.Status) error {
+	f.calls++
+	f.gotID, f.gotAtt, f.gotFence, f.gotPhase = serverID, attemptID, fence, phase
+	return f.err
+}
+
+func progressBody(attemptID, fence int64, phase string) string {
+	return fmt.Sprintf(`{"attempt_id":%d,"fence":%d,"phase":%q}`, attemptID, fence, phase)
+}
+
+func TestProgressForwardsReportablePhases(t *testing.T) {
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	for _, phase := range []string{"fetching", "building", "starting", "health_checking"} {
+		reporter := &fakeProgressReporter{}
+		h := Handler{ProgressReporter: reporter}
+		r := newRequestTLS(newRequest(t, pathProgress, progressBody(4, 2, phase), bearerPrefix+string(tok), "server_1"))
+		w := do(h, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("phase=%s status=%d body=%s", phase, w.Code, w.Body.String())
+		}
+		if reporter.calls != 1 || string(reporter.gotPhase) != phase || reporter.gotAtt != 4 || reporter.gotFence != 2 {
+			t.Fatalf("phase=%s reporter=%+v", phase, reporter)
+		}
+	}
+}
+
+// TestProgressRejectsControlPlanePhases proves an agent cannot claim the
+// control plane's own verdicts: activation and healthy belong to route
+// switching under ADR 0005.
+func TestProgressRejectsControlPlanePhases(t *testing.T) {
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	for _, phase := range []string{"activating", "healthy", "queued", "assigned", "failed", "cancelled", "", "nonsense"} {
+		reporter := &fakeProgressReporter{}
+		h := Handler{ProgressReporter: reporter}
+		r := newRequestTLS(newRequest(t, pathProgress, progressBody(4, 2, phase), bearerPrefix+string(tok), "server_1"))
+		w := do(h, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("phase=%q status=%d, want 400", phase, w.Code)
+		}
+		if reporter.calls != 0 {
+			t.Fatalf("phase=%q reached the repository", phase)
+		}
+	}
+}
+
+func TestProgressRejectsInvalidIdentifiersAndUnknownFields(t *testing.T) {
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	for _, body := range []string{
+		progressBody(0, 2, "building"),
+		progressBody(4, 0, "building"),
+		`{"attempt_id":4,"fence":2,"phase":"building","extra":true}`,
+	} {
+		reporter := &fakeProgressReporter{}
+		h := Handler{ProgressReporter: reporter}
+		r := newRequestTLS(newRequest(t, pathProgress, body, bearerPrefix+string(tok), "server_1"))
+		w := do(h, r)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("body=%s status=%d, want 400", body, w.Code)
+		}
+		if reporter.calls != 0 {
+			t.Fatalf("body=%s reached the repository", body)
+		}
+	}
+}
+
+func TestProgressRequiresCredentialAndDependency(t *testing.T) {
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	r := newRequestTLS(newRequest(t, pathProgress, progressBody(4, 2, "building"), "", ""))
+	if w := do(Handler{ProgressReporter: &fakeProgressReporter{}}, r); w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401 without a credential", w.Code)
+	}
+	r = newRequestTLS(newRequest(t, pathProgress, progressBody(4, 2, "building"), bearerPrefix+string(tok), "server_1"))
+	if w := do(Handler{}, r); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503 with no reporter wired", w.Code)
+	}
+}
+
+func TestProgressMapsAuthorizationFailureToGenericUnauthorized(t *testing.T) {
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	reporter := &fakeProgressReporter{err: postgres.ErrServerAuthorizationDenied}
+	r := newRequestTLS(newRequest(t, pathProgress, progressBody(4, 2, "building"), bearerPrefix+string(tok), "server_1"))
+	w := do(Handler{ProgressReporter: reporter}, r)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status=%d, want 401", w.Code)
 	}
 }

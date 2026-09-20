@@ -1502,6 +1502,31 @@ append-only event log. Must prove: progress racing `Complete` never moves a term
 backward; duplicate/backward phase is a no-op; row-count assertion that `agent_job_events` gains
 nothing.
 
+Step 3b result (2026-09-20): done. `ReportProgress` in
+`internal/store/postgres/agent_lease_materialize.go`, `internal/agent/http/progress.go`,
+`deployment.AgentReportablePhase`/`deployment.ExecutionOrder`, client `ReportProgress`, wiring.
+- Same authorization re-derivation and lock order as materialization, except the job is locked
+  `FOR UPDATE` because this path does mutate the deployment, which serializes concurrent progress
+  reports for one job against each other and against Complete.
+- `ExecutionOrder` exists precisely because `canTransition(X,X)` is false: a duplicate report (network
+  retry) or a stale report about an earlier phase is **absorbed as success and appends nothing**, while a
+  skip over a phase that never happened is refused as invalid input rather than forging the intermediate
+  transitions in an append-only log. A test pins `ExecutionOrder` and `canTransition` together so they
+  cannot drift.
+- An agent may report only fetching/building/starting/health_checking. `activating` and `healthy` are the
+  control plane's own verdicts under ADR 0005 and are rejected before any repository call.
+- **Found while testing:** cancellation of a *leased* job is cooperative, so the deployment is still on
+  the execution path and the first version of this endpoint happily advanced it after a cancel request.
+  Now refused from the moment `cancel_requested_at` is set, consistent with materialization and because
+  advancing a deployment toward healthy while it is being cancelled tells an operator the opposite of
+  what is happening.
+- Appends no `agent_job_events` row (ADR 0004's bounded-events rule, same reasoning as renewals);
+  asserted by row count. Deployment phase history lives in the deployment's own append-only log.
+Evidence (full output captured to files): 6 new repository integration tests, 5 handler tests, 3
+deployment-domain tests; three fresh PG18 sweeps normal and three fresh `-race`, 6/6; `make check`,
+`go vet -tags=integration ./...`, `go test -race ./...`, Linux amd64+arm64, `git diff --check`, gofmt.
+Not yet done: independent review of Steps 3a and 3b (delegation still blocked by the spend limit).
+
 #### Step 3c — checkout credential seam
 
 - Extract the method set `Checkout` actually uses (`Binding`, `SetCancel`, `Start`,
