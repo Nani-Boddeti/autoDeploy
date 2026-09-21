@@ -348,9 +348,38 @@
   cgroup v2 remains mandatory before agent use.
 - .tmp/ is untracked but not gitignored; manually exclude it and never use blanket git add.
 - Commit/push accumulated work only with approval.
-- Do not start Docker/BuildKit, routing, or UI work before their dedicated approved slices. The
-  agent transport/credentials/leases slice is now complete (see the dedicated section above); the
-  agent still has no executor, so it never invokes checkout, Docker, or routing.
+- Do not start routing or UI work before their dedicated approved slices. The agent
+  transport/credentials/leases slice is complete (see the dedicated section above), and slice 9b
+  (host execution) is now code-complete: `internal/runtime/docker` (Engine API client over the unix
+  socket, stdlib only; typed label authority; buildx build with BuildKit-session secrets; container
+  run by digest; ADR 0005 health gate) plus `internal/agent/executor` wiring it into `cmd/agent`.
+
+## Slice 9b — host execution: written, never run
+
+- **`cmd/agent` has `const executorEnabled = false`.** The executor is fully assembled behind it, so
+  the heartbeat still reports `executor_available=false` and no lease is ever claimed. Flipping that
+  one constant is what starts real deployments; `TestExecutorEnabledStaysFalse` fails the build if it
+  is flipped without deliberate update.
+- **Nothing in 9b has met real infrastructure.** Every test uses a fake Engine API over a unix socket,
+  a fake `docker` binary on PATH, or an `httptest` server. Unproven until a Linux host: that a built
+  image's history/layers/provenance carry no secret (an ADR 0003 claim), Engine v1.44 field semantics,
+  real container IP timing, and that a `--load`ed image is addressable as `sha256:<config-digest>`.
+- **Two prerequisites before flipping the gate:**
+  1. The privileged Linux checkout smoke (XFS `prjquota`, delegated cgroup v2) — the same one the
+     isolated-checkout milestone already waits on.
+  2. A configured health-gate path column. ADR 0005 requires an exact configured path and Host header;
+     migration 000014 froze port and scheme only. The gate probes `/`, and a failed gate with the
+     container running is `permanent_configuration`, which is never retried — so an application that
+     does not answer 2xx at `/` fails permanently with no recovery. This is a gap in the approved
+     plan, found in review.
+- Design decisions worth not relitigating: the container runs by the image's **config digest** (a
+  `--load`ed image's only local address, and ADR 0005 permits "image ID/digest"); built-image labels
+  deliberately exclude the image's own digest (a true self-reference — labels live in the config blob
+  the digest covers); environment infrastructure has **no** label selector at all, because ADR 0005
+  forbids selecting it during release cleanup; and a release-scoped selector requires the resource's
+  full identity rather than broadening to find leftovers.
+- A successful gate stops the deployment at `health_checking`. `activating -> healthy` and Traefik
+  routing belong to the activation slice, which has not started.
 
 ## Persistence Invariants and Lessons
 
