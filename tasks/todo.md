@@ -1781,6 +1781,69 @@ PG18 sweeps normal and three `-race` (6/6 clean), cross-build+vet darwin/arm64, 
   -> `corrupt_state`. No new enum values.
 
 
+
+**Step 6 was split into 6a (run + health gate) and 6b (executor wiring).** A subdivision, not a scope
+change: the plan already called for independent review between steps, and 6b is what flips
+`executor_available=true` and starts real leases flowing, which deserves its own review rather than
+being bundled with probe mechanics.
+
+Step 6a result (2026-09-21): done — `internal/runtime/docker/run.go`, `health.go`, `classify.go`, with
+`engine.go` extended for container create/start/inspect/list and network inspect. Container runs by
+immutable digest, publishes no ports (the wire struct has no `PortBindings`/`PublishAllPorts` field to
+set), joins exactly one network whose ID must be resolved through `InspectNetwork` and match Docker's own
+ID shape (so `host`/`bridge`/free text cannot reach `NetworkMode`), carries limits and restart policy from
+the frozen config, and is named from a validated opaque runtime-instance ID. The health gate hard-codes
+ADR 0005's default shape with no caller-facing override.
+Corrections made during review, each proven by a guard test that was then broken on purpose:
+- **`ClassifyHealthGateResult` ignored its argument entirely** and returned `permanent_configuration` for
+  every failure. Only `transient` is retryable (`internal/queue/retry.go:73`), so an agent shutdown or a
+  lost lease renewal mid-gate permanently failed a deployment when nothing about the application had
+  failed. Now reason-driven: `context_cancelled` -> transient; `deadline_exceeded` -> permanent (the app
+  came up but never passed the gate); `container_not_running` -> transient if OOM-killed, permanent
+  otherwise; anything unrecognized -> corrupt_state, failing closed.
+- **A host OOM kill was indistinguishable from an application crash.** `ContainerInspect` never read
+  Docker's `State.OOMKilled`, which arrives on the same inspect call the gate already makes. Without it,
+  the host running out of memory permanently failed a deployment that would likely have succeeded on the
+  next attempt. The gate now carries exit code and OOM flag out in `HealthGateResult`.
+- **The same deadline classified two different ways depending on timing.** If the gate's context expired
+  at the top-of-loop check it produced a `deadline_exceeded` result; if it expired while an inspect was in
+  flight, the engine client's transient-classed error escaped instead and the deployment was retried. One
+  condition, two verdicts, decided by which internal timer noticed first. The loop now converts a state
+  error into the deadline result whenever its own context has expired.
+- **Losing a benign create race poisoned the deployment.** A concurrent execution for the same identity
+  (a lease-timeout re-dispatch racing a live attempt) lost the create with a 409 and was classified
+  `corrupt_state`, which is never retried — even though the race had already resolved correctly and the
+  one right container existed. The 409 path now re-runs the exact-label lookup and adopts the container
+  when it matches; a name held by a *different* identity is still `corrupt_state`. Verified under an
+  8-way concurrent probe: exactly one container created, no data race.
+- Two delivered tests proved less than their names claimed: the end-to-end create test never asserted
+  `NetworkMode` or `Image` (so skipping network resolution or running by tag would have passed green), and
+  the lookup handler only checked the filter was non-empty. Both strengthened. Note the strengthened
+  handler builds its expectation from the selector itself, so it is a wiring check; the label set's
+  contents are pinned independently by `labels_test.go`, which is what actually catches a dropped or
+  broadened label (confirmed by deleting the fence label and watching it fail).
+Accepted on its merits: the container runs by the image's **config digest**, not its manifest digest.
+`buildx --load` imports into the local store where the image's only local address is its image ID, which
+is the config digest; the manifest digest is not locally resolvable without a registry round-trip this
+design avoids. ADR 0005 permits "immutable image ID/digest", so this satisfies "never a mutable tag".
+Known gap this leaves: nothing verifies the `ConfigDigest` handed in actually matches the image now in the
+local store — that trust sits on the build step that populated it.
+**Process deviation:** the fix round for 6a was implemented by the orchestrator rather than delegated,
+because the account hit its monthly spend limit (HTTP 429) and subagents became unavailable mid-step. The
+independent review completed and its findings are incorporated; the implementation was not independently
+reviewed afterwards, so 6a carries less review depth than Steps 4 and 5. Worth a second pass when
+delegation is available again.
+**NOT verified here:** every test runs against a fake Engine API over a unix socket and an httptest
+server; no real dockerd was involved. Unproven until the Linux host: that the Engine v1.44 JSON field
+names and semantics used here (`NanoCpus`, `Memory`, `RestartPolicy`, `NetworkMode`) behave as expected
+against a real daemon, that a `--load`ed image is addressable as `sha256:<config-digest>`, real container
+IP assignment timing, and the real 409 response shape.
+Evidence: `make check`, `gofmt -l`, `go vet` incl. `-tags=integration`, `go test -race ./...`, three fresh
+PG18 sweeps normal and three `-race` (6/6 clean), cross-build+vet darwin/arm64, linux/amd64, linux/arm64,
+`git diff --check`. Six invariants broken on purpose and each confirmed to fail its guard: classification
+collapse, the deadline ctx check, OOM evidence, the 409 adopt path, network resolution, and a dropped
+fence label.
+
 ### Verification
 
 Per step, the bar the completed slices already met: `make check`, `go vet` including
