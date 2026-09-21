@@ -322,8 +322,12 @@ func apiVersionSupported(v VersionInfo) bool {
 // day forget -- the wire struct itself has nowhere to put one.
 
 type containerCreateRequest struct {
-	Image      string              `json:"Image"`
-	Labels     map[string]string   `json:"Labels"`
+	Image  string            `json:"Image"`
+	Labels map[string]string `json:"Labels"`
+	// Env carries "NAME=value" entries only -- see RunContainerRequest.Env
+	// and buildEnvEntries, the only constructor. Never populated from
+	// os.Environ() or any ambient process environment.
+	Env        []string            `json:"Env,omitempty"`
 	HostConfig containerHostConfig `json:"HostConfig"`
 }
 
@@ -361,7 +365,11 @@ type containerCreateResponse struct {
 // reconciliation instead of silently overwriting the name collision.
 var ErrContainerNameConflict = errors.New("docker engine: container name already in use")
 
-// CreateContainer calls POST /containers/create?name=<name>.
+// CreateContainer calls POST /containers/create?name=<name>. req.Env can
+// carry secret plaintext (see containerCreateRequest.Env); see EngineError's
+// doc comment for why a non-2xx response here still gets logged/handled the
+// same untrusted-text-must-be-redacted way as every other EngineError, even
+// though Docker does not echo request bodies back today.
 func (c *Client) CreateContainer(ctx context.Context, name string, req containerCreateRequest) (string, error) {
 	if name == "" {
 		return "", &EngineError{Class: ErrClassConfiguration, Op: "container-create", Err: errors.New("empty container name")}

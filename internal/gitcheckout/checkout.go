@@ -72,6 +72,25 @@ type Result struct {
 	err    error
 }
 
+// WorkspaceFD returns the raw workspace descriptor this Result owns, valid
+// until Close (Close sets it to -1). It exists so a caller that needs to
+// actually use the checked-out tree -- Slice 9b's build step -- can address
+// it without this package ever turning the descriptor back into a pathname
+// itself; that "never reconstruct a path from a descriptor" rule is this
+// package's own (see checkoutquota's removeWorkspaceContents), not
+// something a caller assembling a build is bound by. Callers must never
+// close the returned descriptor themselves -- Close owns that -- and must
+// keep this Result open for as long as anything derived from the
+// descriptor (e.g. a resolved /proc/self/fd path) is still in use.
+func (r *Result) WorkspaceFD() int {
+	if r == nil {
+		return -1
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.alloc.Workspace
+}
+
 func (r *Result) Close() error {
 	if r == nil {
 		return nil

@@ -1844,6 +1844,66 @@ PG18 sweeps normal and three `-race` (6/6 clean), cross-build+vet darwin/arm64, 
 collapse, the deadline ctx check, OOM evidence, the 409 adopt path, network resolution, and a dropped
 fence label.
 
+
+Step 6b result (2026-09-21): done — `internal/agent/executor` assembles the real Executor (checkout ->
+build -> run -> health gate), registered in `cmd/agent` behind a gate. `Execute` reports
+`fetching -> building -> starting -> health_checking` and STOPS there; activation is a later slice.
+**`executor_available` is still false.** `cmd/agent/main.go`'s `const executorEnabled = false` is the
+whole switch: while false `buildExecutor` is never called, `agent.Executor` stays nil, and the heartbeat
+keeps reporting false exactly as before. `TestExecutorEnabledStaysFalse` fails the build if it is flipped
+without updating that test, so the flip cannot happen by accident.
+**Two prerequisites must be met before flipping it — flipping starts real deployments:**
+1. The privileged Linux checkout smoke (still pending, gates the first real deployment).
+2. A configured health-gate path (and Host) column. See below — without it the gate probes `/`, and an
+   app that does not return 2xx there fails permanently.
+Corrections made during review, each proven by a guard test broken on purpose:
+- **The health gate had no configured path or Host, and the consequence is severe.** `migrations/000014`
+  defines `container_port` and `container_scheme` only, while ADR 0005 requires an exact configured
+  *path and Host header*. A failed gate with the container running classifies `permanent_configuration`,
+  which `internal/queue/retry.go` never retries — so an application that does not answer 2xx on `/`
+  could never deploy, with no automatic recovery. Decision: do NOT add the schema column in this step
+  (control-plane work, and the slice is already large). Instead `/` is now an explicitly named V1 default
+  documented as a temporary stand-in, and the Host header no longer carries a synthetic
+  `lease.EnvironmentID` — it sends the literal dialed authority (`ip:port`) a direct-IP client would send,
+  rather than attesting a hostname that is not real and could break a Host-routed app. The missing column
+  is recorded as a prerequisite for the flip, at the flip site.
+- **Another vacuous guard test.** `TestExecuteBuildSecretNeverReachesContainerEnv` never reached the
+  defense-in-depth re-check it claimed to prove: the binding's own scope was already Build, so the outer
+  filter excluded it first and deleting the inner check left the test green. Rewritten so the lease-side
+  binding claims Runtime while the materialized value comes back scoped Build. Third occurrence of this
+  pattern on this project.
+- **The progress tracker's idempotency guard is per-call and unpersisted**, so after an agent restart
+  mid-lease correctness rests on the control plane absorbing a repeated status — an assumption the code
+  asserted but never verified, with the error swallowed if wrong. Verified for real:
+  `ReportProgress` DOES absorb, committing without calling `transitionDeployment` when
+  `targetOrder <= currentOrder`. Worth recording how nearly this became a fourth vacuous test: an
+  exact-repeat test passes even with the absorb branch deleted, because `deployment.Transition` has its
+  own same-status shortcut that absorbs it regardless of the postgres layer. Only a STALE report
+  (`building` then `fetching` again) exercises `ReportProgress`'s own ordering check, since
+  `canTransition(building, fetching)` is false. Also found: `ProgressReporter` was never wired into
+  `newTestHandler`, so that route had been 503ing in the integration suite.
+- `EngineError` now documents that a non-2xx body is embedded verbatim in its error text while
+  `CreateContainer` carries secret-bearing `Env` in the same request — an accepted, monitored gap that
+  obliges every logging call site to treat the text as untrusted. Docker does not echo request bodies today.
+- `labels.go`'s `SourceDigest` doc was actually wrong (it claimed a digest of Dockerfile plus context).
+  Corrected in the schema doc: it is `sha256(commitSHA)`, not reproducible by hashing the checkout, and
+  safe only because this slice does no build caching off it. `RuntimeInstanceID` and `BuildOperationID`
+  deliberately share one derived value; separating them is a prerequisite for cross-attempt image sharing.
+Additions outside the step's stated boundary, both load-bearing and minimal: `Env` on
+`docker.RunContainerRequest` (Step 6a had no env-delivery mechanism at all, so runtime secrets could never
+reach the container; ADR 0003's "Runtime-secret delivery" explicitly sanctions Engine API env injection),
+and `gitcheckout.Result.WorkspaceFD()` (Step 3c's `Result` exposed no accessor, so no caller could ever
+use a checkout). The checkout workspace reaches the build as a path via `/proc/self/fd/<n>`, resolved once;
+the residual TOCTOU is the same class Step 5 already accepted.
+**NOT verified, and unchanged by this step:** no part of this has met a real Docker daemon or a real
+checkout. `Execute` is proven only against fakes for every seam; `productionCheckout` is Linux-only and has
+never run; the `Env` field has never been sent to a real Engine API. The plan's end-to-end proof (push to a
+configured repo on the Hetzner host and watch the deployment walk to `health_checking`) remains pending and
+is gated behind both prerequisites above.
+Evidence: `make check`, `gofmt -l`, `go vet` incl. `-tags=integration`, `go test -race ./...`, three fresh
+PG18 sweeps normal and three `-race` (6/6 clean), the new progress tests at `-race -count=20`,
+cross-build+vet darwin/arm64, linux/amd64, linux/arm64, `git diff --check`, go.mod/go.sum untouched.
+
 ### Verification
 
 Per step, the bar the completed slices already met: `make check`, `go vet` including

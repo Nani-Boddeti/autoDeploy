@@ -122,14 +122,29 @@ func ReleaseEphemeralVolumeLabels(id ReleaseResourceIdentity) (map[string]string
 	return buildLabels(KindReleaseEphemeralVolume, id.fields())
 }
 
-// BuiltImageIdentity identifies a built image: owner, project, the digest
-// of the build's source content (Dockerfile plus context, computed by the
-// caller from the checkout before invoking the build), and the build
-// operation's own opaque ID. Images may be shared by multiple runtime
-// instances and are deleted only after reference checks, never by a
-// single-owner label, so this identity deliberately excludes environment,
-// server, release, attempt, and fence: an image does not belong to any one
-// of them.
+// BuiltImageIdentity identifies a built image: owner, project, a digest
+// identifying the build's source content, and the build operation's own
+// opaque ID. Images may be shared by multiple runtime instances and are
+// deleted only after reference checks, never by a single-owner label, so
+// this identity deliberately excludes environment, server, release,
+// attempt, and fence: an image does not belong to any one of them.
+//
+// SourceDigest is required to be a 64-hex digest (requireHexDigest below),
+// but this package does not compute it and does not require it to be a
+// hash of the actual Dockerfile-plus-context tree. Its only caller today,
+// internal/agent/executor (Slice 9b Step 6b), derives it as
+// sha256(commitSHA) over the exact commit SHA gitcheckout.Checkout has
+// already verified (`git rev-parse HEAD` cross-checked against the
+// authorized binding) -- not a hash of the checked-out files themselves.
+// That is a deliberate, documented choice (avoids a second, TOCTOU-prone
+// filesystem walk purely to produce a label value) but it means an auditor
+// cannot reproduce this value by hashing the checkout tree; it is only
+// reproducible by hashing the commit SHA that produced it. A future caller
+// building the same commit through a different Dockerfile would collide on
+// this SourceDigest even though the resulting image differs -- acceptable
+// today because this slice performs no build caching/sharing decisions off
+// SourceDigest alone (see BuildOperationID below), but worth revisiting if
+// a later slice adds real image-sharing/cache lookups keyed on it.
 //
 // It also deliberately excludes the built image's own ImageDigest/
 // ConfigDigest. Those are outputs of the very build these labels are
@@ -148,9 +163,20 @@ func ReleaseEphemeralVolumeLabels(id ReleaseResourceIdentity) (map[string]string
 // reference checks, not by a digest-shaped label filter that no image
 // could ever satisfy.
 type BuiltImageIdentity struct {
-	OwnerID          string
-	ProjectID        string
-	SourceDigest     string
+	OwnerID      string
+	ProjectID    string
+	SourceDigest string
+	// BuildOperationID is this package's caller's own opaque identifier for
+	// one build invocation. internal/agent/executor (Slice 9b Step 6b)
+	// currently derives it as the same value as
+	// ReleaseResourceIdentity.RuntimeInstanceID -- the attempt's own id --
+	// because this slice performs one fresh build per attempt with no
+	// cross-attempt build caching/sharing. If a later slice adds that
+	// sharing (so one image can legitimately serve more than one
+	// RuntimeInstanceID), BuildOperationID must be derived independently
+	// from RuntimeInstanceID at that point; tying it to the attempt would
+	// otherwise make every attempt look like a distinct build operation
+	// even when the image was actually reused.
 	BuildOperationID string
 }
 

@@ -60,6 +60,24 @@ func (c ErrorClass) String() string {
 // host filesystem layout; callers must redact EngineError text before it can
 // reach any tenant-visible surface (deployment logs/output, API responses).
 // The path is kept, not dropped, because operators debugging a host need it.
+//
+// A non-2xx HTTP response's Err is the response BODY read verbatim
+// (checkStatus in engine.go: `msg := strings.TrimSpace(string(body))`) --
+// this is Docker's own daemon-authored text, not anything this client
+// constructs, and it is embedded in Error()/Err unredacted. That matters
+// for CreateContainer specifically (run.go): as of internal/agent/executor
+// (Slice 9b Step 6b), its request body can carry runtime secret values in
+// Env. Docker's daemon does not echo request-body content back in an error
+// response today -- a 4xx from /containers/create names things like a
+// missing image or an invalid host config shape, never the request JSON --
+// so this is not a live leak, but it is an accepted, monitored gap rather
+// than a proven-safe one: if a future Engine API version, a proxy in front
+// of the socket, or an unexpected daemon error path ever changed that, a
+// secret value could reach this same unredacted error text. Every call
+// site that might log an EngineError (or any error wrapping one, via
+// errors.As) must treat its text as untrusted and redact before logging or
+// exposing it, exactly as the dial-failure case above already requires for
+// the socket path.
 type EngineError struct {
 	Class  ErrorClass
 	Op     string

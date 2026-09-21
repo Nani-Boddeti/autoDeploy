@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -125,6 +126,25 @@ type RunContainerRequest struct {
 	CPUMillis     int
 	MemoryBytes   int64
 	RestartPolicy string
+
+	// Env is the container's complete environment: runtime-scoped secret
+	// values and literal_nonsecret bindings from the frozen lease, and
+	// nothing else -- this package never adds an ambient or agent-process
+	// variable to it. See buildEnvEntries, the only constructor for the
+	// wire Env slice, and ContainerEnv.VariableName's validation, which
+	// keeps a binding name from injecting anything into the JSON request
+	// body (it is sent as a value, never argv, so this is a narrower
+	// concern than build.go's reservedSecretEnvVars, which exists only for
+	// the CLI subprocess path).
+	Env []ContainerEnv
+}
+
+// ContainerEnv is one runtime environment variable delivered to the release
+// container. Value may be a secret's plaintext; callers must never log it
+// (see internal/agent/executor, this package's only caller of Env).
+type ContainerEnv struct {
+	VariableName string
+	Value        string
 }
 
 func (r RunContainerRequest) validate() error {
@@ -142,7 +162,36 @@ func (r RunContainerRequest) validate() error {
 	if _, err := requireNetworkID(r.NetworkID); err != nil {
 		return err
 	}
+	if _, err := buildEnvEntries(r.Env); err != nil {
+		return err
+	}
 	return nil
+}
+
+// buildEnvEntries validates every variable name (envVarPattern, shared with
+// build.go's secret-name check) and returns deterministic, sorted-by-name
+// "NAME=value" wire entries. Sorting is for determinism/testability only --
+// it never reorders past a duplicate check, so a duplicate name is always
+// rejected regardless of input order.
+func buildEnvEntries(env []ContainerEnv) ([]string, error) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(env))
+	sorted := append([]ContainerEnv(nil), env...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].VariableName < sorted[j].VariableName })
+	out := make([]string, 0, len(sorted))
+	for _, e := range sorted {
+		if !envVarPattern.MatchString(e.VariableName) {
+			return nil, fmt.Errorf("%w: invalid container env variable name %q", ErrInvalidIdentifier, e.VariableName)
+		}
+		if _, dup := seen[e.VariableName]; dup {
+			return nil, fmt.Errorf("%w: duplicate container env variable %q", ErrInvalidIdentifier, e.VariableName)
+		}
+		seen[e.VariableName] = struct{}{}
+		out = append(out, e.VariableName+"="+e.Value)
+	}
+	return out, nil
 }
 
 // buildContainerCreatePayload translates a validated RunContainerRequest
@@ -154,9 +203,14 @@ func (r RunContainerRequest) validate() error {
 // is a single string), and the image reference is the digest form, never a
 // tag.
 func buildContainerCreatePayload(req RunContainerRequest, labels map[string]string) containerCreateRequest {
+	// Error ignored: every caller (EnsureReleaseRuntimeContainer) already
+	// ran req.validate(), which calls buildEnvEntries itself and refuses to
+	// proceed on error, so req.Env is already known-valid here.
+	envEntries, _ := buildEnvEntries(req.Env)
 	return containerCreateRequest{
 		Image:  "sha256:" + strings.TrimPrefix(req.Identity.ConfigDigest, "sha256:"),
 		Labels: labels,
+		Env:    envEntries,
 		HostConfig: containerHostConfig{
 			NetworkMode: req.NetworkID,
 			RestartPolicy: containerRestartPolicy{

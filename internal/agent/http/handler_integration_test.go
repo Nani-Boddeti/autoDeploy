@@ -179,12 +179,13 @@ func newTestHandler(pool *pgxpool.Pool) Handler {
 			_, err := servers.Authenticate(ctx, id, d)
 			return err
 		}),
-		Heartbeater: servers,
-		Claimer:     leases,
-		Renewer:     leases,
-		Completer:   leases,
-		Canceller:   leases,
-		Reconciler:  leases,
+		Heartbeater:      servers,
+		Claimer:          leases,
+		Renewer:          leases,
+		Completer:        leases,
+		Canceller:        leases,
+		Reconciler:       leases,
+		ProgressReporter: leases,
 	}
 }
 
@@ -293,6 +294,79 @@ func TestAgentHTTPFullLifecycle(t *testing.T) {
 	resp, body = postJSON(t, srv, pathRenew, credentialToken, f.serverID, renewRequest{AttemptID: attemptID, Fence: fence, Sequence: 1})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("renew: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// internal/agent/executor's progress reporter relies on the control
+	// plane absorbing a repeated phase report as success rather than
+	// rejecting it (see internal/agent/executor/progress.go's doc comment
+	// and tasks/lessons: "deployment.canTransition(X, X) is false"). That
+	// reliance is proven at the repository layer by
+	// TestReportProgressAbsorbsDuplicateAndStalePhases in
+	// agent_lease_materialize_test.go; this drives the same guarantee
+	// through the actual HTTP route (postJSON -> handleProgress ->
+	// ReportProgress) that agentclient.Client.ReportProgress -- and
+	// therefore Execute -- really calls, over a real PostgreSQL 18
+	// database, closing the one layer that repository-level test does not
+	// reach.
+	progressReq := progressRequest{AttemptID: attemptID, Fence: fence, Phase: string(deployment.StatusFetching)}
+	resp, body = postJSON(t, srv, pathProgress, credentialToken, f.serverID, progressReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("progress fetching: status=%d body=%v", resp.StatusCode, body)
+	}
+	// Repeat of the same phase: must be absorbed as success (200), never an
+	// error -- a network-retried progress report must not fail an
+	// otherwise-healthy build.
+	resp, body = postJSON(t, srv, pathProgress, credentialToken, f.serverID, progressReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("repeated progress fetching: status=%d body=%v", resp.StatusCode, body)
+	}
+	var status string
+	var deploymentID string
+	if err := f.pool.QueryRow(context.Background(), `SELECT deployment_id FROM agent_jobs WHERE id=$1`, f.jobID).Scan(&deploymentID); err != nil {
+		t.Fatalf("look up deployment id: %v", err)
+	}
+	if err := f.pool.QueryRow(context.Background(), `SELECT status FROM deployments WHERE id=$1`, deploymentID).Scan(&status); err != nil {
+		t.Fatalf("look up deployment status: %v", err)
+	}
+	if status != string(deployment.StatusFetching) {
+		t.Fatalf("deployment status = %q after a duplicate progress report, want %q (a duplicate must be absorbed, never re-applied or rejected)", status, deployment.StatusFetching)
+	}
+
+	// A genuinely later phase still advances normally after the duplicate.
+	progressReq.Phase = string(deployment.StatusBuilding)
+	resp, body = postJSON(t, srv, pathProgress, credentialToken, f.serverID, progressReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("progress building: status=%d body=%v", resp.StatusCode, body)
+	}
+	if err := f.pool.QueryRow(context.Background(), `SELECT status FROM deployments WHERE id=$1`, deploymentID).Scan(&status); err != nil {
+		t.Fatalf("look up deployment status: %v", err)
+	}
+	if status != string(deployment.StatusBuilding) {
+		t.Fatalf("deployment status = %q, want %q", status, deployment.StatusBuilding)
+	}
+
+	// A STALE report (behind the deployment's current status, not merely
+	// equal to it) is the case that genuinely exercises ReportProgress's
+	// own ExecutionOrder absorb branch: deployment.Transition's own
+	// same-status shortcut ("if to == d.status { return d, nil }",
+	// internal/deployment/deployment.go) already makes an exact repeat a
+	// no-op independently of anything in internal/store/postgres, so a
+	// repeat-only test does not actually prove ReportProgress's absorb
+	// logic does anything -- confirmed by deliberately deleting that
+	// branch and finding the exact-repeat assertion above still passed.
+	// Fetching is behind the deployment's current Building status here,
+	// and canTransition(Building, Fetching) is false, so this can only
+	// succeed via ReportProgress's own currentOrder/targetOrder check.
+	progressReq.Phase = string(deployment.StatusFetching)
+	resp, body = postJSON(t, srv, pathProgress, credentialToken, f.serverID, progressReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stale progress fetching (after building): status=%d body=%v", resp.StatusCode, body)
+	}
+	if err := f.pool.QueryRow(context.Background(), `SELECT status FROM deployments WHERE id=$1`, deploymentID).Scan(&status); err != nil {
+		t.Fatalf("look up deployment status: %v", err)
+	}
+	if status != string(deployment.StatusBuilding) {
+		t.Fatalf("deployment status = %q after a stale progress report, want it to stay %q (a stale report must be absorbed, never move status backward or error)", status, deployment.StatusBuilding)
 	}
 
 	var resultDigest [32]byte

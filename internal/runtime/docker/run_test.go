@@ -147,6 +147,40 @@ func TestRunContainerRequestValidateRejectsBadRestartPolicy(t *testing.T) {
 	}
 }
 
+func TestBuildContainerCreatePayloadIncludesSortedEnv(t *testing.T) {
+	req := RunContainerRequest{
+		Identity:      validReleaseIdentity(),
+		NetworkID:     strings.Repeat("d", 64),
+		CPUMillis:     500,
+		MemoryBytes:   256 << 20,
+		RestartPolicy: RestartPolicyUnlessStopped,
+		Env: []ContainerEnv{
+			{VariableName: "ZVAR", Value: "z"},
+			{VariableName: "AVAR", Value: "a-secret"},
+		},
+	}
+	labels, _ := ReleaseRuntimeContainerLabels(req.Identity)
+	payload := buildContainerCreatePayload(req, labels)
+	want := []string{"AVAR=a-secret", "ZVAR=z"}
+	if !reflect.DeepEqual(payload.Env, want) {
+		t.Fatalf("Env = %v, want %v (sorted by name)", payload.Env, want)
+	}
+}
+
+func TestRunContainerRequestValidateRejectsBadEnv(t *testing.T) {
+	base := RunContainerRequest{NetworkID: strings.Repeat("a", 64), CPUMillis: 1, MemoryBytes: 1, RestartPolicy: RestartPolicyUnlessStopped}
+	badName := base
+	badName.Env = []ContainerEnv{{VariableName: "not valid", Value: "x"}}
+	if err := badName.validate(); err == nil {
+		t.Fatal("want rejection of invalid env variable name")
+	}
+	dup := base
+	dup.Env = []ContainerEnv{{VariableName: "A", Value: "1"}, {VariableName: "A", Value: "2"}}
+	if err := dup.validate(); err == nil {
+		t.Fatal("want rejection of duplicate env variable name")
+	}
+}
+
 func TestRunContainerRequestValidateRejectsNonPositiveLimits(t *testing.T) {
 	base := RunContainerRequest{NetworkID: strings.Repeat("a", 64), RestartPolicy: RestartPolicyUnlessStopped}
 	cpuZero := base
