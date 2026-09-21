@@ -6,7 +6,7 @@ Snapshot: 2026-09-21. Branch: main; base 177e181 (feat: add runtime configuratio
 
 AutoDeploy replaces Coolify for the owner's private GitHub Dockerfile applications on Hetzner. V1 has one administrator and one initial server but retains owner/project/environment/server scope. The approved stack is Go, PostgreSQL, Docker/BuildKit, and Traefik; routes require HTTPS and environments select health-gated blue/green by default or explicit stop-then-start.
 
-Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end, and `cmd/agent` still registers no executor, so it heartbeats `executor_available=false` and claims nothing. Host execution, release routing, operations UI, packaging, and end-to-end recovery remain.
+Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Release routing, operations UI, packaging, and end-to-end recovery remain.
 
 Completed outcomes:
 
@@ -19,7 +19,28 @@ Completed outcomes:
 7. Architecture decisions ADR 0001–0006 that constrain remaining work.
 8. Server registration with single-use enrollment tokens, scoped agent credentials (digest-only storage, rotation, revocation), authenticated heartbeat, fenced job claim/renewal, cancellation, expiry, and reconciliation over the existing queue; an authenticated `/agent/v1/` HTTP protocol; and a host agent client (enroll, credential file, per-environment fence state, heartbeat, renew loop) with no executor wired in.
 
-Beyond those outcomes, **slice 9a (control-plane host-execution foundation) is complete and committed**: migrations 000014/000015, claim-time freeze of execution configuration and secret versions, the minimal release model, fenced secret materialization, deployment phase progress, the checkout credential lifecycle, and the session/CSRF admin pages that write the runtime configuration a claim freezes. The remaining work is **slice 9b, agent host execution**: build, run, and health-gate on the target host. No release activation or Traefik routing is in scope for 9b.
+Beyond those outcomes, **slice 9a (control-plane host-execution foundation) is complete and committed**: migrations 000014/000015, claim-time freeze of execution configuration and secret versions, the minimal release model, fenced secret materialization, deployment phase progress, the checkout credential lifecycle, and the session/CSRF admin pages that write the runtime configuration a claim freezes. **Slice 9b (agent host execution) is code-complete and committed** (2026-09-21): an Engine API client
+over the Docker unix socket using only the standard library, the typed label authority ADR 0005's
+cleanup-by-exact-label invariant depends on, `docker buildx build` with secrets travelling the BuildKit
+session, container run by immutable digest with no published ports on one environment network, ADR 0005's
+default health gate, and an executor in `cmd/agent` assembling all of it. No release activation or Traefik
+routing is in scope, and a successful gate deliberately leaves the deployment at `health_checking`.
+
+**It has never run.** Every test in 9b exercises a fake: a fake Engine API over a real unix socket, a fake
+`docker` binary on PATH, an `httptest` server for the probe. No real dockerd, no real BuildKit, no real
+checkout. `executor_available` stays false until two prerequisites are met, both tracked in
+[tasks/todo.md](../tasks/todo.md):
+
+1. The **privileged Linux checkout smoke** (XFS prjquota, delegated cgroup v2, root helpers), still pending
+   and only the owner can run it.
+2. A **configured health-gate path column**. ADR 0005 requires an exact configured path and Host header;
+   migration 000014 froze port and scheme only. The gate currently probes `/`, and a failed gate with the
+   container running is classified `permanent_configuration`, which is never retried — so an application
+   that does not answer 2xx at `/` would fail permanently with no automatic recovery. This is a gap in the
+   approved plan, found in review, not a coding slip.
+
+Flipping `cmd/agent`'s `executorEnabled` constant is what starts real deployments; a test fails the build
+if it is flipped without being updated deliberately.
 
 ## Architecture and trust boundaries
 
@@ -95,6 +116,30 @@ Server/leases-slice evidence (steps 1-6c, each independently reviewed before the
 - three fresh full PostgreSQL 18 integration runs, normal and `-race`, per step (server domain/migration 000012; lease schema/migration 000013; claim+renew; complete/cancel/expire/reconcile+sweeper; agent HTTP alone on a fresh DB, then the full suite); concurrency-sensitive tests additionally repeated `-race -count=20`;
 - correctness and security review each step; findings fixed before proceeding (notable: Step 1 owner-scope security FAIL fixed and re-reviewed PASS; Step 3 claim deadlock/occupant-check/pre-auth/limit fixes; Step 5 write-amplification fix for unauthenticated-rejection audit rows; Step 6c redirect-credential-leak and claim-retry fixes);
 - Linux amd64/arm64 builds for `cmd/agent`.
+
+Slice 9b evidence (2026-09-21; four atomic commits, each independently reviewed with findings fixed before
+the next, and each verified with the full bar before commit — `make check`, `go vet` including
+`-tags=integration`, `go test -race ./...`, three fresh PostgreSQL 18 integration sweeps normal and three
+`-race`, cross-build and vet for darwin/arm64 and linux/amd64/arm64, `git diff --check`, go.mod unchanged
+at four direct dependencies):
+
+- defects found by review that the delivered, green, `-race`-clean work could not see: a request timeout
+  cancelled on return, killing any response body that trails its headers — the shape of every streaming
+  endpoint the build and run paths need; dial failures all classified retryable, so a misconfigured socket
+  path would have been retried forever; `buildx --file` accepting an absolute or `../` path, letting a
+  build open any file on the host and echo its contents into output redacted only for known secrets; a
+  secret binding named `DOCKER_HOST` able to repoint the CLI at another daemon; the agent's whole
+  environment — database password included — handed to the build subprocess; a built-image selector
+  demanding labels no image can carry, which would have matched nothing forever while reporting success;
+  a health-gate classifier that permanently failed deployments for an agent restart or a host OOM kill,
+  discarding evidence Docker returns on the inspect call it already makes; and the same deadline
+  classified two different ways depending on which internal timer noticed first.
+- **three delivered tests passed against deliberately broken code** and were rewritten: one restating the
+  invariant instead of exercising it, one pointed at a nonexistent path so a missing file and a real
+  rejection were indistinguishable, and one whose secret never reached the defense-in-depth check it
+  claimed to prove. A fourth was caught in the act: an exact-repeat progress test passes even with the
+  absorbing branch deleted, because `deployment.Transition` absorbs an exact repeat by itself.
+- every guard test above was broken on purpose and confirmed to fail before being accepted.
 
 Slice 9a evidence (2026-09-18..2026-09-21; each step verified before the next, most independently reviewed):
 
