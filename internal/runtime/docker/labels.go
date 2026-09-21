@@ -122,16 +122,34 @@ func ReleaseEphemeralVolumeLabels(id ReleaseResourceIdentity) (map[string]string
 	return buildLabels(KindReleaseEphemeralVolume, id.fields())
 }
 
-// BuiltImageIdentity identifies a built image. Images may be shared by
-// multiple runtime instances and are deleted only after reference checks,
-// never by a single-owner label, so this identity deliberately excludes
-// environment, server, release, attempt, and fence: an image does not
-// belong to any one of them.
+// BuiltImageIdentity identifies a built image: owner, project, the digest
+// of the build's source content (Dockerfile plus context, computed by the
+// caller from the checkout before invoking the build), and the build
+// operation's own opaque ID. Images may be shared by multiple runtime
+// instances and are deleted only after reference checks, never by a
+// single-owner label, so this identity deliberately excludes environment,
+// server, release, attempt, and fence: an image does not belong to any one
+// of them.
+//
+// It also deliberately excludes the built image's own ImageDigest/
+// ConfigDigest. Those are outputs of the very build these labels are
+// attached to via `buildx build --label`, and Docker image labels are
+// baked into the image config that the image's own digest is computed
+// over -- so a built image's own image/config digest can never be a
+// self-referencing baked-in label without an artificial multi-pass
+// reproducible-build scheme, which this package does not attempt. Step 5
+// applies exactly these fields as build-time labels; the resulting
+// ImageDigest/ConfigDigest are read back from the build's own result
+// (buildx --metadata-file) and belong to the database, not a label.
+// Consequently BuiltImageSelector also matches on exactly these fields
+// (plus the kind/schema labels every selector matches): per ADR 0005, a
+// shared built image is looked up by owner/project/source/build-operation
+// identity together with the database's own image-ID/digest record and
+// reference checks, not by a digest-shaped label filter that no image
+// could ever satisfy.
 type BuiltImageIdentity struct {
 	OwnerID          string
 	ProjectID        string
-	ImageDigest      string
-	ConfigDigest     string
 	SourceDigest     string
 	BuildOperationID string
 }
@@ -140,14 +158,14 @@ func (id BuiltImageIdentity) fields() []labelField {
 	return []labelField{
 		{LabelOwnerID, id.OwnerID, requireOpaqueID},
 		{LabelProjectID, id.ProjectID, requireOpaqueID},
-		{LabelImageDigest, id.ImageDigest, requireHexDigest},
-		{LabelConfigDigest, id.ConfigDigest, requireHexDigest},
 		{LabelSourceDigest, id.SourceDigest, requireHexDigest},
 		{LabelBuildOperationID, id.BuildOperationID, requireOpaqueID},
 	}
 }
 
-// BuiltImageLabels builds the creation labels for a built image.
+// BuiltImageLabels builds the labels Step 5 applies to a built image at
+// build time via `buildx build --label`. See BuiltImageIdentity for why
+// ImageDigest/ConfigDigest are excluded.
 func BuiltImageLabels(id BuiltImageIdentity) (map[string]string, error) {
 	return buildLabels(KindBuiltImage, id.fields())
 }

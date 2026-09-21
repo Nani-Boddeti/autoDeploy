@@ -34,8 +34,6 @@ func validImageIdentity() BuiltImageIdentity {
 	return BuiltImageIdentity{
 		OwnerID:          validID,
 		ProjectID:        validID,
-		ImageDigest:      validDigest,
-		ConfigDigest:     validDigest,
 		SourceDigest:     validDigest,
 		BuildOperationID: validID,
 	}
@@ -183,8 +181,6 @@ func TestBuiltImageLabelsMissingRequiredField(t *testing.T) {
 	}{
 		{"OwnerID", func(id *BuiltImageIdentity) { id.OwnerID = "" }},
 		{"ProjectID", func(id *BuiltImageIdentity) { id.ProjectID = "" }},
-		{"ImageDigest", func(id *BuiltImageIdentity) { id.ImageDigest = "" }},
-		{"ConfigDigest", func(id *BuiltImageIdentity) { id.ConfigDigest = "" }},
 		{"SourceDigest", func(id *BuiltImageIdentity) { id.SourceDigest = "" }},
 		{"BuildOperationID", func(id *BuiltImageIdentity) { id.BuildOperationID = "" }},
 	}

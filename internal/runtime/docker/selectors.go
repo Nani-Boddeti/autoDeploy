@@ -28,10 +28,14 @@ func ReleaseEphemeralVolumeSelector(id ReleaseResourceIdentity) (map[string]stri
 }
 
 // BuiltImageSelector builds the exact-match label filter for one built
-// image. It never includes attempt or fence labels, because
-// BuiltImageIdentity has no such fields: image cleanup uses exact
-// image/config/source digest and build-operation identity plus database
-// reference checks, not runtime attempt/fence ownership.
+// image, on owner/project/source-digest/build-operation identity -- the
+// fields BuiltImageIdentity actually carries. It never includes attempt,
+// fence, or the image's own image/config digest: those are runtime/
+// output-only facts a label on the image itself cannot carry (see
+// BuiltImageIdentity), so per ADR 0005 a specific built image is resolved
+// by this selector together with the database's own image-ID/digest record
+// and reference checks, not by a digest-shaped label a real image could
+// never match.
 func BuiltImageSelector(id BuiltImageIdentity) (map[string]string, error) {
 	return buildLabels(KindBuiltImage, id.fields())
 }

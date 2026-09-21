@@ -1720,6 +1720,55 @@ dial classification reverted, a forbidden `attempt-id` label injected into a bui
   Build output streams through `crypto.RedactingWriter` before it leaves the agent. Prove on Linux
   (skipped elsewhere): a fixture image's history, layers, and provenance contain no secret;
   BuildKit-unavailable fails closed; redaction failure suppresses output.
+
+Step 5 result (2026-09-21): done — image build via `docker buildx build`, in `internal/runtime/docker`
+(`build.go`, `build_linux.go`, `build_unsupported.go`). Secrets reach BuildKit only as
+`--secret id=<opaque>,env=<VAR>` with the value in the subprocess environment; the id is positional
+(`build-secret-0`, ...), never the variable name. There is no `--build-arg` call site in the package and
+no fallback to the legacy builder, which has no `--secret` support at all: a missing or broken buildx
+fails closed before the subprocess starts. Both stdout and stderr are wrapped in `crypto.RedactingWriter`
+before the build runs, and a redactor construction failure suppresses output rather than emitting raw.
+The image digest is read back from buildx's `--metadata-file` and validated through `requireHexDigest`;
+everything downstream runs by digest.
+Corrections made during review, each proven by a guard test that was then broken on purpose to confirm it
+fails:
+- **`--file` does not require the Dockerfile to live inside the build context.** The first implementation
+  only rejected NUL/CR/LF, so an absolute or `../`-prefixed path would have made buildx open an arbitrary
+  host file as a Dockerfile — and a parse error echoes the offending line into output that is redacted
+  only for known secret patterns, not arbitrary file content. `resolveDockerfilePath` now rejects absolute
+  paths, rejects anything escaping the context after `filepath.Clean`, and `os.Lstat`s every component
+  from the context root down so no symlink (including an intermediate directory) is traversed.
+- **A secret binding named after one of the CLI's own control variables repoints the CLI.** A binding
+  named `DOCKER_HOST` or `BUILDKIT_HOST` lands verbatim in the child environment and could aim the build
+  at another daemon or a less isolated builder. `resolveBuildSecrets` now rejects reserved names. Note the
+  env allowlist below does NOT cover this: secret entries are appended last and would win regardless.
+- **The build subprocess no longer inherits the agent's environment.** It was `append(os.Environ(), ...)`;
+  this codebase configures through env (`AUTODEPLOY_DATABASE_URL` carries a password, plus KEK manifest and
+  GitHub App key paths), so the child now gets an explicit allowlist only, then the secret entries.
+- **`BuiltImageIdentity` lost `ImageDigest`/`ConfigDigest`.** An image's own digest cannot be a label on
+  that image: labels live in the config blob the digest is computed over, so it is a genuine self-reference
+  that no single build can satisfy. The digest-bearing variants were therefore selecting labels no image
+  could ever carry, which would have made image cleanup match zero images forever and silently leak disk.
+  The identity is now the four fields knowable before the build; digests are returned in `BuildResult` and
+  recorded by the caller. ADR 0005 already says shared images are selected by exact image/config digest
+  plus database and Docker reference checks, not a label filter.
+  `TestBuiltImageSelectorMatchesLabelsTheBuildActuallyApplies` is the guard against the two drifting apart.
+- One delivered test was vacuous and was caught by the break-on-purpose pass: the traversal test pointed at
+  a path that did not exist, so an `Lstat` failure and a genuine escape rejection were indistinguishable and
+  it passed against deliberately broken code. Rewritten to target a real file above a real context.
+**NOT verified here, and it gates the first real deployment along with the privileged checkout smoke:**
+there is no Docker daemon on the dev box, so every build test runs against a fake `docker` binary written
+into a temp dir. That exhaustively proves the agent-side argv, env, redaction and fail-closed logic and
+proves nothing about BuildKit's own behavior. The ADR 0003 claim that a built image's history, layers and
+provenance contain no secret is therefore still UNPROVEN and must be demonstrated on the Linux host with
+`docker history`/`docker inspect`/provenance inspection against a real build through this package.
+Residual risk accepted for now: `resolveDockerfilePath` validates and buildx later opens the path, so a
+symlink swapped in between the two is a TOCTOU window. The checkout is agent-controlled and the window is
+small, but a repo-supplied context is not trusted input — revisit if checkout ever runs concurrently with
+the build.
+Evidence: `make check`, `gofmt -l`, `go vet` incl. `-tags=integration`, `go test -race ./...`, three fresh
+PG18 sweeps normal and three `-race` (6/6 clean), cross-build+vet darwin/arm64, linux/amd64, linux/arm64,
+`git diff --check`, go.mod/go.sum untouched (4 direct deps).
 - **Step 6** — run and gate: create/start by image digest, no published ports, joined only to the
   stable environment network (network creation is environment provisioning, not per-deployment),
   resource limits, restart policy, immutable release/runtime-instance/attempt/fence labels. Health
