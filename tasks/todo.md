@@ -1632,6 +1632,43 @@ Must prove: CSRF/origin rules and owner scoping match the server pages; a stale-
 rejected; invalid port/scheme/strategy/limit values are refused before any write; no secret value
 reaches the response, logs, or audit rows.
 
+Step 3d result (2026-09-21): done — slice 9a complete.
+`internal/store/postgres/environment_runtime_config_repository.go`, `internal/web/web.go` routes
+`/environments/config`, `/environments/bindings/add`, `/environments/bindings/remove`, migration 000016.
+- **Lock-order constraint satisfied and proven.** The write path locks only the administrator session/user
+  rows and then the config row itself (single INSERT or single CAS UPDATE). The ownership check does name
+  `agent_jobs` but as a plain unlocked SELECT, so it takes no row lock and cannot join a wait cycle. Proven
+  two ways: a real-repository-vs-real-Claim concurrency test over 8 environments in both interleavings
+  (`-race -count=20`, clean), and a source-reading test asserting no backtick SQL literal in the repository
+  locks `environment_slots`/`agent_jobs`/`agent_job_attempts`/`servers`/`server_credentials`.
+- I rewrote that second test: as delivered it inlined copies of the queries, so editing the real SQL and
+  leaving the copy alone would still have passed — it restated the invariant instead of proving it. It now
+  reads the repository source. Verified by injecting `FOR SHARE` on the ownership check: the test fails with
+  the right message, and passes again once reverted.
+- **Accepted deviation — migration 000016.** No existing audit table fits: `server_audit_events.action` is a
+  closed enum with no config action and its `server_id` FK-references `servers`, which a config mutation has
+  no value for; every other audit table is a fixed enum for an unrelated domain. 000016 adds one independent
+  append-only `environment_runtime_config_audit_events` with its own no-update/no-delete triggers and touches
+  no existing table. The alternative was shipping admin mutations with no durable audit trail, which ADR 0006
+  would not accept.
+- Implementer's own bug, found in testing and fixed: it first wrote a failure-audit row inside the same
+  transaction after a Postgres error, which always fails because an errored transaction is poisoned until
+  rollback. Failure audits for genuine server-side errors now write separately, while zero-row outcomes
+  (stale-revision CAS, remove-not-found) still audit atomically.
+- Validation reaches the operator: stale-revision CAS renders a distinct "changed underneath you" and
+  refreshes the expected revision; schema/trigger rejections (cross-environment head, delivery-scope
+  mismatch, provider-purpose head) surface as validation, never a 500; a secret binding shows only head id
+  and version number, never a value.
+- End-to-end: an environment with no config is skipped by `Claim`, then claimed once a config exists.
+**Known limitation, recorded not assumed away:** `environment_id` has no owner column anywhere in this
+schema, so ownership is derived from `agent_jobs.owner_id` exactly as `MarkReconciled` already does. Two
+consequences: an environment cannot be pre-configured before its first job is queued, and two owners using
+the same `environment_id` string would share one config row (V1 has one administrator, so not exploitable
+today, but it is a latent multi-tenancy gap that wants an environments table or an owner column).
+Evidence: three fresh PG18 sweeps normal and three `-race` across store/postgres, agent/http, web,
+migrations (6/6); both deadlock proofs at `-race -count=20`; `make check`, `go vet -tags=integration ./...`,
+`go test -race ./...`, Linux amd64+arm64, `git diff --check`, gofmt.
+
 ### Slice 9b — agent host execution
 
 - **Step 4** — `internal/runtime/docker`: Engine API client over the unix socket (stdlib only),

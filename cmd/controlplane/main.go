@@ -160,6 +160,10 @@ func run(ctx context.Context) error {
 	serverRepository := postgres.NewServerRepository(pool)
 	leaseRepository := postgres.NewAgentLeaseRepository(pool, postgres.NewDeploymentRepository(pool))
 	webOptions.ServerAdmin = serverAdmin{serverRepository, leaseRepository}
+	// EnvironmentRuntimeConfigRepository already satisfies web.RuntimeConfigAdmin's
+	// method set directly (Slice 9a Step 3d), so no adapter type is needed
+	// here the way serverAdmin composes two repositories above.
+	webOptions.RuntimeConfigAdmin = postgres.NewEnvironmentRuntimeConfigRepository(pool)
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {
 		return err

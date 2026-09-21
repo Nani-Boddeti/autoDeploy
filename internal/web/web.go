@@ -62,6 +62,21 @@ type ServerAdmin interface {
 	MarkReconciled(context.Context, auth.Principal, string, string) error
 }
 
+// RuntimeConfigAdmin is the narrow surface the runtime-configuration admin
+// pages (/environments/config, /environments/bindings/*) use. Every method
+// takes the session principal and is owner-scoped by the repository itself,
+// exactly like ServerAdmin above. A nil RuntimeConfigAdmin disables all of
+// these routes (same nil-disables convention): they 404. It never returns a
+// secret value -- only a bound secret head's identity and current version
+// number.
+type RuntimeConfigAdmin interface {
+	GetEnvironmentRuntimeConfig(context.Context, auth.Principal, string) (postgres.RuntimeConfig, []postgres.RuntimeBinding, bool, error)
+	CreateEnvironmentRuntimeConfig(context.Context, auth.Principal, string, postgres.RuntimeConfigInput) (postgres.RuntimeConfig, error)
+	UpdateEnvironmentRuntimeConfig(context.Context, auth.Principal, string, postgres.RuntimeConfigInput, int64) (postgres.RuntimeConfig, error)
+	AddEnvironmentRuntimeBinding(context.Context, auth.Principal, string, postgres.BindingInput) (postgres.RuntimeBinding, error)
+	RemoveEnvironmentRuntimeBinding(context.Context, auth.Principal, string, string) error
+}
+
 type Config struct {
 	PublicOrigin          string
 	CSRFKeys              auth.CSRFKeyRing
@@ -73,6 +88,7 @@ type Config struct {
 	GitHubSetup           *githubapp.SetupService
 	GitHubInstallationURL string
 	ServerAdmin           ServerAdmin
+	RuntimeConfigAdmin    RuntimeConfigAdmin
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -121,7 +137,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" {
+	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" {
 		http.NotFound(w, r)
 		return
 	}
@@ -220,6 +236,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.environmentsMarkReconciled(w, r)
+	case "/environments/config":
+		if h.config.RuntimeConfigAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			h.environmentConfigGet(w, r)
+		case http.MethodPost:
+			h.environmentConfigPost(w, r)
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
+	case "/environments/bindings/add":
+		if h.config.RuntimeConfigAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.environmentBindingAdd(w, r)
+	case "/environments/bindings/remove":
+		if h.config.RuntimeConfigAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.environmentBindingRemove(w, r)
 	case "/livez":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -750,6 +799,336 @@ func (h *Handler) environmentsMarkReconciled(w http.ResponseWriter, r *http.Requ
 	redirect(w, "/servers")
 }
 
+// validRuntimeConfigFields mirrors migration 000014's
+// environment_runtime_configs CHECK constraints exactly (also mirrored,
+// independently, by postgres.RuntimeConfigInput.valid -- the repository is
+// the authoritative last check; this lets the web layer reject bad input
+// with a specific message before ever calling it). Keep both in sync with
+// the migration if its bounds ever change.
+func validRuntimeConfigFields(port, drain, cpu int, scheme, strategy, restart string, memory int64) bool {
+	return port >= 1 && port <= 65535 &&
+		(scheme == "http" || scheme == "https") &&
+		(strategy == "blue_green" || strategy == "stop_then_start") &&
+		drain >= 1 && drain <= 300 &&
+		cpu > 0 && cpu <= 256000 &&
+		memory > 0 && memory <= 549755813888 &&
+		(restart == "unless-stopped" || restart == "on-failure")
+}
+
+// parseRuntimeConfigForm parses and validates the /environments/config POST
+// body's configuration fields, returning a descriptive error (never a bare
+// parse failure) so the caller can show the operator exactly what was
+// wrong, before any repository call and therefore before any write.
+func parseRuntimeConfigForm(v url.Values) (postgres.RuntimeConfigInput, error) {
+	port, err1 := strconv.Atoi(v.Get("container_port"))
+	drain, err2 := strconv.Atoi(v.Get("drain_seconds"))
+	cpu, err3 := strconv.Atoi(v.Get("cpu_millis"))
+	memory, err4 := strconv.ParseInt(v.Get("memory_bytes"), 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		return postgres.RuntimeConfigInput{}, errors.New("port, drain seconds, cpu millis, and memory bytes must be whole numbers")
+	}
+	scheme, strategy, restart := v.Get("container_scheme"), v.Get("release_strategy"), v.Get("restart_policy")
+	if !validRuntimeConfigFields(port, drain, cpu, scheme, strategy, restart, memory) {
+		return postgres.RuntimeConfigInput{}, errors.New("container port must be 1-65535, scheme http/https, strategy blue_green/stop_then_start, drain seconds 1-300, cpu millis 1-256000, memory bytes 1-549755813888, restart policy unless-stopped/on-failure")
+	}
+	return postgres.RuntimeConfigInput{ContainerPort: port, ContainerScheme: scheme, ReleaseStrategy: strategy, DrainSeconds: drain, CPUMillis: cpu, MemoryBytes: memory, RestartPolicy: restart}, nil
+}
+
+// runtimeConfigFormView builds a sticky config view directly from the
+// operator's just-submitted form values (not from the database), so a
+// rejected submission re-displays exactly what was typed rather than
+// discarding it. Numeric fields are carried as the raw submitted text, not
+// reformatted, so an invalid (non-numeric) entry is shown back unchanged
+// too.
+func runtimeConfigFormView(csrf, environmentID string, v url.Values) runtimeConfigView {
+	return runtimeConfigView{
+		CSRF: csrf, EnvironmentID: environmentID, Revision: v.Get("expected_revision"),
+		Port: v.Get("container_port"), Scheme: v.Get("container_scheme"), Strategy: v.Get("release_strategy"),
+		Drain: v.Get("drain_seconds"), CPU: v.Get("cpu_millis"), Memory: v.Get("memory_bytes"), Restart: v.Get("restart_policy"),
+	}
+}
+
+// buildRuntimeConfigView renders the stored configuration and bindings
+// exactly as read back from the repository (the normal GET path, and the
+// fallback view after a rejected mutation once bindings are re-fetched).
+func buildRuntimeConfigView(csrf, environmentID string, cfg postgres.RuntimeConfig, bindings []postgres.RuntimeBinding, found bool) runtimeConfigView {
+	view := runtimeConfigView{CSRF: csrf, EnvironmentID: environmentID, Exists: found, Bindings: buildBindingRows(bindings)}
+	if found {
+		view.Revision = strconv.FormatInt(cfg.Revision, 10)
+		view.Port = strconv.Itoa(cfg.ContainerPort)
+		view.Scheme = cfg.ContainerScheme
+		view.Strategy = cfg.ReleaseStrategy
+		view.Drain = strconv.Itoa(cfg.DrainSeconds)
+		view.CPU = strconv.Itoa(cfg.CPUMillis)
+		view.Memory = strconv.FormatInt(cfg.MemoryBytes, 10)
+		view.Restart = cfg.RestartPolicy
+		view.HealthPolicyRevision = strconv.Itoa(cfg.HealthPolicyRevision)
+		view.UpdatedAt = formatTimestamp(cfg.UpdatedAt)
+	} else {
+		// Sensible starting defaults for the create form; not stored
+		// anywhere until the operator submits them.
+		view.Scheme, view.Strategy, view.Restart = "http", "stop_then_start", "unless-stopped"
+	}
+	return view
+}
+
+// buildBindingRows never carries a secret value: a secret binding shows
+// only the head's identity and current active version number (0/"no active
+// version" if the head currently has none -- the same eligibility gap that
+// fails Claim). A literal_nonsecret binding's value is shown as-is: ADR
+// 0003 classifies it as non-secret protected metadata, not a secret.
+func buildBindingRows(bindings []postgres.RuntimeBinding) []bindingRow {
+	rows := make([]bindingRow, 0, len(bindings))
+	for _, b := range bindings {
+		row := bindingRow{VariableName: b.VariableName, Kind: b.BindingKind, Scope: b.DeliveryScope, CreatedAt: formatTimestamp(b.CreatedAt)}
+		if b.BindingKind == "secret" {
+			if b.SecretVersionNumber > 0 {
+				row.Identity = "secret head " + b.SecretHeadID + " (version " + strconv.FormatInt(b.SecretVersionNumber, 10) + ")"
+			} else {
+				row.Identity = "secret head " + b.SecretHeadID + " (no active version)"
+			}
+		} else {
+			row.Identity = b.LiteralValue
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+func renderEnvironmentConfig(w http.ResponseWriter, view runtimeConfigView) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = environmentConfigTemplate.Execute(w, view)
+}
+
+// environmentConfigGet renders one environment's runtime configuration and
+// its bindings. GET is safe/idempotent, matching serversList: no CSRF
+// check, only a fresh token minted for the forms this page renders.
+func (h *Handler) environmentConfigGet(w http.ResponseWriter, r *http.Request) {
+	_, p, ok := h.session(r.Context(), r)
+	if !ok {
+		redirect(w, "/login")
+		return
+	}
+	q := r.URL.Query()
+	if len(q) != 1 || len(q["environment_id"]) != 1 {
+		badRequest(w)
+		return
+	}
+	environmentID := q.Get("environment_id")
+	if !github.ValidOpaqueID(environmentID) {
+		badRequest(w)
+		return
+	}
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	cfg, bindings, found, err := h.config.RuntimeConfigAdmin.GetEnvironmentRuntimeConfig(r.Context(), p, environmentID)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	renderEnvironmentConfig(w, buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found))
+}
+
+// renderConfigRejection re-fetches only the bindings table (never the
+// config, which the caller has already populated into submitted with the
+// operator's just-rejected values) so the page still shows the current
+// binding list beside the sticky, errored configuration form. The
+// freshly-read revision replaces submitted.Revision so the operator's next
+// attempt starts from a valid CAS value instead of repeating the same
+// stale one.
+func (h *Handler) renderConfigRejection(w http.ResponseWriter, r *http.Request, p auth.Principal, submitted runtimeConfigView) {
+	cfg, bindings, found, err := h.config.RuntimeConfigAdmin.GetEnvironmentRuntimeConfig(r.Context(), p, submitted.EnvironmentID)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	submitted.Exists = found
+	submitted.Bindings = buildBindingRows(bindings)
+	if found {
+		submitted.Revision = strconv.FormatInt(cfg.Revision, 10)
+	}
+	renderEnvironmentConfig(w, submitted)
+}
+
+// environmentConfigPost creates (expected_revision empty) or CAS-updates
+// (expected_revision set) one environment's runtime configuration. Every
+// field is validated before any repository call; a rejection at any stage
+// re-displays the operator's submitted values rather than discarding them.
+func (h *Handler) environmentConfigPost(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 10 {
+		badRequest(w)
+		return
+	}
+	for _, name := range []string{"environment_id", "csrf", "expected_revision", "container_port", "container_scheme", "release_strategy", "drain_seconds", "cpu_millis", "memory_bytes", "restart_policy"} {
+		if len(v[name]) != 1 {
+			badRequest(w)
+			return
+		}
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	environmentID := v.Get("environment_id")
+	if !github.ValidOpaqueID(environmentID) {
+		badRequest(w)
+		return
+	}
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	submitted := runtimeConfigFormView(csrf, environmentID, v)
+
+	in, parseErr := parseRuntimeConfigForm(v)
+	if parseErr != nil {
+		submitted.ConfigError = parseErr.Error()
+		h.renderConfigRejection(w, r, p, submitted)
+		return
+	}
+
+	revisionRaw := v.Get("expected_revision")
+	var opErr error
+	if revisionRaw == "" {
+		_, opErr = h.config.RuntimeConfigAdmin.CreateEnvironmentRuntimeConfig(r.Context(), p, environmentID, in)
+	} else {
+		expected, convErr := strconv.ParseInt(revisionRaw, 10, 64)
+		if convErr != nil || expected < 0 {
+			submitted.ConfigError = "invalid expected revision"
+			h.renderConfigRejection(w, r, p, submitted)
+			return
+		}
+		_, opErr = h.config.RuntimeConfigAdmin.UpdateEnvironmentRuntimeConfig(r.Context(), p, environmentID, in, expected)
+	}
+	if opErr != nil {
+		switch {
+		case errors.Is(opErr, postgres.ErrEnvironmentRuntimeConfigConflict):
+			submitted.ConfigError = "this configuration changed underneath you since the page was loaded; the values below have been refreshed -- review and resubmit"
+		case errors.Is(opErr, postgres.ErrEnvironmentRuntimeConfigNotFound):
+			submitted.ConfigError = "this configuration no longer exists; reload the page"
+		case errors.Is(opErr, postgres.ErrEnvironmentRuntimeConfigAlreadyExists):
+			submitted.ConfigError = "a configuration already exists for this environment; reload the page and edit it instead"
+		default:
+			submitted.ConfigError = "configuration rejected: invalid values, or you are not authorized to configure this environment"
+		}
+		h.renderConfigRejection(w, r, p, submitted)
+		return
+	}
+	redirect(w, "/environments/config?environment_id="+url.QueryEscape(environmentID))
+}
+
+// parseBindingForm parses the /environments/bindings/add POST body.
+func parseBindingForm(v url.Values) postgres.BindingInput {
+	return postgres.BindingInput{
+		VariableName:  v.Get("variable_name"),
+		BindingKind:   v.Get("binding_kind"),
+		DeliveryScope: v.Get("delivery_scope"),
+		SecretHeadID:  v.Get("secret_head_id"),
+		LiteralValue:  v.Get("literal_value"),
+	}
+}
+
+// environmentBindingAdd adds one variable binding. A rejection (invalid
+// shape, or the schema's bind-time scope trigger refusing a cross-
+// environment/scope-mismatched/provider-purpose secret head) re-displays
+// the configuration page with the current configuration, the current
+// bindings, and the operator's just-submitted (rejected) binding fields
+// still filled in.
+func (h *Handler) environmentBindingAdd(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 7 {
+		badRequest(w)
+		return
+	}
+	for _, name := range []string{"environment_id", "csrf", "variable_name", "binding_kind", "delivery_scope"} {
+		if len(v[name]) != 1 {
+			badRequest(w)
+			return
+		}
+	}
+	if len(v["secret_head_id"]) != 1 || len(v["literal_value"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	environmentID := v.Get("environment_id")
+	if !github.ValidOpaqueID(environmentID) {
+		badRequest(w)
+		return
+	}
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	in := parseBindingForm(v)
+	_, opErr := h.config.RuntimeConfigAdmin.AddEnvironmentRuntimeBinding(r.Context(), p, environmentID, in)
+	if opErr != nil {
+		cfg, bindings, found, err := h.config.RuntimeConfigAdmin.GetEnvironmentRuntimeConfig(r.Context(), p, environmentID)
+		if err != nil {
+			badRequest(w)
+			return
+		}
+		view := buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found)
+		view.BindVariable, view.BindKind, view.BindScope, view.BindSecretHeadID, view.BindLiteralValue = in.VariableName, in.BindingKind, in.DeliveryScope, in.SecretHeadID, in.LiteralValue
+		switch {
+		case errors.Is(opErr, postgres.ErrEnvironmentRuntimeBindingInvalid):
+			view.BindingError = "binding rejected: the secret head does not exist, belongs to a different environment or delivery scope, is a provider-purpose head, or the variable is already bound"
+		default:
+			view.BindingError = "binding rejected: invalid values, or you are not authorized to configure this environment"
+		}
+		renderEnvironmentConfig(w, view)
+		return
+	}
+	redirect(w, "/environments/config?environment_id="+url.QueryEscape(environmentID))
+}
+
+// environmentBindingRemove deletes one variable binding.
+func (h *Handler) environmentBindingRemove(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 3 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["variable_name"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	environmentID := v.Get("environment_id")
+	if !github.ValidOpaqueID(environmentID) {
+		badRequest(w)
+		return
+	}
+	if err := h.config.RuntimeConfigAdmin.RemoveEnvironmentRuntimeBinding(r.Context(), p, environmentID, v.Get("variable_name")); err != nil {
+		badRequest(w)
+		return
+	}
+	redirect(w, "/environments/config?environment_id="+url.QueryEscape(environmentID))
+}
+
 // newEnrollmentToken mints a fresh single-use enrollment token and its
 // digest together, so every caller mints and digests it the same way and
 // the raw token never touches anything but the one response that displays
@@ -1132,7 +1511,34 @@ func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expire
 // 000012). Rotation is deferred to a follow-up agent-initiated rotation
 // protocol; this slice ships register, reissue-before-enrollment, and
 // revoke only.
-var serversTemplate = template.Must(template.New("servers").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy servers</title></head><body><main><h1>Servers</h1><form method="post" action="/servers/register"><label>Name <input name="name" required maxlength="128"></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Register server</button></form><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Last heartbeat</th><th>Active credential</th><th>Enrollment</th><th>Actions</th></tr></thead><tbody>{{range .Servers}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.CreatedAt}}</td><td>{{.LastHeartbeatAt}}</td><td>{{.ActiveCredentialVersion}}</td><td>{{.Enrollment}}</td><td><form method="post" action="/servers/enrollment"><input type="hidden" name="server_id" value="{{.ID}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Reissue enrollment token</button></form><form method="post" action="/servers/revoke"><input type="hidden" name="server_id" value="{{.ID}}"><label>Reason <input name="reason" required maxlength="512"></label><label><input type="checkbox" name="confirm" value="revoke" required> Confirm revoke</label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Revoke</button></form></td></tr>{{end}}</tbody></table><h2>Reconciling environments</h2><table><thead><tr><th>Environment</th><th>Attempt</th><th>Job</th><th>Server</th><th>Since</th><th>Actions</th></tr></thead><tbody>{{range .ReconcilingEnvironments}}<tr><td>{{.EnvironmentID}}</td><td>{{.AttemptID}}</td><td>{{.JobID}}</td><td>{{.ServerID}}</td><td>{{.Since}}</td><td><form method="post" action="/environments/mark-reconciled"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><label>Reason <input name="reason" required maxlength="512"></label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Mark reconciled</button></form></td></tr>{{end}}</tbody></table><p><a href="/">Back</a></p></main></body></html>`))
+var serversTemplate = template.Must(template.New("servers").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy servers</title></head><body><main><h1>Servers</h1><form method="post" action="/servers/register"><label>Name <input name="name" required maxlength="128"></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Register server</button></form><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Last heartbeat</th><th>Active credential</th><th>Enrollment</th><th>Actions</th></tr></thead><tbody>{{range .Servers}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.CreatedAt}}</td><td>{{.LastHeartbeatAt}}</td><td>{{.ActiveCredentialVersion}}</td><td>{{.Enrollment}}</td><td><form method="post" action="/servers/enrollment"><input type="hidden" name="server_id" value="{{.ID}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Reissue enrollment token</button></form><form method="post" action="/servers/revoke"><input type="hidden" name="server_id" value="{{.ID}}"><label>Reason <input name="reason" required maxlength="512"></label><label><input type="checkbox" name="confirm" value="revoke" required> Confirm revoke</label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Revoke</button></form></td></tr>{{end}}</tbody></table><h2>Reconciling environments</h2><table><thead><tr><th>Environment</th><th>Attempt</th><th>Job</th><th>Server</th><th>Since</th><th>Actions</th></tr></thead><tbody>{{range .ReconcilingEnvironments}}<tr><td>{{.EnvironmentID}}</td><td>{{.AttemptID}}</td><td>{{.JobID}}</td><td>{{.ServerID}}</td><td>{{.Since}}</td><td><form method="post" action="/environments/mark-reconciled"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><label>Reason <input name="reason" required maxlength="512"></label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Mark reconciled</button></form></td></tr>{{end}}</tbody></table><h2>Runtime configuration</h2><form method="get" action="/environments/config"><label>Environment ID <input name="environment_id" required maxlength="128"></label><button type="submit">View / edit configuration</button></form><p><a href="/">Back</a></p></main></body></html>`))
+
+// runtimeConfigView and bindingRow are pre-formatted the same way
+// serverRow/reconcilingRow are: every field is already rendered to text
+// (including a rejected submission's raw, possibly-invalid input), so
+// environmentConfigTemplate stays free of template functions or logic.
+// html/template auto-escapes every field.
+type bindingRow struct {
+	VariableName, Kind, Scope, Identity, CreatedAt string
+}
+type runtimeConfigView struct {
+	CSRF, EnvironmentID                                                   string
+	Exists                                                                bool
+	Revision                                                              string
+	Port, Scheme, Strategy, Drain, CPU, Memory, Restart                   string
+	HealthPolicyRevision, UpdatedAt                                       string
+	ConfigError                                                           string
+	Bindings                                                              []bindingRow
+	BindingError                                                          string
+	BindVariable, BindKind, BindScope, BindSecretHeadID, BindLiteralValue string
+}
+
+// environmentConfigTemplate renders one environment's runtime configuration
+// form (create or CAS-update, depending on whether Exists is true) and its
+// variable bindings with add/remove forms. Plain HTML, no JavaScript, no
+// design system (deferred to the operations UI milestone) -- matches
+// serversTemplate's own conventions exactly.
+var environmentConfigTemplate = template.Must(template.New("environment-config").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment runtime configuration</title></head><body><main><h1>Runtime configuration: {{.EnvironmentID}}</h1>{{if .ConfigError}}<p><strong>{{.ConfigError}}</strong></p>{{end}}{{if not .Exists}}<p>No configuration exists yet for this environment. Fill in the form below to create one.</p>{{end}}<form method="post" action="/environments/config"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Container port <input name="container_port" required maxlength="5" value="{{.Port}}"></label><label>Container scheme <select name="container_scheme"><option value="http" {{if eq .Scheme "http"}}selected{{end}}>http</option><option value="https" {{if eq .Scheme "https"}}selected{{end}}>https</option></select></label><label>Release strategy <select name="release_strategy"><option value="blue_green" {{if eq .Strategy "blue_green"}}selected{{end}}>blue_green</option><option value="stop_then_start" {{if eq .Strategy "stop_then_start"}}selected{{end}}>stop_then_start</option></select></label><label>Drain seconds <input name="drain_seconds" required maxlength="3" value="{{.Drain}}"></label><label>CPU millis <input name="cpu_millis" required maxlength="6" value="{{.CPU}}"></label><label>Memory bytes <input name="memory_bytes" required maxlength="12" value="{{.Memory}}"></label><label>Restart policy <select name="restart_policy"><option value="unless-stopped" {{if eq .Restart "unless-stopped"}}selected{{end}}>unless-stopped</option><option value="on-failure" {{if eq .Restart "on-failure"}}selected{{end}}>on-failure</option></select></label><button type="submit">{{if .Exists}}Save configuration{{else}}Create configuration{{end}}</button></form><h2>Variable bindings</h2>{{if .BindingError}}<p><strong>{{.BindingError}}</strong></p>{{end}}<table><thead><tr><th>Variable</th><th>Kind</th><th>Scope</th><th>Value / identity</th><th>Created</th><th>Actions</th></tr></thead><tbody>{{range .Bindings}}<tr><td>{{.VariableName}}</td><td>{{.Kind}}</td><td>{{.Scope}}</td><td>{{.Identity}}</td><td>{{.CreatedAt}}</td><td><form method="post" action="/environments/bindings/remove"><input type="hidden" name="environment_id" value="{{$.EnvironmentID}}"><input type="hidden" name="variable_name" value="{{.VariableName}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Remove</button></form></td></tr>{{end}}</tbody></table><h3>Add binding</h3><form method="post" action="/environments/bindings/add"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Variable name <input name="variable_name" required maxlength="128" value="{{.BindVariable}}"></label><label>Kind <select name="binding_kind"><option value="secret" {{if eq .BindKind "secret"}}selected{{end}}>secret</option><option value="literal_nonsecret" {{if eq .BindKind "literal_nonsecret"}}selected{{end}}>literal_nonsecret</option></select></label><label>Delivery scope <select name="delivery_scope"><option value="runtime" {{if eq .BindScope "runtime"}}selected{{end}}>runtime</option><option value="build" {{if eq .BindScope "build"}}selected{{end}}>build</option></select></label><label>Secret head ID (kind=secret only) <input name="secret_head_id" maxlength="128" value="{{.BindSecretHeadID}}"></label><label>Literal value (kind=literal_nonsecret only) <input name="literal_value" maxlength="4096" value="{{.BindLiteralValue}}"></label><button type="submit">Add binding</button></form><p><a href="/servers">Back to servers</a></p></main></body></html>`))
 
 // enrollmentTokenTemplate is rendered exactly once per register/reissue
 // response: the raw enrollment token appears here and nowhere else.
