@@ -1676,6 +1676,45 @@ migrations (6/6); both deadlock proofs at `-race -count=20`; `make check`, `go v
   cleanup-by-exact-label invariant is enforced), `//go:build linux` implementation plus a `!linux`
   stub whose constructors return an unsupported-platform error, mirroring `checkoutcontain`. No
   executor wiring yet. Prove: `go build ./...` and `go vet` on darwin and linux.
+
+Step 4 result (2026-09-21): done — `internal/runtime/docker`. Engine API client over the unix socket
+(stdlib `net/http` only, go.mod still at its 4 direct deps), typed per-kind label builders, exact-match
+selectors, `//go:build linux` constructor plus a `!linux` stub returning an unsupported-platform error.
+No executor wiring, no `cmd/agent` change. Decisions and corrections, all proven by tests:
+- **API version pinned at `v1.44`** (Engine 25.0). The Engine API is backward compatible, so a pinned
+  older-but-supported version keeps working against newer daemons — safer across a fleet provisioned at
+  different times than tracking the newest. `Probe` reads the daemon's own `MinAPIVersion..APIVersion`
+  range and fails closed with a configuration error if v1.44 falls outside it, so an incompatible engine
+  is caught at enrollment rather than mid-deployment.
+- **The default request timeout must not be cancelled when the request function returns.** The first
+  implementation used `defer cancel()`, which tore the context down as soon as the headers arrived —
+  any response whose body trails its headers failed with `context canceled`. Caught by review, not by
+  the delivered suite, which only exercised bodies that arrive with the headers. The cancel is now
+  handed to the response body and fires on `Close`. This was not cosmetic: every streaming endpoint
+  Steps 5 and 6 need (build log, container wait) is a trailing-body response.
+  Regression test: `TestTrailingBodyDeadlineCoversTheWholeCall`.
+- **Dial failures are not uniformly transient.** `ENOENT`/`EACCES`/`ENOTDIR` mean the configured socket
+  path is wrong or unusable and are classified `configuration`; connection-refused/reset/timeout stay
+  `transient`. The delivered test had asserted the opposite — it dialed a never-created path and demanded
+  "transient" — which would have had a retry loop hammering a permanently misconfigured agent forever.
+- `EngineError` carries the literal socket path in a dial failure's wrapped error. The path is kept
+  (operators need it) but the type documents that `Error()`/`Err` are operator-facing only and must be
+  redacted before reaching any tenant-visible surface.
+- Buildx is deliberately NOT probed here: it is a CLI plugin with no Engine HTTP API surface. Its
+  capability probe belongs to Step 5, its only caller.
+- No selector exists for environment networks/volumes, by design: ADR 0005 forbids selecting stable
+  environment infrastructure by label during release cleanup, so the package offers no way to do it.
+**Obligation this places on Step 6, recorded so it is not rediscovered the hard way:** the release-scoped
+selector requires the resource's *full* identity (attempt, fence, runtime-instance, image and config
+digests). That is correct — ADR 0005 requires cleanup to fail closed rather than broaden a selector — but
+it means the retry path cannot find a prior attempt's leftover container by guessing. Step 6 must persist
+each attempt's complete identity durably at or before resource creation, and reconstruct the selector from
+those stored values. `release_runtime_instances` (migration 000014) already holds job/attempt/fence and
+the container name; confirm it carries everything the selector needs before writing the retry lookup.
+Evidence: `make check`, `gofmt -l`, `go vet` incl. `-tags=integration`, `go test -race ./...`, three fresh
+PG18 sweeps normal and three `-race` (6/6 clean), cross-build+vet darwin/arm64, linux/amd64, linux/arm64,
+`git diff --check`. Guard tests were each broken on purpose and confirmed to fail: early-cancel restored,
+dial classification reverted, a forbidden `attempt-id` label injected into a built image.
 - **Step 5** — build: `docker buildx build` with `--secret id=<opaque>,env=<var>` so values travel
   the BuildKit session, never argv, ARG, context files, or layers. Missing BuildKit fails closed.
   Build output streams through `crypto.RedactingWriter` before it leaves the agent. Prove on Linux
