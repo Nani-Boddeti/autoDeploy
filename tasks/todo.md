@@ -1977,6 +1977,17 @@ Slice 10 = Step 0 + blue/green activation only. Deferred to slice 11+: stop-then
 - Minimal hostname assignment: one hostname per environment, audited admin mutation (mirrors 000016 audit), explicit authority acknowledgement per ADR 0005; no ownership challenge (single admin V1).
 - Tests: CHECK/trigger edges both legal and illegal; CAS revision advance-by-one; audit-with-mutation.
 
+#### Step 10a result (2026-09-22, verified)
+- Migration 000018: `route_heads` (unique lowercase hostname, CAS `route_revision`, nullable `active_release_id`, `reconciliation_required`), append-only `route_events` and `route_head_audit_events`, `releases.state` widened with `active`/`retained` (new edges `ready->active`, `active->retained`, `retained->active`; every 000014 rule unchanged), and at most one `active` release per environment (partial unique index).
+- Same-environment pointer is structural: composite FK `(active_release_id, environment_id) -> releases(id, environment_id)`; `releases.environment_id` is immutable.
+- Deferred constraint triggers enforce at commit that a head points only at an `active` release and that no referenced release leaves `active`. They are deferred so 10c's finalization can retire, activate and repoint in one transaction; they re-read rows because each write queues its own firing.
+- `retained -> removing` not added: retention is deferred to slice 11 and no transaction yet enforces the reference check ADR 0005 attaches to that edge.
+- `RouteHeadRepository.AssignRouteHostname`: authorization, then `SELECT ... FOR UPDATE` on the head, then decide not-found / immutable / stale from the locked row. Hostname changes are refused once a release is active (typed error; the trigger also refuses). Duplicate hostname maps to a typed error. `/environments/route` admin form requires an authority acknowledgement and accepts exact field names only.
+- Route hostnames need at least two labels and a final label that is not all digits (no IP literals, no `localhost`); same literal regex in SQL and `internal/healthgate`.
+- Defects found in review and fixed before landing: diagnostic error-class race after a zero-row CAS update; no repository-level test of the immutable rule; IP/single-label hostnames accepted; unknown fifth form key tolerated; no link between `active_release_id` and release state (orchestrator); and a **write skew** in the first deferred triggers, where the head side and release side both passed on committed state and a head ended up pointing at a `retained` release. Orchestrator reproduced it live, and the fix is `FOR SHARE` on the release read. `TestRouteHeadActiveReleaseWriteSkewPrevented` covers both orderings and fails in both when the lock is removed.
+- Every guard was broken on purpose and seen to fail.
+- Evidence: gofmt, `go vet` incl. integration, Linux amd64/arm64 vet, build, `git diff --check`, `go test -race ./...` (27 packages ok), three fresh PG18 sweeps normal + `-race` (6/6), concurrency incl. write skew and hostname race `-race -count=20`.
+
 ### Step 10b — Traefik file-provider adapter (agent; one subagent)
 - New `internal/runtime/traefik`: deterministic render of one environment's dynamic config from route-head state, canonical digest, schema validation, no secret values structurally (render input type has no secret fields), atomic write per ADR 0005, Linux/unsupported build split.
 - Traefik static config (entrypoints, ACME resolver, watched dir) is host provisioning — documented here, installed by the packaging slice.
