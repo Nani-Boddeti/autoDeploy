@@ -564,6 +564,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		ReleaseStrategy: frozenConfig.ReleaseStrategy, HealthPolicyRevision: frozenConfig.HealthPolicyRevision,
 		CPUMillis: frozenConfig.CPUMillis, MemoryBytes: frozenConfig.MemoryBytes,
 		RestartPolicy: frozenConfig.RestartPolicy, DrainSeconds: frozenConfig.DrainSeconds,
+		HealthGatePath: frozenConfig.HealthGatePath, HealthGateHost: frozenConfig.HealthGateHost,
 		ReleaseID: releaseID, SecretBindings: toQueueSecretBindings(frozenBindings),
 		LiteralBindings: toQueueLiteralBindings(frozenLiterals),
 		LeaseExpiresAt:  leaseExpiresAt, AuthorityExpiresAt: leaseExpiresAt,

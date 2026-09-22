@@ -144,7 +144,7 @@ func newAgentHTTPFixture(t *testing.T) agentHTTPFixture {
 	// so this fresh envID needs one before Claim can ever succeed against
 	// it. Fixed, arbitrary-but-valid defaults; nothing here asserts on
 	// their values.
-	if _, err := pool.Exec(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision) VALUES ($1,8080,'http','stop_then_start',30,500,268435456,'unless-stopped',1)`, envID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_host) VALUES ($1,8080,'http','stop_then_start',30,500,268435456,'unless-stopped',1,'app.internal')`, envID); err != nil {
 		t.Fatal(err)
 	}
 

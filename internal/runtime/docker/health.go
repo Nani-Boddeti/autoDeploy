@@ -8,8 +8,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
+
+	"autodeploy/internal/healthgate"
 )
 
 // This file is Step 6a's health gate: ADR 0005's "Health-gate contract",
@@ -66,12 +69,24 @@ type HealthGateTarget struct {
 	Scheme string // "http" or "https"
 }
 
+// validate re-checks Host and Path against internal/healthgate's exact
+// migration-000017 CHECK mirror, not just the loose "non-empty"/"starts
+// with /" shape the earlier checks below already covered. This is defense
+// in depth (the plan's own words): the control plane's schema CHECKs and
+// the web admin form's validation already refuse a malformed value long
+// before a lease is ever issued, but this package trusts nothing it did
+// not itself verify about a value that is about to be used to build an
+// outbound HTTP request -- a wire/decoding defect or a compromised/buggy
+// control plane must not be able to smuggle a header-injection or
+// userinfo-bearing value this far down. A rejection here is exactly as
+// fail-closed as the pre-existing checks: RunHealthGate returns the error
+// without ever issuing a probe.
 func (t HealthGateTarget) validate() error {
-	if t.Host == "" {
-		return fmt.Errorf("%w: empty health gate host", ErrInvalidIdentifier)
+	if !healthgate.ValidHost(t.Host) {
+		return fmt.Errorf("%w: health gate host %q is not a valid configured hostname", ErrInvalidIdentifier, t.Host)
 	}
-	if t.Path == "" || t.Path[0] != '/' {
-		return fmt.Errorf("%w: health gate path must be absolute", ErrInvalidIdentifier)
+	if !healthgate.ValidPath(t.Path) {
+		return fmt.Errorf("%w: health gate path %q is not a valid absolute path", ErrInvalidIdentifier, t.Path)
 	}
 	if t.Port < 1 || t.Port > 65535 {
 		return fmt.Errorf("%w: health gate port out of range", ErrInvalidIdentifier)
@@ -81,7 +96,54 @@ func (t HealthGateTarget) validate() error {
 	default:
 		return fmt.Errorf("%w: unsupported health gate scheme %q", ErrInvalidIdentifier, t.Scheme)
 	}
+	// Fail closed before ever entering the gate loop, not just before
+	// issuing the first probe: prove the configured path can be
+	// represented byte-identically as a request-target before this target
+	// is used for anything. See buildProbeURL's doc comment for why this
+	// check exists at all.
+	if _, err := buildProbeURL(t); err != nil {
+		return err
+	}
 	return nil
+}
+
+// buildProbeURL resolves target's configured path (and optional
+// '?'-introduced query string) into a *url.URL whose RequestURI() -- the
+// exact bytes net/http's Request.Write puts on the wire as the request
+// line's target -- reproduces target.Path byte for byte.
+//
+// This exists because two more obvious ways to build the request both
+// re-encode instead of reproducing: the pre-Slice-10-review code built the
+// URL by string concatenation (target.Scheme+"://"+target.Host+target.Path),
+// which mishandles a configured '?' by reinterpreting query boundaries; and
+// Slice 10 Step 0's own first pass switched to url.URL{Path: target.Path},
+// which is wrong for a different reason -- url.URL.Path is documented as
+// the *decoded* path, so assigning an already-percent-encoded or non-ASCII
+// string to it makes url.URL.EscapedPath() escape it a second time when
+// producing the request line: "/health%2Fcheck" became
+// "/health%252Fcheck" on the wire, "/a%zz" became "/a%25zz", and "/hé"
+// became "/h%C3%A9" -- a different resource than configured, violating ADR
+// 0005's "exact configured ... path". url.ParseRequestURI instead decodes
+// target.Path into (Path, RawPath, RawQuery) the way net/url's own request
+// parser would, retaining RawPath -- the original, already-encoded bytes
+// -- whenever re-escaping Path would not reproduce them exactly. The
+// explicit RequestURI() comparison below re-proves that round trip rather
+// than trusting net/url's internals blindly: healthgate.ValidPath's
+// grammar is chosen so every value it accepts should round-trip cleanly,
+// but if a future net/url change, or an edge case that grammar admits but
+// net/url cannot re-encode byte-identically, ever breaks that assumption,
+// this fails closed instead of silently sending something else.
+func buildProbeURL(target HealthGateTarget) (*url.URL, error) {
+	u, err := url.ParseRequestURI(target.Path)
+	if err != nil {
+		return nil, &EngineError{Class: ErrClassMalformed, Op: "health-gate-probe-target", Err: fmt.Errorf("health gate path %q could not be parsed as a request-target: %w", target.Path, err)}
+	}
+	u.Scheme = target.Scheme
+	u.Host = target.Host
+	if got := u.RequestURI(); got != target.Path {
+		return nil, &EngineError{Class: ErrClassMalformed, Op: "health-gate-probe-target", Err: fmt.Errorf("health gate path %q round-trips to %q, refusing an inexact request-target", target.Path, got)}
+	}
+	return u, nil
 }
 
 // HealthProbeFunc performs exactly one probe attempt and reports whether it
@@ -181,8 +243,23 @@ func runHealthGate(ctx context.Context, probe HealthProbeFunc, state ContainerSt
 		}
 
 		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-		ok, _ := probe(probeCtx)
+		ok, err := probe(probeCtx)
 		cancel()
+		if err != nil {
+			// Unlike an ordinary network-level probe failure (connection
+			// refused/reset/timeout, a non-2xx response), which
+			// newHTTPProbe always reports as (false, nil) so a single blip
+			// resets the consecutive count and the gate keeps trying until
+			// its own deadline (see TestHTTPProbeConnectionRefusedIsFailureNotError),
+			// a non-nil error here means newHTTPProbe detected its own
+			// request-target does not match the configured health gate
+			// path byte-for-byte -- an internal invariant violation, not a
+			// transient condition retrying will clear. Propagate and abort
+			// immediately, exactly like state()'s error handling above,
+			// rather than burning the full 60s deadline on a defect no
+			// number of retries fixes.
+			return HealthGateResult{}, err
+		}
 
 		if ok {
 			consecutive++
@@ -292,6 +369,18 @@ func (c *Client) containerRunningState(ctx context.Context, containerID string) 
 // success criterion. The response body is read up to
 // healthGateMaxBodyBytes and discarded, never persisted, matching ADR
 // 0005's "bounded response body that is discarded rather than persisted."
+//
+// TLS ServerName (https scheme): TLSClientConfig below leaves ServerName
+// unset and DialContext dials the raw ip:port directly, bypassing net/http's
+// own DNS resolution entirely -- but net/http's transport still derives the
+// TLS ClientHello's SNI server_name from the *request URL's* hostname (the
+// connect-method "TLS host"), not from whatever DialContext actually
+// dialed. Since the request URL built below sets Host to target.Host, the
+// probe's outbound TLS handshake sends target.Host as SNI, exactly matching
+// the plain HTTP request's Host header -- both identify the same configured
+// name to the candidate, consistent with ADR 0005's "exact configured ...
+// Host header" even though certificate verification itself is skipped (see
+// InsecureSkipVerify's comment below).
 func newHTTPProbe(ip string, target HealthGateTarget) HealthProbeFunc {
 	dialer := &net.Dialer{}
 	addr := net.JoinHostPort(ip, strconv.Itoa(target.Port))
@@ -306,6 +395,10 @@ func newHTTPProbe(ip string, target HealthGateTarget) HealthProbeFunc {
 		// production data-plane check through Traefik, not this candidate
 		// gate. This is a deliberate, narrower trust boundary: only
 		// reachable from the agent's probe, never from outside the host.
+		// ServerName is deliberately left unset here (see this function's
+		// doc comment): net/http already derives SNI from the request
+		// URL's host, which is target.Host, so setting it again here would
+		// be redundant, not a behavior change.
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 	}
 	client := &http.Client{
@@ -319,13 +412,49 @@ func newHTTPProbe(ip string, target HealthGateTarget) HealthProbeFunc {
 		},
 	}
 
+	// probeURL/buildErr are resolved once per newHTTPProbe call, not once
+	// per probe attempt: target is immutable for the lifetime of this
+	// HealthProbeFunc, so the byte-identical round trip buildProbeURL
+	// proves either holds for every attempt or none, and there is no
+	// reason to repeat the parse ~30 times over one 60s gate.
+	probeURL, buildErr := buildProbeURL(target)
+
 	return func(ctx context.Context) (bool, error) {
-		url := target.Scheme + "://" + target.Host + target.Path
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return false, err
+		if buildErr != nil {
+			return false, buildErr
 		}
-		req.Host = target.Host
+		// req.URL is a fresh copy of the already-validated probeURL,
+		// assigned directly rather than built by re-stringifying and
+		// re-parsing through http.NewRequestWithContext (the pre-fix code's
+		// approach here, and Slice 10 Step 0's own first pass before that):
+		// net/http's Request.Write puts exactly req.URL.RequestURI() on the
+		// wire as the request line's target, with no further transformation
+		// -- so assigning our own already-round-tripped *url.URL straight
+		// into req.URL is what actually guarantees the wire bytes match
+		// target.Path, rather than merely making it likely.
+		reqURL := *probeURL
+		req := &http.Request{
+			Method:     http.MethodGet,
+			URL:        &reqURL,
+			Host:       target.Host,
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header:     make(http.Header),
+		}
+		req = req.WithContext(ctx)
+		// Defense in depth, repeated per attempt rather than trusted once
+		// from buildProbeURL: proves the exact bytes about to be written to
+		// the wire for this specific request still match the configured
+		// path. Under correct operation this can never fail (reqURL is an
+		// unmodified copy of the already-round-tripped probeURL) -- it
+		// exists so that if a future change ever mutates req.URL between
+		// here and client.Do, or buildProbeURL's guarantee turns out not to
+		// hold for some input, the probe fails closed instead of silently
+		// sending a different request-target than configured.
+		if got := req.URL.RequestURI(); got != target.Path {
+			return false, &EngineError{Class: ErrClassMalformed, Op: "health-gate-probe-target", Err: fmt.Errorf("probe request-target %q does not match configured health gate path %q", got, target.Path)}
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			return false, nil

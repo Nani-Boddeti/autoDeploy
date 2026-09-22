@@ -56,7 +56,7 @@ func newLeaseFixture(t *testing.T, seed byte) leaseFixture {
 // between assertions within one test.
 func (f leaseFixture) insertRuntimeConfig(t *testing.T, environmentID string) {
 	t.Helper()
-	if _, err := f.pool.Exec(context.Background(), `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision) VALUES ($1,8080,'http','stop_then_start',30,500,268435456,'unless-stopped',1) ON CONFLICT DO NOTHING`, environmentID); err != nil {
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_host) VALUES ($1,8080,'http','stop_then_start',30,500,268435456,'unless-stopped',1,'app.internal') ON CONFLICT DO NOTHING`, environmentID); err != nil {
 		t.Fatal(err)
 	}
 }

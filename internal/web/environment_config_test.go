@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -90,6 +91,8 @@ func validConfigForm(environmentID, csrf, expectedRevision string) url.Values {
 		"cpu_millis":        {"500"},
 		"memory_bytes":      {"268435456"},
 		"restart_policy":    {"unless-stopped"},
+		"health_gate_path":  {"/healthz"},
+		"health_gate_host":  {"app.internal"},
 	}
 }
 
@@ -279,6 +282,25 @@ func TestEnvironmentConfigInvalidFieldsRejectedBeforeWrite(t *testing.T) {
 		{"cpu", "cpu_millis", "0", true},
 		{"memory", "memory_bytes", "0", true},
 		{"restart", "restart_policy", "always", false},
+		{"gate path missing slash", "health_gate_path", "no-leading-slash", true},
+		{"gate path double slash", "health_gate_path", "//evil", true},
+		{"gate path space", "health_gate_path", "/a b", true},
+		{"gate path fragment", "health_gate_path", "/a#b", true},
+		{"gate path non-ASCII", "health_gate_path", "/hé", true},
+		{"gate path malformed percent", "health_gate_path", "/a%zz", true},
+		{"gate path truncated percent", "health_gate_path", "/a%2", true},
+		{"gate path double quote", "health_gate_path", `/a"b`, true},
+		{"gate path angle bracket", "health_gate_path", "/a<b", true},
+		{"gate path backslash", "health_gate_path", `/a\b`, true},
+		{"gate path caret", "health_gate_path", "/a^b", true},
+		{"gate path pipe", "health_gate_path", "/a|b", true},
+		{"gate path curly brace", "health_gate_path", "/a{b", true},
+		{"gate path backtick", "health_gate_path", "/a`b", true},
+		{"gate host userinfo", "health_gate_host", "user@host", true},
+		{"gate host embedded path", "health_gate_host", "host/path", true},
+		{"gate host ipv6 brackets", "health_gate_host", "[::1]", true},
+		{"gate host port zero", "health_gate_host", "app.internal:0", true},
+		{"gate host port too large", "health_gate_host", "app.internal:65536", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,8 +324,13 @@ func TestEnvironmentConfigInvalidFieldsRejectedBeforeWrite(t *testing.T) {
 			if !strings.Contains(body, "container port must be 1-65535") {
 				t.Fatalf("%s: missing validation error message: %s", tc.name, body)
 			}
-			if tc.freeText && !strings.Contains(body, tc.value) {
-				t.Fatalf("%s: submitted value %q not re-displayed: %s", tc.name, tc.value, body)
+			// html/template auto-escapes the re-displayed value for its
+			// attribute context (e.g. '"' -> "&#34;", '<' -> "&lt;"), so a
+			// value containing HTML-special characters must be looked for
+			// in its escaped form, not verbatim -- that escaping is
+			// correct, expected behavior, not a bug this test should flag.
+			if tc.freeText && !strings.Contains(body, html.EscapeString(tc.value)) {
+				t.Fatalf("%s: submitted value %q not re-displayed (escaped form %q): %s", tc.name, tc.value, html.EscapeString(tc.value), body)
 			}
 		})
 	}

@@ -41,7 +41,7 @@ func (f erConfigFixture) insertOwnedEnvironment(t *testing.T, environmentID, key
 }
 
 func validInput() RuntimeConfigInput {
-	return RuntimeConfigInput{ContainerPort: 8080, ContainerScheme: "http", ReleaseStrategy: "stop_then_start", DrainSeconds: 30, CPUMillis: 500, MemoryBytes: 268435456, RestartPolicy: "unless-stopped"}
+	return RuntimeConfigInput{ContainerPort: 8080, ContainerScheme: "http", ReleaseStrategy: "stop_then_start", DrainSeconds: 30, CPUMillis: 500, MemoryBytes: 268435456, RestartPolicy: "unless-stopped", HealthGatePath: "/healthz", HealthGateHost: "app.internal"}
 }
 
 // TestEnvironmentRuntimeConfigCreateGetUpdateCAS proves the full
@@ -191,6 +191,27 @@ func TestEnvironmentRuntimeConfigInvalidFieldsRejected(t *testing.T) {
 		func() RuntimeConfigInput { in := validInput(); in.CPUMillis = 0; return in }(),
 		func() RuntimeConfigInput { in := validInput(); in.MemoryBytes = 0; return in }(),
 		func() RuntimeConfigInput { in := validInput(); in.RestartPolicy = "always"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "no-leading-slash"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "//evil"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a#b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a\tb"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/hé"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a%zz"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a%2"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = `/a"b`; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a<b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = `/a\b`; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a^b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a|b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a{b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGatePath = "/a`b"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGateHost = ""; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGateHost = "user@host"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGateHost = "host/path"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGateHost = "[::1]"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGateHost = "app.internal:0"; return in }(),
+		func() RuntimeConfigInput { in := validInput(); in.HealthGateHost = "app.internal:65536"; return in }(),
 	}
 	for i, in := range cases {
 		if _, err := f.repo.CreateEnvironmentRuntimeConfig(ctx, f.principal, env, in); !errors.Is(err, ErrServerAuthorizationDenied) {

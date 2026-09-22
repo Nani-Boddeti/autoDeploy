@@ -169,8 +169,8 @@ func TestEnvironmentRuntimeConfigCAS(t *testing.T) {
 	tx := beginTx(t, ctx, conn)
 	envID := "env-cfg-" + randomSuffix(t)
 	if _, err := tx.Exec(ctx, `INSERT INTO environment_runtime_configs
-	      (environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision)
-	      VALUES ($1,8080,'http','blue_green',30,500,268435456,'unless-stopped',1)`, envID); err != nil {
+	      (environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_host)
+	      VALUES ($1,8080,'http','blue_green',30,500,268435456,'unless-stopped',1,'app.internal')`, envID); err != nil {
 		t.Fatalf("insert config: %v", err)
 	}
 
@@ -270,8 +270,8 @@ func TestAgentJobAttemptExecutionInsertOnce(t *testing.T) {
 	f := buildReleaseFixture(t, ctx, tx)
 
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision)
-	      VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0)`, f.attemptID); err != nil {
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
+	      VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID); err != nil {
 		t.Fatalf("insert execution row: %v", err)
 	}
 
@@ -295,16 +295,16 @@ func TestAgentJobAttemptExecutionDrainSecondsBounds(t *testing.T) {
 
 	mustFail(t, ctx, tx, "expected rejection of drain_seconds=0",
 		`INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision)
-	      VALUES ($1,8080,'http','blue_green',0,1,500,268435456,'unless-stopped',0)`, f.attemptID)
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
+	      VALUES ($1,8080,'http','blue_green',0,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID)
 	mustFail(t, ctx, tx, "expected rejection of drain_seconds=301",
 		`INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision)
-	      VALUES ($1,8080,'http','blue_green',301,1,500,268435456,'unless-stopped',0)`, f.attemptID)
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
+	      VALUES ($1,8080,'http','blue_green',301,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID)
 
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision)
-	      VALUES ($1,8080,'http','blue_green',300,1,500,268435456,'unless-stopped',0)`, f.attemptID); err != nil {
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
+	      VALUES ($1,8080,'http','blue_green',300,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID); err != nil {
 		t.Fatalf("insert execution row with drain_seconds=300: %v", err)
 	}
 	var drain int

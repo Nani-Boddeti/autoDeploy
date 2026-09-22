@@ -10,6 +10,7 @@ import (
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/github"
+	"autodeploy/internal/healthgate"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -108,9 +109,17 @@ type RuntimeConfigInput struct {
 	CPUMillis       int
 	MemoryBytes     int64
 	RestartPolicy   string
+	// HealthGatePath and HealthGateHost are migration 000017's Slice 10
+	// Step 0 additions: the exact configured health-gate probe path and
+	// Host header (ADR 0005's health-gate contract). HealthGateHost is
+	// required (decision D2): there is no sensible fallback once a failed
+	// gate with the container running classifies permanent_configuration
+	// (never retried).
+	HealthGatePath string
+	HealthGateHost string
 }
 
-// valid mirrors migration 000014's environment_runtime_configs CHECK
+// valid mirrors migration 000014/000017's environment_runtime_configs CHECK
 // constraints exactly, so an out-of-bounds value is refused here, before
 // ever reaching the database (and before any lock is taken).
 func (in RuntimeConfigInput) valid() bool {
@@ -120,7 +129,9 @@ func (in RuntimeConfigInput) valid() bool {
 		in.DrainSeconds >= 1 && in.DrainSeconds <= 300 &&
 		in.CPUMillis > 0 && in.CPUMillis <= 256000 &&
 		in.MemoryBytes > 0 && in.MemoryBytes <= 549755813888 &&
-		(in.RestartPolicy == "unless-stopped" || in.RestartPolicy == "on-failure")
+		(in.RestartPolicy == "unless-stopped" || in.RestartPolicy == "on-failure") &&
+		healthgate.ValidPath(in.HealthGatePath) &&
+		healthgate.ValidHost(in.HealthGateHost)
 }
 
 // RuntimeConfig is the full read view of one environment's runtime
@@ -246,8 +257,8 @@ func (r *EnvironmentRuntimeConfigRepository) GetEnvironmentRuntimeConfig(ctx con
 
 func readRuntimeConfig(ctx context.Context, tx pgx.Tx, environmentID string) (RuntimeConfig, bool, error) {
 	var cfg RuntimeConfig
-	err := tx.QueryRow(ctx, `SELECT environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, revision, updated_at FROM environment_runtime_configs WHERE environment_id=$1`, environmentID).
-		Scan(&cfg.EnvironmentID, &cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthPolicyRevision, &cfg.Revision, &cfg.UpdatedAt)
+	err := tx.QueryRow(ctx, `SELECT environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_path, health_gate_host, revision, updated_at FROM environment_runtime_configs WHERE environment_id=$1`, environmentID).
+		Scan(&cfg.EnvironmentID, &cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthPolicyRevision, &cfg.HealthGatePath, &cfg.HealthGateHost, &cfg.Revision, &cfg.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RuntimeConfig{}, false, nil
 	}
@@ -327,8 +338,8 @@ func (r *EnvironmentRuntimeConfigRepository) CreateEnvironmentRuntimeConfig(ctx 
 	cfg.EnvironmentID = environmentID
 	cfg.RuntimeConfigInput = in
 	cfg.HealthPolicyRevision = 1
-	err = tx.QueryRow(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,0) RETURNING revision, updated_at`,
-		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy).Scan(&cfg.Revision, &cfg.UpdatedAt)
+	err = tx.QueryRow(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_path, health_gate_host, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10,0) RETURNING revision, updated_at`,
+		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, in.HealthGatePath, in.HealthGateHost).Scan(&cfg.Revision, &cfg.UpdatedAt)
 	if isUniqueViolation(err) {
 		// The INSERT above already returned a genuine PostgreSQL error,
 		// which poisons the rest of this transaction until rollback -- a
@@ -399,8 +410,8 @@ func (r *EnvironmentRuntimeConfigRepository) UpdateEnvironmentRuntimeConfig(ctx 
 	cfg.EnvironmentID = environmentID
 	cfg.RuntimeConfigInput = in
 	cfg.HealthPolicyRevision = 1
-	err = tx.QueryRow(ctx, `UPDATE environment_runtime_configs SET container_port=$2, container_scheme=$3, release_strategy=$4, drain_seconds=$5, cpu_millis=$6, memory_bytes=$7, restart_policy=$8, revision=revision+1, updated_at=clock_timestamp() WHERE environment_id=$1 AND revision=$9 RETURNING revision, updated_at`,
-		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, expectedRevision).Scan(&cfg.Revision, &cfg.UpdatedAt)
+	err = tx.QueryRow(ctx, `UPDATE environment_runtime_configs SET container_port=$2, container_scheme=$3, release_strategy=$4, drain_seconds=$5, cpu_millis=$6, memory_bytes=$7, restart_policy=$8, health_gate_path=$9, health_gate_host=$10, revision=revision+1, updated_at=clock_timestamp() WHERE environment_id=$1 AND revision=$11 RETURNING revision, updated_at`,
+		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, in.HealthGatePath, in.HealthGateHost, expectedRevision).Scan(&cfg.Revision, &cfg.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Zero rows affected: either the row does not exist at all, or it
 		// exists but expectedRevision is stale. Distinguish with a second,

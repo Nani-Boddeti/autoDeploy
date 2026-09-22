@@ -104,6 +104,8 @@ type Lease struct {
 	MemoryBytes          int64
 	RestartPolicy        string
 	DrainSeconds         int
+	HealthGatePath       string
+	HealthGateHost       string
 	ReleaseID            string
 	SecretBindings       []SecretBinding
 	LiteralBindings      []LiteralBinding
@@ -153,6 +155,8 @@ type leaseWire struct {
 	MemoryBytes          int64                `json:"memory_bytes"`
 	RestartPolicy        string               `json:"restart_policy"`
 	DrainSeconds         int                  `json:"drain_seconds"`
+	HealthGatePath       string               `json:"health_gate_path"`
+	HealthGateHost       string               `json:"health_gate_host"`
 	ReleaseID            string               `json:"release_id"`
 	SecretBindings       []secretBindingWire  `json:"secret_bindings"`
 	LiteralBindings      []literalBindingWire `json:"literal_bindings"`
@@ -189,6 +193,8 @@ func (w leaseWire) parse() (Lease, error) {
 		MemoryBytes:          w.MemoryBytes,
 		RestartPolicy:        w.RestartPolicy,
 		DrainSeconds:         w.DrainSeconds,
+		HealthGatePath:       w.HealthGatePath,
+		HealthGateHost:       w.HealthGateHost,
 		ReleaseID:            w.ReleaseID,
 		SecretBindings:       bindings,
 		LiteralBindings:      literals,

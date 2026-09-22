@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"autodeploy/internal/healthgate"
 )
 
 // Short durations for the gate loop's own tests: runHealthGate is
@@ -149,6 +151,35 @@ func TestRunHealthGateStatePropagatesError(t *testing.T) {
 	_, err := runHealthGate(context.Background(), fixedProbe(true), state, testInterval, testTimeout, 3)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+}
+
+// TestRunHealthGatePropagatesProbeErrorImmediately proves the fix for the
+// independent-review finding: unlike an ordinary probe failure (which
+// newHTTPProbe always reports as (false, nil), see
+// TestHTTPProbeConnectionRefusedIsFailureNotError), a non-nil probe error
+// -- the shape newHTTPProbe now returns when its own request-target does
+// not match the configured path -- must abort the gate loop immediately,
+// not be silently swallowed and retried until the 60s deadline.
+func TestRunHealthGatePropagatesProbeErrorImmediately(t *testing.T) {
+	wantErr := errors.New("probe target mismatch")
+	var calls int32
+	probe := func(context.Context) (bool, error) {
+		atomic.AddInt32(&calls, 1)
+		return false, wantErr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := runHealthGate(ctx, probe, alwaysRunning, testInterval, testTimeout, 3)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("took %v, want an immediate abort on the first probe error, not a wait for the deadline", elapsed)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("probe called %d times, want exactly 1 (abort on first error, no retry)", got)
 	}
 }
 
@@ -302,5 +333,100 @@ func TestHealthGateTargetValidateRejectsBadInput(t *testing.T) {
 		if err := c.validate(); err == nil {
 			t.Fatalf("case %+v validated, want rejection", c)
 		}
+	}
+}
+
+// TestHealthGateTargetValidateRejectsHeaderInjectionAndUserinfoHost proves
+// Slice 10 Step 0's defense-in-depth re-validation (validate now delegates
+// to internal/healthgate, mirroring migration 000017's CHECKs exactly,
+// rather than the old bare "non-empty"/"starts with /" shape check): a
+// userinfo-bearing host, an embedded path, an IPv6-bracket host, an
+// out-of-range port suffix, and a path carrying a header-injection-shaped
+// control character or '#' are all rejected, even though the old, looser
+// checks would have accepted every one of them.
+func TestHealthGateTargetValidateRejectsHeaderInjectionAndUserinfoHost(t *testing.T) {
+	cases := map[string]HealthGateTarget{
+		"userinfo host":                            {Host: "user@host", Path: "/p", Port: 80, Scheme: "http"},
+		"embedded path in host":                    {Host: "host/path", Path: "/p", Port: 80, Scheme: "http"},
+		"ipv6 bracket host":                        {Host: "[::1]", Path: "/p", Port: 80, Scheme: "http"},
+		"host port out of range":                   {Host: "host:70000", Path: "/p", Port: 80, Scheme: "http"},
+		"path with CR/LF (header injection shape)": {Host: "h", Path: "/p\r\nX-Injected: 1", Port: 80, Scheme: "http"},
+		"path with double leading slash":           {Host: "h", Path: "//evil", Port: 80, Scheme: "http"},
+		"path with fragment delimiter":             {Host: "h", Path: "/a#b", Port: 80, Scheme: "http"},
+	}
+	for name, tg := range cases {
+		if err := tg.validate(); err == nil {
+			t.Fatalf("%s: target %+v validated, want rejection", name, tg)
+		}
+	}
+}
+
+// TestHTTPProbeSplitsQueryStringFromPath proves the url.URL-based request
+// construction (replacing the old target.Scheme+"://"+target.Host+target.Path
+// string concatenation) correctly separates a '?'-introduced query string
+// from the request path, both landing on the server exactly as configured.
+func TestHTTPProbeSplitsQueryStringFromPath(t *testing.T) {
+	var gotPath, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.Path, r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	ip, target := newHTTPProbeTarget(srv, "/healthz?ready=1")
+	probe := newHTTPProbe(ip, target)
+	if _, err := probe(context.Background()); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if gotPath != "/healthz" {
+		t.Fatalf("path = %q, want /healthz", gotPath)
+	}
+	if gotQuery != "ready=1" {
+		t.Fatalf("query = %q, want ready=1", gotQuery)
+	}
+}
+
+// TestHTTPProbeRequestTargetIsByteIdenticalToConfiguredPath is the
+// independent-review regression test: for every accepted path shape
+// (including ones that are already percent-encoded, or that carry
+// characters a naive re-encoding would mangle), the exact bytes the server
+// reads off the wire as the request-target (net/http's r.RequestURI,
+// populated from the raw request line before any decoding) must equal
+// target.Path exactly. Before the fix, url.URL{Path: target.Path} silently
+// re-encoded "/health%2Fcheck" into "/health%252Fcheck" and similar.
+func TestHTTPProbeRequestTargetIsByteIdenticalToConfiguredPath(t *testing.T) {
+	cases := []string{
+		"/",
+		"/healthz",
+		"/health%2Fcheck",
+		"/a;b",
+		"/p?x=1&y=%20",
+		"/a:b@c",
+		"/foo?",  // empty query: net/url ForceQuery must keep the bare '?'
+		"/a?b?c", // second '?' belongs to the raw query
+	}
+	for _, path := range cases {
+		t.Run(path, func(t *testing.T) {
+			if !healthgate.ValidPath(path) {
+				t.Fatalf("test bug: %q is not accepted by healthgate.ValidPath", path)
+			}
+			var gotRequestURI string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotRequestURI = r.RequestURI
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer srv.Close()
+			ip, target := newHTTPProbeTarget(srv, path)
+			probe := newHTTPProbe(ip, target)
+			ok, err := probe(context.Background())
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			if !ok {
+				t.Fatal("want success for 200")
+			}
+			if gotRequestURI != path {
+				t.Fatalf("server observed request-target %q, want the configured path %q byte-identically", gotRequestURI, path)
+			}
+		})
 	}
 }

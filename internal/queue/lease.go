@@ -78,9 +78,15 @@ type ClaimedLease struct {
 	MemoryBytes          int64
 	RestartPolicy        string
 	DrainSeconds         int
-	ReleaseID            string
-	SecretBindings       []SecretBinding
-	LiteralBindings      []LiteralBinding
+	// HealthGatePath and HealthGateHost are migration 000017's Slice 10
+	// Step 0 additions: the exact configured health-gate probe path and
+	// Host header (ADR 0005's health-gate contract), frozen alongside
+	// every other execution field.
+	HealthGatePath  string
+	HealthGateHost  string
+	ReleaseID       string
+	SecretBindings  []SecretBinding
+	LiteralBindings []LiteralBinding
 }
 
 // RenewalResult is the durable outcome of one successful renewal, including

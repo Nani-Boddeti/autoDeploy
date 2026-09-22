@@ -331,10 +331,14 @@ func TestAgentLeaseClaimRetryDoesNotObserveConfigChange(t *testing.T) {
 		t.Fatalf("first=%+v", first)
 	}
 
+	if first[0].HealthGatePath != "/" || first[0].HealthGateHost != "app.internal" {
+		t.Fatalf("first health gate path/host = %q/%q, want defaults from insertRuntimeConfig", first[0].HealthGatePath, first[0].HealthGateHost)
+	}
+
 	// An administrator's config CAS update, exactly the single-statement
-	// shape Step 3d's admin page will issue: bump container_port and
-	// revision together.
-	if _, err := f.pool.Exec(ctx, `UPDATE environment_runtime_configs SET container_port=9090, revision=revision+1, updated_at=clock_timestamp() WHERE environment_id=$1 AND revision=0`, f.envID); err != nil {
+	// shape Step 3d's admin page will issue: bump container_port, the
+	// health-gate path/Host, and revision together.
+	if _, err := f.pool.Exec(ctx, `UPDATE environment_runtime_configs SET container_port=9090, health_gate_path='/changed', health_gate_host='changed.internal', revision=revision+1, updated_at=clock_timestamp() WHERE environment_id=$1 AND revision=0`, f.envID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -350,14 +354,21 @@ func TestAgentLeaseClaimRetryDoesNotObserveConfigChange(t *testing.T) {
 	if second[0].ContainerPort != 8080 {
 		t.Fatalf("attempt 2 observed the post-attempt-1 config change: containerPort=%d, want 8080", second[0].ContainerPort)
 	}
+	if second[0].HealthGatePath != "/" || second[0].HealthGateHost != "app.internal" {
+		t.Fatalf("attempt 2 observed the post-attempt-1 health gate path/host change: path=%q host=%q, want attempt 1's frozen /,app.internal", second[0].HealthGatePath, second[0].HealthGateHost)
+	}
 
 	var containerPort int
 	var configRevision int64
-	if err := f.pool.QueryRow(ctx, `SELECT container_port, environment_runtime_config_revision FROM agent_job_attempt_execution WHERE attempt_id=$1`, second[0].AttemptID).Scan(&containerPort, &configRevision); err != nil {
+	var healthGatePath, healthGateHost string
+	if err := f.pool.QueryRow(ctx, `SELECT container_port, environment_runtime_config_revision, health_gate_path, health_gate_host FROM agent_job_attempt_execution WHERE attempt_id=$1`, second[0].AttemptID).Scan(&containerPort, &configRevision, &healthGatePath, &healthGateHost); err != nil {
 		t.Fatal(err)
 	}
 	if containerPort != 8080 || configRevision != 0 {
 		t.Fatalf("attempt 2 execution row containerPort=%d configRevision=%d, want 8080/0 (copied from attempt 1)", containerPort, configRevision)
+	}
+	if healthGatePath != "/" || healthGateHost != "app.internal" {
+		t.Fatalf("attempt 2 execution row health gate path/host = %q/%q, want attempt 1's frozen /,app.internal (copied forward, not re-read)", healthGatePath, healthGateHost)
 	}
 }
 

@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"strconv"
 	"sync"
 	"time"
@@ -30,21 +29,6 @@ import (
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
 )
-
-// healthGatePathV1Default is a temporary stand-in, not a considered design
-// choice: ADR 0005 calls for an "exact configured ... path", but no schema
-// column carries one -- checked, migrations 000014/000016 carry only
-// container_port/container_scheme, nothing for path or Host. Adding that
-// column is control-plane work outside this slice's scope (independent
-// review, 2026-09-21); until it exists, every deployment's health gate
-// probes this fixed path regardless of what the application actually
-// serves there. An application that never returns 2xx on "/" cannot pass
-// the gate, and a failed gate with the container still running classifies
-// permanent_configuration (never retried -- see classify.go), so this is a
-// real, not theoretical, deployment-blocking gap. The missing path/host
-// column is a prerequisite for flipping executorEnabled in cmd/agent, same
-// as the privileged Linux checkout smoke.
-const healthGatePathV1Default = "/"
 
 // probeBuildxFunc is docker.ProbeBuildx, indirected through a package
 // variable so NewExecutor's fail-closed startup probe is testable without a
@@ -150,6 +134,29 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 // cancelled. A successful run stops at health_checking; activating/healthy
 // belongs to a later slice.
 func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentclient.Outcome {
+	// Fail closed before any container work at all -- checkout, build, and
+	// run all happen after this point. Migration 000017 makes both
+	// health_gate_path and health_gate_host NOT NULL with CHECK constraints
+	// on environment_runtime_configs, and agent_job_attempt_execution
+	// freezes them the same way, so a lease reaching here with either
+	// field empty cannot reflect a real, validly configured environment: it
+	// means the control plane sent a lease this attempt cannot trust (a
+	// wire/decoding defect, a stale binary on either side of the claim
+	// protocol, or a genuine control-plane bug), not an application or
+	// source defect and not a transient condition retrying will clear.
+	// That is exactly the shape queue.FailureClassCorruptState exists for
+	// (see ErrAgentLeaseCorruptState's own doc comment: "a mismatch ...
+	// means either this process or a previous one has a bug"), and unlike
+	// FailureClassPermanentConfiguration (a real application/config defect)
+	// or FailureClassTransient (retryable, per internal/queue/retry.go's
+	// Retryable), corrupt_state is the one class that says "do not retry
+	// this and do not blame the application" -- it is never retried
+	// (Retryable() is true only for FailureClassTransient), matching that a
+	// resend of the same corrupt lease would fail identically.
+	if lease.HealthGatePath == "" || lease.HealthGateHost == "" {
+		return e.outcome(lease, false, queue.FailureClassCorruptState)
+	}
+
 	progress := newProgressReporter(e.controlPlane)
 	materializer := newSecretMaterializer(e.controlPlane, lease.AttemptID, lease.Fence)
 	tracker := &phaseTracker{}
@@ -236,14 +243,20 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		return e.outcome(lease, false, queue.FailureClassTransient)
 	}
 
-	networkID, containerIP, err := resolveNetworkAndIP(inspect)
+	// The IP itself is no longer needed here: RunHealthGate resolves it
+	// internally from containerID+networkID (see health.go's
+	// containerNetworkIP) now that the Host header comes from the
+	// configured lease value, not a synthesized ip:port. resolveNetworkAndIP
+	// is still called for its validation (exactly one network, a resolved
+	// IP present) -- a malformed inspect result must still fail closed here.
+	networkID, _, err := resolveNetworkAndIP(inspect)
 	if err != nil {
 		return e.outcome(lease, false, docker.ClassifyFailure(err))
 	}
 
 	gateResult, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
-		Host:   healthGateHost(containerIP, lease.ContainerPort),
-		Path:   healthGatePathV1Default,
+		Host:   lease.HealthGateHost,
+		Path:   lease.HealthGatePath,
 		Port:   lease.ContainerPort,
 		Scheme: lease.ContainerScheme,
 	})
@@ -267,24 +280,6 @@ func (e *Executor) containerEnv(ctx context.Context, m *secretMaterializer, leas
 		return nil, err
 	}
 	return append(secretEnv, literalRuntimeEnv(lease.LiteralBindings)...), nil
-}
-
-// healthGateHost is the Host header the candidate health gate probe sends.
-// See healthGatePathV1Default: no schema column carries a configured
-// health-check Host either, so -- per independent review, 2026-09-21 -- this
-// sends exactly what a plain HTTP client makes of a direct-IP probe with no
-// separate hostname: the dialed authority itself (RFC 7230 5.4 -- Host
-// defaults to the authority when there is no other name to send). It
-// deliberately does NOT send a synthetic value like an environment id: that
-// would assert a hostname that does not exist and could break an
-// application that branches on Host, and ADR 0005 requires this probe to
-// stay independent of production route state regardless (the real
-// configured production hostname belongs to a later slice's route/Traefik
-// binding, not this candidate gate). A configured Host header, like the
-// configured path, is pending the same schema work noted on
-// healthGatePathV1Default.
-func healthGateHost(containerIP string, port int) string {
-	return net.JoinHostPort(containerIP, strconv.Itoa(port))
 }
 
 // sourceDigest derives BuiltImageIdentity.SourceDigest from the checkout's

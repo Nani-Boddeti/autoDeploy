@@ -20,6 +20,7 @@ import (
 	"autodeploy/internal/auth"
 	"autodeploy/internal/github"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
 )
@@ -799,20 +800,25 @@ func (h *Handler) environmentsMarkReconciled(w http.ResponseWriter, r *http.Requ
 	redirect(w, "/servers")
 }
 
-// validRuntimeConfigFields mirrors migration 000014's
+// validRuntimeConfigFields mirrors migration 000014/000017's
 // environment_runtime_configs CHECK constraints exactly (also mirrored,
 // independently, by postgres.RuntimeConfigInput.valid -- the repository is
 // the authoritative last check; this lets the web layer reject bad input
 // with a specific message before ever calling it). Keep both in sync with
-// the migration if its bounds ever change.
-func validRuntimeConfigFields(port, drain, cpu int, scheme, strategy, restart string, memory int64) bool {
+// the migration if its bounds ever change. health_gate_path/health_gate_host
+// are validated via internal/healthgate, the one shared place that mirror
+// lives (unlike the simple numeric bounds here, a regex-shaped rule is not
+// safe to hand-duplicate a third time).
+func validRuntimeConfigFields(port, drain, cpu int, scheme, strategy, restart, healthGatePath, healthGateHost string, memory int64) bool {
 	return port >= 1 && port <= 65535 &&
 		(scheme == "http" || scheme == "https") &&
 		(strategy == "blue_green" || strategy == "stop_then_start") &&
 		drain >= 1 && drain <= 300 &&
 		cpu > 0 && cpu <= 256000 &&
 		memory > 0 && memory <= 549755813888 &&
-		(restart == "unless-stopped" || restart == "on-failure")
+		(restart == "unless-stopped" || restart == "on-failure") &&
+		healthgate.ValidPath(healthGatePath) &&
+		healthgate.ValidHost(healthGateHost)
 }
 
 // parseRuntimeConfigForm parses and validates the /environments/config POST
@@ -828,10 +834,11 @@ func parseRuntimeConfigForm(v url.Values) (postgres.RuntimeConfigInput, error) {
 		return postgres.RuntimeConfigInput{}, errors.New("port, drain seconds, cpu millis, and memory bytes must be whole numbers")
 	}
 	scheme, strategy, restart := v.Get("container_scheme"), v.Get("release_strategy"), v.Get("restart_policy")
-	if !validRuntimeConfigFields(port, drain, cpu, scheme, strategy, restart, memory) {
-		return postgres.RuntimeConfigInput{}, errors.New("container port must be 1-65535, scheme http/https, strategy blue_green/stop_then_start, drain seconds 1-300, cpu millis 1-256000, memory bytes 1-549755813888, restart policy unless-stopped/on-failure")
+	healthGatePath, healthGateHost := v.Get("health_gate_path"), v.Get("health_gate_host")
+	if !validRuntimeConfigFields(port, drain, cpu, scheme, strategy, restart, healthGatePath, healthGateHost, memory) {
+		return postgres.RuntimeConfigInput{}, errors.New("container port must be 1-65535, scheme http/https, strategy blue_green/stop_then_start, drain seconds 1-300, cpu millis 1-256000, memory bytes 1-549755813888, restart policy unless-stopped/on-failure, health gate path must be an absolute path with no whitespace/control characters/#, health gate host must be a valid hostname with an optional :port")
 	}
-	return postgres.RuntimeConfigInput{ContainerPort: port, ContainerScheme: scheme, ReleaseStrategy: strategy, DrainSeconds: drain, CPUMillis: cpu, MemoryBytes: memory, RestartPolicy: restart}, nil
+	return postgres.RuntimeConfigInput{ContainerPort: port, ContainerScheme: scheme, ReleaseStrategy: strategy, DrainSeconds: drain, CPUMillis: cpu, MemoryBytes: memory, RestartPolicy: restart, HealthGatePath: healthGatePath, HealthGateHost: healthGateHost}, nil
 }
 
 // runtimeConfigFormView builds a sticky config view directly from the
@@ -845,6 +852,7 @@ func runtimeConfigFormView(csrf, environmentID string, v url.Values) runtimeConf
 		CSRF: csrf, EnvironmentID: environmentID, Revision: v.Get("expected_revision"),
 		Port: v.Get("container_port"), Scheme: v.Get("container_scheme"), Strategy: v.Get("release_strategy"),
 		Drain: v.Get("drain_seconds"), CPU: v.Get("cpu_millis"), Memory: v.Get("memory_bytes"), Restart: v.Get("restart_policy"),
+		HealthGatePath: v.Get("health_gate_path"), HealthGateHost: v.Get("health_gate_host"),
 	}
 }
 
@@ -862,12 +870,17 @@ func buildRuntimeConfigView(csrf, environmentID string, cfg postgres.RuntimeConf
 		view.CPU = strconv.Itoa(cfg.CPUMillis)
 		view.Memory = strconv.FormatInt(cfg.MemoryBytes, 10)
 		view.Restart = cfg.RestartPolicy
+		view.HealthGatePath = cfg.HealthGatePath
+		view.HealthGateHost = cfg.HealthGateHost
 		view.HealthPolicyRevision = strconv.Itoa(cfg.HealthPolicyRevision)
 		view.UpdatedAt = formatTimestamp(cfg.UpdatedAt)
 	} else {
 		// Sensible starting defaults for the create form; not stored
-		// anywhere until the operator submits them.
+		// anywhere until the operator submits them. HealthGateHost has no
+		// sensible default (decision D2: required, no fallback), so it is
+		// left blank for the operator to fill in.
 		view.Scheme, view.Strategy, view.Restart = "http", "stop_then_start", "unless-stopped"
+		view.HealthGatePath = "/"
 	}
 	return view
 }
@@ -963,11 +976,11 @@ func (h *Handler) environmentConfigPost(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 10 {
+	if err != nil || len(v) != 12 {
 		badRequest(w)
 		return
 	}
-	for _, name := range []string{"environment_id", "csrf", "expected_revision", "container_port", "container_scheme", "release_strategy", "drain_seconds", "cpu_millis", "memory_bytes", "restart_policy"} {
+	for _, name := range []string{"environment_id", "csrf", "expected_revision", "container_port", "container_scheme", "release_strategy", "drain_seconds", "cpu_millis", "memory_bytes", "restart_policy", "health_gate_path", "health_gate_host"} {
 		if len(v[name]) != 1 {
 			badRequest(w)
 			return
@@ -1526,6 +1539,7 @@ type runtimeConfigView struct {
 	Exists                                                                bool
 	Revision                                                              string
 	Port, Scheme, Strategy, Drain, CPU, Memory, Restart                   string
+	HealthGatePath, HealthGateHost                                        string
 	HealthPolicyRevision, UpdatedAt                                       string
 	ConfigError                                                           string
 	Bindings                                                              []bindingRow
@@ -1538,7 +1552,7 @@ type runtimeConfigView struct {
 // variable bindings with add/remove forms. Plain HTML, no JavaScript, no
 // design system (deferred to the operations UI milestone) -- matches
 // serversTemplate's own conventions exactly.
-var environmentConfigTemplate = template.Must(template.New("environment-config").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment runtime configuration</title></head><body><main><h1>Runtime configuration: {{.EnvironmentID}}</h1>{{if .ConfigError}}<p><strong>{{.ConfigError}}</strong></p>{{end}}{{if not .Exists}}<p>No configuration exists yet for this environment. Fill in the form below to create one.</p>{{end}}<form method="post" action="/environments/config"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Container port <input name="container_port" required maxlength="5" value="{{.Port}}"></label><label>Container scheme <select name="container_scheme"><option value="http" {{if eq .Scheme "http"}}selected{{end}}>http</option><option value="https" {{if eq .Scheme "https"}}selected{{end}}>https</option></select></label><label>Release strategy <select name="release_strategy"><option value="blue_green" {{if eq .Strategy "blue_green"}}selected{{end}}>blue_green</option><option value="stop_then_start" {{if eq .Strategy "stop_then_start"}}selected{{end}}>stop_then_start</option></select></label><label>Drain seconds <input name="drain_seconds" required maxlength="3" value="{{.Drain}}"></label><label>CPU millis <input name="cpu_millis" required maxlength="6" value="{{.CPU}}"></label><label>Memory bytes <input name="memory_bytes" required maxlength="12" value="{{.Memory}}"></label><label>Restart policy <select name="restart_policy"><option value="unless-stopped" {{if eq .Restart "unless-stopped"}}selected{{end}}>unless-stopped</option><option value="on-failure" {{if eq .Restart "on-failure"}}selected{{end}}>on-failure</option></select></label><button type="submit">{{if .Exists}}Save configuration{{else}}Create configuration{{end}}</button></form><h2>Variable bindings</h2>{{if .BindingError}}<p><strong>{{.BindingError}}</strong></p>{{end}}<table><thead><tr><th>Variable</th><th>Kind</th><th>Scope</th><th>Value / identity</th><th>Created</th><th>Actions</th></tr></thead><tbody>{{range .Bindings}}<tr><td>{{.VariableName}}</td><td>{{.Kind}}</td><td>{{.Scope}}</td><td>{{.Identity}}</td><td>{{.CreatedAt}}</td><td><form method="post" action="/environments/bindings/remove"><input type="hidden" name="environment_id" value="{{$.EnvironmentID}}"><input type="hidden" name="variable_name" value="{{.VariableName}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Remove</button></form></td></tr>{{end}}</tbody></table><h3>Add binding</h3><form method="post" action="/environments/bindings/add"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Variable name <input name="variable_name" required maxlength="128" value="{{.BindVariable}}"></label><label>Kind <select name="binding_kind"><option value="secret" {{if eq .BindKind "secret"}}selected{{end}}>secret</option><option value="literal_nonsecret" {{if eq .BindKind "literal_nonsecret"}}selected{{end}}>literal_nonsecret</option></select></label><label>Delivery scope <select name="delivery_scope"><option value="runtime" {{if eq .BindScope "runtime"}}selected{{end}}>runtime</option><option value="build" {{if eq .BindScope "build"}}selected{{end}}>build</option></select></label><label>Secret head ID (kind=secret only) <input name="secret_head_id" maxlength="128" value="{{.BindSecretHeadID}}"></label><label>Literal value (kind=literal_nonsecret only) <input name="literal_value" maxlength="4096" value="{{.BindLiteralValue}}"></label><button type="submit">Add binding</button></form><p><a href="/servers">Back to servers</a></p></main></body></html>`))
+var environmentConfigTemplate = template.Must(template.New("environment-config").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment runtime configuration</title></head><body><main><h1>Runtime configuration: {{.EnvironmentID}}</h1>{{if .ConfigError}}<p><strong>{{.ConfigError}}</strong></p>{{end}}{{if not .Exists}}<p>No configuration exists yet for this environment. Fill in the form below to create one.</p>{{end}}<form method="post" action="/environments/config"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Container port <input name="container_port" required maxlength="5" value="{{.Port}}"></label><label>Container scheme <select name="container_scheme"><option value="http" {{if eq .Scheme "http"}}selected{{end}}>http</option><option value="https" {{if eq .Scheme "https"}}selected{{end}}>https</option></select></label><label>Release strategy <select name="release_strategy"><option value="blue_green" {{if eq .Strategy "blue_green"}}selected{{end}}>blue_green</option><option value="stop_then_start" {{if eq .Strategy "stop_then_start"}}selected{{end}}>stop_then_start</option></select></label><label>Drain seconds <input name="drain_seconds" required maxlength="3" value="{{.Drain}}"></label><label>CPU millis <input name="cpu_millis" required maxlength="6" value="{{.CPU}}"></label><label>Memory bytes <input name="memory_bytes" required maxlength="12" value="{{.Memory}}"></label><label>Restart policy <select name="restart_policy"><option value="unless-stopped" {{if eq .Restart "unless-stopped"}}selected{{end}}>unless-stopped</option><option value="on-failure" {{if eq .Restart "on-failure"}}selected{{end}}>on-failure</option></select></label><label>Health gate path <input name="health_gate_path" required maxlength="2048" value="{{.HealthGatePath}}"></label><label>Health gate host <input name="health_gate_host" required maxlength="269" value="{{.HealthGateHost}}"></label><button type="submit">{{if .Exists}}Save configuration{{else}}Create configuration{{end}}</button></form><h2>Variable bindings</h2>{{if .BindingError}}<p><strong>{{.BindingError}}</strong></p>{{end}}<table><thead><tr><th>Variable</th><th>Kind</th><th>Scope</th><th>Value / identity</th><th>Created</th><th>Actions</th></tr></thead><tbody>{{range .Bindings}}<tr><td>{{.VariableName}}</td><td>{{.Kind}}</td><td>{{.Scope}}</td><td>{{.Identity}}</td><td>{{.CreatedAt}}</td><td><form method="post" action="/environments/bindings/remove"><input type="hidden" name="environment_id" value="{{$.EnvironmentID}}"><input type="hidden" name="variable_name" value="{{.VariableName}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Remove</button></form></td></tr>{{end}}</tbody></table><h3>Add binding</h3><form method="post" action="/environments/bindings/add"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Variable name <input name="variable_name" required maxlength="128" value="{{.BindVariable}}"></label><label>Kind <select name="binding_kind"><option value="secret" {{if eq .BindKind "secret"}}selected{{end}}>secret</option><option value="literal_nonsecret" {{if eq .BindKind "literal_nonsecret"}}selected{{end}}>literal_nonsecret</option></select></label><label>Delivery scope <select name="delivery_scope"><option value="runtime" {{if eq .BindScope "runtime"}}selected{{end}}>runtime</option><option value="build" {{if eq .BindScope "build"}}selected{{end}}>build</option></select></label><label>Secret head ID (kind=secret only) <input name="secret_head_id" maxlength="128" value="{{.BindSecretHeadID}}"></label><label>Literal value (kind=literal_nonsecret only) <input name="literal_value" maxlength="4096" value="{{.BindLiteralValue}}"></label><button type="submit">Add binding</button></form><p><a href="/servers">Back to servers</a></p></main></body></html>`))
 
 // enrollmentTokenTemplate is rendered exactly once per register/reissue
 // response: the raw enrollment token appears here and nowhere else.

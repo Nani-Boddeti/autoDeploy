@@ -42,7 +42,14 @@ type frozenExecutionSnapshot struct {
 	CPUMillis            int
 	MemoryBytes          int64
 	RestartPolicy        string
-	ConfigRevision       int64
+	// HealthGatePath and HealthGateHost are migration 000017's Slice 10
+	// Step 0 additions: the exact configured health-gate probe path and
+	// Host header an attempt freezes alongside every other execution
+	// field, resolved (attempt 1) or copied forward (attempt N>1) exactly
+	// like the rest of this snapshot.
+	HealthGatePath string
+	HealthGateHost string
+	ConfigRevision int64
 }
 
 // frozenBinding is one resolved (or copied-forward) secret-version
@@ -90,8 +97,8 @@ type frozenLiteral struct {
 // same check had already passed for it.
 func lockEnvironmentRuntimeConfig(ctx context.Context, tx pgx.Tx, environmentID string) (frozenExecutionSnapshot, bool, error) {
 	var cfg frozenExecutionSnapshot
-	err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, revision FROM environment_runtime_configs WHERE environment_id=$1 FOR SHARE`, environmentID).
-		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision)
+	err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, health_gate_path, health_gate_host, revision FROM environment_runtime_configs WHERE environment_id=$1 FOR SHARE`, environmentID).
+		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthGatePath, &cfg.HealthGateHost, &cfg.ConfigRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return frozenExecutionSnapshot{}, false, nil
 	}
@@ -190,8 +197,8 @@ func resolveRuntimeLiteralBindings(ctx context.Context, tx pgx.Tx, environmentID
 // insertAttemptExecution durably freezes cfg as attemptID's
 // agent_job_attempt_execution row (insert-once per migration 000014).
 func insertAttemptExecution(ctx context.Context, tx pgx.Tx, attemptID int64, cfg frozenExecutionSnapshot) error {
-	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		attemptID, cfg.ContainerPort, cfg.ContainerScheme, cfg.ReleaseStrategy, cfg.DrainSeconds, cfg.HealthPolicyRevision, cfg.CPUMillis, cfg.MemoryBytes, cfg.RestartPolicy, cfg.ConfigRevision); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		attemptID, cfg.ContainerPort, cfg.ContainerScheme, cfg.ReleaseStrategy, cfg.DrainSeconds, cfg.HealthPolicyRevision, cfg.CPUMillis, cfg.MemoryBytes, cfg.RestartPolicy, cfg.ConfigRevision, cfg.HealthGatePath, cfg.HealthGateHost); err != nil {
 		return fmt.Errorf("insert agent job attempt execution: %w", err)
 	}
 	return nil
@@ -264,8 +271,8 @@ func copyPreviousFrozenLiteralValues(ctx context.Context, tx pgx.Tx, newAttemptI
 // for this unlocked read to race against.
 func copyPreviousAttemptExecution(ctx context.Context, tx pgx.Tx, newAttemptID, prevAttemptID int64) (frozenExecutionSnapshot, error) {
 	var cfg frozenExecutionSnapshot
-	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision FROM agent_job_attempt_execution WHERE attempt_id=$1`, prevAttemptID).
-		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host FROM agent_job_attempt_execution WHERE attempt_id=$1`, prevAttemptID).
+		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision, &cfg.HealthGatePath, &cfg.HealthGateHost); err != nil {
 		return frozenExecutionSnapshot{}, fmt.Errorf("load previous attempt %d execution for copy-forward: %w", prevAttemptID, err)
 	}
 	if err := insertAttemptExecution(ctx, tx, newAttemptID, cfg); err != nil {
@@ -316,20 +323,26 @@ func copyPreviousFrozenSecretVersions(ctx context.Context, tx pgx.Tx, newAttempt
 // rather than inventing a second canonicalization scheme in the same
 // codebase.
 //
-// The leading tag is "2": step 2b appended the frozen literal set to this
-// encoding, which changes the shape of what is hashed, so a digest computed
-// by the "1" encoding is not comparable to one computed here. Nothing has
-// ever stored a release row outside throwaway test databases, so no existing
-// digest is invalidated by the bump -- it exists so that if this encoding
-// ever changes again against real data, the two can be told apart instead of
-// silently disagreeing through ensureRelease's corrupt-state path.
+// The leading tag is "3": Slice 10 Step 0 appended HealthGatePath/
+// HealthGateHost to this encoding, which changes the shape of what is
+// hashed, so a digest computed by the "2" (or "1") encoding is not
+// comparable to one computed here -- exactly as step 2b's own bump from "1"
+// to "2" reasoned. Nothing has ever stored a release row outside throwaway
+// test databases, so no existing digest is invalidated by this bump either;
+// it exists so that if this encoding ever changes again against real data,
+// the two can be told apart instead of silently disagreeing through
+// ensureRelease's corrupt-state path. Widening the digest inputs here is
+// required, not optional: without it, an administrator could change
+// health_gate_path/health_gate_host after attempt 1 without the deployment's
+// stored config_digest ever reflecting that change, defeating the very
+// mismatch check ensureRelease exists to perform.
 func computeConfigDigest(cfg frozenExecutionSnapshot, bindings []frozenBinding, literals []frozenLiteral) [32]byte {
 	sorted := append([]frozenBinding(nil), bindings...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].VariableName < sorted[j].VariableName })
 	sortedLiterals := append([]frozenLiteral(nil), literals...)
 	sort.Slice(sortedLiterals, func(i, j int) bool { return sortedLiterals[i].VariableName < sortedLiterals[j].VariableName })
 	parts := []string{
-		"2",
+		"3",
 		strconv.Itoa(cfg.ContainerPort),
 		cfg.ContainerScheme,
 		cfg.ReleaseStrategy,
@@ -338,6 +351,8 @@ func computeConfigDigest(cfg frozenExecutionSnapshot, bindings []frozenBinding, 
 		strconv.Itoa(cfg.CPUMillis),
 		strconv.FormatInt(cfg.MemoryBytes, 10),
 		cfg.RestartPolicy,
+		cfg.HealthGatePath,
+		cfg.HealthGateHost,
 		strconv.FormatInt(cfg.ConfigRevision, 10),
 		strconv.Itoa(len(sorted)),
 	}

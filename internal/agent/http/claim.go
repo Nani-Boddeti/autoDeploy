@@ -70,6 +70,8 @@ type leaseView struct {
 	MemoryBytes          int64                `json:"memory_bytes"`
 	RestartPolicy        string               `json:"restart_policy"`
 	DrainSeconds         int                  `json:"drain_seconds"`
+	HealthGatePath       string               `json:"health_gate_path"`
+	HealthGateHost       string               `json:"health_gate_host"`
 	ReleaseID            string               `json:"release_id"`
 	SecretBindings       []secretBindingView  `json:"secret_bindings"`
 	LiteralBindings      []literalBindingView `json:"literal_bindings"`
@@ -108,6 +110,8 @@ func newLeaseView(l queue.ClaimedLease) leaseView {
 		MemoryBytes:          l.MemoryBytes,
 		RestartPolicy:        l.RestartPolicy,
 		DrainSeconds:         l.DrainSeconds,
+		HealthGatePath:       l.HealthGatePath,
+		HealthGateHost:       l.HealthGateHost,
 		ReleaseID:            l.ReleaseID,
 		SecretBindings:       bindings,
 		LiteralBindings:      literals,

@@ -54,14 +54,16 @@ func (f *fakeControlPlane) ReportProgress(ctx context.Context, attemptID, fence 
 }
 
 type fakeCheckout struct {
-	result   CheckoutResult
-	err      error
-	block    bool
-	closeN   int
-	closeErr error
+	result    CheckoutResult
+	err       error
+	block     bool
+	closeN    int
+	closeErr  error
+	checkoutN int
 }
 
 func (f *fakeCheckout) Checkout(ctx context.Context, attemptID, fence int64) (CheckoutResult, error) {
+	f.checkoutN++
 	if f.block {
 		<-ctx.Done()
 		return CheckoutResult{}, ctx.Err()
@@ -143,6 +145,7 @@ func testLease() agentclient.Lease {
 		RepositoryID: 1, Ref: "refs/heads/main", CommitSHA: "abc1230000000000000000000000000000000f",
 		ContainerPort: 8080, ContainerScheme: "http", HealthPolicyRevision: 1,
 		CPUMillis: 500, MemoryBytes: 256 << 20, RestartPolicy: docker.RestartPolicyUnlessStopped,
+		HealthGatePath: "/healthz", HealthGateHost: "configured.internal:9443",
 		ReleaseID: "rel1",
 		SecretBindings: []agentclient.SecretBinding{
 			{VariableName: "BUILD_SECRET", DeliveryScope: docker.DeliveryScopeBuild, SecretVersionID: "sv1"},
@@ -243,13 +246,12 @@ func TestExecuteHappyPathReachesHealthChecking(t *testing.T) {
 	}
 }
 
-// TestExecuteHealthGateTargetUsesDirectIPHostNeverSyntheticValue proves the
-// fix ordered by independent review: the probe's Host header must be what a
-// plain HTTP client sends for a direct-IP request (the dialed IP:port
-// authority), never a synthetic non-hostname value like EnvironmentID,
-// which could break an app that branches on Host and would assert
-// something false about the request.
-func TestExecuteHealthGateTargetUsesDirectIPHostNeverSyntheticValue(t *testing.T) {
+// TestExecuteHealthGateTargetUsesConfiguredPathAndHostNeverSynthesized
+// proves Slice 10 Step 0's fix: the probe's Path and Host header must come
+// exactly from the lease's frozen, administrator-configured values, never a
+// synthesized ip:port authority or a hard-coded "/" default -- the gap
+// independent review flagged before migration 000017 existed.
+func TestExecuteHealthGateTargetUsesConfiguredPathAndHostNeverSynthesized(t *testing.T) {
 	lease := testLease()
 	cp := &fakeControlPlane{secrets: fullSecrets()}
 	co := &fakeCheckout{result: happyCheckoutResult()}
@@ -265,15 +267,63 @@ func TestExecuteHealthGateTargetUsesDirectIPHostNeverSyntheticValue(t *testing.T
 		t.Fatalf("Execute did not succeed: %+v", outcome)
 	}
 
-	wantHost := "10.0.0.5:8080" // testInspect's IP, lease.ContainerPort
-	if dk.lastTarget.Host != wantHost {
-		t.Fatalf("Host = %q, want %q (the direct-IP authority, never lease.EnvironmentID %q or any other synthetic value)", dk.lastTarget.Host, wantHost, lease.EnvironmentID)
+	if dk.lastTarget.Host != lease.HealthGateHost {
+		t.Fatalf("Host = %q, want the lease's configured HealthGateHost %q, never a synthesized ip:port authority", dk.lastTarget.Host, lease.HealthGateHost)
 	}
-	if dk.lastTarget.Path != healthGatePathV1Default {
-		t.Fatalf("Path = %q, want the named V1 default %q", dk.lastTarget.Path, healthGatePathV1Default)
+	if dk.lastTarget.Path != lease.HealthGatePath {
+		t.Fatalf("Path = %q, want the lease's configured HealthGatePath %q, never a hard-coded default", dk.lastTarget.Path, lease.HealthGatePath)
 	}
 	if dk.lastNetID != "networkabc123" {
 		t.Fatalf("networkID passed to RunHealthGate = %q, want the resolved network ID", dk.lastNetID)
+	}
+}
+
+// TestExecuteEmptyHealthGatePathFailsClosedBeforeAnyContainerWork and
+// TestExecuteEmptyHealthGateHostFailsClosedBeforeAnyContainerWork prove
+// Slice 10 Step 0's fail-closed guard: a lease with an empty configured
+// path or Host (which migration 000017's NOT NULL/CHECK constraints should
+// make unreachable for a genuinely valid configuration) is rejected as
+// FailureClassCorruptState before checkout, build, or any docker call --
+// proving this is a protocol-level defect classification, not an
+// application failure, and that nothing downstream ever runs.
+func TestExecuteEmptyHealthGatePathFailsClosedBeforeAnyContainerWork(t *testing.T) {
+	lease := testLease()
+	lease.HealthGatePath = ""
+	assertFailsClosedBeforeContainerWork(t, lease)
+}
+
+func TestExecuteEmptyHealthGateHostFailsClosedBeforeAnyContainerWork(t *testing.T) {
+	lease := testLease()
+	lease.HealthGateHost = ""
+	assertFailsClosedBeforeContainerWork(t, lease)
+}
+
+func assertFailsClosedBeforeContainerWork(t *testing.T, lease agentclient.Lease) {
+	t.Helper()
+	cp := &fakeControlPlane{secrets: fullSecrets()}
+	co := &fakeCheckout{result: happyCheckoutResult()}
+	dk := &fakeDocker{
+		ensureResult: testInspect("networkabc123"),
+		gateResult:   docker.HealthGateResult{Success: true},
+	}
+	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+	e := newTestExecutor(cp, co, dk, build)
+
+	outcome := e.Execute(context.Background(), lease)
+	if outcome.Succeeded {
+		t.Fatal("Execute succeeded with an empty configured health gate path/host, want failure")
+	}
+	if outcome.FailureClass != queue.FailureClassCorruptState {
+		t.Fatalf("FailureClass = %q, want %q", outcome.FailureClass, queue.FailureClassCorruptState)
+	}
+	if co.checkoutN != 0 {
+		t.Fatalf("Checkout called %d times, want 0 -- must fail before any container work", co.checkoutN)
+	}
+	if dk.ensureN != 0 || dk.gateN != 0 {
+		t.Fatalf("ensureN=%d gateN=%d, want 0 and 0 -- must fail before any container work", dk.ensureN, dk.gateN)
+	}
+	if len(cp.progressCalls) != 0 {
+		t.Fatalf("progress calls = %v, want none -- must fail before reporting any phase", cp.progressCalls)
 	}
 }
 
