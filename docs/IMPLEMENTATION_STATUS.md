@@ -28,16 +28,15 @@ routing is in scope, and a successful gate deliberately leaves the deployment at
 
 **It has never run.** Every test in 9b exercises a fake: a fake Engine API over a real unix socket, a fake
 `docker` binary on PATH, an `httptest` server for the probe. No real dockerd, no real BuildKit, no real
-checkout. `executor_available` stays false until two prerequisites are met, both tracked in
-[tasks/todo.md](../tasks/todo.md):
+checkout. `executor_available` stays false until the remaining prerequisite is met (both tracked in
+[tasks/todo.md](../tasks/todo.md)):
 
 1. The **privileged Linux checkout smoke** (XFS prjquota, delegated cgroup v2, root helpers), still pending
    and only the owner can run it.
-2. A **configured health-gate path column**. ADR 0005 requires an exact configured path and Host header;
-   migration 000014 froze port and scheme only. The gate currently probes `/`, and a failed gate with the
-   container running is classified `permanent_configuration`, which is never retried — so an application
-   that does not answer 2xx at `/` would fail permanently with no automatic recovery. This is a gap in the
-   approved plan, found in review, not a coding slip.
+2. ~~A configured health-gate path column~~ — **closed by slice 10 Step 0 (2026-09-22)**: migration 000017
+   adds an operator-configured path and a required Host header, frozen per attempt and part of
+   `config_digest`; the agent probes exactly that path/Host. Before this the gate probed `/`, and a failed
+   gate is `permanent_configuration` (never retried).
 
 Flipping `cmd/agent`'s `executorEnabled` constant is what starts real deployments; a test fails the build
 if it is flipped without being updated deliberately.

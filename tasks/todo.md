@@ -1937,3 +1937,83 @@ then confirm a forced failure leaves no resources labeled as a successful attemp
 1 (migration) -> 2 (claim freeze) -> 3a (materialize) -> 3b (progress) -> 3c (checkout seam) ->
 3d (admin pages) -> 4 (docker skeleton) -> 5 (build) -> 6 (run + gate + executor wiring).
 One subagent per step, independent review between steps, atomic commit per step.
+
+## Approved Slice 10 — health-gate configuration + blue/green activation (approved 2026-09-22: D1 blue/green only, D2 Host required, D3 same lease; D4/D5 defaults)
+
+### Context
+- 9b stops at `health_checking`; `executorEnabled = false`; nothing has run on a host.
+- Executor flip blocked by: (1) privileged Linux checkout smoke (owner), (2) no configured health-gate path/Host — `internal/agent/executor/executor.go` hard-codes `healthGatePathV1Default = "/"` and synthesizes Host from `ip:port`; a failed gate with the container running is `permanent_configuration` (never retried).
+- ADR 0005 already decides: Traefik watched **file provider** (no Docker socket to Traefik), atomic temp-file+fsync+rename+fsync-dir, two-transaction fenced activation, no blind automatic rollback, 30s drain then stop (not remove) predecessor.
+- Verified ready: `internal/deployment` already allows `health_checking -> activating -> healthy|failed`; `AgentReportablePhase` excludes `activating`/`healthy`.
+- Verified missing: no route/hostname table, no Traefik code, `releases.state` lacks `active`/`retained` (000014 CHECK + `validate_release_update`).
+
+### Scope
+Slice 10 = Step 0 + blue/green activation only. Deferred to slice 11+: stop-then-start (needs maintenance service), rollback, retention/cleanup batches, full host reconciler (this slice fails closed to reconciliation-required; resolution is operator `mark-reconciled`).
+
+### Step 0 — configured health-gate path + Host (land first, independently; one subagent)
+- Migration `000017`: `environment_runtime_configs.health_gate_path TEXT NOT NULL DEFAULT '/'`, `health_gate_host TEXT` (see decision D2); same columns frozen NOT NULL on `agent_job_attempt_execution`. CHECKs: path starts with `/`, not `//`, ≤2048 bytes, no whitespace/control chars/`#`; host is a DNS hostname with optional `:port` (strict charset, ≤253), no userinfo/path. Test file per 000014/000015 precedent. Safe additive: neither table has ever had a production row (`executorEnabled=false`).
+- `environment_runtime_config_repository.go`: input fields + `valid()` mirroring the CHECKs exactly; create/update/get SQL.
+- `internal/web/web.go` runtime-config page: two fields, validation, display; `environment_config_test.go` negatives.
+- `agent_lease_execution.go`: fresh-resolve SELECT, attempt INSERT, copy-forward SELECT gain both columns; **`config_digest` inputs widen** (otherwise path/Host could change without changing the digest).
+- Wire: `internal/agent/http/claim.go` + `internal/agent/client/api.go` Lease fields.
+- Executor: delete `healthGatePathV1Default` and `healthGateHost`; pass the lease values.
+- `internal/runtime/docker/health.go`: build the probe URL with `url.URL{Scheme, Host, Path/RawQuery}` instead of string concatenation (today `Scheme + "://" + Host + Path`), and re-validate path/host agent-side (defense in depth; the dial target stays `ip:port`).
+- `ClassifyHealthGateResult` unchanged unless review finds a misclassification independent of this gap — report either way.
+- Must-prove: CHECK negatives; CAS trigger still enforced over widened row (break trigger, see test fail); copy-forward keeps attempt-1 path/Host after config changes; digest changes when path/Host change (guard: remove from digest inputs, see test fail); executor passes configured values (fake gate); `//evil`, `?`-only, header-injection and userinfo host rejected at every layer.
+- Fully provable on macOS. Outcome counter does not move.
+
+#### Step 0 result (2026-09-22, verified; uncommitted — git blocked by unaccepted Xcode license)
+- Migration 000017: `health_gate_path` (default `/`) and required `health_gate_host` on `environment_runtime_configs`, frozen NOT NULL on `agent_job_attempt_execution`. Path grammar is an ASCII RFC 3986 allowlist (well-formed `%XX` only, optional query, not `//`, ≤2048 bytes); host is DNS labels with optional port 1–65535. `internal/healthgate` holds the Go validators as the same literal regex strings the CHECKs use, and the repository, web form and agent all reuse them.
+- Claim freeze, copy-forward and `config_digest` (tag 3) carry both values; the lease wire carries them; the executor's hard-coded `/` and synthetic Host are deleted. A lease with an empty value fails closed as `corrupt_state` before any checkout/build/container work.
+- The probe URL is built with `url.ParseRequestURI` and must satisfy `RequestURI() == configured path` (else `corrupt_state`). Probe invariant errors now propagate; network/TLS/timeout failures are still failed probes. SNI follows the configured Host (documented net/http behaviour; not captured on the wire).
+- Defect found in review, fixed before landing: the first cut used `url.URL{Path: p}`, which re-encoded `/health%2Fcheck` as `/health%252Fcheck` and `/hé` as `/h%C3%A9` — a valid config would have failed permanently. Orchestrator property-checked 200,012 grammar-generated paths: 0 round-trip mismatches.
+- Every new guard was broken on purpose and seen to fail (8 in the first pass, 4 in the fix pass). The one exception is `buildProbeURL`'s own assertion, which no accepted input can reach (see the property check).
+- Evidence: gofmt, `go vet` incl. integration, build, `go test -race ./...` (27 packages ok), three fresh PG18 sweeps normal + `-race` (6/6, 4/4 packages each), concurrency tests `-race -count=20`, Linux amd64/arm64 vet. `git diff --check` not run (git unusable). `make` is also unusable until the license is accepted, so the targets were run directly with `GOFLAGS=-buildvcs=false`.
+- Executor-flip prerequisite 2 (configured health-gate path/Host) is now closed. Prerequisite 1 (privileged Linux checkout smoke) is still pending.
+
+### Step 10a — route head + release states (migration `000018`; one subagent)
+- New `route_heads` (PK `environment_id`, `route_revision BIGINT` CAS, `active_release_id` FK nullable, `hostname` nullable, `reconciliation_required`, append-only `route_events`).
+- New forward migration widens `releases.state` with `active`, `retained` and edges `ready->active`, `active->retained`, `retained->active` (drop/recreate CHECK + replace trigger function; never edit 000014).
+- Minimal hostname assignment: one hostname per environment, audited admin mutation (mirrors 000016 audit), explicit authority acknowledgement per ADR 0005; no ownership challenge (single admin V1).
+- Tests: CHECK/trigger edges both legal and illegal; CAS revision advance-by-one; audit-with-mutation.
+
+### Step 10b — Traefik file-provider adapter (agent; one subagent)
+- New `internal/runtime/traefik`: deterministic render of one environment's dynamic config from route-head state, canonical digest, schema validation, no secret values structurally (render input type has no secret fields), atomic write per ADR 0005, Linux/unsupported build split.
+- Traefik static config (entrypoints, ACME resolver, watched dir) is host provisioning — documented here, installed by the packaging slice.
+- macOS proves render/digest/atomic-write against a temp dir only; real reload timing is a Linux gate.
+
+### Step 10c — fenced activation, control plane (one subagent)
+- Activation continues under the **same lease/attempt** (decision D3): new `/agent/v1/leases/activate` (tx1: recheck authorization, lease, fence, cancellation, route revision, source active release, candidate `ready`; transition `activating`; record switch-authorized operation with digest) and `/agent/v1/leases/activation-result` (tx2: recheck op/revision/fence; advance route revision + active pointer; candidate `active`, predecessor `retained`; deployment `healthy`; append events/audit). Ambiguous/failed after switch-authorized → `reconciliation_required`, environment blocked.
+- Lock order: ADR 0004 amendment — route-head rows between deployment heads (6) and secret versions (7).
+- Idempotency: same op digest replays as success; conflicting digest fails.
+- Control-plane `activationEnabled = false` gate until 10e is reviewed.
+- Tests (live PG18): racing activators on one route head → exactly one operation (several goroutines, one row); cancel vs activate race; stale fence refused; replay idempotent; guard tests by breaking the fence recheck.
+
+### Step 10d — agent activation execution (one subagent)
+- After a passing gate the executor calls activate, switches the route via 10b, verifies Traefik API + HTTPS data plane (dial local Traefik with SNI = hostname, verify cert), reports activation-result.
+- Classification (decision D4): write/reload/transport failures `transient` **before** switch authorization only; after authorization every failure is reconciliation-required, never auto-retried as a fresh attempt.
+
+### Step 10e — drain and stop predecessor (one subagent)
+- Frozen `drain_seconds` (default 30), then stop (not remove) predecessor selected by exact labels; inspect until stopped. Failure here does not undo activation; recorded for reconciliation.
+
+### Owner decisions (recommended default first)
+- D1 Scope: blue/green only; stop-then-start/rollback/retention → slice 11.
+- D2 Health-gate Host: **required** (admin-time validation error, frozen NOT NULL) vs NULL falling back to `ip:port`. Required matches ADR 0005 "exact configured Host header" and turns a permanent runtime failure into a form error.
+- D3 Activation under the same lease (recommended) vs a separate queued activation job (more queue machinery, second fence handoff).
+- D4 Classification as above.
+- D5 Lock slot for route heads after deployment heads (ADR 0004 amendment).
+
+### Verification
+Per step: subagent runs affected tests (normal + `-race`, one fresh PG18); orchestrator runs full bar before each commit (`make check`, `go test -race ./...`, three fresh PG18 sweeps normal + `-race`, concurrency `-race -count=20`, Linux cross-builds, `git diff --check`); independent zero-context review after every step, findings fixed first.
+
+### Not provable on macOS
+Real Traefik reload, ACME/HTTPS probe, fsync/rename semantics, real dockerd/BuildKit. End-to-end bar: on the Hetzner host a push walks to `healthy` behind a real hostname while the old release serves through the gate, then the predecessor is stopped and retained.
+
+### Outcome counter
+Step 0: no change. 10a–10e proven on a real host: mark "Traefik route generation, HTTPS, atomic switching" (9/18); blue/green/stop-then-start/retention/rollback stays open until slice 11.
+
+### Rollback
+Forward-only migrations (rollback = new migration dropping added tables/columns; safe while unwritten). Code behind `executorEnabled`/`activationEnabled`.
+
+### Step order
+0 -> 10a -> 10b -> 10c -> 10d -> 10e. One subagent per step, review between steps, atomic commit per step.
