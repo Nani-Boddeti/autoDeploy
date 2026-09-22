@@ -78,6 +78,16 @@ type RuntimeConfigAdmin interface {
 	RemoveEnvironmentRuntimeBinding(context.Context, auth.Principal, string, string) error
 }
 
+// RouteHeadAdmin is the narrow surface the /environments/route admin page
+// (Slice 10 Step 10a) uses. Mirrors ServerAdmin/RuntimeConfigAdmin's
+// nil-disables convention exactly: a nil RouteHeadAdmin 404s the route. It
+// never sets active_release_id -- Step 10a ships no activation logic, only
+// hostname assignment.
+type RouteHeadAdmin interface {
+	GetRouteHead(context.Context, auth.Principal, string) (postgres.RouteHead, bool, error)
+	AssignRouteHostname(context.Context, auth.Principal, string, string, *int64) (postgres.RouteHead, error)
+}
+
 type Config struct {
 	PublicOrigin          string
 	CSRFKeys              auth.CSRFKeyRing
@@ -90,6 +100,7 @@ type Config struct {
 	GitHubInstallationURL string
 	ServerAdmin           ServerAdmin
 	RuntimeConfigAdmin    RuntimeConfigAdmin
+	RouteHeadAdmin        RouteHeadAdmin
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -138,7 +149,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" {
+	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" {
 		http.NotFound(w, r)
 		return
 	}
@@ -260,6 +271,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.environmentBindingAdd(w, r)
+	case "/environments/route":
+		if h.config.RouteHeadAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			h.environmentRouteGet(w, r)
+		case http.MethodPost:
+			h.environmentRoutePost(w, r)
+		default:
+			methodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
 	case "/environments/bindings/remove":
 		if h.config.RuntimeConfigAdmin == nil {
 			http.NotFound(w, r)
@@ -1142,6 +1166,174 @@ func (h *Handler) environmentBindingRemove(w http.ResponseWriter, r *http.Reques
 	redirect(w, "/environments/config?environment_id="+url.QueryEscape(environmentID))
 }
 
+// buildRouteHeadView builds the sticky route view for a GET (from the
+// stored row) or a freshly re-read row after a rejected mutation.
+func buildRouteHeadView(csrf, environmentID string, head postgres.RouteHead, found bool) routeHeadView {
+	view := routeHeadView{CSRF: csrf, EnvironmentID: environmentID, Exists: found}
+	if found {
+		view.Hostname = head.Hostname
+		view.Revision = strconv.FormatInt(head.RouteRevision, 10)
+		view.ActiveReleaseID = head.ActiveReleaseID
+		view.ReconciliationRequired = head.ReconciliationRequired
+		view.UpdatedAt = formatTimestamp(head.UpdatedAt)
+	}
+	return view
+}
+
+func renderRouteHead(w http.ResponseWriter, view routeHeadView) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = routeHeadTemplate.Execute(w, view)
+}
+
+// environmentRouteGet renders one environment's route head. GET is
+// safe/idempotent, matching environmentConfigGet exactly: no CSRF check,
+// only a fresh token minted for the form this page renders.
+func (h *Handler) environmentRouteGet(w http.ResponseWriter, r *http.Request) {
+	_, p, ok := h.session(r.Context(), r)
+	if !ok {
+		redirect(w, "/login")
+		return
+	}
+	q := r.URL.Query()
+	if len(q) != 1 || len(q["environment_id"]) != 1 {
+		badRequest(w)
+		return
+	}
+	environmentID := q.Get("environment_id")
+	if !github.ValidOpaqueID(environmentID) {
+		badRequest(w)
+		return
+	}
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	head, found, err := h.config.RouteHeadAdmin.GetRouteHead(r.Context(), p, environmentID)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	renderRouteHead(w, buildRouteHeadView(csrf, environmentID, head, found))
+}
+
+// renderRouteRejection re-fetches the current route head so a rejected
+// submission still shows accurate Exists/ActiveReleaseID/Revision state
+// beside the operator's just-rejected (sticky) form values, matching
+// renderConfigRejection's pattern.
+func (h *Handler) renderRouteRejection(w http.ResponseWriter, r *http.Request, p auth.Principal, submitted routeHeadView) {
+	head, found, err := h.config.RouteHeadAdmin.GetRouteHead(r.Context(), p, submitted.EnvironmentID)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	submitted.Exists = found
+	if found {
+		submitted.Revision = strconv.FormatInt(head.RouteRevision, 10)
+		submitted.ActiveReleaseID = head.ActiveReleaseID
+		submitted.ReconciliationRequired = head.ReconciliationRequired
+	}
+	renderRouteHead(w, submitted)
+}
+
+// environmentRoutePost creates (expected_revision empty) or CAS-assigns
+// (expected_revision set) one environment's route hostname. ADR 0005
+// ("Domains, TLS, and servers") requires an authenticated administrator to
+// explicitly acknowledge authority to use the hostname before it is bound;
+// acknowledge_authority is an HTML checkbox, which browsers omit entirely
+// from the submitted body when unchecked (not merely send it as "off"), so
+// this handler treats it as optional in the form shape and only checks its
+// value, rather than requiring it as a fifth always-present field the way
+// every other field here is required.
+func (h *Handler) environmentRoutePost(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || (len(v) != 4 && len(v) != 5) {
+		badRequest(w)
+		return
+	}
+	for _, name := range []string{"environment_id", "csrf", "expected_revision", "hostname"} {
+		if len(v[name]) != 1 {
+			badRequest(w)
+			return
+		}
+	}
+	// A 5th key, if present at all, must be exactly acknowledge_authority
+	// with exactly its one legitimate value ("on", the value the checkbox
+	// in routeHeadTemplate submits when checked) -- any other 5th key name,
+	// or any other value, is an unrecognized/tampered field and is rejected
+	// outright rather than silently ignored or treated as an unchecked box.
+	if len(v) == 5 {
+		ack, ok := v["acknowledge_authority"]
+		if !ok || len(ack) != 1 || ack[0] != "on" {
+			badRequest(w)
+			return
+		}
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	environmentID := v.Get("environment_id")
+	if !github.ValidOpaqueID(environmentID) {
+		badRequest(w)
+		return
+	}
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	submitted := routeHeadView{CSRF: csrf, EnvironmentID: environmentID, Hostname: v.Get("hostname"), Revision: v.Get("expected_revision")}
+
+	if v.Get("acknowledge_authority") != "on" {
+		submitted.RouteError = "you must acknowledge that you have authority to use this hostname"
+		h.renderRouteRejection(w, r, p, submitted)
+		return
+	}
+	hostname := strings.ToLower(v.Get("hostname"))
+	if !healthgate.ValidRouteHostname(hostname) {
+		submitted.RouteError = "hostname must be a lowercase DNS hostname with no port, at most 253 bytes"
+		h.renderRouteRejection(w, r, p, submitted)
+		return
+	}
+
+	revisionRaw := v.Get("expected_revision")
+	var expected *int64
+	if revisionRaw != "" {
+		parsed, convErr := strconv.ParseInt(revisionRaw, 10, 64)
+		if convErr != nil || parsed < 0 {
+			submitted.RouteError = "invalid expected revision"
+			h.renderRouteRejection(w, r, p, submitted)
+			return
+		}
+		expected = &parsed
+	}
+	if _, opErr := h.config.RouteHeadAdmin.AssignRouteHostname(r.Context(), p, environmentID, hostname, expected); opErr != nil {
+		switch {
+		case errors.Is(opErr, postgres.ErrRouteHeadConflict):
+			submitted.RouteError = "this route changed underneath you since the page was loaded; the values below have been refreshed -- review and resubmit"
+		case errors.Is(opErr, postgres.ErrRouteHeadNotFound):
+			submitted.RouteError = "this route no longer exists; reload the page"
+		case errors.Is(opErr, postgres.ErrRouteHeadAlreadyExists):
+			submitted.RouteError = "a route already exists for this environment; reload the page and edit it instead"
+		case errors.Is(opErr, postgres.ErrRouteHeadHostnameTaken):
+			submitted.RouteError = "this hostname is already assigned to another environment"
+		case errors.Is(opErr, postgres.ErrRouteHeadHostnameImmutable):
+			submitted.RouteError = "this route has an active release; the hostname cannot change until it is deactivated"
+		default:
+			submitted.RouteError = "route rejected: invalid values, or you are not authorized to configure this environment"
+		}
+		h.renderRouteRejection(w, r, p, submitted)
+		return
+	}
+	redirect(w, "/environments/route?environment_id="+url.QueryEscape(environmentID))
+}
+
 // newEnrollmentToken mints a fresh single-use enrollment token and its
 // digest together, so every caller mints and digests it the same way and
 // the raw token never touches anything but the one response that displays
@@ -1553,6 +1745,28 @@ type runtimeConfigView struct {
 // design system (deferred to the operations UI milestone) -- matches
 // serversTemplate's own conventions exactly.
 var environmentConfigTemplate = template.Must(template.New("environment-config").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment runtime configuration</title></head><body><main><h1>Runtime configuration: {{.EnvironmentID}}</h1>{{if .ConfigError}}<p><strong>{{.ConfigError}}</strong></p>{{end}}{{if not .Exists}}<p>No configuration exists yet for this environment. Fill in the form below to create one.</p>{{end}}<form method="post" action="/environments/config"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Container port <input name="container_port" required maxlength="5" value="{{.Port}}"></label><label>Container scheme <select name="container_scheme"><option value="http" {{if eq .Scheme "http"}}selected{{end}}>http</option><option value="https" {{if eq .Scheme "https"}}selected{{end}}>https</option></select></label><label>Release strategy <select name="release_strategy"><option value="blue_green" {{if eq .Strategy "blue_green"}}selected{{end}}>blue_green</option><option value="stop_then_start" {{if eq .Strategy "stop_then_start"}}selected{{end}}>stop_then_start</option></select></label><label>Drain seconds <input name="drain_seconds" required maxlength="3" value="{{.Drain}}"></label><label>CPU millis <input name="cpu_millis" required maxlength="6" value="{{.CPU}}"></label><label>Memory bytes <input name="memory_bytes" required maxlength="12" value="{{.Memory}}"></label><label>Restart policy <select name="restart_policy"><option value="unless-stopped" {{if eq .Restart "unless-stopped"}}selected{{end}}>unless-stopped</option><option value="on-failure" {{if eq .Restart "on-failure"}}selected{{end}}>on-failure</option></select></label><label>Health gate path <input name="health_gate_path" required maxlength="2048" value="{{.HealthGatePath}}"></label><label>Health gate host <input name="health_gate_host" required maxlength="269" value="{{.HealthGateHost}}"></label><button type="submit">{{if .Exists}}Save configuration{{else}}Create configuration{{end}}</button></form><h2>Variable bindings</h2>{{if .BindingError}}<p><strong>{{.BindingError}}</strong></p>{{end}}<table><thead><tr><th>Variable</th><th>Kind</th><th>Scope</th><th>Value / identity</th><th>Created</th><th>Actions</th></tr></thead><tbody>{{range .Bindings}}<tr><td>{{.VariableName}}</td><td>{{.Kind}}</td><td>{{.Scope}}</td><td>{{.Identity}}</td><td>{{.CreatedAt}}</td><td><form method="post" action="/environments/bindings/remove"><input type="hidden" name="environment_id" value="{{$.EnvironmentID}}"><input type="hidden" name="variable_name" value="{{.VariableName}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Remove</button></form></td></tr>{{end}}</tbody></table><h3>Add binding</h3><form method="post" action="/environments/bindings/add"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Variable name <input name="variable_name" required maxlength="128" value="{{.BindVariable}}"></label><label>Kind <select name="binding_kind"><option value="secret" {{if eq .BindKind "secret"}}selected{{end}}>secret</option><option value="literal_nonsecret" {{if eq .BindKind "literal_nonsecret"}}selected{{end}}>literal_nonsecret</option></select></label><label>Delivery scope <select name="delivery_scope"><option value="runtime" {{if eq .BindScope "runtime"}}selected{{end}}>runtime</option><option value="build" {{if eq .BindScope "build"}}selected{{end}}>build</option></select></label><label>Secret head ID (kind=secret only) <input name="secret_head_id" maxlength="128" value="{{.BindSecretHeadID}}"></label><label>Literal value (kind=literal_nonsecret only) <input name="literal_value" maxlength="4096" value="{{.BindLiteralValue}}"></label><button type="submit">Add binding</button></form><p><a href="/servers">Back to servers</a></p></main></body></html>`))
+
+type routeHeadView struct {
+	CSRF, EnvironmentID    string
+	Exists                 bool
+	Hostname               string
+	Revision               string
+	ActiveReleaseID        string
+	ReconciliationRequired bool
+	UpdatedAt              string
+	RouteError             string
+}
+
+// routeHeadTemplate renders one environment's route head (hostname
+// assignment only, Slice 10 Step 10a's scope): plain HTML, no JavaScript,
+// matching environmentConfigTemplate's own conventions exactly, including
+// html/template's automatic contextual escaping of every field. The
+// acknowledgement checkbox is ADR 0005's requirement ("Domains, TLS, and
+// servers": "An authenticated owner/administrator explicitly assigns the
+// hostname and acknowledges authority to use it") -- it is never
+// pre-checked and carries no stored value, only a one-time attestation the
+// server requires on every submission.
+var routeHeadTemplate = template.Must(template.New("environment-route").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment route</title></head><body><main><h1>Route: {{.EnvironmentID}}</h1>{{if .RouteError}}<p><strong>{{.RouteError}}</strong></p>{{end}}{{if not .Exists}}<p>No route exists yet for this environment. Assign a hostname below to create one.</p>{{else}}<p>Active release: {{if .ActiveReleaseID}}{{.ActiveReleaseID}}{{else}}none{{end}}{{if .ReconciliationRequired}} (reconciliation required){{end}}</p><p>Updated: {{.UpdatedAt}}</p>{{end}}<form method="post" action="/environments/route"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Hostname <input name="hostname" required maxlength="253" value="{{.Hostname}}"></label><label><input type="checkbox" name="acknowledge_authority" value="on" required> I have authority to use this hostname</label><button type="submit">{{if .Exists}}Change hostname{{else}}Assign hostname{{end}}</button></form><p><a href="/environments/config?environment_id={{.EnvironmentID}}">Runtime configuration</a></p></main></body></html>`))
 
 // enrollmentTokenTemplate is rendered exactly once per register/reissue
 // response: the raw enrollment token appears here and nowhere else.

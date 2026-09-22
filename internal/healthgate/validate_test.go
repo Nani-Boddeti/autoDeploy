@@ -88,3 +88,49 @@ func TestValidHostRejectsBadShapes(t *testing.T) {
 		}
 	}
 }
+
+func TestValidRouteHostnameAcceptsGoodShapes(t *testing.T) {
+	label := strings.Repeat("a", 63)
+	host253 := label + "." + label + "." + label + "." + strings.Repeat("a", 253-3*64)
+	if len(host253) != 253 {
+		t.Fatalf("test bug: constructed host is %d bytes, want 253", len(host253))
+	}
+	cases := []string{
+		"h.co", "app.example.com", "a-b.example.com", "a.b.example",
+		"app1.example.io", "xn--bcher-kva.example", host253,
+	}
+	for _, h := range cases {
+		if !ValidRouteHostname(h) {
+			t.Fatalf("ValidRouteHostname(%q) = false, want true", h)
+		}
+	}
+}
+
+func TestValidRouteHostnameRejectsBadShapes(t *testing.T) {
+	label := strings.Repeat("a", 63)
+	host253 := label + "." + label + "." + label + "." + strings.Repeat("a", 253-3*64)
+	cases := map[string]string{
+		"empty":               "",
+		"uppercase":           "App.Example.com",
+		"userinfo":            "user@host.com",
+		"embedded path":       "host.com/path",
+		"port":                "app.example.com:8443",
+		"ipv6 brackets":       "[::1]",
+		"trailing dot":        "app.example.com.",
+		"254 bytes":           host253 + "a",
+		"leading hyphen":      "-bad.example.com",
+		"trailing hyphen":     "bad-.example.com",
+		"empty label":         "bad..example.com",
+		"whitespace":          "app example.com",
+		"control byte":        "app\x00example.com",
+		"single label":        "localhost",
+		"single label short":  "app",
+		"ipv4 literal":        "1.2.3.4",
+		"ipv4 literal common": "192.168.0.1",
+	}
+	for name, h := range cases {
+		if ValidRouteHostname(h) {
+			t.Fatalf("%s: ValidRouteHostname(%q) = true, want false", name, h)
+		}
+	}
+}

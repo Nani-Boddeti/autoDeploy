@@ -109,3 +109,52 @@ func ValidHost(host string) bool {
 	}
 	return len(hostPart) <= MaxHostLabelBytes
 }
+
+// routeHostLabelPattern mirrors migration 000018's route_heads.hostname
+// CHECK: the same DNS label grammar as hostLabelPattern above, but with two
+// differences a health-gate Host header does not need and a production
+// route hostname must not have -- no optional ":port" suffix (a route
+// belongs to one canonical hostname, never a host:port pair), and a
+// strictly lowercase charset ([a-z0-9-], not [A-Za-z0-9-]) so two hostnames
+// differing only in case can never be treated as distinct by the database's
+// UNIQUE(hostname) constraint. ValidRouteHostname's caller
+// (route_head_repository.go) is responsible for lowercasing the operator's
+// input before calling this function; this pattern intentionally rejects an
+// uppercase byte rather than silently accepting and folding it, so a caller
+// that forgot to normalize fails loudly instead of writing a
+// case-sensitive duplicate of an existing route.
+const routeHostLabelPattern = `[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?`
+
+// routeHostnamePattern additionally requires at least two labels (one or
+// more "label." prefixes, not zero-or-more, before the final label), unlike
+// hostPattern above: a route hostname is used for public HTTPS/ACME (ADR
+// 0005 "Domains, TLS, and servers"), where a bare single-label name like
+// "localhost" or "app" is never routable or issuable a certificate for.
+var routeHostnamePattern = regexp.MustCompile(`^(?:` + routeHostLabelPattern + `\.)+` + routeHostLabelPattern + `$`)
+
+// routeHostFinalLabelAllDigits matches a final label consisting entirely of
+// decimal digits. This is the standard heuristic for rejecting a bare IPv4
+// dotted-quad literal (e.g. "1.2.3.4", "192.168.0.1") without a separate
+// IPv4 parser: every public DNS TLD is all-letters (including punycode IDN
+// TLDs like "xn--..."), while an IPv4 literal's last octet is all-digits by
+// construction. IPv6 literals are already excluded by routeHostnamePattern's
+// charset, which has no ':' or '[' ']'.
+var routeHostFinalLabelAllDigits = regexp.MustCompile(`^[0-9]+$`)
+
+// ValidRouteHostname reports whether host satisfies migration 000018's
+// route_heads.hostname CHECK: a lowercase DNS hostname (each label 1-63
+// bytes, no leading/trailing hyphen), at least two labels, a final label
+// that is not all-digits, no port, no trailing dot, at most
+// MaxHostLabelBytes bytes overall. Callers must lowercase the operator's
+// input before calling this (see the comment above); this function does not
+// normalize case itself, it only validates it.
+func ValidRouteHostname(host string) bool {
+	if host == "" || len(host) > MaxHostLabelBytes || !routeHostnamePattern.MatchString(host) {
+		return false
+	}
+	// routeHostnamePattern guarantees at least one '.', so idx >= 0 always
+	// holds here.
+	idx := strings.LastIndexByte(host, '.')
+	finalLabel := host[idx+1:]
+	return !routeHostFinalLabelAllDigits.MatchString(finalLabel)
+}
