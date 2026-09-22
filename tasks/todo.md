@@ -1993,6 +1993,16 @@ Slice 10 = Step 0 + blue/green activation only. Deferred to slice 11+: stop-then
 - Traefik static config (entrypoints, ACME resolver, watched dir) is host provisioning — documented here, installed by the packaging slice.
 - macOS proves render/digest/atomic-write against a temp dir only; real reload timing is a Linux gate.
 
+#### Step 10b result (2026-09-22, verified)
+- New `internal/runtime/traefik` (agent-side library; not wired into the executor). Traefik's file provider takes YAML or TOML, not JSON; YAML is hand-rendered as a fixed write sequence (no maps, no new dependency), with a SHA-256 digest over the bytes.
+- Backend is `<scheme>://<container-name>:<port>` via `docker.ContainerName`, i.e. Docker DNS on the environment network Traefik joins (ADR 0005 network model), not a container IP. Router `autodeploy-router-<env>`; service `autodeploy-svc-<env>-<release>-<fence>`.
+- Atomic write: `O_EXCL|O_NOFOLLOW` temp file with a non-provider extension, fsync, rename, fsync dir; idempotent on equal digest, reports the previous digest; bounded `O_NOFOLLOW` read-back. Directory must be owned by the agent UID or root and not world-writable (expected packaging topology documented in `write.go`).
+- Observer: loopback-only Traefik API client (no proxy, no redirects, bounded body); tells not-loaded, loaded-but-wrong and transport errors apart. `not loaded` is `transient` and is safe only under a caller-enforced deadline (10d).
+- Defects found in review and fixed: the YAML quoter passed bytes ≥0x80 through (NEL read back as a space and invalid UTF-8 broke parsing in PyYAML and yaml.v3); ASCII-only is now enforced. Also fixed: `O_EXCL` untested, an owner==agent-only directory check that would fail on a root-provisioned host, and an unbounded `os.ReadFile` that followed symlinks.
+- Open before activation is enabled: (1) Traefik API auth. ADR 0005 says private and authenticated; the client currently makes unauthenticated loopback requests. Recommendation: keep the API bound to loopback and add an optional credential in the packaging slice. (2) The API JSON shapes come from the docs and have not been observed against a running Traefik. (3) Entrypoint and cert-resolver names are unverifiable here; a typo shows up as a router that never loads.
+- Every guard was broken on purpose and seen to fail; the orchestrator re-broke `O_EXCL` independently.
+- Evidence: gofmt, vet incl. integration, Linux amd64/arm64 vet+build, `git diff --check`, `go test -race ./...`, concurrent-writer test `-race -count=20`, three fresh PG18 sweeps normal + `-race` (6/6).
+
 ### Step 10c — fenced activation, control plane (one subagent)
 - Activation continues under the **same lease/attempt** (decision D3): new `/agent/v1/leases/activate` (tx1: recheck authorization, lease, fence, cancellation, route revision, source active release, candidate `ready`; transition `activating`; record switch-authorized operation with digest) and `/agent/v1/leases/activation-result` (tx2: recheck op/revision/fence; advance route revision + active pointer; candidate `active`, predecessor `retained`; deployment `healthy`; append events/audit). Ambiguous/failed after switch-authorized → `reconciliation_required`, environment blocked.
 - Lock order: ADR 0004 amendment — route-head rows between deployment heads (6) and secret versions (7).
