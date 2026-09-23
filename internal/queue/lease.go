@@ -97,6 +97,26 @@ type RenewalResult struct {
 	CancelRequested    bool
 }
 
+// ActivationResult is everything an agent needs to re-render and write the
+// same route document tx1 (Step 10c, POST /agent/v1/leases/activate)
+// already rendered and authorized: the operation the agent must report back
+// against in the (separate, Step 10c-2) activation-result call, the new
+// route revision it must write, the hostname/entrypoint/cert-resolver/
+// backend identity that document names, and the control-plane-computed
+// digest (internal/runtime/traefik.Digest's "sha256:<hex>" form) the agent
+// compares its own re-render against before ever touching the host. No
+// secret value is ever carried here, matching ADR 0005's "route documents
+// ... contain no secret values".
+type ActivationResult struct {
+	OperationID              string
+	RouteRevision            int64
+	Hostname                 string
+	EntrypointName           string
+	CertResolverName         string
+	BackendRuntimeInstanceID string
+	RouteDigest              string
+}
+
 // FrozenSecretReference is one frozen secret this attempt is authorized to
 // materialize, resolved from locked rows: the variable it binds, its
 // delivery scope, the exact version id, and the scope fields decryption

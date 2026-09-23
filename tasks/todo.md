@@ -2010,6 +2010,692 @@ Slice 10 = Step 0 + blue/green activation only. Deferred to slice 11+: stop-then
 - Control-plane `activationEnabled = false` gate until 10e is reviewed.
 - Tests (live PG18): racing activators on one route head → exactly one operation (several goroutines, one row); cancel vs activate race; stale fence refused; replay idempotent; guard tests by breaking the fence recheck.
 
+#### Step 10c orchestrator decisions on the design (2026-09-22)
+- **The control plane renders the route document and computes its digest** in tx1, not the agent. The draft had the agent present a digest it cannot compute yet: the hostname and the new route revision only reach it in tx1's response. The control plane imports 10b's pure render function (no host access is implied by linking it; extract the naming helpers if that would pull the Engine client into the control-plane binary) and stores the digest on the operation. The agent re-renders from the response and refuses to write unless its digest matches. The operation's replay key is `(attempt_id, fence, image_digest)`.
+- **Entrypoint and cert-resolver names** come from control-plane configuration with V1 defaults and are returned in tx1's response. The agent uses what the response says rather than a second copy of the literals.
+- **tx2 locks in ADR 0004 order**: slot, job, attempt, deployment, route head, then release rows by id ascending. The draft started at the attempt.
+- **Owner decision (2026-09-22): operator-declared reconciliation outcome ships in 10c-2.** Admin `mark-reconciled` for an activation-caused block requires a declared outcome: `activated` finalizes exactly as tx2's success path, `not_activated` fails the deployment and leaves the route head where it was. Audited, fenced, and refused unless the environment is actually blocked by an activation operation. Without it a blocked environment would need manual SQL.
+- Confirmed by reading: `tryClaim` does read `environment_slots.reconciliation_required` (`agent_lease_repository.go:355`), so a blocked environment is genuinely unclaimable. `RequestCancellation` already refuses once the deployment is `activating`, so only `Complete`, the sweeper and `Reconcile` need changing.
+- **Gaps in shipped 9b code that 10c must close** (verified): `Complete` never transitions the deployment on success, and nothing anywhere sets `releases.image_digest` or moves a release `candidate -> ready`. The agent's built image digest has never reached the control plane.
+- Split confirmed: **10c-1** = migration 000019 + `/leases/activate` + the `activationEnabled` gate; **10c-2** = `/leases/activation-result` + the `Complete` guard + sweeper diversion + the operator-declared reconciliation outcome.
+
+#### Step 10c design (draft for orchestrator review)
+
+##### 1. Where a 9b attempt ends today, and what must change
+
+Verified in `internal/store/postgres/agent_lease_repository.go`'s `Complete` (line ~845):
+on `queue.CompletionSucceeded` it closes `agent_job_attempts` to `succeeded`, frees
+`environment_slots.current_attempt_id`, closes `agent_jobs` to `succeeded`, and appends a
+`succeeded` job event — **it never calls `transitionDeployment` on the success path** (only
+`newJobState == "dead" || "failed"` does, line 989). So a passing 9b gate today leaves the
+deployment stuck at `health_checking` forever; nothing moves it to `activating`/`healthy`. This
+is exactly the gap `deployment.canTransition` already anticipates (`health_checking -> activating`
+is the only non-terminal edge out of `health_checking` in `internal/deployment/deployment.go`
+line ~296) but no code path takes it.
+
+Also verified: **nothing in the codebase ever sets `releases.image_digest` or moves a release
+`candidate -> ready`.** `grep -rn image_digest` outside migrations and tests matches only
+`agent_lease_execution.go`'s claim-time insert (`image_digest` NULL) and its comment. The build
+result (`buildResult.ImageDigest`, `internal/agent/executor/executor.go` line ~227) is computed
+agent-side and is currently never transmitted to the control plane by any endpoint — `progress.go`
+carries only a `Phase` enum excluding `activating`/`healthy`, and `Complete`'s wire struct
+(`leases.go`) carries no digest field of any release kind. This means **the new `/leases/activate`
+request must be the first time the control plane learns the candidate's image digest**, and tx1
+must itself perform `candidate -> ready` (setting `image_digest` write-once, satisfying
+`validate_release_update`'s `state='ready' requires image_digest IS NOT NULL`) as a precondition
+check, not assume some earlier step already did it. This is a real, previously-unrecognized gap in
+9b/10a/10b, not an omission in this design — flagged explicitly per the task's "flag every
+uncertainty" instruction.
+
+Required changes: `executor.go`'s `Execute` must call `/agent/v1/leases/activate` (not `Complete`)
+immediately after a passing gate, carrying `buildResult.ImageDigest`; `Complete` continues to be the
+only path for build/health-gate *failure* (unchanged) and becomes, for success, reachable only after
+activation's own two transactions finish (see §4's "completion follows activation" point) — `Complete`
+itself must refuse to run while an activation operation is open (§4).
+
+##### 2. Migration 000019 schema
+
+`internal/store/postgres/route_head_repository.go`'s own header comment already reserves the ADR
+0004 lock slot ("D5: route-head rows ... immediately after deployment aggregate heads (position 6)
+and before secret-version/frozen-reference rows (position 7)") without touching the ADR text, and
+000018's own comment says `route_events`'s `'activated'` kind was "named now ... ahead of use" for
+exactly this step. Both are ready to receive 10c's writes with no further schema change needed on
+`route_heads`/`route_events`.
+
+**Reused, not reinvented:** `release_operations` (migration 000014, lines 275-332) is already the
+ADR-0005-shaped "one append-only operation ... immutable operation ID/type, canonical digest,
+environment route revision, job/attempt/fence, source/target release IDs, state, sanitized outcome"
+record — `kind` already includes `'activate'` ("named now ... ahead of use", matching 000018's own
+precedent), it already FK's to `release_id`/`job_id`/`attempt_id`/`fence` and validates the
+attempt/fence/job_id triple by trigger exactly like `release_runtime_instances` does, and **it has
+zero application writers today** (`grep -rln release_operations` over non-test `.go` files: no
+hits) — so, like every other 000014/000018 table, it is safe to widen additively. Its current
+`state` enum (`'started','succeeded','failed'`) doesn't yet distinguish "authorized, host work not
+yet observed" from "in flight", and it has no columns for the *expected* prior state an activation
+must recheck against. Design: widen it in place rather than add a parallel table.
+
+Migration `000019` (schema-only, extends 000014's table, never edits 000014 itself — matching
+000018's own precedent for 000014's `releases.state`):
+
+```sql
+ALTER TABLE release_operations ADD COLUMN environment_id TEXT;
+ALTER TABLE release_operations ADD COLUMN expected_active_release_id TEXT
+  REFERENCES releases(id) ON DELETE RESTRICT;
+ALTER TABLE release_operations ADD COLUMN expected_route_revision BIGINT
+  CHECK (expected_route_revision IS NULL OR expected_route_revision >= 0);
+```
+
+`environment_id` is denormalized from `releases.environment_id` (same join `route_heads` already
+uses) purely so a **partial unique index can express "at most one open activation per environment"
+without a cross-table join**, which Postgres partial indexes cannot do. It is validated, not
+trusted: extend `validate_release_operation_insert` (already checks fence/job_id against the named
+attempt with an unlocked read, because those columns are immutable on `agent_job_attempts`) to also
+`SELECT environment_id FROM releases WHERE id = NEW.release_id` and reject a mismatch — same
+no-lock reasoning applies (`releases.environment_id` is immutable per `validate_release_update`).
+`environment_id` and the two `expected_*` columns stay NULL for `kind IN ('prepare','rollback',
+'retire','cleanup')` (only `'activate'` populates them in this slice) — enforced by a CHECK:
+
+```sql
+ALTER TABLE release_operations ADD CONSTRAINT release_operations_activate_expectations_check
+  CHECK ((kind = 'activate') = (environment_id IS NOT NULL));
+-- expected_active_release_id is separately nullable *within* kind='activate' (first
+-- deployment: no prior active release — see §7), so it is not tied to kind by a CHECK,
+-- only environment_id and expected_route_revision are (route_revision is always known,
+-- even 0, once a route head exists, which activation already requires).
+ALTER TABLE release_operations ALTER COLUMN expected_route_revision
+  SET NOT NULL /* only enforceable together with the kind check above via a second CHECK: */;
+ALTER TABLE release_operations ADD CONSTRAINT release_operations_activate_route_revision_check
+  CHECK ((kind = 'activate') = (expected_route_revision IS NOT NULL));
+```
+
+(The two-CHECK split above is illustrative; the implementing subagent should fold them into one
+`CHECK` expression per column, following 000018's `CHECK ((event_kind = 'hostname_assigned') =
+(hostname IS NOT NULL))` idiom exactly.)
+
+State widening — this is the switch_authorized → succeeded | reconciliation_required machine the
+task asks for, layered onto the existing `started`/`succeeded`/`failed` enum:
+
+```sql
+ALTER TABLE release_operations DROP CONSTRAINT release_operations_state_check; -- name per introspection
+ALTER TABLE release_operations ADD CONSTRAINT release_operations_state_check
+  CHECK (state IN ('started','succeeded','failed','switch_authorized','reconciliation_required'));
+ALTER TABLE release_operations DROP CONSTRAINT release_operations_closed_at_check; -- the CHECK((state='started')=(closed_at IS NULL)) shape
+ALTER TABLE release_operations ADD CONSTRAINT release_operations_closed_at_check
+  CHECK ((state IN ('started','switch_authorized')) = (closed_at IS NULL));
+```
+
+For `kind='activate'` only, the legal edges (enforced in `validate_release_operation_update`,
+which today unconditionally requires `OLD.state = 'started'` and rejects any further write once
+closed — that blanket rule must become kind-aware):
+
+- `started` is never used by `kind='activate'` in this design — tx1 inserts the row directly as
+  `switch_authorized` (there is no separate "started, not yet authorized" moment for activation:
+  authorization *is* the insert, all in the same transaction as the deployment's
+  `health_checking -> activating` move). `started` remains exactly as today for `prepare` and the
+  as-yet-unimplemented `rollback`/`retire`/`cleanup` kinds.
+- `switch_authorized -> succeeded`: tx2's success path (§4).
+- `switch_authorized -> reconciliation_required`: tx2's failure/ambiguous path, or the expiry
+  sweeper firing mid-`switch_authorized` (§6).
+- `reconciliation_required` is terminal for this table (closed_at set on entry, matching the CHECK
+  above) — the *environment's* block is lifted by the existing `POST
+  /agent/v1/environments/reconcile` / `mark-reconciled` flow (ADR 0004 amendment, already
+  implemented), which is a statement about `environment_slots`/`route_heads`, not a reopening of
+  this operation row. This reuses machinery that already exists rather than inventing a second
+  reconciliation path — see §4 and §9 for exactly which flags that flow must now also touch.
+
+Linking to `route_events`/deployment events: tx1 does **not** append a `route_events` row (no route
+mutation has happened yet — only the deployment moved to `activating` and the operation was
+opened); tx2's success path appends `route_events(kind='activated', route_revision=<new>,
+active_release_id=<candidate>)` exactly like `route_head_repository.go`'s existing
+`insertRouteEvent` helper, reusing that function unchanged. `agent_job_events` gets a new
+`activation_authorized` event type from tx1 and `activated` / `activation_reconciliation_required`
+from tx2, mirroring `appendAgentJobEvent`'s existing shape (no schema change needed there: it is a
+free-text-checked column already, per 000013 — verify the exact CHECK list before adding a new
+literal; if it is a closed enum, migration 000019 must widen it too, alongside the `release_operations`
+changes above. **Uncertainty**: I did not read `agent_job_events`'s exact CHECK in this pass; the
+implementing subagent must check it before assuming the new literals are legal.
+
+##### 3. `POST /agent/v1/leases/activate` (tx1)
+
+**Wire structs** (mirroring `leases.go`'s existing shape — `attempt_id`/`fence` first, one
+domain-specific field, hex-digest fields via the existing `decodeDigest`/`encodeDigest` helpers in
+`enroll.go`):
+
+```go
+type activateRequest struct {
+    AttemptID   int64  `json:"attempt_id"`
+    Fence       int64  `json:"fence"`
+    ImageDigest string `json:"image_digest"` // hex sha256, candidate's built image
+    RouteDigest string `json:"route_digest"` // hex sha256, agent-rendered canonical route document
+}
+type activateResponse struct {
+    OperationID          string `json:"operation_id"`
+    RouteRevision        int64  `json:"route_revision"`         // the NEW revision the agent must write
+    Hostname             string `json:"hostname"`
+    EntrypointName       string `json:"entrypoint_name"`
+    CertResolverName     string `json:"cert_resolver_name"`
+    BackendRuntimeInstanceID string `json:"backend_runtime_instance_id"`
+}
+```
+
+No `operation_id` is accepted from the agent on this call (unlike `Complete`/`AcknowledgeCancellation`,
+which accept an agent-computed `operation_id`/`result_digest` for their own idempotent-replay
+scheme) — tx1 **mints** the operation row and its id server-side, because the operation must exist
+before the agent does any host work at all (ADR 0005: "Begin the fenced activation operation and
+transition to `activating`" precedes "Atomically replace the environment route file"). The agent's
+replay key for *this* call is `(attempt_id, fence, ImageDigest, RouteDigest)`: a retried POST with
+the identical digests against the same still-`switch_authorized` operation returns the same stored
+`OperationID`/response (idempotent replay, per the task's wording); a retried POST with a
+*different* `RouteDigest` for the same attempt/fence while `switch_authorized` is refused — see the
+"idempotent replay" bullet below. No secret leaves this response — matches ADR 0005 "Route
+documents ... contain no secret values"; `Hostname`/`EntrypointName`/`CertResolverName`/backend
+identity are exactly `internal/runtime/traefik.EnvironmentRoute`'s non-secret fields.
+
+**Who computes the route digest — agent or control plane?** The agent renders and sends it.
+Justification: `internal/runtime/traefik.Render`/its digest function (`render.go`, verified to
+produce "a SHA-256 digest over the bytes" per Step 10b's result note) live in `internal/runtime/traefik`,
+an **agent-side library not imported by `internal/store/postgres` or `internal/agent/http`** (Step
+10b's own result note: "not wired into the executor" — i.e. it is agent code, never control-plane
+code, and control-plane binaries do not vendor `internal/runtime/traefik` at all as far as this pass
+found). Re-rendering the exact same YAML byte-for-byte on the control plane would require
+duplicating that renderer (or importing it into the control-plane binary, which ADR 0005's "no
+Docker socket to Traefik" boundary keeps deliberately separate from anything that talks to hosts) —
+and even if imported, the control plane does not know `BackendRuntimeInstanceID` (the candidate's
+runtime-instance ID) independently of what the agent already computed at container-start time
+(`attemptOpaqueID(lease.AttemptID)`, `executor.go`) unless it re-derives that too. The simpler,
+already-precedented shape is: the agent renders (as 10b already builds it to do), computes the
+digest, and **presents** it; the control plane's job is to recheck it *matches the operation it
+already authorized* (idempotent-replay compare, not independent recomputation) and, for the actual
+switch-safety property ADR 0005 needs ("a conflicting digest fails"), to compare against what it
+told the agent to render (the `RouteRevision`/`Hostname`/candidate identity it already committed in
+`activateResponse`) — i.e. tx1 does not need to recompute bytes, only to confirm the operation row
+it stored what the agent is about to write and that the resulting digest is the one recorded.
+**This means tx1 cannot verify a maliciously wrong digest is byte-correct** — it can only verify
+*consistency* (same operation, same digest across a replay). That is an accepted trust boundary
+identical to today's: `Complete`'s `result_digest` is agent-computed and control-plane-compared,
+never independently recomputed by the control plane either (`Complete`, line ~927:
+`digestMatches := ... [32]byte(storedResultDigest) == resultDigest`). **Flagged uncertainty**: ADR
+0005 does not say explicitly which side computes the digest; this design infers it from where the
+renderer already lives and from the existing `Complete`/`AcknowledgeCancellation` precedent of
+agent-computed, control-plane-compared digests. If the orchestrator disagrees, tx1's shape changes
+significantly (it would need the full `EnvironmentRoute` struct as input and would need to import
+`internal/runtime/traefik` into the control plane).
+
+**Entrypoint/cert-resolver names**: verified there is **no schema column anywhere** for these — not
+`environment_runtime_configs` (000017 only added `health_gate_path`/`health_gate_host`), not
+`route_heads` (000018 has no such columns). Step 10b's own result note calls Traefik's static
+config, including entrypoints and the ACME resolver, "host provisioning — documented here,
+installed by the packaging slice," and `route.go`'s own comment on `EntrypointName`/
+`CertResolverName` calls them "static Traefik configuration objects ... provisioned by host
+packaging, not database-controlled identifiers." Given V1 is one Traefik instance per host with
+one entrypoint and one ACME resolver (no multi-entrypoint/multi-resolver requirement stated
+anywhere in ADR 0005), the simplest consistent design is: **compile-time/config constants shared by
+the control plane and the agent** (e.g. `"websecure"` / `"letsencrypt-production"`), not a database
+row — there is exactly one value system-wide in this slice, so a DB column would be a CAS-tracked
+mutable value for something that never varies per environment. **Flagged uncertainty**: this is
+inferred, not decided by any ADR text; if a future slice needs per-server or per-environment
+entrypoints, this becomes a real config table then. For 10c, recommend a small
+`internal/runtime/traefik` (or new `internal/activation`) package-level constant plus a
+control-plane config flag of the same value, verified equal at startup (fail closed if they
+disagree) rather than trusting two independently-maintained literals to never drift.
+
+**Every ADR 0005 recheck**, mapped onto verified code:
+
+| ADR 0005 recheck | Verified mechanism |
+|---|---|
+| current authorization | `lockActiveServerCredential` (existing helper, same as `Complete`) |
+| lease authority | attempt row `FOR UPDATE`; `authority_expires_at.After(now)` (mirrors `Complete` line 937) |
+| operation digest | compare presented `RouteDigest`/`ImageDigest` against any already-stored operation for this attempt/fence (replay path) |
+| environment fence | `attemptFence == fence && slotFence == fence && slotCurrentAttemptID == attemptID` (mirrors `Complete` line 937 verbatim) |
+| route revision | lock `route_heads FOR UPDATE` (new — no existing caller takes this lock for write), compare to a caller-independent value: **tx1 does not accept a client-presented "expected route revision"** — it reads the current `route_heads.route_revision` itself under the lock and uses that as `expected_route_revision` in the operation row. (Unlike `AssignRouteHostname`'s CAS, the agent does not know the route revision independently — it never sees it until this response — so there is nothing for it to assert; the control plane is the sole source of truth here.) |
+| source active release | read `route_heads.active_release_id` under the same lock; NULL is legal (§7, first deployment) |
+| candidate readiness | lock the candidate `releases` row `FOR UPDATE`; if `state='candidate'`, perform the `candidate->ready` transition described in §1 (set `image_digest` from the request, matching the write-once trigger, then `state='ready'`) in the *same* tx1 transaction, then require `state='ready'` before continuing — a `state` other than `candidate`/`ready` (e.g. `failed`) is refused |
+| cancellation state | `agent_jobs.cancel_requested_at IS NULL` under the job row lock (same row `RequestCancellation` locks) |
+
+**Deployment transition**: `transitionDeployment(ctx, tx, r.deployments, deploymentID,
+deployment.StatusActivating, now, r.inject)` — reuses the existing helper (`agent_lease_repository.go`
+line 583) exactly as `Complete`/`RequestCancellation` already do; `canTransition` already allows
+`health_checking -> activating` so no `deployment` package change is needed.
+
+**Idempotent replay**: after locking the attempt, check for an existing `release_operations` row
+`WHERE attempt_id=$1 AND fence=$2 AND kind='activate'`. None found → proceed as above (mint a new
+row). Found with `state='switch_authorized'` and `digest` equal to a canonical hash of
+`(ImageDigest, RouteDigest)` (the operation's own `digest` column, reusing 000014's existing
+`digest BYTEA` field for this composite rather than adding two more digest columns) → return the
+same stored `OperationID`/response, no further mutation (true replay, matching `Complete`'s
+"already accepted sequence" idiom). Found with a **different** digest while still
+`switch_authorized` → `ErrAgentLeaseIntegrityConflict` (existing sentinel, same one `Complete`
+uses for a conflicting replay) — "a conflicting digest fails," per ADR 0005 verbatim. Found already
+`succeeded`/`reconciliation_required` → also a conflict/stale response (this call cannot be
+reached again for that attempt/fence in the intended flow, since completion is gated on the
+operation being closed — see §4 — but the check must exist defensively).
+
+**Lock order** (ADR 0004 hierarchy §9, route heads inserted between position 6 and 7 per D5):
+
+1. Authorization: server credential (`lockActiveServerCredential`, `FOR SHARE`) — position 1.
+2. Environment execution slot (`environment_slots FOR UPDATE`) — position 3 (position 2, webhook/
+   automatic-intent rows, is enqueue-only and never touched here, matching every existing lease
+   endpoint).
+3. Logical job row (`agent_jobs FOR UPDATE`) — position 4.
+4. Attempt row (`agent_job_attempts FOR UPDATE`) — position 5.
+5. Deployment aggregate head (`deployments FOR UPDATE`, via `transitionDeployment`'s existing lock —
+   verify it takes `FOR UPDATE`; `RequestCancellation`'s leased branch already locks it explicitly
+   at line 1123) — position 6.
+6. **Route head (`route_heads FOR UPDATE`) — new position "6b", per D5, before secret versions.**
+7. Candidate release row (`releases FOR UPDATE`) — this slice has no secret-version freeze on the
+   activate path (secrets were already frozen at claim time, per ADR 0003/000013), so nothing
+   occupies position 7 here; the release row is not itself in ADR 0004's original list (it postdates
+   the ADR) but belongs logically alongside "secret-version and frozen-reference rows" as a
+   per-deployment resource row locked after the route head, consistent with 000018's own note that
+   route heads sit **before** secret-version rows, i.e. `releases` locks after `route_heads` in this
+   transaction's own order even though ADR 0004 never enumerated it. **Flagged uncertainty**: ADR
+   0004's hierarchy predates `releases` entirely; this ordering (route head before release) is this
+   design's own choice, consistent with D5's stated intent but not literally specified by either ADR.
+8. Append-only inserts (`release_operations`, `agent_job_events`) — position 8, last, per hierarchy.
+
+##### 4. `POST /agent/v1/leases/activation-result` (tx2)
+
+**Wire**: `{attempt_id, fence, operation_id, succeeded bool, observed_route_digest string}` on
+success, or `{attempt_id, fence, operation_id, succeeded: false, failure_summary string}` (bounded/
+sanitized, matching `release_operations.outcome_summary`'s own CHECK) on failure/ambiguity — a
+single struct with `Succeeded bool` and an optional summary is simplest, mirroring `completeRequest`'s
+own `Outcome`/`FailureClass` split shape.
+
+**Success path** — recheck, then in one transaction:
+
+1. Lock attempt (`FOR UPDATE`), verify `attemptFence == fence`, authority still unexpired *is not*
+   required here in the same way as `Complete` — ADR 0005: "An in-flight syscall cannot be
+   preempted," and the whole point of `switch_authorized` is that authority may have lapsed while
+   the agent was mid-syscall; tx2 instead requires the **operation** to still be `switch_authorized`
+   for this exact `attempt_id`/`fence` (its own identity columns, immutable per
+   `validate_release_operation_update`), which is the actual linearization point, not the lease
+   clock. **This is a deliberate, load-bearing difference from every other lease endpoint's
+   `authority_expires_at.After(now)` check**, and must be called out to reviewers explicitly: if the
+   implementing subagent copies `Complete`'s authority check here unmodified, a legitimately
+   authorized activation whose lease later expired mid-syscall would be wrongly rejected, directly
+   contradicting "An in-flight syscall cannot be preempted."
+2. Lock `route_heads FOR UPDATE`; recheck `route_revision == operation.expected_route_revision` and
+   `active_release_id IS NOT DISTINCT FROM operation.expected_active_release_id` (both must still
+   match what tx1 recorded — nothing else may have moved the head in between, which D5/the deferred
+   triggers already guarantee structurally but this is the *operation's own* linearization check,
+   independent of the trigger).
+3. Lock the candidate `releases` row `FOR UPDATE`; require `state='ready'`.
+4. If `operation.expected_active_release_id` is non-NULL, lock that predecessor `releases` row
+   `FOR UPDATE FOR SHARE`... **actually `FOR UPDATE`**, since this transaction is about to write
+   its state (`active -> retained`) — note 000018's write-skew fix uses `FOR SHARE` inside the
+   *deferred trigger*, which fires automatically at commit; tx2 itself should take `FOR UPDATE`
+   directly on both the predecessor and candidate rows since it is the one performing the writes,
+   and the deferred trigger becomes a second, redundant-but-harmless line of defense exactly as
+   000018 designed it to be for any writer, not just this one.
+5. Write, in this order (all still inside tx2, deferred triggers fire at commit):
+   - `releases`: predecessor `active -> retained` (skip if no predecessor, §7).
+   - `releases`: candidate `ready -> active`.
+   - `route_heads`: `active_release_id = candidate`, `route_revision = route_revision + 1`,
+     `updated_at = clock_timestamp()` (single UPDATE, satisfying `validate_route_head_update`'s
+     CAS-by-exactly-one trigger).
+   - `route_events`: append `kind='activated'`, `route_revision=<new>`, `active_release_id=<candidate>`
+     (reuses `insertRouteEvent`).
+   - `release_operations`: `switch_authorized -> succeeded`, `closed_at=now`, `outcome_summary`
+     from the sanitized `observed_route_digest`/success note.
+   - `deployments`: `activating -> healthy` via `transitionDeployment` (already a legal edge per
+     `canTransition`).
+   - `agent_job_attempts`: close `succeeded` (this is where completion actually happens now — see
+     "completion follows" below).
+   - `environment_slots`: free `current_attempt_id` (same predicate as `Complete` today:
+     `WHERE environment_id=$1 AND current_attempt_id=$2`).
+   - `agent_jobs`: `state='succeeded'`.
+   - `agent_job_events`: append `activated`, then the existing `succeeded` job event.
+6. Commit.
+
+**Completion folded into tx2, not a separate `Complete` call.** This directly answers the "how does
+completion follow, and how must it refuse to complete an attempt whose activation is open" part of
+the task: the answer is that **for the activation path, `Complete` is never called again after
+`/activate`** — tx2 *is* the completion transaction for a successful activation, performing exactly
+the same attempt-close/slot-free/job-close/event steps `Complete` performs today, plus the
+activation-specific writes, in one atomic unit (ADR 0004 "Transaction boundaries": "Completion/
+failure, slot release, deployment transition, and events" must commit atomically — tx2 satisfies
+this for the activation case exactly as `Complete` does for the non-activation case). The executor
+therefore stops calling `/leases/complete` on the success path entirely once activation ships;
+`Complete` remains reachable only for build/health-gate failure before `/activate` was ever called.
+**`Complete`'s own guard**: add, at the top of `Complete`'s attempt-state check (after loading the
+attempt row), a check for an open activation: `SELECT 1 FROM release_operations WHERE attempt_id=$1
+AND fence=$2 AND kind='activate' AND state='switch_authorized'` — if found, return a new sentinel
+(e.g. `ErrAgentLeaseActivationOpen`) rather than proceeding, so a stray/duplicate `Complete` call
+racing an in-flight activation can never free the slot or close the job out from under tx2. This
+mirrors `RequestCancellation`'s existing `ErrAgentJobActivating` guard (which checks
+`deployments.status == activating` directly) but checks the **operation** row instead of deployment
+status, because by the time tx2 runs, deployment status has already flipped to `healthy` — a
+`Complete` call arriving *after* tx2 already succeeded must instead hit the ordinary "attempt already
+closed, replay-or-conflict" branch that exists today, which is unaffected by this change.
+
+**Failure/ambiguous path** — recheck the operation is still `switch_authorized` for this attempt/
+fence (same as step 1 above; if it is not, this is itself a stale/conflicting call and should be
+rejected, not silently accepted as a second failure report), then in one transaction:
+
+1. `release_operations`: `switch_authorized -> reconciliation_required`, `closed_at=now`,
+   `outcome_summary` from the sanitized failure summary.
+2. `route_heads`: `reconciliation_required = true` (no revision bump — the desired state did not
+   move; this is exactly the column 000018 added "so this slice's scope note says resolution is the
+   existing operator mark-reconciled flow, not new code here").
+3. `environment_slots`: `reconciliation_required = true`, `reconciliation_attempt_id = attemptID`
+   (reusing the **existing** ADR 0004 mechanism `closeExpiredOrRevokedAttempt` already uses) —
+   **but do not free `current_attempt_id`** and **do not close the `agent_job_attempts`/`agent_jobs`
+   rows to any terminal state**. This is the "environment remains blocked" ADR 0005 requires:
+   the slot stays occupied by this exact attempt/fence indefinitely (ADR 0004's "no-slot-reuse"
+   rule), and the job/attempt/deployment stay exactly where they are (`activating`/`leased`) — there
+   is no legal `deployment.canTransition` edge out of `activating` other than `-> healthy` or `->
+   failed`, and ADR 0005 explicitly forbids resolving ambiguity as either ("never resolved by blind
+   automatic rollback"). The **existing** `POST /agent/v1/environments/reconcile` (owning server,
+   matching attempt/fence) or the session-authenticated `mark-reconciled` break-glass are the only
+   two ways out, exactly as the ADR 0004 amendment already documents — and per that amendment's own
+   text, whichever one runs must (this slice's necessary but not-yet-existing addition) also finish
+   the deployment/attempt/job/route-head resolution once the operator/agent supplies the real
+   outcome; **that finishing logic is out of 10c's stated scope** (10c's own bullet says "environment
+   blocked" is the end state) and is a gap the plan should either accept as deferred-to-later-slice
+   or explicitly assign — flagged as an open question for the orchestrator, since `Reconcile`
+   today only clears `environment_slots.reconciliation_required` and appends a `reconciled` event; it
+   does **not** touch `route_heads.reconciliation_required`, `release_operations.state`, or the
+   deployment status at all in its current (10a/pre-10c) form. **This means Step 10c must also
+   extend `Reconcile`** (not just add the two new endpoints) so that clearing reconciliation for an
+   activation-caused block also resolves the operation/route-head/deployment/attempt/job rows
+   consistently — otherwise "operator resolution" has no code path that actually unblocks anything
+   for this specific cause. This is the single largest scope question in this design; see §11.
+4. Commit. No `agent_job_events` "failed"/"dead"/"retry_scheduled" event — this is not a retry-
+   eligible failure by ADR 0005's own words ("It does not permit a different attempt to activate
+   concurrently"); append a new `activation_reconciliation_required` event instead (subject to the
+   `agent_job_events` CHECK-widening flagged in §2).
+
+##### 5. Cancellation vs activation race
+
+Verified: `RequestCancellation`'s `leased` branch already has the exact guard needed —
+`if deploymentStatus == string(deployment.StatusActivating) { return ErrAgentJobActivating }`
+(line 1126), checked **after** locking the deployment row (line 1123), which is locked **after**
+the job row (line 1062) and **before** the environment slot lock at line 1056 — wait, verified
+order in `RequestCancellation` is: admin session (no lock helper name, but `lockAdministratorSession`)
+→ environment slot `FOR UPDATE` (line 1056, via a peeked environment ID) → job `FOR UPDATE` (line
+1062) → attempt `FOR UPDATE` (line 1119, leased branch only) → deployment `FOR UPDATE` (line 1123).
+This is **already** slot-before-job-before-attempt-before-deployment, i.e. positions 3-4-5-6 in
+order, but deployment (position 6) is locked *after* attempt (position 5) here, whereas tx1 above
+locks deployment via `transitionDeployment` and then additionally needs `route_heads` afterward —
+**no conflict**: cancellation never touches `route_heads` at all, so the two paths only ever
+contend on the shared prefix (slot → job → attempt → deployment), and standard lock-ordering
+reasoning applies: whichever transaction locks the deployment row first wins the race outright,
+because by the time either reaches the deployment lock it has already committed to a course of
+action that the other side's own check (tx1's `cancel_requested_at IS NULL` check, or
+`RequestCancellation`'s `deploymentStatus == activating` check) will observe consistently:
+
+- **Cancel locks deployment first** (already `health_checking`, not yet `activating`): cancel sees
+  `deploymentStatus != activating`, proceeds to cap deadlines and mark `cancel_requested_at`,
+  commits. tx1 (activate), running concurrently, blocks on the deployment lock until cancel
+  commits, then re-reads and finds `cancel_requested_at IS NOT NULL` → **tx1 must refuse** ("cancel
+  after switch-authorized must be refused" is the ADR's phrasing for the reverse order; the forward
+  order — cancel-before-authorize — is simply "cancellation observed, activation refused," already
+  implied by tx1's own cancellation-state recheck in §3's table).
+- **Activate locks deployment first**: tx1 transitions `health_checking -> activating` and commits.
+  `RequestCancellation`, blocked on the same deployment lock, then re-reads `deploymentStatus ==
+  activating` and returns `ErrAgentJobActivating` — **no change needed to this existing code path
+  at all**; it already refuses correctly, because activation already committed by the time
+  cancellation's own lock is granted. This is the "cancel after switch-authorized must be refused"
+  behavior the task asks to "show where it must change" — **verified finding: it does not need to
+  change**, `RequestCancellation` already has this guard from Step 3's own work, predating this
+  slice. The only change this slice makes to the cancellation path is the `Complete`
+  activation-open guard in §4 (a different endpoint, not `RequestCancellation`).
+
+**Lock order both paths take** (shared prefix, per above): environment slot → job → attempt (leased
+branch only) → deployment. tx1 additionally continues to route head → candidate release after
+deployment; `RequestCancellation` never proceeds past deployment. Since neither path acquires a lock
+the other needs *after* diverging, there is no deadlock risk from the divergence itself — both paths
+already lock the shared prefix in the identical order today.
+
+##### 6. Expiry/sweeper vs an open `switch_authorized` operation
+
+Verified `expireOne` (line 1331): it locks slot → job → attempt, checks `authorityExpiresAt.After(now)`,
+and if expired calls `closeExpiredOrRevokedAttempt`, which unconditionally closes the attempt to
+`expired`/`cancelled`, advances the slot fence, marks `environment_slots.reconciliation_required=true`,
+and — critically — **transitions the deployment to `failed`/`cancelled`** via `transitionDeployment`
+when the resulting job state is `dead`/`cancelled` (lines 796-807). **This is wrong for an attempt
+whose operation is `switch_authorized`**: ADR 0005 says ambiguity is "never resolved by blind
+automatic rollback," but `closeExpiredOrRevokedAttempt` as written would advance the fence (freeing
+the slot for *reuse* pending reconciliation — actually it does NOT free `current_attempt_id`, it
+sets it NULL at line 764 while also setting `reconciliation_required=true` — re-reading: it clears
+`current_attempt_id` to NULL *and* sets `reconciliation_required=true` in the same statement, which
+is the existing ADR 0004 "in-flight syscall, block slot reuse pending reconciliation" shape, not an
+actual slot release for reuse — `reconciliation_required=true` is what actually blocks new claims,
+confirmed by needing to check `Claim`'s candidate predicates for this flag, not read in this pass;
+**flagged uncertainty**: I have not verified `tryClaim` actually checks `environment_slots.
+reconciliation_required` before claiming a new candidate for that environment — this must be
+confirmed, since if it does not, this whole mechanism does not actually block reuse and is a
+pre-existing gap unrelated to 10c) — and it would incorrectly transition the deployment/job to a
+terminal failed/cancelled state and schedule (or skip) a retry, contradicting "no replacement
+attempt is leased meanwhile" and "no auto-retry."
+
+**Required change**: `expireOne` (or `closeExpiredOrRevokedAttempt`) must check, before doing any
+of its existing work, whether `release_operations` has an open (`switch_authorized`) `kind='activate'`
+row for this `attempt_id`/`fence`. If so:
+- Do **not** close the attempt to `expired`/`cancelled` (its terminal-state meaning would be wrong —
+  the syscall may still be running or may have already succeeded on the host, unresolved from the
+  database's point of view).
+- Do **not** touch `agent_jobs.state` or call `transitionDeployment` at all.
+- Do set `environment_slots.reconciliation_required=true` / `reconciliation_attempt_id=attemptID`
+  (same durable block, so no new claim can occupy this environment).
+- Optionally transition `release_operations` itself `switch_authorized -> reconciliation_required`
+  right here (rather than waiting for a `/activation-result` that may now never arrive, since the
+  agent's local executor is the only thing that knows whether the syscall is still running, and the
+  control plane cannot distinguish "slow" from "lost" purely from lease expiry) — recommended, since
+  it gives the operator-facing state a name (`reconciliation_required`) instead of leaving it silently
+  at `switch_authorized` forever with no durable signal that expiry, not just slowness, occurred.
+- Leave `agent_job_attempts.state='leased'` (not closed) so a legitimate late
+  `/leases/activation-result` from the agent (if the syscall does eventually finish and report back)
+  can still be evaluated against real state rather than hitting a "no matching attempt" wall — though
+  by ADR 0005's own reconciliation model, a *late* result at this point should itself route to
+  reconciliation rather than blind success/failure finalization; the safest form is for
+  `/activation-result` to check `release_operations.state=='reconciliation_required'` (already set by
+  the sweeper above) and, in that case, record the late report as reconciliation evidence rather than
+  finalizing the transaction — **this exact behavior is not fully specified by ADR 0005 and is
+  flagged as an implementation judgment call for the subagent, to be confirmed against "It then
+  resumes/finalizes the same operation, restores the last verified route when safe, or requires
+  operator recovery."**
+
+##### 7. First deployment and repeat activation
+
+**First deployment** (`route_heads.active_release_id IS NULL`, no predecessor): tx1's "source active
+release" recheck (§3) simply reads `active_release_id` as NULL and stores
+`expected_active_release_id = NULL` in the operation row (nullable, per §2's schema). tx2's success
+path skips step 4 (predecessor `active -> retained`) entirely when `expected_active_release_id IS
+NULL` — no predecessor row exists to lock or transition. Everything else is unchanged: the route
+head still advances `route_revision` by exactly one and gets its `active_release_id` set for the
+first time (`validate_route_head_update`'s hostname-immutability check only fires when
+`OLD.active_release_id IS NOT NULL`, so the very first activation is unaffected by it).
+
+**Repeat activation of the same release** (re-running the same already-`active` release, e.g. after
+a crash before the agent ever got the tx1 response, or an operator retrying a no-op activation):
+tx1's candidate-readiness recheck (§3) requires the candidate release's state to be `candidate` or
+`ready` before proceeding to `ready` — a release that is **already `active`** fails this check
+outright (not `candidate`/`ready`), so tx1 refuses with a typed error before minting any operation.
+This is correct: ADR 0005's release state machine has no `active -> active` edge, and re-activating
+an already-active release is not a distinct intent this slice models (that would be closer to a
+no-op "verify current route" operation, out of scope). **Flagged as a real product question, not
+just an implementation detail**: is "the deployment that is already active gets re-attempted" even
+reachable in practice? It would require a new deployment job whose release row is the *same*
+`releases.id` as the currently active one — but `releases.id` is `deploymentID` (per
+`ensureRelease`'s doc comment: "releaseID reuses deploymentID directly"), and each deployment has
+exactly one release (UNIQUE(deployment_id)), so a *different* deployment can never name an
+already-active release as its own candidate. The only way this path is reachable at all is a
+**retry of the same job/deployment** after a prior attempt's activation already succeeded — which
+cannot happen either, because a successful tx2 already closed the job `succeeded` (terminal,
+`Claim`/retry logic never revisits a `succeeded` job). So "repeat activation of the same release" is,
+on inspection, **unreachable in the intended flow** and only matters as a defensive check against a
+corrupted/adversarial request — worth stating plainly in the design rather than treating as a live
+scenario requiring special-case product behavior.
+
+##### 8. `activationEnabled` gate
+
+Mirrors the existing `executorEnabled`/`Authenticator`-gated pattern (`claim.go`'s
+`executor_available=false` short-circuit is the closest precedent, per `handler.go`'s comment on
+`Authenticator`: "used only where a route must gate business logic ... without performing that
+logic"). Recommend a control-plane-side boolean (config/env, not a DB row, matching
+`executorEnabled`'s own home — **uncertainty: I did not locate where `executorEnabled` itself is
+actually stored/read in this pass**; the implementing subagent should mirror that exact mechanism
+for consistency rather than inventing a second gating convention) checked at the very top of
+`handleActivate`/`handleActivationResult`, before touching any repository: while disabled, both
+endpoints return `503 service_unavailable` (the existing `h.writeError(w, http.StatusServiceUnavailable,
+"service_unavailable")` idiom every nil-dependency check already uses) — an agent that reaches a
+passing gate while `activationEnabled=false` simply cannot advance past `health_checking`'s "next
+call" and its lease eventually expires through the ordinary (non-`switch_authorized`, since tx1 never
+ran) expiry path, retrying `health_checking` from scratch on the next attempt — acceptable, since
+`activationEnabled=false` means "review not yet complete, do not activate anything," not "special
+handling for gated deployments."
+
+##### 9. ADR 0004 amendment text (new lock class)
+
+Proposed addition to `docs/adr/0004-postgresql-queue-leases.md`'s existing "Amendments (2026-09-17)"
+section (a **new** dated amendment block, never editing the existing 2026-09-17 entries — matching
+000018's own migration-file discipline of never editing a prior migration):
+
+> **Amendments (2026-09-22)**
+>
+> The fenced activation slice (migration 000019; `internal/store/postgres/agent_lease_repository.go`
+> `/agent/v1/leases/activate` and `/agent/v1/leases/activation-result`) inserts one new row class
+> into the global lock hierarchy defined above, between position 6 (deployment aggregate heads) and
+> position 7 (secret-version and frozen-reference rows):
+>
+> - **6b. Route head rows (`route_heads`) by environment ID**, then the **candidate and predecessor
+>   release rows (`releases`)** they govern, by release ID ascending when both must be locked in the
+>   same transaction.
+>
+> Activation's own database transactions (tx1 `/activate`, tx2 `/activation-result`) lock
+> authorization, slot, job, attempt, and deployment rows in the existing order (positions 1, 3-6),
+> then route head and release rows (position 6b) before any append-only event insert (position 8).
+> No activation transaction locks secret-version rows at all (secrets are frozen once at claim time,
+> per the original ADR text and ADR 0003); position 7 is simply skipped by these transactions, which
+> is safe because skipping an unused position in a total lock order cannot introduce a cycle with a
+> transaction that does use it.
+>
+> The expiry sweeper (`expireOne`/`closeExpiredOrRevokedAttempt`) must recognize an open
+> `switch_authorized` activation operation for the attempt it is about to expire and divert to
+> marking the environment `reconciliation_required` without closing the attempt/job/deployment to any
+> terminal state — see the fenced-activation design note in `tasks/todo.md` Step 10c for the full
+> reasoning; this amendment records only the lock-order and "in-flight syscall cannot be preempted"
+> consequence, which the original ADR text already states in principle ("expiry/cancellation during
+> an in-flight host mutation marks the environment `reconciliation_required`") but which no code
+> implemented before this slice.
+
+##### 10. Must-prove test list (live PG18)
+
+Functional/recheck:
+- Full happy path: claim → gate pass → `/activate` (candidate `candidate->ready`, deployment
+  `activating`, operation `switch_authorized`) → `/activation-result` success (predecessor
+  `retained`, candidate `active`, route head repointed + revision+1, deployment `healthy`, attempt/
+  job `succeeded`, slot freed) — first deployment (no predecessor) and a second deployment
+  (predecessor present), both.
+- `/activate` refuses: wrong fence, wrong server, cancelled job, candidate not `candidate`/`ready`,
+  candidate already `active` (§7), missing route head (never assigned a hostname).
+- `/activation-result` refuses: operation not `switch_authorized` (already resolved, or never
+  authorized), route revision/active-release mismatch against the operation's own expectations,
+  wrong fence.
+- Idempotent replay: repeated `/activate` with identical `(ImageDigest, RouteDigest)` returns the
+  same operation/response without a second state change; repeated `/activation-result` success
+  replay is a no-op (second call after commit observes the operation already `succeeded` and
+  returns success without re-mutating); conflicting digest on either call is refused.
+- `Complete` refuses while an activation operation is `switch_authorized` for that attempt/fence
+  (§4's new guard) — and still replays/refuses correctly for every *existing* `Complete` scenario
+  unchanged (regression coverage, not just new coverage).
+
+Concurrency (goroutines against one live PG18, matching Step 10a's own
+`TestRouteHeadActiveReleaseWriteSkewPrevented` style):
+- Racing `/activate` calls for the same environment/attempt (simulating a retried agent call under
+  network uncertainty) → exactly one `release_operations` row ever reaches `switch_authorized`, the
+  rest observe the replay or conflict path — never two.
+- `/activate` racing `RequestCancellation` on the same job, both orderings (§5) → exactly one side
+  wins, the other observes a consistent refusal, never both succeeding.
+- `/activate` racing the expiry sweeper on the same attempt (lease expires the instant it's granted)
+  → either tx1 commits first (sweeper then must see `switch_authorized` and divert, §6) or the
+  sweeper closes the attempt first (tx1 then must see the attempt no longer `leased` and refuse) —
+  never both "succeeding" into inconsistent state.
+- Stale fence presented to either `/activate` or `/activation-result` after a fence bump elsewhere
+  (e.g. via `Reconcile`/`RevokeServer`) → refused.
+- `/activation-result` replay racing a second, conflicting `/activation-result` call for the same
+  operation → exactly one write wins; the other sees the now-`succeeded`/`reconciliation_required`
+  state and is rejected as stale/conflicting, not accepted as a second finalization.
+- Deferred-trigger handoff under concurrency: tx2's explicit `FOR UPDATE` locks on predecessor/
+  candidate `releases` rows (§4 step 4) must not reintroduce the exact write-skew window
+  000018's `TestRouteHeadActiveReleaseWriteSkewPrevented` already closed — add a variant of that
+  test driven through tx2's actual code path (not raw SQL) to prove the application-level locking
+  and the deferred trigger agree.
+
+Guard tests (break each recheck on purpose, prove the test fails, matching every prior step's
+discipline): fence recheck, route-revision recheck, active-release-id recheck, candidate-state
+recheck, cancellation recheck, the `Complete` activation-open guard, and the sweeper's
+`switch_authorized` diversion (remove each check one at a time, observe the specific guard test
+fail, then restore it).
+
+##### 11. Sizing recommendation
+
+**Split into two subagents, not one**, given the scope actually uncovered in this design pass —
+larger than the task's own framing assumed:
+
+- **10c-1: schema (migration 000019) + `/agent/v1/leases/activate` (tx1) + the `activationEnabled`
+  gate.** Self-contained: it only ever *reads* `route_heads`/`releases` state and opens an operation;
+  nothing it does is hard to unwind if 10c-2 needs rework. Includes the `agent_job_events` CHECK
+  investigation from §2 and the `release_operations` widening.
+- **10c-2: `/agent/v1/leases/activation-result` (tx2) + the `Complete` activation-open guard + the
+  expiry-sweeper diversion (§6) + the `RequestCancellation`/`Reconcile` extension needed to actually
+  resolve a `reconciliation_required` activation (§4's flagged scope gap).** This half is
+  substantially larger and riskier than 10c-1: it touches three existing, already-shipped functions
+  (`expireOne`/`closeExpiredOrRevokedAttempt`, `Complete`, `Reconcile`) rather than only adding new
+  ones, and its correctness depends on getting the "in-flight syscall cannot be preempted" semantics
+  right in each of them consistently. Splitting it out lets its review focus entirely on
+  interactions with existing code, rather than sharing a review pass with the more mechanical tx1
+  addition.
+
+**Recommend resolving §4's flagged scope gap (does 10c also extend `Reconcile` to actually finish an
+activation-blocked environment, or is that explicitly deferred to a later slice with `Reconcile`
+staying as-is and the environment simply staying blocked until a manual, not-yet-designed recovery
+procedure runs) before either subagent starts** — it changes 10c-2's size substantially and is a
+product/scope decision, not an implementation detail this design can settle unilaterally.
+
+#### 10c-1 review finding, recorded for 10c-2 (2026-09-23, not implemented in 10c-1)
+
+Migration 000019's `release_operations_environment_open_activation_idx` partial unique index
+(`UNIQUE(environment_id) WHERE kind='activate' AND state='switch_authorized'`) means: once
+`activationEnabled` flips, an environment left with an un-closed `switch_authorized` row (a crash
+between `Activate` committing and `/leases/activation-result` ever running, or any other abandoned
+deploy) will make **every subsequent `Activate` call for that same environment fail the unique index
+outright** with a raw PostgreSQL `23505` unique-violation error. `Activate`'s own idempotent-replay
+branch only recognizes a *matching* `(attempt_id, fence, kind='activate')` row; a *different*
+attempt/fence hitting the same still-open environment never reaches that branch at all -- it fails
+at the `INSERT` with a database error `mapError` (`internal/agent/http/handler.go`) has no case for,
+so it falls to the generic default 503 `service_unavailable`, and the agent's client
+(`internal/agent/client/httpclient.go` `mapStatus`) treats that as `ErrServiceUnavailable` --
+retryable. A permanently stuck environment (nothing will ever unblock it without operator/agent
+action) would therefore look exactly like ordinary transient backpressure to every layer above the
+database, indefinitely.
+
+**10c-2 must**: (a) detect this specific unique-violation (`pgErr.Code == "23505"` on constraint
+`release_operations_environment_open_activation_idx`, mirroring `isUniqueViolation`'s existing
+pattern in this package) inside `Activate` and translate it into a typed, non-retryable refusal
+(a new sentinel, mapped to its own 409-family wire code, not 503) rather than letting the raw
+constraint violation surface; and (b) make sure the reconciliation path
+(`/agent/v1/environments/reconcile`, `MarkReconciled`) can actually clear a stranded open
+`switch_authorized` operation for this cause -- today neither touches `release_operations` at all
+(see §4's already-flagged gap above), so an environment wedged this way has no code path back to
+claimable even via break-glass until 10c-2 adds one. This is a prerequisite for 10c-2's own
+`/leases/activation-result` and sweeper-diversion work, not a 10c-1 defect: 10c-1 never leaves an
+operation open on its own (it only ever inserts a fresh `switch_authorized` row inside one
+transaction that either commits whole or rolls back whole), so this scenario is unreachable until a
+real "in-flight syscall never reports back" failure mode exists, which is exactly what 10c-2 adds.
+
+#### Step 10c-1 result (2026-09-23, verified)
+- Migration `000019` widens `release_operations` (`environment_id`, `expected_active_release_id`, `expected_route_revision`, `route_digest`), widens its `state` CHECK with `switch_authorized`/`reconciliation_required`, adds a partial unique index for "at most one open activation per environment", makes `validate_release_operation_update` kind-aware, and widens `agent_job_events` with `activation_authorized`. Constraint names were introspected, not assumed: the `(state='started')=(closed_at IS NULL)` CHECK is really `release_operations_check1`, not the design draft's guessed `release_operations_closed_at_check`.
+- `Activate` (tx1) mints one `switch_authorized` operation, performs the `candidate -> ready` transition with the write-once `image_digest` (the first time the agent's built digest ever reaches the control plane — the 9b gap §1 identified), and moves the deployment `health_checking -> activating`. Lock order: credential (SHARE) -> slot -> job -> attempt -> deployment -> route head -> candidate release -> append-only inserts.
+- Binding decision applied: **the control plane renders the route document and computes its digest**, not the agent. This required extracting `internal/runtime/dockerid` (pure leaf package) so that importing `internal/runtime/traefik` into the control plane no longer drags in `internal/runtime/docker`'s Engine socket client. `go list -deps` confirms the dependency is gone. Entrypoint/cert-resolver are shared Go constants (`traefik.DefaultEntrypointName`/`DefaultCertResolverName`) rather than two configs checked for equality at startup — one value, so it cannot drift.
+- `activationEnabled = false` in `cmd/controlplane/main.go` mirrors `executorEnabled`: the repository is simply not wired, and the existing nil-dependency branch answers 503. `TestActivationEnabledStaysFalse` guards it.
+- Defects found in review and fixed: both new sentinels fell through `mapError` to the generic **503, which the agent client classifies retryable** — a permanent "no hostname assigned" or "candidate in a terminal state" would have been retried to lease expiry, and was indistinguishable from the gate's own 503; now 409 `no_route_head` / `candidate_not_ready`. Also fixed: a `LeaseActivator` doc comment attached to `LeaseCanceller`, and `fmt.Errorf("...: %w", err)` on a branch where `err` is nil.
+- Independent zero-context review (PASS WITH NOTES) confirmed 000019's `CREATE OR REPLACE`d trigger functions preserve every 000014 rule, and found the cancel-vs-activate "race" test was **sequential** — it would have passed with every `FOR UPDATE` in both methods deleted. Replaced with `TestAgentLeaseActivateGenuinelyRacesRequestCancellation`: a third transaction holds the slot row, both calls block on it (confirmed via `pg_stat_activity`, not a sleep), then contend for real; asserts exactly one winner and the matching committed end state. Proved non-vacuous by removing `Activate`'s slot `FOR UPDATE` and watching it fail.
+- Review also corrected a wrong causal claim in `Activate`'s comments and the ADR 0004 amendment: both races are decided at the **environment slot row (position 3)**, not the attempt (5) or deployment (6) row. Conclusions were right; the stated mechanism was not — the kind of error that later convinces someone a lock is removable.
+- Evidence: gofmt, `go build`, `go vet`, `make check`, `go test -race ./...`, three fresh PG18 sweeps normal + `-race` (6/6, 4 packages each), `TestAgentLeaseActivate*` at `-race -count=20`, Linux amd64/arm64 cross-builds, `git diff --check`.
+- Outcome counter unchanged: nothing has executed. `/leases/activate` is unreachable while `activationEnabled` is false, and no agent calls it until 10d.
+
 ### Step 10d — agent activation execution (one subagent)
 - After a passing gate the executor calls activate, switches the route via 10b, verifies Traefik API + HTTPS data plane (dial local Traefik with SNI = hostname, verify cert), reports activation-result.
 - Classification (decision D4): write/reload/transport failures `transient` **before** switch authorization only; after authorization every failure is reconciliation-required, never auto-retried as a fresh attempt.

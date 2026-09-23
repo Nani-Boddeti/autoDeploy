@@ -15,6 +15,16 @@ import (
 	githubhttp "autodeploy/internal/github/http"
 )
 
+// TestActivationEnabledStaysFalse pins the gate Step 10c-1 adds, mirroring
+// cmd/agent's own TestExecutorEnabledStaysFalse exactly: it must take a
+// deliberate, separately reviewed source change to flip it, never a silent
+// regression, and a test is what actually enforces that.
+func TestActivationEnabledStaysFalse(t *testing.T) {
+	if activationEnabled {
+		t.Fatal("activationEnabled must stay false until Step 10c is fully reviewed (tx1 alone ships in 10c-1; 10c-2 -- activation-result, the Complete guard, and the sweeper diversion -- has not shipped yet)")
+	}
+}
+
 func TestNewHTTPServerUsesProductionLimits(t *testing.T) {
 	server := newHTTPServer("127.0.0.1:8080", http.NotFoundHandler())
 	if server.Addr != "127.0.0.1:8080" || server.ReadHeaderTimeout != readHeaderTimeout || server.ReadTimeout != readTimeout || server.WriteTimeout != writeTimeout || server.IdleTimeout != idleTimeout || server.MaxHeaderBytes != maxHeaderBytes {

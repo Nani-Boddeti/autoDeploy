@@ -337,6 +337,8 @@ func TestErrorMapping(t *testing.T) {
 		{"wrapped auth denied", wrap(postgres.ErrServerAuthorizationDenied), http.StatusUnauthorized, "unauthorized"},
 		{"stale lease", postgres.ErrAgentLeaseStale, http.StatusConflict, "stale_lease"},
 		{"integrity conflict", postgres.ErrAgentLeaseIntegrityConflict, http.StatusConflict, "integrity_conflict"},
+		{"activation candidate not ready", postgres.ErrAgentLeaseActivationCandidateNotReady, http.StatusConflict, "candidate_not_ready"},
+		{"activation no route head", postgres.ErrAgentLeaseActivationNoRouteHead, http.StatusConflict, "no_route_head"},
 		{"invalid input", postgres.ErrAgentLeaseInvalidInput, http.StatusBadRequest, "invalid_request"},
 		{"infra error", errors.New("boom secret db dsn"), http.StatusServiceUnavailable, "service_unavailable"},
 	}

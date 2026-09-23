@@ -33,6 +33,7 @@ const (
 	pathHeartbeat     = "/agent/v1/heartbeat"
 	pathClaim         = "/agent/v1/jobs/claim"
 	pathRenew         = "/agent/v1/leases/renew"
+	pathActivate      = "/agent/v1/leases/activate"
 	pathComplete      = "/agent/v1/leases/complete"
 	pathCancelAck     = "/agent/v1/leases/cancel-ack"
 	pathReconcile     = "/agent/v1/environments/reconcile"
@@ -102,6 +103,7 @@ type LeaseRenewer interface {
 type LeaseCompleter interface {
 	Complete(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, outcome queue.CompletionOutcome, failureClass queue.FailureClass, operationID string, resultDigest [32]byte) error
 }
+
 type LeaseCanceller interface {
 	AcknowledgeCancellation(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, resultDigest [32]byte) error
 }
@@ -119,6 +121,7 @@ type Handler struct {
 	Heartbeater               Heartbeater
 	Claimer                   LeaseClaimer
 	Renewer                   LeaseRenewer
+	Activator                 LeaseActivator
 	Completer                 LeaseCompleter
 	Canceller                 LeaseCanceller
 	Reconciler                EnvironmentReconciler
@@ -181,6 +184,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleClaim(w, r)
 	case pathRenew:
 		h.handleRenew(w, r)
+	case pathActivate:
+		h.handleActivate(w, r)
 	case pathComplete:
 		h.handleComplete(w, r)
 	case pathCancelAck:
@@ -308,6 +313,25 @@ func (h Handler) mapError(w http.ResponseWriter, err error) {
 		h.writeError(w, http.StatusConflict, "stale_lease")
 	case errors.Is(err, postgres.ErrAgentLeaseIntegrityConflict):
 		h.writeError(w, http.StatusConflict, "integrity_conflict")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationCandidateNotReady):
+		// 409, not 503: this is a permanent state mismatch (the candidate
+		// release is terminal or already active), never a condition retrying
+		// will resolve. Distinct from "stale_lease" so
+		// internal/agent/client/httpclient.go's mapStatus, which already
+		// treats any 409 other than stale_lease as the non-retryable
+		// ErrIntegrityConflict, classifies it correctly without any client
+		// change -- 10d can refine the client-side error further, but the
+		// wire contract already carries the right retry semantics today.
+		h.writeError(w, http.StatusConflict, "candidate_not_ready")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationNoRouteHead):
+		// Same reasoning as candidate_not_ready above: an environment that
+		// has never been assigned a hostname will not become activatable by
+		// retrying the lease, so this must not collapse into the same 503
+		// service_unavailable the activationEnabled=false gate returns --
+		// that would make "activation is switched off" and "this
+		// environment is missing required configuration" indistinguishable
+		// to the agent.
+		h.writeError(w, http.StatusConflict, "no_route_head")
 	case errors.Is(err, postgres.ErrAgentLeaseInvalidInput):
 		h.writeError(w, http.StatusBadRequest, "invalid_request")
 	default:

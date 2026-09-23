@@ -2,15 +2,20 @@ package postgres
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/github"
 	"autodeploy/internal/queue"
+	"autodeploy/internal/runtime/dockerid"
+	"autodeploy/internal/runtime/traefik"
 	"autodeploy/internal/server"
 
 	"github.com/jackc/pgx/v5"
@@ -1015,6 +1020,331 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 		return fmt.Errorf("commit agent lease complete: %w", err)
 	}
 	return nil
+}
+
+// ErrAgentLeaseActivationCandidateNotReady reports that this attempt's
+// candidate release is not in a state tx1 can authorize an activation for:
+// not 'candidate' or 'ready' (already 'active', 'retained', 'failed',
+// 'removing', or 'removed' -- see ADR 0005's release state machine and
+// tasks/todo.md Step 10c design §7 on why "re-activate an already-active
+// release" is unreachable in the intended flow and only matters as a
+// defensive refusal here).
+var ErrAgentLeaseActivationCandidateNotReady = errors.New("agent lease activation candidate release is not ready")
+
+// ErrAgentLeaseActivationNoRouteHead reports that environmentID has never
+// been assigned a hostname (Step 10a AssignRouteHostname): there is nothing
+// for tx1 to render a route document against.
+var ErrAgentLeaseActivationNoRouteHead = errors.New("agent lease activation environment has no route head")
+
+// Activate is tx1 of Step 10c's fenced activation (ADR 0005 "Fenced
+// activation and reconciliation"; tasks/todo.md Step 10c, the 2026-09-22
+// orchestrator decisions binding over the design draft below them). It is
+// the control-plane half of the exchange: the agent presents only
+// attempt_id/fence/image_digest (never a route digest of its own -- the
+// control plane renders the route document and computes its digest itself,
+// per the orchestrator's binding decision overriding the design draft's
+// agent-renders assumption), and this call authorizes exactly one
+// switch-authorized release_operations row before any host mutation is
+// permitted to begin (ADR 0005: "Begin the fenced activation operation and
+// transition to activating" precedes any write to the host).
+//
+// Lock order (ADR 0004 hierarchy, 2026-09-22 amendment, position "6b"):
+// authorization (SHARE) -> environment slot (UPDATE) -> job (UPDATE) ->
+// attempt (UPDATE) -> deployment (UPDATE, via transitionDeployment) ->
+// route head (UPDATE, new position 6b) -> candidate release (UPDATE) ->
+// append-only inserts (release_operations, agent_job_events).
+//
+// Idempotency: two concurrent /activate calls for the same attempt/fence
+// necessarily name the same environment (an attempt belongs to exactly one
+// environment_slots row for its whole lifetime), so the earliest lock both
+// transactions actually contend on is environment_slots FOR UPDATE
+// (position 3, locked a few lines below) -- not the attempt row (position
+// 5), which is locked later and is redundant for this specific race, only
+// load-bearing for the fence/authority/cancellation rechecks it protects.
+// Whichever transaction locks the environment slot row first proceeds
+// through every subsequent lock (job, attempt, deployment, route head,
+// candidate release) uncontended; the other blocks on that same slot row
+// until the first commits or rolls back, then re-reads every value fresh
+// under its own locks and only then reaches the release_operations check
+// below, observing the row the first transaction just inserted and taking
+// the replay branch, never inserting a second one. A presented image_digest
+// identical to the one already recorded for this attempt/fence's still-
+// switch_authorized operation replays the stored response without mutating
+// anything further; a different image_digest is rejected as
+// ErrAgentLeaseIntegrityConflict ("a conflicting digest fails", ADR 0005).
+func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, imageDigest [32]byte) (queue.ActivationResult, error) {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 {
+		return queue.ActivationResult{}, ErrAgentLeaseInvalidInput
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("begin agent lease activate: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return queue.ActivationResult{}, err
+	}
+
+	// Non-locking peek, exactly like Complete/Renew: only used to find which
+	// slot to lock before the job/attempt, per the ADR hierarchy. Every
+	// value read here is re-verified against the locked rows below.
+	var jobID int64
+	var environmentID, ownerServerID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id, server_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID, &ownerServerID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return queue.ActivationResult{}, ErrServerAuthorizationDenied
+		}
+		return queue.ActivationResult{}, fmt.Errorf("locate agent job attempt: %w", err)
+	}
+	if ownerServerID != serverID {
+		return queue.ActivationResult{}, ErrServerAuthorizationDenied
+	}
+
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotFence, &slotCurrentAttemptID); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("lock environment slot for activate: %w", err)
+	}
+
+	var deploymentID string
+	var cancelRequestedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID, &cancelRequestedAt); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("lock agent job for activate: %w", err)
+	}
+
+	var attemptState, attemptServerID string
+	var attemptFence int64
+	var authorityExpiresAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT state, server_id, fence, authority_expires_at FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).
+		Scan(&attemptState, &attemptServerID, &attemptFence, &authorityExpiresAt); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("lock agent job attempt for activate: %w", err)
+	}
+	if attemptServerID != serverID {
+		return queue.ActivationResult{}, ErrServerAuthorizationDenied
+	}
+
+	var now time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("agent lease activate canonical time: %w", err)
+	}
+
+	// Every ADR 0005 recheck this endpoint owns, mirroring Complete's own
+	// combined fence/slot/authority check exactly (line ~937 of this file):
+	// attempt must still be the leased, currently-occupying attempt for this
+	// fence, with unexpired authority, and no cancellation must have been
+	// requested against its job. Unlike Complete there is no "attempt already
+	// closed" replay branch here at all: tx1 never closes the attempt (only
+	// Complete-on-failure or the not-yet-implemented tx2 do), so an attempt
+	// that is not 'leased' when Activate reaches it is simply stale.
+	if attemptState != "leased" || attemptFence != fence || slotFence != fence ||
+		slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID || !authorityExpiresAt.After(now) {
+		return queue.ActivationResult{}, ErrAgentLeaseStale
+	}
+	if cancelRequestedAt != nil {
+		return queue.ActivationResult{}, ErrAgentLeaseStale
+	}
+
+	// Idempotent replay check. Safe against a concurrent second /activate for
+	// this same attempt/fence because the environment_slots row locked above
+	// (position 3 -- the earliest lock two such calls actually share, see
+	// this function's own doc comment) already serializes them: a racing
+	// call blocks on that same slot row until this transaction commits or
+	// rolls back, then re-locks every row itself and observes whatever this
+	// transaction left behind (including a freshly inserted operation row),
+	// never a state this transaction hasn't committed yet.
+	var existingOperationID int64
+	var existingDigest, existingRouteDigest []byte
+	var existingExpectedRouteRevision int64
+	var existingExpectedActiveReleaseID *string
+	var existingState string
+	err = tx.QueryRow(ctx, `SELECT id, digest, route_digest, expected_route_revision, expected_active_release_id, state FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND kind='activate'`, attemptID, fence).
+		Scan(&existingOperationID, &existingDigest, &existingRouteDigest, &existingExpectedRouteRevision, &existingExpectedActiveReleaseID, &existingState)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return queue.ActivationResult{}, fmt.Errorf("check existing activation operation: %w", err)
+	}
+	if err == nil {
+		if existingState != "switch_authorized" {
+			// Already resolved by a (not-yet-implemented in this slice) tx2,
+			// or otherwise closed: this call is stale, not a live replay.
+			return queue.ActivationResult{}, ErrAgentLeaseStale
+		}
+		if len(existingDigest) != 32 || [32]byte(existingDigest) != imageDigest {
+			return queue.ActivationResult{}, ErrAgentLeaseIntegrityConflict
+		}
+		// True replay: read the current hostname under lock for an accurate
+		// response, but perform no further mutation at all -- no candidate
+		// transition, no deployment transition (both already happened on the
+		// original call and are not repeated), no new event.
+		var hostname string
+		if err = tx.QueryRow(ctx, `SELECT hostname FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&hostname); err != nil {
+			return queue.ActivationResult{}, fmt.Errorf("lock route head for activate replay: %w", err)
+		}
+		result := queue.ActivationResult{
+			OperationID:              strconv.FormatInt(existingOperationID, 10),
+			RouteRevision:            existingExpectedRouteRevision + 1,
+			Hostname:                 hostname,
+			EntrypointName:           traefik.DefaultEntrypointName,
+			CertResolverName:         traefik.DefaultCertResolverName,
+			BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
+			RouteDigest:              "sha256:" + hex.EncodeToString(existingRouteDigest),
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate replay: %w", err)
+		}
+		return result, nil
+	}
+
+	// Fresh authorization. Deployment first (position 6, via the existing
+	// helper every other lease endpoint already uses for this transition).
+	if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusActivating, now, r.inject); err != nil {
+		return queue.ActivationResult{}, err
+	}
+	if err = r.inject("deployment"); err != nil {
+		return queue.ActivationResult{}, err
+	}
+
+	// Route head, position 6b per the 2026-09-22 ADR 0004 amendment. tx1
+	// reads the current route_revision/active_release_id itself under this
+	// lock -- the agent has never seen either value before this response, so
+	// there is nothing for it to assert as an "expected" value the way
+	// AssignRouteHostname's admin-facing CAS does.
+	var hostname string
+	var routeRevision int64
+	var activeReleaseID *string
+	var reconciliationRequired bool
+	err = tx.QueryRow(ctx, `SELECT hostname, route_revision, active_release_id, reconciliation_required FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).
+		Scan(&hostname, &routeRevision, &activeReleaseID, &reconciliationRequired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return queue.ActivationResult{}, ErrAgentLeaseActivationNoRouteHead
+	}
+	if err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("lock route head for activate: %w", err)
+	}
+	if reconciliationRequired {
+		return queue.ActivationResult{}, ErrAgentLeaseStale
+	}
+
+	// Candidate release, position 7 (after the route head, per the design's
+	// own reasoning: releases postdates ADR 0004's original hierarchy but
+	// belongs alongside "secret-version and frozen-reference rows"). One
+	// release per deployment (releases.deployment_id UNIQUE), identity
+	// looked up non-locking (deployment_id is immutable) then locked.
+	var releaseID, releaseState string
+	var releaseImageDigest []byte
+	err = tx.QueryRow(ctx, `SELECT id, state, image_digest FROM releases WHERE deployment_id=$1 FOR UPDATE`, deploymentID).Scan(&releaseID, &releaseState, &releaseImageDigest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return queue.ActivationResult{}, fmt.Errorf("%w: deployment %s has no release row", ErrAgentLeaseCorruptState, deploymentID)
+	}
+	if err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("lock candidate release for activate: %w", err)
+	}
+	switch releaseState {
+	case "candidate":
+		// First time this release becomes ready: the write-once image_digest
+		// set and the candidate->ready transition happen together, in the
+		// one UPDATE releases_validate_update's trigger requires them in
+		// (Step 10c design §1's previously-unrecognized 9b/10a/10b gap: this
+		// is the first point anywhere in the codebase that ever learns the
+		// candidate's built image digest and sets it durably).
+		if _, err = tx.Exec(ctx, `UPDATE releases SET image_digest=$2, state='ready', updated_at=$3 WHERE id=$1`, releaseID, imageDigest[:], now); err != nil {
+			return queue.ActivationResult{}, fmt.Errorf("transition candidate release to ready: %w", err)
+		}
+		if err = r.inject("release_ready"); err != nil {
+			return queue.ActivationResult{}, err
+		}
+	case "ready":
+		// Already ready from an earlier attempt of the same job (ensureRelease
+		// reuses one release row per deployment across retries) or an earlier,
+		// lost /activate response for this very attempt that never reached a
+		// stored operation row (e.g. a crash between this UPDATE committing
+		// and the operation insert below, on some prior call this replay
+		// branch above cannot see because no row survived). The presented
+		// digest must agree with what is already durably, write-once stored.
+		if len(releaseImageDigest) != 32 || [32]byte(releaseImageDigest) != imageDigest {
+			return queue.ActivationResult{}, ErrAgentLeaseIntegrityConflict
+		}
+	default:
+		// 'active', 'retained', 'failed', 'removing', 'removed': not
+		// authorizable (Step 10c design §7 -- "repeat activation of an
+		// already-active release" is unreachable in the intended flow and
+		// only matters as this defensive refusal).
+		return queue.ActivationResult{}, ErrAgentLeaseActivationCandidateNotReady
+	}
+
+	// Render the route document and compute its digest here, in the control
+	// plane (2026-09-22 orchestrator decision, overriding the design draft's
+	// agent-renders assumption): internal/runtime/traefik has no dependency
+	// on internal/runtime/docker (Step 10c's dockerid extraction removed
+	// that coupling -- see internal/runtime/dockerid's package doc), so
+	// importing it here does not pull any Docker Engine API client into the
+	// control-plane binary.
+	var containerPort int
+	var containerScheme string
+	if err = tx.QueryRow(ctx, `SELECT container_port, container_scheme FROM agent_job_attempt_execution WHERE attempt_id=$1`, attemptID).Scan(&containerPort, &containerScheme); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("load frozen execution config for activate: %w", err)
+	}
+	route := traefik.EnvironmentRoute{
+		EnvironmentID:            environmentID,
+		RouteRevision:            uint64(routeRevision) + 1,
+		Hostname:                 hostname,
+		EntrypointName:           traefik.DefaultEntrypointName,
+		CertResolverName:         traefik.DefaultCertResolverName,
+		BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
+		BackendPort:              containerPort,
+		BackendScheme:            containerScheme,
+		ReleaseID:                releaseID,
+		FenceID:                  strconv.FormatInt(fence, 10),
+	}
+	_, routeDigestHex, err := traefik.Render(route)
+	if err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("render activation route document: %w", err)
+	}
+	routeDigestRaw, err := hex.DecodeString(strings.TrimPrefix(routeDigestHex, "sha256:"))
+	if err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("decode rendered route digest: %w", err)
+	}
+	if len(routeDigestRaw) != 32 {
+		return queue.ActivationResult{}, fmt.Errorf("decode rendered route digest: got %d bytes, want 32", len(routeDigestRaw))
+	}
+
+	var expectedActiveReleaseID *string
+	if activeReleaseID != nil && *activeReleaseID != "" {
+		expectedActiveReleaseID = activeReleaseID
+	}
+
+	var operationID int64
+	err = tx.QueryRow(ctx, `INSERT INTO release_operations(release_id, job_id, attempt_id, fence, kind, digest, state, environment_id, expected_active_release_id, expected_route_revision, route_digest)
+		VALUES ($1,$2,$3,$4,'activate',$5,'switch_authorized',$6,$7,$8,$9) RETURNING id`,
+		releaseID, jobID, attemptID, fence, imageDigest[:], environmentID, expectedActiveReleaseID, routeRevision, routeDigestRaw).Scan(&operationID)
+	if err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("insert activation operation: %w", err)
+	}
+	if err = r.inject("operation_insert"); err != nil {
+		return queue.ActivationResult{}, err
+	}
+
+	if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, "activation_authorized"); err != nil {
+		return queue.ActivationResult{}, err
+	}
+	if err = r.inject("job_event"); err != nil {
+		return queue.ActivationResult{}, err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate: %w", err)
+	}
+
+	return queue.ActivationResult{
+		OperationID:              strconv.FormatInt(operationID, 10),
+		RouteRevision:            routeRevision + 1,
+		Hostname:                 hostname,
+		EntrypointName:           traefik.DefaultEntrypointName,
+		CertResolverName:         traefik.DefaultCertResolverName,
+		BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
+		RouteDigest:              routeDigestHex,
+	}, nil
 }
 
 // RequestCancellation cancels jobID on behalf of an owner-scoped, live

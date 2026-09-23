@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"autodeploy/internal/runtime/dockerid"
 )
 
 // This file is Step 6a: creating and starting a release's runtime container
@@ -25,38 +27,35 @@ import (
 // containerNamePrefix makes every AutoDeploy-managed container name
 // recognizable at a glance and, combined with the opaque runtime-instance ID
 // appended after it, gives Docker's own name uniqueness a namespace that
-// cannot collide with an operator's own unrelated containers.
-const containerNamePrefix = "autodeploy-rt-"
-
-// containerNamePattern is Docker's own container-name constraint
-// (^[a-zA-Z0-9][a-zA-Z0-9_.-]+$) restated here so ContainerName fails a bad
-// name before ever reaching the Engine API, not just after a 400 comes
-// back. requireOpaqueID's charset ([A-Za-z0-9_-]) is already a strict subset
-// of Docker's, so this only needs to check the prefixed result's length.
-var containerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+// cannot collide with an operator's own unrelated containers. It is an
+// alias for dockerid.ContainerNamePrefix (see that package's doc comment
+// for why ContainerName's logic moved there), kept as a package-local
+// constant purely so run_test.go's existing assertions, written against
+// this name, keep compiling unchanged.
+const containerNamePrefix = dockerid.ContainerNamePrefix
 
 // ContainerName builds the collision-checked, safe container name for a
 // release runtime container: containerNamePrefix plus the immutable,
 // opaque, internal runtime-instance ID. It is deliberately not derived from
-// any user input, branch name, repository name, or commit message -- only
-// requireOpaqueID's validated identifier -- and it is deterministic, which
-// is what makes it collision-checkable: the same runtime-instance ID always
+// any user input, branch name, repository name, or commit message -- only a
+// validated opaque identifier -- and it is deterministic, which is what
+// makes it collision-checkable: the same runtime-instance ID always
 // produces the same name, so a genuine retry of the same attempt resolves
 // to a name Docker itself already holds under this package's own labels
 // (found by the label-selector lookup, see FindReleaseRuntimeContainer),
 // while any other collision under that name is necessarily foreign state
 // (see ErrContainerNameConflict in engine.go).
+//
+// The actual derivation lives in internal/runtime/dockerid.ContainerName
+// (Step 10c): that package has no Docker Engine API dependency at all, so
+// internal/runtime/traefik -- and, through it, the control plane -- can
+// import it to render a route document without ever linking this package's
+// engine.go/client_linux.go Docker-socket client. This wrapper exists so
+// every existing caller of docker.ContainerName is unaffected.
 func ContainerName(runtimeInstanceID string) (string, error) {
-	id, err := requireOpaqueID("runtime-instance-id", runtimeInstanceID)
+	name, err := dockerid.ContainerName(runtimeInstanceID)
 	if err != nil {
-		return "", err
-	}
-	name := containerNamePrefix + id
-	if len(name) > 255 {
-		return "", fmt.Errorf("%w: container name exceeds 255 bytes", ErrInvalidIdentifier)
-	}
-	if !containerNamePattern.MatchString(name) {
-		return "", fmt.Errorf("%w: container name %q is not Docker-safe", ErrInvalidIdentifier, name)
+		return "", fmt.Errorf("%w: %v", ErrInvalidIdentifier, err)
 	}
 	return name, nil
 }

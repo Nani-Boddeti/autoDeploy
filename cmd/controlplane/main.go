@@ -28,6 +28,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// activationEnabled gates whether run wires Step 10c's tx1
+// (POST /agent/v1/leases/activate) onto the agent handler. It mirrors
+// cmd/agent's executorEnabled convention exactly (see that file's package
+// doc for the full rationale): a single hardcoded constant, flipped only by
+// a separately reviewed commit, never an environment variable. While it
+// stays false, agentHandler.Activator is left nil below, and
+// agenthttp.Handler's existing nil-dependency discipline (every other route
+// in that package already follows it) answers 503 service_unavailable
+// before touching any repository -- no separate per-request gate check is
+// needed in the handler itself.
+const activationEnabled = false
+
 const (
 	readHeaderTimeout = 5 * time.Second
 	readTimeout       = 15 * time.Second
@@ -189,6 +201,9 @@ func run(ctx context.Context) error {
 			// secrets" (agenthttp.handleMaterializeSecrets fails closed).
 			handler.MaterializationAuthorizer = leaseRepository
 			handler.ProgressReporter = leaseRepository
+			if activationEnabled {
+				handler.Activator = leaseRepository
+			}
 			if enabled {
 				handler.SecretMaterializerFactory = secretMaterializerFactory{postgres.NewSecretRepository(pool)}
 			}

@@ -3,7 +3,7 @@ package traefik
 import (
 	"fmt"
 
-	"autodeploy/internal/runtime/docker"
+	"autodeploy/internal/runtime/dockerid"
 )
 
 // Naming prefixes. Every derived name is namespaced so it cannot collide
@@ -68,14 +68,18 @@ func routeFileName(environmentID string) string {
 //     resolve that name exactly as any other container on the same network
 //     can.
 //
-// The name is derived through docker.ContainerName itself, the same
-// collision-checked function 9b's executor uses to create the container,
-// rather than duplicating its prefix/charset here -- this is a hard
-// guarantee that this package can never name a backend Traefik will never
-// find, and any future change to that naming scheme cannot silently
-// desynchronize the two packages.
+// The name is derived through dockerid.ContainerName itself, the same
+// collision-checked function 9b's executor (via internal/runtime/docker,
+// which now wraps dockerid.ContainerName -- see that package's doc comment)
+// uses to create the container, rather than duplicating its prefix/charset
+// here -- this is a hard guarantee that this package can never name a
+// backend Traefik will never find, and any future change to that naming
+// scheme cannot silently desynchronize the two packages. Depending on
+// dockerid rather than internal/runtime/docker directly means this package
+// (and, through it, the control plane -- Step 10c) never links Docker
+// Engine API client code.
 func backendServerURL(r EnvironmentRoute) (string, error) {
-	name, err := docker.ContainerName(r.BackendRuntimeInstanceID)
+	name, err := dockerid.ContainerName(r.BackendRuntimeInstanceID)
 	if err != nil {
 		return "", err
 	}

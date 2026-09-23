@@ -28,6 +28,7 @@ import (
 	"autodeploy/internal/gitcheckout"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
+	"autodeploy/internal/runtime/dockerid"
 )
 
 // probeBuildxFunc is docker.ProbeBuildx, indirected through a package
@@ -189,7 +190,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 			OwnerID:          checkoutResult.Binding.OwnerID,
 			ProjectID:        lease.ProjectID,
 			SourceDigest:     sourceDigest(lease.CommitSHA),
-			BuildOperationID: attemptOpaqueID(lease.AttemptID),
+			BuildOperationID: dockerid.AttemptRuntimeInstanceID(lease.AttemptID),
 		},
 		SecretBindings: docker.BuildScopedBindings(toScopedBindings(lease.SecretBindings)),
 		Materializer:   materializer,
@@ -222,7 +223,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		JobID:             strconv.FormatInt(lease.JobID, 10),
 		AttemptID:         strconv.FormatInt(lease.AttemptID, 10),
 		FenceID:           strconv.FormatInt(lease.Fence, 10),
-		RuntimeInstanceID: attemptOpaqueID(lease.AttemptID),
+		RuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(lease.AttemptID),
 		CommitSHA:         lease.CommitSHA,
 		ImageDigest:       buildResult.ImageDigest,
 		ConfigDigest:      buildResult.ConfigDigest,
@@ -293,41 +294,25 @@ func sourceDigest(commitSHA string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// attemptOpaqueID derives a stable, opaque identifier from an attempt's own
-// durable primary key (agent_job_attempts.id), used both as
-// RuntimeInstanceID and as BuiltImageIdentity.BuildOperationID.
-//
-// RuntimeInstanceID: Step 4's result block requires the release-scoped
-// label selector's full identity to be reconstructible from durably stored
-// values, not guessed. AttemptID and Fence are exactly that: persisted in
-// agent_job_attempts/environment_slots before this executor ever runs, and
-// Fence does not change across renewals within one attempt (Agent.
-// claimAndRun always renews with the lease's original Fence), so this value
-// is stable for the whole lifetime of one attempt. That is also as far as
-// it needs to be stable: FindReleaseRuntimeContainer's selector requires
-// AttemptID/FenceID to match exactly too, so it can only ever hit the
-// in-process "I already created this, adopt it" retry Step 6a built for one
-// attempt reconstructing its own prior work (e.g. after an agent process
-// restart mid-lease) -- never a genuinely new attempt's, which always gets
-// a new AttemptID. Cross-attempt container/image reuse is not attempted in
-// this slice.
-//
-// BuildOperationID: this slice performs one fresh build per attempt with no
-// cross-attempt build caching/sharing (a later optimization), so tying it
-// 1:1 to the attempt is correct today.
-//
-// RuntimeInstanceID and BuildOperationID deliberately share this one
-// derived value in this slice -- there is no reason yet for them to differ,
-// since neither cross-attempt container reuse nor cross-attempt image
-// sharing is attempted here. If a later slice adds build caching/sharing
-// across attempts (so one image legitimately serves more than one
+// RuntimeInstanceID and BuildOperationID deliberately share one derived
+// value in this slice -- there is no reason yet for them to differ, since
+// neither cross-attempt container reuse nor cross-attempt image sharing is
+// attempted here. If a later slice adds build caching/sharing across
+// attempts (so one image legitimately serves more than one
 // RuntimeInstanceID), BuildOperationID must be derived independently at
 // that point -- tying it to AttemptID would then make every attempt look
 // like a distinct build operation even when the image was reused, which is
 // exactly backwards for a shared-image lookup.
-func attemptOpaqueID(attemptID int64) string {
-	return strconv.FormatInt(attemptID, 10)
-}
+//
+// The derivation itself moved to internal/runtime/dockerid.
+// AttemptRuntimeInstanceID (Step 10c): the control plane's own activation
+// transaction (internal/store/postgres's Activate) must derive this same
+// value independently, to name the same backend runtime instance in the
+// route document it renders, before the agent has told it anything beyond
+// attempt_id/fence/image_digest -- see that package's doc comment for the
+// full stability argument (AttemptID/Fence are durably persisted before
+// this executor ever runs, and Fence does not change across renewals
+// within one attempt).
 
 // resolveNetworkAndIP extracts the one network ID and IP address a release
 // runtime container must have (run.go's own container-create payload sets
@@ -408,7 +393,7 @@ func classifyPhaseError(ctx context.Context, err error) queue.FailureClass {
 // recorded (agent_lease_repository.go). Deriving both deterministically
 // from (attemptID, fence, succeeded, failureClass) means a second Execute
 // for the same still-leased attempt/fence (the only way this can be called
-// twice for one attempt -- see attemptOpaqueID) reports byte-identical
+// twice for one attempt -- see dockerid.AttemptRuntimeInstanceID) reports byte-identical
 // values when it reaches the same real result, so a lost/retried Complete
 // call replays cleanly. A second Execute that reaches a genuinely different
 // real result (rare: it implies the same attempt/fence was re-dispatched

@@ -587,6 +587,68 @@ with the following clarifications. They refine, and do not reverse, the accepted
   cannot immediately acquire the advisory lock skips this tick rather than queuing behind another
   replica, keeping each tick short and bounded.
 
+## Amendments (2026-09-22)
+
+The fenced activation slice (migration 000019; `internal/store/postgres/agent_lease_repository.go`
+`Activate`, serving `POST /agent/v1/leases/activate`) inserts one new row class into the global lock
+hierarchy defined above, between position 6 (deployment aggregate heads) and position 7
+(secret-version and frozen-reference rows):
+
+- **6b. Route head rows (`route_heads`) by environment ID**, then the **candidate and predecessor
+  release rows (`releases`)** they govern, by release ID ascending when both must be locked in the
+  same transaction. `internal/store/postgres/route_head_repository.go`'s own header comment already
+  reserved this slot (Step 10a) against the ADR text as written, without amending it; this entry
+  records that reservation in the ADR itself now that a transaction actually uses it.
+
+Activation's own database transaction (`Activate`, this slice's tx1; a later slice's tx2 -- Step
+10c-2, not yet implemented -- will use the same route head/release lock class for its own finalize/
+fail transaction) locks authorization, slot, job, attempt, and deployment rows in the existing order
+(positions 1, 3-6), then the route head and candidate release row (position 6b) before any
+append-only event insert (position 8). No activation transaction locks secret-version rows at all
+(secrets are frozen once at claim time, per the original ADR text and ADR 0003); position 7 is simply
+skipped by these transactions, which is safe because skipping an unused position in a total lock
+order cannot introduce a cycle with a transaction that does use it.
+
+- **Cancellation and activation are ordered by whichever transaction locks the environment slot row
+  first (position 3), not the deployment row (position 6) as an earlier draft of this amendment
+  said.** Read against the actual code: `Activate` locks `environment_slots FOR UPDATE` for the
+  attempt's environment, then `agent_jobs FOR UPDATE` for the same job, before ever reaching the
+  attempt or deployment row; `RequestCancellation` locks the identical `environment_slots` row (via
+  a non-locking peek at the job's environment, then `SELECT 1 FROM environment_slots ... FOR UPDATE`)
+  and then the same `agent_jobs` row, in that same order, before its own `leased` branch reaches the
+  attempt and deployment rows. Both transactions target one job, so both target one environment, so
+  the slot row is the first row either one can possibly contend on -- whichever gets there first
+  proceeds through every later lock (job, attempt, deployment, ...) uncontended, and the other blocks
+  on the slot row alone until the first commits or rolls back. `RequestCancellation`'s existing
+  `deploymentStatus == activating` guard (added before this slice, Step 3) and `Activate`'s own
+  `agent_jobs.cancel_requested_at IS NOT NULL` check are what each side observes once unblocked and
+  re-reading fresh state under its own locks -- the deployment-row check is where each side's
+  *decision* is made, but the slot row is where the *ordering* is actually decided. Neither path
+  acquires a lock after the other needs one it does not already hold in the same relative order, so
+  this ordering carries no new deadlock risk -- it resolves the race the original ADR text left
+  implicit for these two transactions specifically.
+- **A `switch_authorized` release operation is idempotent-replay safe under the environment slot
+  row's own lock, not the attempt row's.** Two concurrent `Activate` calls for the same attempt/fence
+  necessarily name the same environment (an attempt belongs to exactly one environment for its whole
+  lifetime), so they serialize on the `environment_slots FOR UPDATE` lock already required at
+  position 3 -- not the `agent_job_attempts FOR UPDATE` lock at position 5, which is locked later in
+  the same transaction and is redundant for this specific race (it remains load-bearing for the
+  fence/authority/cancellation rechecks it protects). Whichever transaction locks the slot row first
+  is the one that (fresh) authorizes or (replay) observes its own prior row, and the second call,
+  once unblocked, always observes a settled result rather than racing to insert twice. A
+  `UNIQUE(environment_id) WHERE kind='activate' AND state='switch_authorized'` partial index is a
+  second, structural line of defense against the same duplication, independent of the application
+  lock order.
+- **An in-flight `switch_authorized` operation must not be resolved by the expiry sweeper as an
+  ordinary lease expiry.** The original ADR text already states the principle in general terms
+  ("expiry/cancellation during an in-flight host mutation marks the environment
+  `reconciliation_required`"), but no code implemented the specific `switch_authorized` case before
+  this slice, and no code implements it yet either -- `expireOne`/`closeExpiredOrRevokedAttempt`'s
+  diversion for this state is Step 10c-2's scope, not this migration's. This amendment records only
+  the lock-order and ordering consequences that ship with 10c-1; the sweeper diversion itself is
+  deferred, tracked in `tasks/todo.md` Step 10c-2, and must not be assumed already handled by this
+  amendment's presence.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

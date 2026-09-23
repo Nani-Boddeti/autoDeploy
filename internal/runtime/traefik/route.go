@@ -6,7 +6,7 @@ import (
 	"regexp"
 
 	"autodeploy/internal/healthgate"
-	"autodeploy/internal/runtime/docker"
+	"autodeploy/internal/runtime/dockerid"
 )
 
 // ErrInvalidRoute is wrapped into every error EnvironmentRoute.validate
@@ -121,7 +121,7 @@ func (r EnvironmentRoute) validate() error {
 	if !staticNamePattern.MatchString(r.CertResolverName) {
 		return fmt.Errorf("%w: cert resolver name %q", ErrInvalidRoute, r.CertResolverName)
 	}
-	if _, err := docker.ContainerName(r.BackendRuntimeInstanceID); err != nil {
+	if _, err := dockerid.ContainerName(r.BackendRuntimeInstanceID); err != nil {
 		return fmt.Errorf("%w: backend runtime instance id %q: %v", ErrInvalidRoute, r.BackendRuntimeInstanceID, err)
 	}
 	if r.BackendPort < 1 || r.BackendPort > 65535 {
