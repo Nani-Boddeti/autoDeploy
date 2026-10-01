@@ -17,3 +17,6 @@
 .idea/
 .vscode/
 
+
+# Intermediate/scratch files (never commit)
+/.tmp/
