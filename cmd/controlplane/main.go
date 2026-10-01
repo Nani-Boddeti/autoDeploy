@@ -29,11 +29,12 @@ import (
 )
 
 // activationEnabled gates whether run wires Step 10c's tx1
-// (POST /agent/v1/leases/activate) onto the agent handler. It mirrors
+// (POST /agent/v1/leases/activate) and tx2 (POST
+// /agent/v1/leases/activation-result) onto the agent handler. It mirrors
 // cmd/agent's executorEnabled convention exactly (see that file's package
 // doc for the full rationale): a single hardcoded constant, flipped only by
 // a separately reviewed commit, never an environment variable. While it
-// stays false, agentHandler.Activator is left nil below, and
+// stays false, agentHandler.Activator and .ActivationReporter are left nil below, and
 // agenthttp.Handler's existing nil-dependency discipline (every other route
 // in that package already follows it) answers 503 service_unavailable
 // before touching any repository -- no separate per-request gate check is
@@ -203,6 +204,7 @@ func run(ctx context.Context) error {
 			handler.ProgressReporter = leaseRepository
 			if activationEnabled {
 				handler.Activator = leaseRepository
+				handler.ActivationReporter = leaseRepository
 			}
 			if enabled {
 				handler.SecretMaterializerFactory = secretMaterializerFactory{postgres.NewSecretRepository(pool)}

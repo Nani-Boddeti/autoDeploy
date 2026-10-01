@@ -2724,3 +2724,596 @@ Forward-only migrations (rollback = new migration dropping added tables/columns;
 
 ### Step order
 0 -> 10a -> 10b -> 10c -> 10d -> 10e. One subagent per step, review between steps, atomic commit per step.
+
+#### Step 10c-2 plan (approved 2026-09-30)
+
+
+## Context
+
+Step 10c-1 (`08bd6cc`) shipped migration `000019` and `POST /agent/v1/leases/activate` — tx1, which
+mints exactly one `switch_authorized` `release_operations` row per environment, records the
+control-plane-rendered route digest, performs the candidate `candidate -> ready` transition with the
+write-once `image_digest` (the first time the agent's built digest ever reaches the control plane),
+and moves the deployment `health_checking -> activating`.
+
+Nothing closes that operation. Once `activationEnabled` flips, an authorized switch has no end state,
+and three already-shipped functions behave wrongly while one is open (all verified this session):
+
+- **`Complete`** (`agent_lease_repository.go:850`) never queries `release_operations` and, on
+  `CompletionSucceeded`, closes the attempt, frees the slot and closes the job — out from under an
+  in-flight activation — while never transitioning the deployment at all.
+- **`closeExpiredOrRevokedAttempt`** (`:757`, reached from `expireOne` `:1661` and
+  `revokeInFlightLeases` `:1956`) closes the attempt `expired`/`cancelled`, advances the slot fence,
+  clears `current_attempt_id`, closes the job `dead`/`cancelled` and transitions the deployment to
+  `failed`/`cancelled` — blind automatic rollback of an authorized switch, which ADR 0005 forbids
+  ("an in-flight syscall cannot be preempted").
+- **`Reconcile`** (`:1747`) and **`MarkReconciled`** (`:1879`) write only
+  `environment_slots.reconciliation_required=false` and a `reconciled` event. Neither touches
+  `release_operations`, `route_heads.reconciliation_required` or the deployment, so an
+  activation-blocked environment has no code path back to claimable. Worse, `Reconcile` today
+  *rejects* exactly this case: it denies unless the attempt is non-`leased` with `closed_at` set, and
+  an activation-blocked attempt stays `leased` with `closed_at` NULL by design.
+
+Plus the defect the 10c-1 review deferred here: `000019`'s partial unique index
+`release_operations_environment_open_activation_idx` means a stranded open activation makes every
+later `Activate` for that environment fail at the INSERT (`:1318`) with a raw `23505`, wrapped as
+`insert activation operation: %w` (`:1322`). `mapError` has no case, so it becomes the default 503
+`service_unavailable`, which the agent client's `mapStatus` classifies **retryable** — a permanently
+wedged environment is indistinguishable from transient backpressure, forever.
+
+Outcome: an authorized switch always reaches a durable, named end state — `succeeded`, or
+`reconciliation_required` with the environment blocked and a fenced, audited, declared way out.
+`activationEnabled` stays `false`; nothing ships enabled, and the outcome counter stays 8/18.
+
+## Owner decisions (2026-09-30)
+
+- **Two subagents**, 10c-2a then 10c-2b, independent zero-context review between them.
+- **The agent-owned reconcile also declares an outcome.** `POST /agent/v1/environments/reconcile`
+  carries `activated | not_activated` for an activation-caused block and finalizes the same way the
+  admin break-glass does; typed refusal when the block is activation-caused and no outcome is
+  declared, so the existing clear-the-flag path can never leave an operation silently open.
+- **The sweeper diversion neither advances the slot fence nor clears `current_attempt_id`**, unlike
+  the existing close path: the slot stays occupied by this exact attempt/fence (ADR 0004
+  no-slot-reuse), matching tx2's own failure path. `reconciliation_required` is what actually blocks
+  new claims (`tryClaim` reads it, `agent_lease_repository.go:355`).
+
+## Step 10c-2a — `/agent/v1/leases/activation-result` (tx2) + the `Complete` guard
+
+Implements the design already in `tasks/todo.md` §4. Load-bearing points the implementer must not
+"tidy away":
+
+- **tx2 deliberately omits the `authority_expires_at.After(now)` check** that every other lease
+  endpoint makes. The linearization point is the operation still being `switch_authorized` for this
+  exact `attempt_id`/`fence` (immutable identity columns per `validate_release_operation_update`),
+  not the lease clock. Copying `Complete`'s stale check here would reject a legitimately authorized
+  activation whose lease lapsed mid-syscall — the exact case ADR 0005 protects.
+- **tx2 *is* the completion transaction** for a successful activation: it performs the attempt close,
+  slot free, job close and job event that `Complete` does today (`:941`-`:987` as the model), plus the
+  activation writes, atomically (ADR 0004 transaction boundaries). On success the executor will never
+  call `/leases/complete` (wiring in 10d); `Complete` stays the failure-before-activation path.
+- **Lock order**: credential SHARE -> slot -> job -> attempt -> deployment -> route head -> release
+  rows by id ascending, i.e. the same sequence `Activate` uses (`:1087`-`:1241`). `FOR UPDATE` on both
+  predecessor and candidate releases — tx2 is the writer; `000018`'s deferred `FOR SHARE` trigger
+  remains a redundant second line of defense.
+- Success writes: recheck `route_revision == expected_route_revision` and `active_release_id IS NOT
+  DISTINCT FROM expected_active_release_id`; predecessor `active -> retained` (skipped when
+  `expected_active_release_id IS NULL`, the first deployment); candidate `ready -> active`; route head
+  `active_release_id` + `route_revision + 1` in one UPDATE (`validate_route_head_update` enforces
+  CAS-by-exactly-one); `route_events` `activated` via the existing `insertRouteEvent`; operation
+  `switch_authorized -> succeeded` with `closed_at` and sanitized `outcome_summary`; deployment
+  `activating -> healthy` via `transitionDeployment`; then attempt/slot/job closes and
+  `appendAgentJobEvent` `activated` + `succeeded`.
+- Failure or ambiguity: operation -> `reconciliation_required`; `route_heads.reconciliation_required =
+  true` with **no** revision bump; slot `reconciliation_required = true` +
+  `reconciliation_attempt_id`. Nothing else — `current_attempt_id` stays set, attempt and job stay
+  open, deployment stays `activating`. Event `activation_reconciliation_required`; no
+  `failed`/`dead`/`retry_scheduled` event, this is not retry-eligible.
+- **`Complete`'s guard** goes immediately after the non-`leased` replay block closes (`:930`) and
+  before the stale check (`:932`) — the one point where slot, job and attempt locks are all held, the
+  attempt is known `leased`, and `environmentID`/`jobID`/`attemptID`/`fence` are in scope. A
+  `switch_authorized` `kind='activate'` row for this attempt/fence returns a new
+  `ErrAgentLeaseActivationOpen`. A `Complete` arriving *after* a successful tx2 must still fall
+  through to the existing replay-or-conflict branch, unchanged.
+- **Extract the success finalization into an internal helper taking an open `pgx.Tx`**, so 10c-2b's
+  `activated` outcome reuses it verbatim rather than duplicating the write sequence.
+- Both new sentinels get explicit `mapError` cases (`internal/agent/http/handler.go:308`) with
+  409-family wire codes — the 10c-1 review's finding was precisely this fall-through to a retryable
+  503; do not repeat it. Note `mapStatus` (`internal/agent/client/httpclient.go:196`) turns any 409
+  that is not `stale_lease` into `ErrIntegrityConflict` (non-retryable), which is the correct class.
+
+Files: `internal/store/postgres/agent_lease_repository.go`; new
+`internal/agent/http/activation_result.go` mirroring `activate.go`'s handler shape (identity 401 ->
+nil-dependency gate 503 -> `readJSON` -> `parse` 400 -> repository -> `mapError`);
+`internal/agent/http/handler.go` (route constant, dispatch, `Handler` field, interface, `mapError`);
+`internal/queue/lease.go` if a result type is needed. No migration. No executor rewiring (10d).
+
+## Step 10c-2b — stranded activations: typed refusal, sweeper diversion, declared resolution
+
+1. **Typed `23505` refusal in `Activate`** at the INSERT (`:1318`-`:1322`): match
+   `pgErr.ConstraintName == "release_operations_environment_open_activation_idx"` reusing the existing
+   `isUniqueViolation` (`deployment_repository.go:254`; `pgconn` is already imported at
+   `agent_lease_repository.go:22`), and return a new non-retryable sentinel with its own 409 wire code
+   — never the raw violation.
+2. **Sweeper diversion** in `closeExpiredOrRevokedAttempt` (covering both `expireOne` and
+   `revokeInFlightLeases`): when a `switch_authorized` activation exists for this attempt/fence, skip
+   the attempt close, the fence advance, the `current_attempt_id` clear, the `agent_jobs` write and
+   the `transitionDeployment` call entirely. Do set slot `reconciliation_required` +
+   `reconciliation_attempt_id`, and move the operation `switch_authorized -> reconciliation_required`
+   so expiry has a durable name instead of sitting at `switch_authorized` forever. Attempt stays
+   `leased` so a late genuine report can be evaluated. Keep the existing `inject(...)` hook points so
+   the rollback tests still cover every stage.
+3. **A late `/activation-result`** against an operation already at `reconciliation_required` records
+   the report as reconciliation evidence (`outcome_summary` + event) and does **not** finalize.
+4. **Declared resolution** in `Reconcile` (agent, owning server, matching attempt/fence) and
+   `MarkReconciled` (admin break-glass, audited). Both require `activated | not_activated` when the
+   block is activation-caused, and refuse with a typed error otherwise or when the environment is not
+   actually blocked by an activation operation. `Reconcile` additionally needs a new branch for a
+   still-`leased`, `closed_at IS NULL` attempt — today that shape is denied outright (`:1747`ff), and
+   it is exactly the shape an activation block leaves behind.
+   - `activated` -> reuse 10c-2a's finalize helper exactly; operation `reconciliation_required ->
+     succeeded`.
+   - `not_activated` -> route head `active_release_id`/`route_revision` byte-identical, its
+     `reconciliation_required` cleared, operation -> `failed`, deployment `activating -> failed`,
+     attempt and job closed, slot freed and unblocked.
+   - Both clear the slot's `reconciliation_required`/`reconciliation_attempt_id` and append the
+     existing `reconciled` event plus an activation-specific one; `MarkReconciled` keeps its
+     `insertServerAuditEvent`.
+5. Wire the outcome through `internal/agent/http/reconcile.go` (`reconcileRequest`), the
+   `EnvironmentReconciler`/`web.ServerAdmin` signatures (`handler.go:110`, `internal/web/web.go:63`)
+   and the admin route `POST /environments/mark-reconciled` (`web.go:241`, `:801`) — its exact-key
+   count goes from 3 to 4, and the outcome is an explicit choice with no default.
+
+Migration: only if a state value or `agent_job_events` kind beyond `000019`'s set is needed —
+introspect first, add `000020` forward-only, never edit `000019` in place.
+
+## Verification
+
+Per step, by the implementing subagent: affected packages only, normal + `-race`, one fresh PG18
+(memory's recipe: `postgres:18` on `55433` via `AUTODEPLOY_TEST_DATABASE_URL`, drop/recreate the
+database between sweeps and always after any migration change).
+
+Orchestrator before each commit: `gofmt`, `go build`, `go vet`, `make check`, `go test -race ./...`,
+three fresh PG18 sweeps normal + `-race` over `./internal/store/postgres ./internal/agent/http
+./internal/web ./migrations`, the new concurrency tests at `-race -count=20`, Linux amd64/arm64
+cross-builds, `git diff --check`. Independent zero-context `code-reviewer` after each step, findings
+fixed before the commit.
+
+Must-prove tests, each proved non-vacuous by breaking the thing it tests — the 10c-1 review caught a
+"race" test that was sequential and would have passed with every `FOR UPDATE` deleted, so use
+`TestAgentLeaseActivateGenuinelyRacesRequestCancellation` (`agent_lease_activate_test.go:531`) as the
+pattern: a third transaction holds the slot row, both callers confirmed blocked via
+`pg_stat_activity`, never a sleep.
+
+- Two concurrent `/activation-result` calls -> exactly one finalizes; `Complete` racing an open
+  activation -> `ErrAgentLeaseActivationOpen`, slot never freed, job never closed.
+- Stale fence, and a stale `expected_route_revision`/`expected_active_release_id`, both refused;
+  replay of a succeeded result idempotent; conflicting digest refused.
+- Expiry with an open activation: attempt still `leased`, fence unchanged, `current_attempt_id` still
+  set, job untouched, deployment still `activating`, slot blocked, operation
+  `reconciliation_required`. Same for `revokeInFlightLeases`.
+- The wedge: strand an open activation, assert a different attempt's `Activate` returns the typed
+  non-retryable refusal (and that `mapStatus` does not classify it retryable), then assert each
+  declared outcome unwedges the environment to claimable — via `Reconcile` and via `MarkReconciled`.
+- First deployment (no predecessor) succeeds; `not_activated` leaves the route head byte-identical.
+- Guard tests stay green: `TestActivationEnabledStaysFalse` and the `executorEnabled` equivalent.
+
+#### Step 10c-2a status (2026-09-30, end of session — NOT committed)
+
+Implemented and live-verified on PG 18.4, then **failed independent zero-context review**; a fix
+round was in flight when the session ended. Nothing committed; all work is in the working tree.
+
+Added (untracked): `migrations/000020_activation_result_events.sql` + its test,
+`internal/agent/http/activation_result.go` + test,
+`internal/store/postgres/agent_lease_activation_result_test.go`,
+`internal/store/postgres/agent_lease_activation_sanitize_test.go`,
+`internal/agent/client/activation_status_test.go`.
+Modified: `internal/store/postgres/agent_lease_repository.go` (+~423),
+`internal/agent/http/handler.go`, `cmd/controlplane/main.go`, `tasks/todo.md`.
+
+`migration 000020` does two things: widens `agent_job_events_event_type_check` with `activated` and
+`activation_reconciliation_required`, and **replaces `validate_route_head_update`** to exempt an
+update that leaves `route_revision` unchanged when only `reconciliation_required` and `updated_at`
+differ. That second part was forced: `000018:126` requires `route_revision = OLD + 1` on *every*
+update with no column filter, so the designed failure path (set the flag, no revision bump) was
+impossible. Option B (bump on failure) was rejected — it burns a revision the control plane already
+rendered and handed the agent, and breaks 10c-2b's byte-identical `not_activated`.
+
+Two other schema walls found by reading, not by design review: `agent_job_events`' CHECK had neither
+event kind (000019 deferred them deliberately), and **10c-2b will hit a third** —
+`validate_release_operation_update` allows only `switch_authorized -> succeeded|reconciliation_required`
+and raises "release operation % is closed" for any update once `reconciliation_required`, so the
+planned `reconciliation_required -> succeeded` (declared `activated`) and `-> failed`
+(`not_activated`) are both impossible today. `failed` is not even a legal state for an `activate`
+operation. 10c-2b needs its own migration, and `finalizeActivationSucceeded`'s operation UPDATE
+(currently `WHERE state='switch_authorized'`) must be parameterized for reuse.
+
+Fix list issued and in flight (blocking the commit):
+1. `Complete`'s guard matches only `switch_authorized` — widen to `reconciliation_required` too.
+   After a failure report the attempt is still `leased`, so `Complete(failed)` transitions the
+   deployment to `failed`: blind resolution of an ambiguous switch, ADR 0005 forbids it. The closed
+   attempt then makes `Reconcile` available, clearing the slot flag as well. (Orchestrator's spec
+   error, not the implementer's.)
+2. Ambiguous success (digest mismatch, `ErrAgentLeaseActivationRouteMoved`) currently rolls back and
+   writes nothing, leaving the operation `switch_authorized` with no flag and no event. Route both
+   through `blockActivationForReconciliation` with the discrepancy as evidence; still return 409.
+   "Does not finalize" was right, "writes nothing" was wrong.
+3. Failure report must be idempotent on identical replay (today `ErrAgentLeaseStale`, so a lost
+   response is indistinguishable from a lost lease).
+4. Catch-all mapping unexpected `pgconn` 23xxx to a typed 409 — a deferred trigger failure at
+   `Commit` or a `transitionDeployment` error is otherwise retried forever as a 503. Genuine
+   infrastructure failures stay 503.
+5. `RowsAffected()==1` on the route-head flag UPDATE.
+6. Read the clock *after* the blocking locks (or `GREATEST(updated_at, $n)`) — the new monotonicity
+   rule can otherwise trip on a concurrent writer.
+7. Enforce `release_operations.outcome_summary`'s real CHECK at `parse()`; test empty and
+   whitespace-only.
+8. `TestCompleteGenuinelyRacesOpenActivation` is vacuous against the guard (hoisting the EXISTS above
+   the locks still passes) — add the tx2-first / `Complete`-second contended order.
+9. Atomicity test injects only at `job_event`; inject at every stage of both paths.
+10. The migration's hostname-at-unchanged-revision case is vacuous — the pre-existing hostname freeze
+    raises regardless, so deleting the new exemption's hostname clause still passes. Isolate it, and
+    add `created_at`-changed and active-to-different-active cases.
+11. Assert post-state in the `fence bumped elsewhere` / `never authorized` / `wrong server` subtests;
+    confirm `wrong server` reaches the ownership check rather than being denied at
+    `lockActiveServerCredential`.
+12. Prove or soften the "serializes at the slot row" comment — the race tests cannot distinguish the
+    slot row from the job or operation row (`FOR SHARE` would still pass).
+13. **Unexplained intermittent failure**: sweep 3 of `go test -race -p 1 -tags=integration
+    ./internal/store/postgres` FAILED; 5 later runs passed and the failing test name was not
+    captured. Hunt it over >=8 fresh-database runs with full logs kept. Suspicion (unconfirmed): a
+    `pg_stat_activity` blocked-backend wait in `holdSlotAndRace` being slower under `-race`. Fix
+    without making the wait vacuous — keep polling the real condition, no sleeps.
+14. For the record only: does 10b's adapter enforce revision monotonicity / same-revision-same-digest?
+    After an ambiguous failure the head stays at revision N, so a later attempt re-renders N with a
+    different digest.
+
+Deferred to 10c-2b as planned, comments left at each site: the sweeper and `revokeInFlightLeases`
+still closing an attempt with an open activation, and the unmapped 23505 from
+`release_operations_environment_open_activation_idx`.
+
+Verified this session before the review: `gofmt`, `go build`, `go vet` (both tag sets), `make check`
+clean; 5 of 6 fresh-PG18 sweeps green (the 6th is item 13). Gates unchanged:
+`activationEnabled = false` (`cmd/controlplane/main.go:42`), `executorEnabled = false`
+(`cmd/agent/main.go:60`). Outcome counter still 8/18 — nothing has executed.
+
+**Tomorrow, first actions:** `git status` to see what the fix round actually landed; re-run the full
+bar from scratch; re-review independently (the fix list above is the checklist, so a lost subagent
+report is not fatal); then commit 10c-2a atomically and start 10c-2b with its migration.
+
+##### 10c-2a addendum (2026-09-30, late): fix round landed, still uncommitted and NOT yet re-reviewed
+
+All 14 items above were addressed in the working tree. The implementer reports the full bar green
+(gofmt, build, vet both tag sets, `git diff --check`, three fresh-database sweeps of the four
+packages normal and `-race` = 6/6, the race/atomicity/lapsed-authority tests at `-race -count=20`,
+and unit `go test ./...`), with a mutation proof per changed test. **None of that has been
+re-verified by the orchestrator, and no independent re-review has run.** Both are tomorrow's first
+actions, before any commit. Do not treat the implementer's green bar as the commit gate —
+[[subagent-verification-scope]].
+
+Substantive outcomes worth carrying forward:
+
+- **Item 13 root-caused, and my suspicion was wrong.** Not a `pg_stat_activity` wait timeout. The
+  failing test was the implementer's own `TestReportActivationResultIgnoresLapsedAuthority`, failing
+  2 of 10 runs with `agent_job_attempts_check` (23514): its UPDATE called `clock_timestamp()` once
+  per column, so `authority_expires_at` could land microseconds after `lease_expires_at`, violating
+  `authority_expires_at <= lease_expires_at`. Fixed with one shared timestamp; passed at
+  `-count=60`. `waitForLockWaiters` was left unchanged.
+- **Item 2 changed tx2's lock behaviour**: to avoid writing before detecting a moved route head, tx2
+  now locks the deployment and route head and rechecks the route *before* calling
+  `blockActivationForReconciliation`, with `finalizeActivationSucceeded` keeping its own recheck as
+  defence in depth. **Tomorrow's re-review must re-walk the lock order against ADR 0004 and against
+  `Activate`/`Complete`/`RequestCancellation`/the sweeper** — the previous review cleared an order
+  that has since changed.
+- **Item 4**: the classifier maps pgconn class 23 **and `P0001`** to a typed 409 —
+  our triggers use plain `RAISE EXCEPTION`, which is `P0001`, not class 23, so class 23 alone would
+  have missed exactly the deferred-trigger-at-commit case the item existed for. Deadlock (40P01),
+  serialization (40001), cancellation and connection errors stay retryable.
+- **Item 12 accepted as softened, not solved.** The comment now claims only what the tests prove
+  (each caller blocks on the slot row when held; outcomes consistent) and explicitly does not claim
+  which row lock decides a race. A test that discriminates (e.g. one that fails under `FOR SHARE` on
+  the slot) remains unbuilt — a separate task if wanted.
+- **Item 14 answered, and it matters for 10c-2b/10d**: `internal/runtime/traefik` enforces **no**
+  revision monotonicity and no same-revision-same-digest rule. `RouteRevision` is rendered only into
+  a `# route_revision:` comment (`render.go:161`), so it feeds the digest but is never compared;
+  `Write` (`write.go:360-385`) compares the on-disk digest with the new render and overwrites on any
+  difference, whether the revision is higher, equal or lower. So after an ambiguous failure leaves
+  the head at revision N, a later attempt at revision N with a different release or fence silently
+  overwrites the file. Any monotonicity or ownership guard must live in the control plane's CAS or be
+  added to 10b.
+- Not mutation-proven, by the implementer's own admission: the `RowsAffected()==1` branches (item 5 —
+  unreachable under the schema), the added post-state assertions in `fence bumped elsewhere` and
+  `never authorized`, a guard hoist that stays below the replay block, and a real deferred-trigger
+  failure at `Commit` (covered only by a synthetic `PgError` in a unit test).
+- The 10c-2b schema wall is reconfirmed: `validate_release_operation_update` refuses any update to an
+  `activate` operation once it is `reconciliation_required`, so both declared outcomes need a new
+  migration.
+
+##### 10c-2a addendum (2026-10-01): orchestrator bar green, independent re-review FAIL, second fix round in flight
+
+**Orchestrator-run verification of the fix-round tree (not the implementer's numbers):** `gofmt -l`
+clean, `go build ./...`, `go vet ./...` and `go vet -tags=integration ./...` clean, `git diff --check`
+clean, `make check` exit 0, `go test -race -count=1 ./...` exit 0 across 29 packages. Integration
+sweeps on live PG 18.4 reached **4 of 6 green** (3/3 normal, 1/3 `-race`) and were then deliberately
+stopped: the code is changing again, and the fix agent needs the same database. Full per-run logs kept
+this time (no `tail` on a live run). Gates re-confirmed false: `activationEnabled`
+(`cmd/controlplane/main.go:42`), `executorEnabled` (`cmd/agent/main.go:60`).
+
+**Migration `000020` fidelity verified by the orchestrator independently**, line by line against
+`000018`: all four original rules survive, and the new unchanged-revision exemption accounts for every
+column in `route_heads` — `environment_id` via rule 1 above it, `hostname`/`active_release_id`/
+`created_at` explicitly, `route_revision` by the branch condition, `updated_at` by the monotonic rule.
+No rule silently dropped. The review agreed. **But two of the tests guarding those rules are vacuous**
+(below), so the preservation was unproven, not wrong.
+
+**Re-review verdict: FAIL.** The lock order — the thing the stale review made urgent — is **clean**:
+tx2 goes creds SHARE -> slot -> job -> attempt -> **release_operations** -> deployment -> route head ->
+releases by id asc -> inserts, and no path anywhere (`Activate`, `Complete`, `RequestCancellation`,
+`AcknowledgeCancellation`, `Reconcile`, `expireOne`, server revoke, `Heartbeat`,
+`AssignRouteHostname`) takes two rows in the opposite order. Every path touching `route_heads` /
+`releases` / `deployments` / `release_operations` for a leased attempt takes the environment slot row
+first. No cycle, no integrity regression. Two by-products: the `release_operations` row is an
+**undocumented lock class** (ADR 0004 never mentions it, and its amendment still calls tx2 "not yet
+implemented"), and the late lock-order change in `blockActivationForReconciliation` is **cosmetic** —
+the operation row is already locked there, so the explicit route-head lock changes nothing in ordering
+terms and its comment overclaims.
+
+Must-fix, now in flight:
+
+1. **Silent rollback on deterministic finalize failures — my spec error, third repeat of the pattern.**
+   Fix-list item 2 named *two* ambiguous paths (digest mismatch, route moved), so exactly those two got
+   the durable block. Every other deterministic failure inside `finalizeActivationSucceeded` still
+   rolls back to `switch_authorized` with no flag and no event: missing route head, candidate not
+   `ready`, predecessor not `active`, `ErrInvalidTransition`, and a deferred-trigger failure at COMMIT.
+   The classifier then returns a terminal 409, so the agent stops reporting while the host may already
+   have switched. **The rule, stated as a rule this time:** once a success report has passed the fence,
+   occupant and authority checks, *any* deterministic failure to finalize must durably block for
+   reconciliation with the discrepancy as evidence and still return the typed non-retryable error; only
+   genuinely retryable failures (40001, 40P01, 57014, 08xxx, context) may roll back. Two windows:
+   savepoint rollback for in-transaction errors (locks survive), a fresh transaction re-taking the lock
+   order for COMMIT-time errors, returning the *original* error if the second transaction also fails.
+   Lesson: **specify guards by rule, never by enumerating instances** — I did this with the `Complete`
+   guard (named one state) and now again here (named two paths).
+2. **Absent `succeeded` parsed as a declared failure** (`internal/agent/http/activation_result.go`):
+   `Succeeded bool` has no presence check, so a body omitting the field durably blocks an environment
+   with an empty summary. `*bool` + 400.
+3. **Two vacuous `000020` tests, both shape (a)** — asserting a new rule rejects what a pre-existing
+   constraint already rejected: the `environment_id` case is caught by `000018`'s composite FK
+   `(active_release_id, environment_id)`, and both non-monotonic `updated_at` cases subtract an hour,
+   falling below `created_at` and tripping the table CHECK rather than the trigger. Deleting rule 1 or
+   the monotonic block respectively still passes. So the header's claim that "all four 000018 rules
+   still fire" was only ever true for the revision and hostname rules.
+
+Also in flight: the sanitize test's 512-byte cut lands on a rune boundary (400 two-byte runes), so the
+rune back-off loop can be deleted and it still passes; the "stale fence" test is redundant (the
+`(attempt_id, fence)` lookup finds no row and returns stale anyway, and the fence equality is forced by
+`validate_release_operation_insert`); `reconciliation_required=true` now raises P0001 when the flag is
+*already* true (unreachable today, would bite 10c-2b); the three overclaiming comments; and the ADR 0004
+amendment.
+
+Carried to 10c-2b as blockers before `executorEnabled` flips: after a declared failure the attempt stays
+leased, so once authority lapses (~90s + 15s tick) `expireOne` closes it, advances the fence and ignores
+the open operation — any later report then hits `ErrAgentLeaseStale` and nothing durable records the
+host switch. `TestReportActivationResultIgnoresLapsedAuthority` does not run the sweeper.
+
+Not covered by any test, and accepted as such for now: the lock order itself. Deleting the deployment
+`FOR UPDATE` or the route-head lock breaks nothing, and no test runs tx2 concurrently with `Activate`,
+`RequestCancellation` or the sweeper on the route-head/deployment rows.
+
+**Next actions:** re-run the full bar from scratch on the second fix round (all six sweeps this time),
+re-review the newly added reconciliation-on-finalize-failure paths specifically, then commit 10c-2a.
+
+##### 10c-2a addendum (2026-10-01, later): second re-review also FAIL — the same defect class one level deeper
+
+Fix round 2 closed all three must-fix items and the five smaller ones, and the orchestrator's static bar
+was green on it (`gofmt`, build, both vet tag sets, `diff --check`, `make check`, `go test -race ./...`;
+integration sweeps reached 4/6 before being stopped for round 3). The second independent review still
+**FAILED** it, and the finding is the important kind: **the block-writing paths can themselves fail, and
+when they do the code returns the *terminal* cause.** So the agent stops reporting and nothing durable
+exists — the identical lost-ambiguity hazard, now in the error handling of the fix for that hazard. One
+test, `...CommitTimeBlockFailureKeepsOriginalError`, asserted exactly the hazardous behaviour.
+
+Two high findings: `blockAfterCommitFailure` converted every fresh-transaction failure (pool timeout,
+40P01, 40001, dropped connection, the ~10s request context expiring) into the original deterministic
+cause via `withSecondary`, which `classifyActivationResultError` turns into a terminal 409; and a failed
+`ROLLBACK TO SAVEPOINT` wrapped `cause` with `%w` where the line three below it already used `%v`
+deliberately for exactly that reason.
+
+**Design decision (orchestrator, this session): invert `isDeterministicActivationFailure` to a NEGATIVE
+definition** — block on anything not *known* transient. Once a failed block write falls back to a
+retryable error, this is **self-correcting**: if the error really was a dead connection or a
+serialization failure, the block attempt fails too and the result is retryable anyway. A dead connection
+cannot write a block, so there is no need to predict which errors are writable. This collapses the
+enumeration problem rather than patching six call sites, and it makes the known-transient list the only
+list that has to be right. Consequence accepted deliberately: an unrecognized error now flags an
+environment for an operator (conservative, visible) instead of looping a 503 forever with the operation
+silently open. `TestReportActivationResultIsAtomic` had to be updated to assert the new behaviour — the
+test follows the rule, not the reverse.
+
+Transient list was materially incomplete; round 3 adds 25006 (read-only transaction during
+failover/standby promotion — every write including the block fails), 25P03/25P04/57P05 (session and
+transaction timeouts that kill the session), 58030, 40003, 26000 and 0A000 (the pgx cached-plan error
+after a migration or pooler reset — **this slice ships a migration**, so that path is live). Also folded
+in: `ErrRevisionConflict`/`ErrNotFound`/`ErrRevisionOverflow` indicate corruption inside tx2, since the
+deployment row is already locked there.
+
+**Orchestrator's own finding, same class:** `blockAfterCommitFailure` revalidated the server credential,
+so a credential revoked between the report and the commit failure meant nothing was recorded. Removed —
+authentication already happened in tx1 and the block grants the agent nothing, it only records that
+something ambiguous occurred. Writing a block for a revoked server is harmless; losing it is not. This
+must fail safe.
+
+Lock order **cleared by two independent reviews now** and unchanged: creds SHARE -> slot -> job ->
+attempt -> `release_operations` -> deployment -> route head -> releases by id asc -> inserts. The fresh
+transaction and `refuseAmbiguous` both take proper subsequences. ADR 0004's amendment now matches the
+code. Savepoint semantics confirmed correct: locks taken before the savepoint survive the rollback, and
+the block's `route_heads` UPDATE touches only `reconciliation_required`/`updated_at` so
+`route_heads_active_release_after_write` (`UPDATE OF active_release_id`) does not fire — which is why
+the predecessor-retained case can still commit its block.
+
+Tests that proved nothing and are being fixed: the `attemptState != 'leased'` and slot-occupant clauses
+could both be **deleted** with every test still passing (the "never authorized" case is caught earlier by
+operation-not-found, "fence bumped" covers only `slotFence`, "already succeeded" is caught by the
+`opState` clause alone); and all four `FOR UPDATE`s in `blockAfterCommitFailure` could be downgraded to
+plain SELECTs with every test still passing.
+
+Honest limits now on record: the commit-time test installs its **own** deferrable constraint trigger — no
+production deferred trigger can be made to fail from inside finalize, because finalize holds every lock
+they read — so it proves "any deferred failure at COMMIT is handled", not that a production trigger does
+it. The retryable-code tests inject rather than forcing a real 40001/deadlock, which cannot be made
+deterministic at that statement. The "predecessor not active" and "route head missing" states are
+unreachable in production (the no-delete and reference triggers prevent them), so those tests exercise
+defensive branches only. `finalizeActivationSucceeded`'s ErrNoRows branch is dead — kept as defence in
+depth, now commented as unreachable rather than deleted.
+
+**Lesson, recurring and worth stating as a rule:** every time this hazard was fixed, the fix introduced a
+new instance of it one level down — first by naming two paths instead of a rule, then in the error
+handling of the blocking code itself. When a fix exists to guarantee a durable record, audit the fix's
+*own* failure paths against the same guarantee before calling it done.
+
+##### 10c-2a addendum (2026-10-01, evening): third re-review FAIL — the fifth instance, found OUTSIDE tx2
+
+Round 3 implemented the negative definition and closed all four named hazard sites. Orchestrator's static
+bar green (`gofmt`, build, both vet tag sets, `diff --check`, `make check`, `go test -race ./...`);
+integration sweeps 5/6 green with the sixth running when round 4 was queued. **Coherence was explicitly
+verified** before trusting any of it, because the round-2 agent had resumed and re-reported after round 3
+was dispatched: `isDeterministicActivationFailure` is genuinely `!isTransientActivationFailure(err)`, the
+`errActivationBlockUnrecorded` sentinel exists, the new SQLSTATEs are present, and
+`lockActiveServerCredential` survives only in the main transactions, not the fresh path. No clobber.
+
+**Process error to not repeat: two fix agents were live on the same files at once.** The round-2 agent was
+flagged as having background work still running and was dispatched over anyway. Nothing was corrupted,
+but that was luck. **Stop the predecessor before dispatching a successor.** Also: its resumed hand-back
+opened "All findings fixed" with a full mutation list and was distinguishable from round 3's only by
+checking its *substance* against the brief — it described the positive definition, the retained credential
+revalidation and the commit path returning the original error, i.e. exactly what round 3 was changing.
+**Read a hand-back against what was asked for, never by its headline.**
+
+**Third review FAIL — the fifth instance of the hazard, and it is pre-existing code outside tx2:**
+`lockActiveServerCredential` (`agent_lease_repository.go:114,120`) collapses ANY error from its two
+SELECTs into `ErrServerAuthorizationDenied` -> 401, and the client never retries a 401
+(`internal/agent/client/httpclient.go:137,200-202`). So a connection reset, failover, context deadline or
+57P01 on tx2's *first statement* silently drops a genuine success report with the operation
+`switch_authorized`, no flag, no event. The helper is shared with Claim/Renew/Complete, where a lost call
+is harmless; **tx2 is the first caller for which it is the hazard.** Lesson: when a slice makes a new
+demand of a shared helper, re-audit the helper against the new demand — four reviews looked only at new
+code.
+
+Second high: `classifyActivationResultError` maps any non-transient `PgError` to a terminal 409 **including
+the pre-occupant read/lock statements**. Class-42 schema skew during a rolling deploy then tells the agent
+to stop with nothing durable, where a 503 would have succeeded on retry. Round 2's broadening was right
+**for post-occupant writes** (a block exists, so the answer must be terminal) and wrong before the occupant
+check — so the fix is **positional**, not a narrower class list, preserving round 2's rationale where it
+applies.
+
+Third: `blockUnrecorded` wraps the inner error with `%w`, and `blockActivationForReconciliation` can return
+`ErrAgentLeaseStale`/`ErrAgentLeaseCorruptState`; `Handler.mapError` tests `errors.Is` on those before its
+default branch, so an unrecorded block would still answer a terminal 409 — contradicting round 3's own
+"block failures are never terminal" claim. Latent (those branches are unreachable while the operation,
+slot and head are all locked) but it must not be left as a trap.
+
+**Two corrections to the orchestrator's own reasoning, both recorded because this project's failure mode is
+a right conclusion resting on a wrong mechanism:**
+1. **"Self-correcting" was overstated.** I justified the negative definition by "a dead connection cannot
+   write a block either". But `abortAndBlock`, the commit-failure paths and `recordBlockInFreshTransaction`
+   write on a *different pooled connection*, so a misjudged transient error on one connection does not stop
+   the block — it succeeds and **spuriously blocks** an environment. Blocking by default is still the right
+   direction; the stated mechanism was wrong and the comment must say so.
+2. **"Retried forever" was false.** The client retries 5 times over ~3s total
+   (`httpclient.go:42,132-149`), and the window is further bounded by authority expiry through the sweeper
+   gap. So today a long outage turns "transient, retry" into a silent loss. The
+   `errActivationBlockUnrecorded` trade therefore **depends on 10d adding a persistent retry** — a hard
+   gate, not an assumption.
+
+Also to fix: missing transient cases that would spuriously block — XX000 ("cache lookup failed", "could not
+open relation" around DDL) and non-`PgError` pgx errors ("conn closed", closed pool); and 0A000 is gated on
+an **English** message substring, so a non-English `lc_messages` server blocks instead — use
+`pgErr.Routine == "RevalidateCachedQuery"`, which is language independent. ADR 0004:615-616 still lists the
+credential in the fresh path; it is gone.
+
+**Security question answered independently** (it was the orchestrator's own removal, so it needed an outside
+check): dropping credential revalidation from the fresh path is sound — the only call sites are in
+`reportActivationResult` after `lockActiveServerCredential(serverID)` passed *and*
+`ownerServerID == serverID` was checked, so a different server cannot reach it, and a server revoked
+mid-flight can only block its own attempt's environment. **Invariant to keep documented:** the
+`server_id=$2` predicate is defence in depth and becomes a tautology if 10c-2b ever passes a serverID read
+from the attempt itself.
+
+Confirmed by the orchestrator directly: `000019:43` does carry
+`CHECK (route_digest IS NULL OR octet_length(route_digest) = 32)`.
+
+**HARD GATES before `activationEnabled` may flip** (beyond the pre-existing privileged-Linux smoke): 10c-2b
+must land (it alone closes the sweeper gap, the `activationBlockNoopOther` window, and the fact that nothing
+clears a block cleanly today — `Reconcile` refuses leased attempts and `MarkReconciled` clears only the slot
+flag, leaving operation and route head flagged), and 10d must add a **persistent** retry for the result
+report. The sweeper gap is worse than previously recorded: it bounds *every* retryable bucket by authority
+expiry.
+
+Still untested and accepted as such: the route-head lock in `blockActivationForReconciliation` (no test
+holds a `route_heads` lock, so a plain SELECT survives); the fresh path's lock *order* (a job-before-slot
+reordering survives); the admin `AssignRouteHostname` contention; and the transient-COMMIT branch at the
+three commit sites. The contention tests discriminate `FOR UPDATE` from `FOR SHARE` by query-text match —
+real but textual, proving each lock is requested rather than which one serializes.
+
+**Reframing for the commit decision:** 10c-2a ships behind `activationEnabled = false`. The bar for
+committing it is therefore "correct, with every gap recorded", not "production-ready" — production-readiness
+is gated on 10c-2b and 10d above. Round 4 closes the four must-fixes and the two cheap should-fixes; the
+rest is recorded as gates.
+
+##### 10c-2a addendum (2026-10-01, final): round 4 landed, orchestrator decisions, ready to commit
+
+Round 4 closed all four must-fixes from review 3 plus the two cheap should-fixes, each with a mutation proof.
+
+1. **`lockActiveServerCredential`** now reserves `ErrServerAuthorizationDenied` for a genuinely absent row or
+   a non-active server/credential; every other database error returns wrapped, so a reset connection,
+   failover, deadline or 57P01 on tx2's first statement is a retryable 503 instead of a 401 the client never
+   retries. **Verified by the orchestrator directly: the constant-time property is intact** — both
+   not-found cases still fall through to `matchServerCredential` with the dummy digest rather than
+   early-returning, so the timing-attack protection is unchanged, and no digest reaches any error message.
+   All 10 call sites checked; none wrapped, inspected or re-mapped the error, so the change strictly improves
+   each.
+2. **Classification is now POSITIONAL**, via an `occupantChecked` flag set immediately after the occupant
+   check, with `classifyActivationResultError` applied only when it is set. The PgError class list was NOT
+   narrowed, so round 2's post-occupant guarantee is preserved exactly where it applies. Typed sentinels
+   (e.g. `ErrAgentLeaseStale` from the occupant check itself) still map correctly unclassified.
+3. **`ErrActivationBlockUnrecorded` is exported and `mapError` checks it FIRST**, so an unrecorded block
+   answers 503 regardless of which sentinel is wrapped inside it. The store-level test cannot assert the 503
+   end to end (a postgres-package test importing `agenthttp` would be an import cycle); the handler test
+   proves it separately.
+4. ADR 0004 corrected (the fresh path does not take the credential, and why), the **"self-correcting" comment
+   replaced with the truth** (the block writes on a different pooled connection, so a misjudged transient
+   error spuriously blocks rather than failing safe; blocking by default is still right because losing the
+   record is worse than a spurious block an operator can clear), and the `server_id=$2` tautology invariant
+   documented on `recordBlockInFreshTransaction`.
+5/6. XX000 and `pgconn.ErrConnClosed` added to the transient set; 0A000 now gated on
+   `pgErr.Routine == "RevalidateCachedQuery"` instead of an English message substring.
+
+`TestReportActivationResultIsAtomic` was correctly *adapted* rather than bent: the new pre-occupant stages
+must stay retryable with nothing written, so a `preOccupantStages` set flips the expectation for them. The
+test follows the rule.
+
+**Orchestrator decision — reverted round 4's `go.mod` change.** It had hand-promoted
+`github.com/jackc/puddle/v2` from indirect to direct (without `go mod tidy`) to reference
+`puddle.ErrClosedPool`. Removed from both the production list and the sanitize test, because it buys no
+behaviour: treated as deterministic, a closed pool makes the block attempt acquire another pooled
+connection, that acquire fails on the same closed pool, the failure is wrapped as
+`ErrActivationBlockUnrecorded`, and the result is retryable — the identical end state, without a direct
+dependency on pgx's pool internals. Reasoning is recorded in a comment at the call site. `go.mod`/`go.sum`
+are now byte-identical to HEAD, so **no dependency change rides along in this commit**.
+
+**Deliberately NOT fixed, recorded as a follow-up:** `authenticateServerCandidate` (~:155) has the identical
+error-collapse bug (`if err != nil || status != "active"` -> denial). It is Claim's non-transactional
+pre-check, so a transient error there costs a *lost claim* — the job stays queued and the next cycle retries
+— not a lost traffic switch. Different method, outside 10c-2a's contract. Fix it in its own change with
+Claim's tests re-run.
+
+**Still unproven at commit time, by design:** no test runs the real `Handler` against the real repository end
+to end; no test shows a real dropped connection or closed pool arriving as those exact sentinels; the
+transient-COMMIT branch at the three commit sites, the route-head lock in
+`blockActivationForReconciliation`, the fresh path's lock *order*, and admin `AssignRouteHostname`
+contention all remain untested. These are recorded rather than closed because 10c-2a ships behind
+`activationEnabled = false`: the commit bar is "correct, with every gap recorded", not "production-ready".
+
+**Production-readiness gates (unchanged, both hard):** 10c-2b must land (it alone closes the sweeper gap, the
+`activationBlockNoopOther` window, and the fact that nothing clears a block cleanly today), and 10d must add
+a **persistent** retry for the result report — the client really retries 5 times over ~3s, so "503 retried
+forever" is false today and the sweeper gap bounds every retryable bucket by authority expiry.

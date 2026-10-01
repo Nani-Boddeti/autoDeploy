@@ -600,14 +600,25 @@ hierarchy defined above, between position 6 (deployment aggregate heads) and pos
   reserved this slot (Step 10a) against the ADR text as written, without amending it; this entry
   records that reservation in the ADR itself now that a transaction actually uses it.
 
-Activation's own database transaction (`Activate`, this slice's tx1; a later slice's tx2 -- Step
-10c-2, not yet implemented -- will use the same route head/release lock class for its own finalize/
-fail transaction) locks authorization, slot, job, attempt, and deployment rows in the existing order
-(positions 1, 3-6), then the route head and candidate release row (position 6b) before any
-append-only event insert (position 8). No activation transaction locks secret-version rows at all
-(secrets are frozen once at claim time, per the original ADR text and ADR 0003); position 7 is simply
-skipped by these transactions, which is safe because skipping an unused position in a total lock
-order cannot introduce a cycle with a transaction that does use it.
+Activation's two database transactions are both shipped: `Activate` (tx1) and `ReportActivationResult`
+(tx2, Step 10c-2a, serving `POST /agent/v1/leases/activation-result`; success finalizes the activation,
+failure or ambiguity durably blocks the environment for reconciliation). Both use the route head/release
+lock class of position 6b. The order tx2 actually takes, which the code's comments and the race tests
+reference, is: credential (SHARE, position 1) -> `environment_slots` (3) -> `agent_jobs` (4) ->
+`agent_job_attempts` (5) -> the **`release_operations` activation row** -> deployment (6) -> route head
+(6b) -> release rows by ID ascending (6b) -> append-only inserts (8). The `release_operations` row is a
+lock class this ADR did not originally name: tx2 locks it between the attempt (5) and the deployment
+(6), so it is acquired after every row a lease endpoint already locks and before any row only activation
+locks. `Activate` never locks that row: it INSERTs it (position 8's class of write) after its own locks,
+so no other transaction can lock the row before tx1 commits it.
+The fresh transaction tx2 opens to record a block after a COMMIT-time failure takes the same order, as a
+subsequence (slot, job, attempt, operation, route head). The credential is deliberately not
+re-validated there: authentication already happened in tx1, the block grants the agent nothing (it only
+records that something ambiguous occurred so an operator looks), and losing the durable record is worse
+than recording one for a since-revoked server. No activation transaction locks
+secret-version rows at all (secrets are frozen once at claim time, per the original ADR text and ADR
+0003); position 7 is simply skipped by these transactions, which is safe because skipping an unused
+position in a total lock order cannot introduce a cycle with a transaction that does use it.
 
 - **Cancellation and activation are ordered by whichever transaction locks the environment slot row
   first (position 3), not the deployment row (position 6) as an earlier draft of this amendment

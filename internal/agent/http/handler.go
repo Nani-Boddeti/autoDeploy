@@ -29,22 +29,23 @@ const (
 	// Prefix is the mount point for every route this handler serves.
 	Prefix = "/agent/v1/"
 
-	pathEnroll        = "/agent/v1/enroll"
-	pathHeartbeat     = "/agent/v1/heartbeat"
-	pathClaim         = "/agent/v1/jobs/claim"
-	pathRenew         = "/agent/v1/leases/renew"
-	pathActivate      = "/agent/v1/leases/activate"
-	pathComplete      = "/agent/v1/leases/complete"
-	pathCancelAck     = "/agent/v1/leases/cancel-ack"
-	pathReconcile     = "/agent/v1/environments/reconcile"
-	pathMaterialize   = "/agent/v1/leases/materialize-secrets"
-	pathProgress      = "/agent/v1/leases/progress"
-	pathCheckoutBegin = "/agent/v1/checkout/begin"
-	pathCheckoutStart = "/agent/v1/checkout/start"
-	pathCheckoutClose = "/agent/v1/checkout/close"
-	authHeaderName    = "Authorization"
-	serverIDHeader    = "X-AutoDeploy-Server-ID"
-	bearerPrefix      = "Bearer "
+	pathEnroll           = "/agent/v1/enroll"
+	pathHeartbeat        = "/agent/v1/heartbeat"
+	pathClaim            = "/agent/v1/jobs/claim"
+	pathRenew            = "/agent/v1/leases/renew"
+	pathActivate         = "/agent/v1/leases/activate"
+	pathActivationResult = "/agent/v1/leases/activation-result"
+	pathComplete         = "/agent/v1/leases/complete"
+	pathCancelAck        = "/agent/v1/leases/cancel-ack"
+	pathReconcile        = "/agent/v1/environments/reconcile"
+	pathMaterialize      = "/agent/v1/leases/materialize-secrets"
+	pathProgress         = "/agent/v1/leases/progress"
+	pathCheckoutBegin    = "/agent/v1/checkout/begin"
+	pathCheckoutStart    = "/agent/v1/checkout/start"
+	pathCheckoutClose    = "/agent/v1/checkout/close"
+	authHeaderName       = "Authorization"
+	serverIDHeader       = "X-AutoDeploy-Server-ID"
+	bearerPrefix         = "Bearer "
 
 	// MaxBodyBytes bounds every request body except heartbeat, which is
 	// tighter because its fixed-schema capability struct never needs more.
@@ -122,6 +123,7 @@ type Handler struct {
 	Claimer                   LeaseClaimer
 	Renewer                   LeaseRenewer
 	Activator                 LeaseActivator
+	ActivationReporter        ActivationResultReporter
 	Completer                 LeaseCompleter
 	Canceller                 LeaseCanceller
 	Reconciler                EnvironmentReconciler
@@ -186,6 +188,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleRenew(w, r)
 	case pathActivate:
 		h.handleActivate(w, r)
+	case pathActivationResult:
+		h.handleActivationResult(w, r)
 	case pathComplete:
 		h.handleComplete(w, r)
 	case pathCancelAck:
@@ -307,6 +311,12 @@ func (h Handler) writeError(w http.ResponseWriter, status int, code string) {
 // generic retryable 503.
 func (h Handler) mapError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, postgres.ErrActivationBlockUnrecorded):
+		// MUST stay first: a reconciliation block that could not be made
+		// durable is always retryable, whatever sentinel the wrapped inner
+		// error happens to match below (stale, corrupt state, ...). Nothing
+		// durable exists, so a terminal answer would drop the report.
+		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable")
 	case errors.Is(err, postgres.ErrServerAuthorizationDenied):
 		h.writeError(w, http.StatusUnauthorized, "unauthorized")
 	case errors.Is(err, postgres.ErrAgentLeaseStale):
@@ -332,6 +342,27 @@ func (h Handler) mapError(w http.ResponseWriter, err error) {
 		// environment is missing required configuration" indistinguishable
 		// to the agent.
 		h.writeError(w, http.StatusConflict, "no_route_head")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationOpen):
+		// 409, not 503: Complete was refused because an activation is in
+		// flight and only its activation-result may close the attempt.
+		// Retrying Complete cannot help, so it must not be the retryable
+		// service_unavailable (the client maps any non-stale_lease 409 to
+		// the non-retryable ErrIntegrityConflict).
+		h.writeError(w, http.StatusConflict, "activation_open")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationRouteMoved):
+		// 409: the route head no longer matches what the operation
+		// recorded; a retry of the same report will see the same mismatch.
+		h.writeError(w, http.StatusConflict, "route_moved")
+	case errors.Is(err, postgres.ErrAgentLeaseCorruptState):
+		// 409: durable state violates an invariant; retrying as if it were
+		// backpressure until lease expiry would only hide it.
+		h.writeError(w, http.StatusConflict, "corrupt_state")
+	case errors.Is(err, postgres.ErrAgentLeaseConstraintViolation):
+		// 409: an unanticipated database error that is not on the repository's
+		// known-transient list (any other PgError: an integrity violation, a
+		// trigger exception, a deferred trigger failing at COMMIT, ...) is
+		// treated as deterministic and will fail identically on retry.
+		h.writeError(w, http.StatusConflict, "constraint_violation")
 	case errors.Is(err, postgres.ErrAgentLeaseInvalidInput):
 		h.writeError(w, http.StatusBadRequest, "invalid_request")
 	default:

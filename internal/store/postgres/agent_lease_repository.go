@@ -5,10 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/deployment"
@@ -103,11 +107,23 @@ func (r *AgentLeaseRepository) inject(stage string) error {
 // HTTP layer already authenticated the caller once: a credential or server
 // revoked in the gap between that authentication and this claim/renew
 // transaction must still be caught here. It returns the server's owner ID on
-// success and the package's one generic denial otherwise.
+// success and the package's one generic denial otherwise. The denial is
+// reserved for a genuinely absent or non-active server/credential; any other
+// database error is returned wrapped (never carrying the digest) so callers
+// treat it as retryable infrastructure failure, not as a 401.
 func lockActiveServerCredential(ctx context.Context, tx pgx.Tx, serverID string, presentedDigest [32]byte) (string, error) {
 	var ownerID, status string
 	foundServer := true
-	if err := tx.QueryRow(ctx, `SELECT owner_id,status FROM servers WHERE id=$1 FOR SHARE`, serverID).Scan(&ownerID, &status); err != nil || status != "active" {
+	if err := tx.QueryRow(ctx, `SELECT owner_id,status FROM servers WHERE id=$1 FOR SHARE`, serverID).Scan(&ownerID, &status); err != nil {
+		// Only a genuinely absent row is a denial. Any other error (reset
+		// connection, failover, deadline, 57P01) must stay retryable: the
+		// agent client never retries a 401, so collapsing it would silently
+		// drop a genuine report.
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("lock active server for credential check: %w", err)
+		}
+		foundServer = false
+	} else if status != "active" {
 		foundServer = false
 	}
 	var storedDigest []byte
@@ -115,6 +131,8 @@ func lockActiveServerCredential(ctx context.Context, tx pgx.Tx, serverID string,
 	if foundServer {
 		if err := tx.QueryRow(ctx, `SELECT digest FROM server_credentials WHERE server_id=$1 AND status='active' FOR SHARE`, serverID).Scan(&storedDigest); err == nil {
 			foundCredential = true
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("lock active server credential: %w", err)
 		}
 	}
 	if !matchServerCredential(foundServer, foundCredential, storedDigest, presentedDigest) {
@@ -738,6 +756,11 @@ func validOperationID(id string) bool {
 	return n >= 1 && n <= 128
 }
 
+// KNOWN GAP, deliberately deferred to Step 10c-2b: this function (reached
+// from expireOne and revokeInFlightLeases) still closes an attempt that has a
+// switch_authorized/reconciliation_required activation operation open, which
+// ADR 0005 forbids ("an in-flight syscall cannot be preempted"). 10c-2b adds
+// the diversion; do not treat its absence as an oversight.
 // closeExpiredOrRevokedAttempt closes a leased attempt whose authority has
 // ended for a reason the agent never reported: it either authority-expired
 // (the sweeper/expireOne) or its server's credential/identity was just
@@ -937,6 +960,24 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 			return fmt.Errorf("commit agent lease complete replay: %w", err)
 		}
 		return nil
+	}
+
+	// An open activation owns this attempt's completion: the host switch may
+	// already be in flight (switch_authorized), or its outcome is ambiguous
+	// and awaiting declared resolution (reconciliation_required). In both
+	// cases completing the attempt here would resolve that ambiguity blindly
+	// (ADR 0005), so only ReportActivationResult (tx2) may close the
+	// attempt, free the slot and close the job, and only reconciliation may
+	// resolve a blocked one. Slot, job and attempt
+	// locks are held and the attempt is known 'leased' here. A Complete that
+	// arrives after a successful tx2 never reaches this point -- the attempt
+	// is then closed and takes the replay-or-conflict branch above.
+	var activationOpen bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND kind='activate' AND state IN ('switch_authorized','reconciliation_required'))`, attemptID, fence).Scan(&activationOpen); err != nil {
+		return fmt.Errorf("check open activation for complete: %w", err)
+	}
+	if activationOpen {
+		return ErrAgentLeaseActivationOpen
 	}
 
 	if attemptFence != fence || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID || !authorityExpiresAt.After(now) {
@@ -1315,6 +1356,10 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	}
 
 	var operationID int64
+	// KNOWN GAP, deliberately deferred to Step 10c-2b: a stranded open
+	// activation makes this INSERT fail on release_operations_environment_
+	// open_activation_idx with a raw 23505, which is not yet mapped to a typed
+	// non-retryable refusal (10c-2b).
 	err = tx.QueryRow(ctx, `INSERT INTO release_operations(release_id, job_id, attempt_id, fence, kind, digest, state, environment_id, expected_active_release_id, expected_route_revision, route_digest)
 		VALUES ($1,$2,$3,$4,'activate',$5,'switch_authorized',$6,$7,$8,$9) RETURNING id`,
 		releaseID, jobID, attemptID, fence, imageDigest[:], environmentID, expectedActiveReleaseID, routeRevision, routeDigestRaw).Scan(&operationID)
@@ -1345,6 +1390,949 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
 		RouteDigest:              routeDigestHex,
 	}, nil
+}
+
+// ErrAgentLeaseActivationOpen reports a Complete call refused because a
+// switch_authorized activation operation is still open for the attempt/fence:
+// only ReportActivationResult (tx2) may close that attempt, free its slot
+// and close its job, since the host switch may already be in flight (ADR
+// 0005 "An in-flight syscall cannot be preempted").
+var ErrAgentLeaseActivationOpen = errors.New("agent lease activation operation is open")
+
+// ErrAgentLeaseActivationRouteMoved reports that the route head no longer
+// matches the route_revision/active_release_id tx1 recorded on the
+// operation, so tx2 cannot finalize the activation against it.
+var ErrAgentLeaseActivationRouteMoved = errors.New("agent lease activation route head moved since authorization")
+
+const (
+	// maxActivationFailureSummaryBytes bounds the sanitized failure summary
+	// tx2 stores in release_operations.outcome_summary; the column's own
+	// CHECK allows 2048, this leaves headroom and keeps rows small.
+	maxActivationFailureSummaryBytes = 512
+)
+
+// sanitizeOutcomeSummary makes agent-supplied text safe for
+// release_operations.outcome_summary: valid UTF-8, no control characters
+// (the column's CHECK rejects [\x00-\x1f\x7f]; Unicode control runes are
+// dropped as well), trimmed and truncated on a rune boundary.
+func sanitizeOutcomeSummary(summary string) string {
+	summary = strings.ToValidUTF8(summary, "?")
+	summary = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, summary)
+	summary = strings.TrimSpace(summary)
+	if len(summary) > maxActivationFailureSummaryBytes {
+		cut := maxActivationFailureSummaryBytes
+		for cut > 0 && !utf8.RuneStart(summary[cut]) {
+			cut--
+		}
+		summary = summary[:cut]
+	}
+	return summary
+}
+
+// activationFinalizeInput is everything finalizeActivationSucceeded needs,
+// already loaded and verified by the caller under the slot/job/attempt/
+// operation locks. Step 10c-2b's operator-declared "activated" reconciliation
+// outcome reuses the helper with its own caller-verified values.
+type activationFinalizeInput struct {
+	jobID                   int64
+	attemptID               int64
+	operationID             int64
+	environmentID           string
+	deploymentID            string
+	candidateReleaseID      string
+	expectedRouteRevision   int64
+	expectedActiveReleaseID *string
+	// resultDigest is the route digest recorded as the attempt's
+	// result_digest (agent_job_attempts requires one on a succeeded row).
+	resultDigest [32]byte
+	summary      string
+	now          time.Time
+}
+
+// finalizeActivationSucceeded is the activation success write sequence, ADR
+// 0004 lock order from the deployment onward: deployment (position 6, via
+// transitionDeployment) -> route head (6b) -> release rows by id ascending,
+// then the writes. The caller must already hold the credential (SHARE),
+// environment slot, job and attempt locks and have verified the operation is
+// switch_authorized for this attempt/fence. Because it IS the completion
+// transaction for a successful activation (ADR 0004 "Transaction
+// boundaries": completion, slot release, deployment transition and events
+// commit atomically), it also closes the attempt, frees the slot and closes
+// the job; Complete is never called afterwards. It does not commit.
+func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, tx pgx.Tx, in activationFinalizeInput) error {
+	if err := transitionDeployment(ctx, tx, r.deployments, in.deploymentID, deployment.StatusHealthy, in.now, r.inject); err != nil {
+		return err
+	}
+	if err := r.inject("deployment"); err != nil {
+		return err
+	}
+
+	var routeRevision int64
+	var activeReleaseID *string
+	if err := tx.QueryRow(ctx, `SELECT route_revision, active_release_id FROM route_heads WHERE environment_id=$1 FOR UPDATE`, in.environmentID).Scan(&routeRevision, &activeReleaseID); err != nil {
+		// Currently unreachable, kept as defence in depth: the caller
+		// (reportActivationResult) already looked the route head up FOR UPDATE
+		// before the savepoint and routes a missing head through
+		// refuseAmbiguous, so by the time this runs the row exists and is
+		// locked by this transaction.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: environment %s has no route head at activation result", ErrAgentLeaseCorruptState, in.environmentID)
+		}
+		return fmt.Errorf("lock route head for activation result: %w", err)
+	}
+	sameActive := (activeReleaseID == nil && in.expectedActiveReleaseID == nil) ||
+		(activeReleaseID != nil && in.expectedActiveReleaseID != nil && *activeReleaseID == *in.expectedActiveReleaseID)
+	if routeRevision != in.expectedRouteRevision || !sameActive {
+		return ErrAgentLeaseActivationRouteMoved
+	}
+
+	// Release rows, ascending id (ADR 0004 position 7 rule for multiple rows
+	// of one class). tx2 is the writer, so FOR UPDATE rather than FOR SHARE;
+	// 000018's deferred FOR SHARE trigger stays a redundant second line.
+	lockIDs := []string{in.candidateReleaseID}
+	if in.expectedActiveReleaseID != nil {
+		lockIDs = append(lockIDs, *in.expectedActiveReleaseID)
+	}
+	rows, err := tx.Query(ctx, `SELECT id, state FROM releases WHERE id = ANY($1) ORDER BY id FOR UPDATE`, lockIDs)
+	if err != nil {
+		return fmt.Errorf("lock releases for activation result: %w", err)
+	}
+	states := make(map[string]string, len(lockIDs))
+	for rows.Next() {
+		var id, state string
+		if err = rows.Scan(&id, &state); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan release for activation result: %w", err)
+		}
+		states[id] = state
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("lock releases for activation result: %w", err)
+	}
+	if states[in.candidateReleaseID] != "ready" {
+		return fmt.Errorf("%w: candidate release %s is %q at activation result", ErrAgentLeaseCorruptState, in.candidateReleaseID, states[in.candidateReleaseID])
+	}
+	if in.expectedActiveReleaseID != nil {
+		if states[*in.expectedActiveReleaseID] != "active" {
+			return fmt.Errorf("%w: predecessor release %s is %q at activation result", ErrAgentLeaseCorruptState, *in.expectedActiveReleaseID, states[*in.expectedActiveReleaseID])
+		}
+		// Predecessor first: at most one active release per environment is
+		// enforced immediately, so it must leave 'active' before the
+		// candidate enters it. Skipped entirely on a first deployment.
+		if _, err = tx.Exec(ctx, `UPDATE releases SET state='retained', updated_at=$2 WHERE id=$1 AND state='active'`, *in.expectedActiveReleaseID, in.now); err != nil {
+			return fmt.Errorf("retain predecessor release: %w", err)
+		}
+	}
+	if _, err = tx.Exec(ctx, `UPDATE releases SET state='active', updated_at=$2 WHERE id=$1 AND state='ready'`, in.candidateReleaseID, in.now); err != nil {
+		return fmt.Errorf("activate candidate release: %w", err)
+	}
+	if err = r.inject("release_active"); err != nil {
+		return err
+	}
+
+	// Pointer and revision move in ONE update; validate_route_head_update
+	// enforces CAS-by-exactly-one.
+	tag, err := tx.Exec(ctx, `UPDATE route_heads SET active_release_id=$2, route_revision=route_revision+1, updated_at=GREATEST(updated_at, $3) WHERE environment_id=$1 AND route_revision=$4`,
+		in.environmentID, in.candidateReleaseID, in.now, in.expectedRouteRevision)
+	if err != nil {
+		return fmt.Errorf("advance route head: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrAgentLeaseActivationRouteMoved
+	}
+	if err = insertRouteEvent(ctx, tx, in.environmentID, "activated", in.expectedRouteRevision+1, nil, &in.candidateReleaseID); err != nil {
+		return err
+	}
+	if err = r.inject("route_head"); err != nil {
+		return err
+	}
+
+	tag, err = tx.Exec(ctx, `UPDATE release_operations SET state='succeeded', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state='switch_authorized'`, in.operationID, in.now, in.summary)
+	if err != nil {
+		return fmt.Errorf("close activation operation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrAgentLeaseStale
+	}
+	if err = r.inject("operation_close"); err != nil {
+		return err
+	}
+
+	// Completion, mirroring Complete's success branch: attempt, slot, job.
+	if _, err = tx.Exec(ctx, `UPDATE agent_job_attempts SET state='succeeded', closed_at=$2, failure_class=NULL, result_operation_id=$3, result_digest=$4 WHERE id=$1`,
+		in.attemptID, in.now, strconv.FormatInt(in.operationID, 10), in.resultDigest[:]); err != nil {
+		return fmt.Errorf("close agent job attempt: %w", err)
+	}
+	if err = r.inject("attempt_close"); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET current_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1 AND current_attempt_id=$3`, in.environmentID, in.now, in.attemptID); err != nil {
+		return fmt.Errorf("free environment slot: %w", err)
+	}
+	if err = r.inject("slot_free"); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='succeeded', updated_at=$2 WHERE id=$1 AND state='leased'`, in.jobID, in.now); err != nil {
+		return fmt.Errorf("close agent job: %w", err)
+	}
+	if err = r.inject("job_close"); err != nil {
+		return err
+	}
+	if err = appendAgentJobEvent(ctx, tx, in.jobID, &in.attemptID, "activated"); err != nil {
+		return err
+	}
+	if err = appendAgentJobEvent(ctx, tx, in.jobID, &in.attemptID, "succeeded"); err != nil {
+		return err
+	}
+	return r.inject("job_event")
+}
+
+// ErrAgentLeaseConstraintViolation reports a database error that no caller
+// anticipated and that is not on the known-transient list
+// (isRetryableActivationPgError): any PgError outside serialization,
+// deadlock, cancellation, connection, shutdown, resource, read-only/failover,
+// timeout and stale-statement-cache conditions, e.g. an integrity violation
+// (class 23), a trigger exception (P0001) or a deferred trigger failing at
+// COMMIT. It is treated as deterministic, so retrying cannot help; it exists
+// so such an error is never reported as a retryable 503.
+var ErrAgentLeaseConstraintViolation = errors.New("agent lease unexpected integrity violation")
+
+// emptyFailureSummary replaces a blank failure summary so the audit row is
+// never empty. release_operations.outcome_summary's own CHECK (live schema:
+// octet_length <= 2048 AND no [\x00-\x1f\x7f]) has no minimum length.
+const emptyFailureSummary = "activation failure reported without detail"
+
+func failureOutcomeSummary(raw string) string {
+	if summary := sanitizeOutcomeSummary(raw); summary != "" {
+		return summary
+	}
+	return emptyFailureSummary
+}
+
+// ErrActivationBlockUnrecorded marks an error from writing (or committing) a
+// reconciliation block that could not be made durable. It is never terminal:
+// the agent must keep reporting until the block exists, so
+// classifyActivationResultError returns it untouched (retryable) even when the
+// wrapped error is a deterministic PgError. The original finalize failure that
+// made the block necessary is carried as text only, never wrapped.
+var ErrActivationBlockUnrecorded = errors.New("activation reconciliation block not recorded")
+
+func blockUnrecorded(err error) error {
+	return fmt.Errorf("%w: %w", ErrActivationBlockUnrecorded, err)
+}
+
+// classifyActivationResultError turns deterministic database/domain errors
+// into typed, non-retryable sentinels. Known-transient failures (see
+// isRetryableActivationPgError) and failures to record a block
+// (ErrActivationBlockUnrecorded) stay untouched and remain retryable.
+func classifyActivationResultError(err error) error {
+	if err == nil || errors.Is(err, ErrActivationBlockUnrecorded) {
+		return err
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && !isRetryableActivationPgError(pgErr) {
+		return fmt.Errorf("%w: sqlstate %s constraint %q: %w", ErrAgentLeaseConstraintViolation, pgErr.Code, pgErr.ConstraintName, err)
+	}
+	if isDeploymentDomainError(err) {
+		return fmt.Errorf("%w: %w", ErrAgentLeaseCorruptState, err)
+	}
+	return err
+}
+
+// isDeploymentDomainError reports a deterministic refusal from the
+// deployment aggregate (an unsupported or post-terminal transition, an
+// out-of-order timestamp, an unreadable snapshot) or from its repository
+// (ErrRevisionConflict, ErrNotFound, ErrRevisionOverflow): a retry reproduces
+// it. Inside tx2 the deployment row is already locked, so the repository
+// sentinels cannot come from concurrency and indicate corruption.
+func isDeploymentDomainError(err error) bool {
+	return errors.Is(err, deployment.ErrInvalidTransition) ||
+		errors.Is(err, deployment.ErrTerminalState) ||
+		errors.Is(err, deployment.ErrInvalidTimestamp) ||
+		errors.Is(err, deployment.ErrUnknownStatus) ||
+		errors.Is(err, deployment.ErrInvalidSnapshot) ||
+		errors.Is(err, deployment.ErrInvalidDeployment) ||
+		errors.Is(err, ErrRevisionConflict) ||
+		errors.Is(err, ErrNotFound) ||
+		errors.Is(err, ErrRevisionOverflow)
+}
+
+// isRetryableActivationPgCode reports SQLSTATEs that describe a transient
+// condition rather than a property of the data: serialization failure
+// (40001), deadlock (40P01), statement-completion-unknown (40003), query
+// cancellation (57014), the connection class (08xxx), server shutdown
+// (57P01-57P03), session/transaction timeouts that kill the session (57P05,
+// 25P03, 25P04), insufficient resources (53xxx), lock-not-available (55P03),
+// read-only transaction (25006: failover or standby promotion, where every
+// write including a block fails), io_error (58030) and
+// invalid_sql_statement_name (26000: a cached prepared statement gone after a
+// pooler reset) and internal_error (XX000: "cache lookup failed" / "could not
+// open relation" around concurrent DDL; it is a catch-all, so a genuinely
+// deterministic XX000 would retry instead of block -- the agent keeps
+// reporting rather than the environment being spuriously blocked).
+func isRetryableActivationPgCode(code string) bool {
+	switch code {
+	case "XX000", "40001", "40P01", "40003", "57014", "57P01", "57P02", "57P03", "57P05",
+		"55P03", "25006", "25P03", "25P04", "58030", "26000":
+		return true
+	}
+	return strings.HasPrefix(code, "08") || strings.HasPrefix(code, "53")
+}
+
+// isRetryableActivationPgError is isRetryableActivationPgCode plus the one
+// code too broad to list bare: 0A000 (feature_not_supported) is transient
+// only for the pgx statement cache's "cached plan must not change result
+// type", which a migration (this slice ships one) or a pooler reset triggers
+// until the cached statement is discarded.
+func isRetryableActivationPgError(pgErr *pgconn.PgError) bool {
+	if isRetryableActivationPgCode(pgErr.Code) {
+		return true
+	}
+	// Matched on the server source routine, not the message text, so a
+	// non-English lc_messages cannot make this spuriously terminal.
+	return pgErr.Code == "0A000" && pgErr.Routine == "RevalidateCachedQuery"
+}
+
+// isTransientActivationFailure is the ONLY list that must be right: an error
+// known to be transient, which rolls back and is retried. Context
+// cancellation/deadline, transient SQLSTATEs and network-level failures
+// (net.Error, EOF) qualify. A network failure on COMMIT has an unknown
+// outcome, so it must stay retryable: the replay path answers it.
+func isTransientActivationFailure(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, pgconn.ErrConnClosed) {
+		return true
+	}
+	// puddle.ErrClosedPool is deliberately NOT listed, to avoid a direct
+	// dependency on pgx's pool internals for no behavioural gain: a closed
+	// pool already ends retryable without it. Treated as deterministic, the
+	// block is attempted on another pooled connection, that acquire fails on
+	// the same closed pool, and the failure is wrapped as
+	// ErrActivationBlockUnrecorded -- which is retryable. Same end state.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return isRetryableActivationPgError(pgErr)
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// isDeterministicActivationFailure decides whether a tx2 finalize error must
+// be recorded as a durable reconciliation block instead of rolled back. It is
+// a NEGATIVE definition: every non-nil error that is not known to be
+// transient is treated as deterministic, so an unrecognized error after the
+// occupant check blocks (visible to an operator) rather than retrying forever
+// with the operation silently open while the host has already switched.
+//
+// The cost is stated plainly: this is NOT self-correcting. The block is
+// written on a DIFFERENT pooled connection (abortAndBlock, the commit-failure
+// paths and recordBlockInFreshTransaction), so a transient error that was
+// misjudged on one connection does not stop the block from succeeding -- it
+// SPURIOUSLY blocks an environment, which an operator must then clear.
+// Blocking by default is still the right direction because losing the record
+// of a switch that may have happened is worse than a spurious block, but the
+// transient list above should be kept broad to keep that cost rare.
+func isDeterministicActivationFailure(err error) bool {
+	return err != nil && !isTransientActivationFailure(err)
+}
+
+// ReportActivationResult is tx2 of Step 10c's fenced activation: the agent
+// reports whether the host switch authorized by Activate succeeded. Lock
+// order as shipped (Activate shares the credential -> slot -> job -> attempt
+// prefix and the deployment/route head/release suffix, but INSERTs the
+// operation row instead of locking it): credential (SHARE, ADR position 1)
+// -> environment slot (3) -> job (4) -> attempt (5) -> the activation
+// release_operations row -> deployment (6) -> route head (6b) -> release rows
+// by id ascending (6b) -> inserts (8). The release_operations row is a lock
+// class ADR 0004 did not originally name; it is taken after the attempt and
+// before the deployment, and the ADR's 2026-09-22 amendment records that
+// position. Every one of those locks is held to commit, so two calls for one operation (or a call racing Complete) cannot
+// interleave. The tests prove that each caller blocks on the environment_slots
+// row when it is held and that the committed outcome is consistent; they do
+// not prove which single row lock decides a race (any of slot, job, attempt
+// or operation would suffice), so none is claimed here. The conditional
+// UPDATE on the operation's state is defense in depth.
+//
+// DELIBERATELY NO authority_expires_at.After(now) CHECK, unlike every other
+// lease endpoint (Renew/Complete/Activate). The agent may be mid host
+// syscall when its lease lapses, and ADR 0005 says such a syscall cannot be
+// preempted: the linearization point is the operation row still being
+// switch_authorized for this exact attempt/fence (identity columns immutable
+// per validate_release_operation_update), not the lease clock. Copying
+// Complete's stale check here would reject a legitimately authorized
+// activation whose lease lapsed mid-syscall -- the very case ADR 0005
+// protects -- and strand the environment. The attempt must still be the
+// leased occupant of the slot at this fence.
+//
+// On success it finalizes the activation and completes the attempt in one
+// transaction (finalizeActivationSucceeded). On failure/ambiguity it moves
+// the operation to reconciliation_required and blocks the environment
+// (route head and slot flagged) without closing the attempt or job, freeing
+// the slot, advancing the fence or touching the deployment -- ADR 0005
+// forbids resolving the ambiguity by blind rollback. A success report that
+// disagrees with what was authorized (the observed route digest differs from
+// the one rendered in tx1, or the route head moved since) is itself
+// ambiguous: the host may have switched to something unauthorized, so it is
+// recorded durably the same way (evidence in outcome_summary) and the typed
+// refusal is still returned. Replays: an identical success report for a
+// succeeded operation, and an identical failure report (same sanitized
+// summary) for a reconciliation_required one, are idempotent successes; any
+// other disagreement is ErrAgentLeaseIntegrityConflict.
+//
+// RULE: once a success report has passed the fence, occupant and authority
+// checks, ANY deterministic failure to finalize is recorded as the same
+// durable reconciliation block (evidence = the specific discrepancy) and the
+// typed non-retryable error is still returned; only failures known to be
+// transient (isTransientActivationFailure) roll back and are retried -- the
+// definition of "deterministic" is negative, so an unrecognized error blocks.
+// A failure raised inside the transaction after the savepoint rolls back to
+// it (taken after the deployment and route head locks are held; the locks
+// survive) and commits the block there. A failure raised before the savepoint
+// exists, or AT COMMIT (a deferred trigger), has already discarded the
+// transaction, so the block is written in a fresh one
+// (recordBlockInFreshTransaction) that re-takes the same lock order minus the
+// credential. If a block cannot be made durable the error returned is always
+// retryable (ErrActivationBlockUnrecorded), never the terminal typed error.
+//
+// Classification is POSITIONAL: only errors raised after the occupant check
+// (a block can exist from there on) are passed through
+// classifyActivationResultError. An error from the earlier read/lock
+// statements (peek, slot, job, attempt, operation) wrote nothing durable, so
+// even a non-transient PgError there (class-42 schema skew mid rolling
+// deploy, 42501, ...) stays unclassified and retryable: a 503 can succeed on
+// retry, a terminal 409 tells the agent to stop with nothing recorded.
+func (r *AgentLeaseRepository) ReportActivationResult(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, succeeded bool, observedRouteDigest [32]byte, failureSummary string) error {
+	var occupantChecked bool
+	err := r.reportActivationResult(ctx, serverID, presentedDigest, attemptID, fence, operationID, succeeded, observedRouteDigest, failureSummary, &occupantChecked)
+	if !occupantChecked {
+		return err
+	}
+	return classifyActivationResultError(err)
+}
+
+func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, succeeded bool, observedRouteDigest [32]byte, failureSummary string, occupantChecked *bool) error {
+	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 || !validOperationID(operationID) {
+		return ErrAgentLeaseInvalidInput
+	}
+	parsedOperationID, err := strconv.ParseInt(operationID, 10, 64)
+	if err != nil || parsedOperationID <= 0 {
+		return ErrAgentLeaseInvalidInput
+	}
+
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin agent lease activation result: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
+		return err
+	}
+
+	var jobID int64
+	var environmentID, ownerServerID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id, server_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&jobID, &environmentID, &ownerServerID); err == nil {
+		err = r.inject("attempt_peek")
+	}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrServerAuthorizationDenied
+		}
+		return fmt.Errorf("locate agent job attempt: %w", err)
+	}
+	if ownerServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotFence, &slotCurrentAttemptID); err == nil {
+		err = r.inject("slot_lock")
+	}
+	if err != nil {
+		return fmt.Errorf("lock environment slot for activation result: %w", err)
+	}
+
+	var deploymentID string
+	if err = tx.QueryRow(ctx, `SELECT deployment_id FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID); err == nil {
+		err = r.inject("job_lock")
+	}
+	if err != nil {
+		return fmt.Errorf("lock agent job for activation result: %w", err)
+	}
+
+	var attemptState, attemptServerID string
+	var attemptFence int64
+	if err = tx.QueryRow(ctx, `SELECT state, server_id, fence FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).Scan(&attemptState, &attemptServerID, &attemptFence); err == nil {
+		err = r.inject("attempt_lock")
+	}
+	if err != nil {
+		return fmt.Errorf("lock agent job attempt for activation result: %w", err)
+	}
+	if attemptServerID != serverID {
+		return ErrServerAuthorizationDenied
+	}
+	if attemptFence != fence {
+		return ErrAgentLeaseStale
+	}
+
+	var op struct {
+		id                      int64
+		releaseID, state        string
+		routeDigest             []byte
+		outcomeSummary          string
+		expectedRouteRevision   int64
+		expectedActiveReleaseID *string
+	}
+	err = tx.QueryRow(ctx, `SELECT id, release_id, state, route_digest, outcome_summary, expected_route_revision, expected_active_release_id FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND kind='activate' FOR UPDATE`, attemptID, fence).
+		Scan(&op.id, &op.releaseID, &op.state, &op.routeDigest, &op.outcomeSummary, &op.expectedRouteRevision, &op.expectedActiveReleaseID)
+	if err == nil {
+		err = r.inject("operation_lock")
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrAgentLeaseStale
+	}
+	if err != nil {
+		return fmt.Errorf("lock activation operation: %w", err)
+	}
+	if op.id != parsedOperationID {
+		return ErrAgentLeaseIntegrityConflict
+	}
+	if len(op.routeDigest) != 32 {
+		return fmt.Errorf("%w: activation operation %d has a malformed route digest", ErrAgentLeaseCorruptState, op.id)
+	}
+	digestMatches := [32]byte(op.routeDigest) == observedRouteDigest
+	summary := failureOutcomeSummary(failureSummary)
+
+	switch op.state {
+	case "succeeded":
+		// Replay: the original call already finalized everything. Accept
+		// only an identical success report.
+		if !succeeded || !digestMatches {
+			return ErrAgentLeaseIntegrityConflict
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent lease activation result replay: %w", err)
+		}
+		return nil
+	case "reconciliation_required":
+		// Already blocked (by an earlier report or, in 10c-2b, the expiry
+		// sweeper). An identical failure report is an idempotent replay so
+		// an agent whose response was lost can tell "already recorded" from
+		// "lost lease". Nothing is finalized here.
+		// 10c-2b insertion point: a late genuine report (especially a
+		// success report) should be recorded as reconciliation evidence
+		// (outcome_summary + event) instead of being refused.
+		if succeeded {
+			return ErrAgentLeaseStale
+		}
+		if summary != op.outcomeSummary {
+			return ErrAgentLeaseIntegrityConflict
+		}
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit agent lease activation result failure replay: %w", err)
+		}
+		return nil
+	case "switch_authorized":
+	default:
+		return fmt.Errorf("%w: activation operation %d in state %q", ErrAgentLeaseCorruptState, op.id, op.state)
+	}
+
+	// Open operation: the attempt must still be the leased occupant of the
+	// slot at this fence. Authority expiry is intentionally not consulted
+	// (see the doc comment above).
+	if attemptState != "leased" || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+		return ErrAgentLeaseStale
+	}
+	// From here a block can be recorded, so every error is classified
+	// terminally (see ReportActivationResult).
+	*occupantChecked = true
+
+	// abortAndBlock handles an error raised before the savepoint exists (the
+	// deployment and route head locks, the SAVEPOINT itself). A known-transient
+	// error is returned for the agent to retry. Anything else is deterministic
+	// and, because a success report has passed the fence/occupant checks, must
+	// still be recorded: this transaction is rolled back FIRST (a fresh one
+	// re-takes the slot lock and would otherwise wait on this connection
+	// forever) and the block is written in a fresh transaction.
+	abortAndBlock := func(err error) error {
+		if !isDeterministicActivationFailure(err) {
+			return err
+		}
+		_ = tx.Rollback(ctx)
+		return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, op.id, "activation finalize failed: ", err)
+	}
+
+	// refuseAmbiguous records a success report that disagrees with what was
+	// authorized as a durable reconciliation block, commits it, then returns
+	// the typed refusal: rolling back would leave the operation open with no
+	// flag and no event while the host may already have switched. If the block
+	// cannot be written or committed the failure is retryable
+	// (blockUnrecorded) -- never the terminal refusal, since nothing durable
+	// would exist -- except that a deterministic COMMIT error falls back to a
+	// fresh transaction.
+	refuseAmbiguous := func(evidence string, refusal error) error {
+		evidence = sanitizeOutcomeSummary(evidence)
+		if err := r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, op.id, environmentID, evidence); err != nil {
+			return blockUnrecorded(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			commitErr := fmt.Errorf("commit agent lease activation ambiguity block: %w", err)
+			if !isDeterministicActivationFailure(err) {
+				return commitErr
+			}
+			if _, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, evidence); freshErr != nil {
+				return fmt.Errorf("%w (after %v)", freshErr, commitErr)
+			}
+		}
+		return refusal
+	}
+
+	if !succeeded {
+		if err = r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, op.id, environmentID, summary); err != nil {
+			return blockUnrecorded(err)
+		}
+		if err = tx.Commit(ctx); err != nil {
+			commitErr := fmt.Errorf("commit agent lease activation result: %w", err)
+			if !isDeterministicActivationFailure(err) {
+				return commitErr
+			}
+			outcome, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, summary)
+			if freshErr != nil {
+				return fmt.Errorf("%w (after %v)", freshErr, commitErr)
+			}
+			switch outcome {
+			case activationBlockRecorded:
+				return nil
+			case activationBlockNoopSucceeded:
+				return ErrAgentLeaseIntegrityConflict
+			default:
+				return ErrAgentLeaseStale
+			}
+		}
+		return nil
+	}
+
+	if !digestMatches {
+		return refuseAmbiguous(fmt.Sprintf("route digest mismatch: expected sha256:%s observed sha256:%s", hex.EncodeToString(op.routeDigest), hex.EncodeToString(observedRouteDigest[:])), ErrAgentLeaseIntegrityConflict)
+	}
+
+	// Deployment (position 6) then route head (6b), held to commit. What the
+	// tests PROVE: the slot, job, attempt and operation locks taken above
+	// serialize every tx2/Complete caller (TestReportActivationResultGenuinely
+	// Races*), which is what makes the route recheck below reliable against
+	// the slot-holding paths. What they do NOT prove: that the deployment and
+	// route head locks make the recheck authoritative against a writer that
+	// takes neither the slot lock nor these -- the only such writer is the
+	// admin AssignRouteHostname path, and no test exercises that contention.
+	// The recheck is believed sound (the route head is locked FOR UPDATE
+	// before it is read) but that is reasoning, not a tested claim.
+	_, err = tx.Exec(ctx, `SELECT 1 FROM deployments WHERE id=$1 FOR UPDATE`, deploymentID)
+	if err == nil {
+		err = r.inject("deployment_lock")
+	}
+	if err != nil {
+		return abortAndBlock(fmt.Errorf("lock deployment for activation result: %w", err))
+	}
+	var routeRevision int64
+	var activeReleaseID *string
+	err = tx.QueryRow(ctx, `SELECT route_revision, active_release_id FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&routeRevision, &activeReleaseID)
+	if err == nil {
+		err = r.inject("route_head_lock")
+	}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			missing := fmt.Sprintf("environment %s has no route head at activation result", environmentID)
+			return refuseAmbiguous(missing, fmt.Errorf("%w: %s", ErrAgentLeaseCorruptState, missing))
+		}
+		return abortAndBlock(fmt.Errorf("lock route head for activation result: %w", err))
+	}
+	if !sameOptionalString(activeReleaseID, op.expectedActiveReleaseID) || routeRevision != op.expectedRouteRevision {
+		return refuseAmbiguous(fmt.Sprintf("route head moved since authorization: expected revision %d active %s, found revision %d active %s",
+			op.expectedRouteRevision, optionalStringForSummary(op.expectedActiveReleaseID), routeRevision, optionalStringForSummary(activeReleaseID)), ErrAgentLeaseActivationRouteMoved)
+	}
+
+	// Savepoint after the deployment and route head locks are held: rolling
+	// back to it releases only locks taken later (the release rows), never
+	// these. A deterministic finalize failure rolls back to here and commits
+	// the reconciliation block instead of the whole transaction vanishing.
+	_, err = tx.Exec(ctx, `SAVEPOINT `+activationFinalizeSavepoint)
+	if err == nil {
+		err = r.inject("savepoint")
+	}
+	if err != nil {
+		return abortAndBlock(fmt.Errorf("savepoint for activation finalize: %w", err))
+	}
+	// Clock read after the slot/job/attempt/operation/deployment/route-head
+	// locks above. finalizeActivationSucceeded still takes the release row
+	// locks (and releases.updated_at has a monotonic trigger) AFTER this read,
+	// so a concurrent writer of those rows could in principle leave
+	// updated_at ahead of `now`. Harmless today: nothing outside the
+	// slot-holding paths writes releases.
+	var now time.Time
+	err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now)
+	if err == nil {
+		err = r.inject("finalize_clock")
+	}
+	if err != nil {
+		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, fmt.Errorf("agent lease activation result canonical time: %w", err))
+	}
+	if err = r.finalizeActivationSucceeded(ctx, tx, activationFinalizeInput{
+		jobID:                   jobID,
+		attemptID:               attemptID,
+		operationID:             op.id,
+		environmentID:           environmentID,
+		deploymentID:            deploymentID,
+		candidateReleaseID:      op.releaseID,
+		expectedRouteRevision:   op.expectedRouteRevision,
+		expectedActiveReleaseID: op.expectedActiveReleaseID,
+		resultDigest:            observedRouteDigest,
+		summary:                 "activated route_digest=sha256:" + hex.EncodeToString(observedRouteDigest[:]),
+		now:                     now,
+	}); err != nil {
+		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		commitErr := fmt.Errorf("commit agent lease activation result: %w", err)
+		if isDeterministicActivationFailure(err) {
+			return r.blockAfterCommitFailure(ctx, serverID, attemptID, fence, op.id, commitErr)
+		}
+		return commitErr
+	}
+	return nil
+}
+
+const activationFinalizeSavepoint = "activation_finalize"
+
+// blockAfterFinalizeFailure handles an error raised inside the transaction,
+// after the savepoint, before COMMIT. A known-transient error is returned
+// untouched (the caller's deferred rollback discards everything and the agent
+// retries). Anything else rolls back to the savepoint (every lock taken
+// before it survives), records the reconciliation block with the discrepancy
+// as evidence, commits, and returns cause so the caller still sees the typed
+// non-retryable error. If recording the block itself fails, nothing durable
+// exists, so that failure is returned as a retryable error (cause kept as
+// text only, so it can never be misclassified as the terminal error); a
+// deterministic COMMIT error of the block transaction falls back to a fresh
+// transaction.
+func (r *AgentLeaseRepository) blockAfterFinalizeFailure(ctx context.Context, tx pgx.Tx, serverID string, jobID, attemptID, fence, operationID int64, environmentID string, cause error) error {
+	if !isDeterministicActivationFailure(cause) {
+		return cause
+	}
+	if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT `+activationFinalizeSavepoint); err != nil {
+		return blockUnrecorded(fmt.Errorf("rollback to savepoint for reconciliation block failed: %w (after %v)", err, cause))
+	}
+	evidence := sanitizeOutcomeSummary("activation finalize failed: " + cause.Error())
+	if err := r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, operationID, environmentID, evidence); err != nil {
+		return blockUnrecorded(fmt.Errorf("record activation reconciliation block after %v: %w", cause, err))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		if !isDeterministicActivationFailure(err) {
+			return blockUnrecorded(fmt.Errorf("commit activation reconciliation block after %v: %w", cause, err))
+		}
+		return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, operationID, "activation finalize failed: ", cause)
+	}
+	return cause
+}
+
+// blockAfterCommitFailure handles a deterministic error raised by COMMIT
+// itself (a deferred constraint trigger): that transaction is gone, so a
+// fresh one writes the block (see recordBlockInFreshTransaction). Results:
+// the block was recorded or this report has nothing to record -> cause (the
+// typed non-retryable error); another writer already finalized this very
+// operation as succeeded -> nil (this report's intent is satisfied, the
+// idempotent answer); the fresh transaction failed for any reason ->
+// that failure, retryable, with cause as text only.
+func (r *AgentLeaseRepository) blockAfterCommitFailure(ctx context.Context, serverID string, attemptID, fence, operationID int64, cause error) error {
+	return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, operationID, "activation finalize failed at commit: ", cause)
+}
+
+// blockAfterAbortedTransaction is blockAfterCommitFailure's body, shared with
+// the failures that occur before the savepoint exists. evidencePrefix says
+// where the failure happened.
+func (r *AgentLeaseRepository) blockAfterAbortedTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, evidencePrefix string, cause error) error {
+	evidence := sanitizeOutcomeSummary(evidencePrefix + cause.Error())
+	outcome, err := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, operationID, evidence)
+	if err != nil {
+		return fmt.Errorf("%w (after %v)", err, cause)
+	}
+	if outcome == activationBlockNoopSucceeded {
+		return nil
+	}
+	return cause
+}
+
+type activationBlockOutcome int
+
+const (
+	// activationBlockRecorded: the block was written and committed.
+	activationBlockRecorded activationBlockOutcome = iota
+	// activationBlockNoopSucceeded: another writer already finalized this
+	// operation as succeeded.
+	activationBlockNoopSucceeded
+	// activationBlockNoopOther: already blocked/closed by a concurrent
+	// writer, or the attempt no longer occupies the slot at this fence.
+	activationBlockNoopOther
+)
+
+// recordBlockInFreshTransaction writes the reconciliation block in a new
+// transaction, re-taking the documented lock order minus the credential:
+// environment slot -> job -> attempt -> operation -> route head (inside
+// blockActivationForReconciliation). That is a strict subsequence of
+// tx2's order (credential SHARE -> slot -> job -> attempt -> operation ->
+// deployment -> route head -> releases), so it cannot introduce a deadlock.
+//
+// The credential is deliberately NOT revalidated: authentication already
+// happened in tx1, and the block grants the agent nothing -- it only records
+// that something ambiguous occurred so an operator looks. A block written for
+// a since-revoked server is harmless; a lost one is not, so this must fail
+// safe. Ownership (server_id on the attempt), occupant and operation-state
+// checks stay. It is idempotent and tolerant: a no-op is a distinct outcome,
+// not an error. EVERY failure of the fresh transaction is returned
+// (blockUnrecorded, retryable), never swallowed, because nothing durable
+// exists.
+//
+// INVARIANT: the `server_id=$2` predicate on the attempt lookup is defence in
+// depth, and serverID MUST come from the authenticated request. It becomes a
+// TAUTOLOGY (always true) if a future caller (10c-2b, e.g. the sweeper) passes
+// a serverID read from the attempt row itself; such a caller must establish
+// authority some other way.
+func (r *AgentLeaseRepository) recordBlockInFreshTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, evidence string) (activationBlockOutcome, error) {
+	fail := func(what string, err error) (activationBlockOutcome, error) {
+		return activationBlockNoopOther, blockUnrecorded(fmt.Errorf("%s: %w", what, err))
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fail("begin activation reconciliation block", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var jobID int64
+	var environmentID string
+	if err = tx.QueryRow(ctx, `SELECT job_id, environment_id FROM agent_job_attempts WHERE id=$1 AND server_id=$2`, attemptID, serverID).Scan(&jobID, &environmentID); err != nil {
+		return fail("locate attempt for activation reconciliation block", err)
+	}
+	var slotFence int64
+	var slotCurrentAttemptID *int64
+	if err = tx.QueryRow(ctx, `SELECT fence, current_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotFence, &slotCurrentAttemptID); err != nil {
+		return fail("lock environment slot for activation reconciliation block", err)
+	}
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID); err != nil {
+		return fail("lock agent job for activation reconciliation block", err)
+	}
+	var attemptState string
+	if err = tx.QueryRow(ctx, `SELECT state FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).Scan(&attemptState); err != nil {
+		return fail("lock agent job attempt for activation reconciliation block", err)
+	}
+	var opState string
+	if err = tx.QueryRow(ctx, `SELECT state FROM release_operations WHERE id=$1 AND attempt_id=$2 AND fence=$3 AND kind='activate' FOR UPDATE`, operationID, attemptID, fence).Scan(&opState); err != nil {
+		return fail("lock activation operation for reconciliation block", err)
+	}
+	if opState == "succeeded" {
+		return activationBlockNoopSucceeded, nil
+	}
+	if opState != "switch_authorized" || attemptState != "leased" || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+		// Already blocked by a concurrent writer, or the slot moved on:
+		// nothing left for this report to record.
+		return activationBlockNoopOther, nil
+	}
+	if err = r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, operationID, environmentID, evidence); err != nil {
+		return activationBlockNoopOther, blockUnrecorded(err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fail("commit activation reconciliation block", err)
+	}
+	return activationBlockRecorded, nil
+}
+
+func sameOptionalString(a, b *string) bool {
+	return (a == nil && b == nil) || (a != nil && b != nil && *a == *b)
+}
+
+func optionalStringForSummary(v *string) string {
+	if v == nil {
+		return "<none>"
+	}
+	return *v
+}
+
+// blockActivationForReconciliation is tx2's failure/ambiguous path. Only the
+// operation, the two reconciliation flags and one event are written. The
+// slot keeps current_attempt_id and its fence; the attempt, job and
+// deployment are left exactly as they are, because the switch may have
+// happened and ADR 0005 forbids resolving that by blind rollback or blind
+// success. The route head's revision does not move (validate_route_head_update
+// exempts a flag-only update, migration 000020): the desired route state did
+// not change. The caller must hold the slot, job, attempt and operation locks.
+func (r *AgentLeaseRepository) blockActivationForReconciliation(ctx context.Context, tx pgx.Tx, jobID, attemptID, operationID int64, environmentID, summary string) error {
+	// Lock the route head (position 6b) and read its flag. The operation row
+	// is already locked by the caller, so taking this lock first changes
+	// nothing about lock ORDER; what it does is (1) serialize this block
+	// with any concurrent route head writer before the clock is read, and
+	// (2) let the flag write below be decided from the locked value. The
+	// deployment row (position 6) is not written here (the success-ambiguity
+	// caller may already hold it, which is harmless). A missing route head
+	// is tolerated (the block must still be recorded on the operation and
+	// slot; "no route head" is itself the evidence in that case).
+	headExists, headFlagged := true, false
+	if err := tx.QueryRow(ctx, `SELECT reconciliation_required FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&headFlagged); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("lock route head for activation reconciliation: %w", err)
+		}
+		headExists = false
+	}
+	// Clock read after the blocking locks so updated_at cannot trip the
+	// route head's monotonicity rule against a concurrent writer; GREATEST
+	// is the belt to that brace.
+	var now time.Time
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return fmt.Errorf("agent lease activation block canonical time: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `UPDATE release_operations SET state='reconciliation_required', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state='switch_authorized'`, operationID, now, summary)
+	if err != nil {
+		return fmt.Errorf("close activation operation for reconciliation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrAgentLeaseStale
+	}
+	if err = r.inject("operation_close"); err != nil {
+		return err
+	}
+	// Migration 000020 exempts a flag-only update from the revision bump only
+	// if the flag actually CHANGES, so an already-flagged head must not be
+	// updated at all (it would raise P0001). The row is locked above, so the
+	// guard and the pre-read agree and exactly one row is affected whenever
+	// the write is attempted.
+	if headExists && !headFlagged {
+		tag, err = tx.Exec(ctx, `UPDATE route_heads SET reconciliation_required=true, updated_at=GREATEST(updated_at, $2) WHERE environment_id=$1 AND NOT reconciliation_required`, environmentID, now)
+		if err != nil {
+			return fmt.Errorf("flag route head for reconciliation: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return fmt.Errorf("%w: route head for environment %s vanished during activation reconciliation", ErrAgentLeaseCorruptState, environmentID)
+		}
+	}
+	tag, err = tx.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=$3 WHERE environment_id=$1`, environmentID, attemptID, now)
+	if err != nil {
+		return fmt.Errorf("flag environment slot for reconciliation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: environment slot %s vanished during activation reconciliation", ErrAgentLeaseCorruptState, environmentID)
+	}
+	if err = r.inject("slot_reconcile"); err != nil {
+		return err
+	}
+	if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, "activation_reconciliation_required"); err != nil {
+		return err
+	}
+	return r.inject("job_event")
 }
 
 // RequestCancellation cancels jobID on behalf of an owner-scoped, live
