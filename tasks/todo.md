@@ -3624,3 +3624,65 @@ the livelock is fixed but the row remains unresolvable); untested paths are a mi
 sweeper, and a pre-flagged head with a `switch_authorized` operation; `ExpireBatch` returns on the first
 `expireOne` error so one persistently failing candidate stalls the batch (pre-existing, but the diversion adds
 new error sources); the `operation_lock` hook name is shared with tx2's (disjoint code paths, commented).
+
+#### 10c-2b session end 2026-10-04 — steps A-D committed, step E WIP uncommitted
+
+**Committed and fully verified (each on a green full bar: gofmt, build, vet both tag sets, `diff --check`,
+`make check`, `go test -race ./...`, Linux amd64+arm64 cross-builds, 6 fresh-database PG18.4 sweeps
+(3 normal + 3 `-race`), 9 concurrency tests at `-race -count=20`):**
+- `1354760` step A — migration 000021
+- `e8aa2ae` step B — shared unresolved-activation predicate (rule, not state name)
+- `f98e6e5` step C — typed refusal in `Activate` (took 3 rounds)
+- `612fcb0` step D — sweeper diversion + `MarkReconciled` refusal **(the step the slice exists for)**
+
+Both gates remain false: `activationEnabled` (`cmd/controlplane/main.go:42`), `executorEnabled`
+(`cmd/agent/main.go:60`). Nothing has executed; outcome count still 8/18.
+
+**STEP E IS UNCOMMITTED WORK IN PROGRESS — stopped mid-flight, no implementer report exists.**
+Files: modified `internal/store/postgres/agent_lease_repository.go`, `internal/agent/http/handler.go`,
+`internal/agent/client/activation_status_test.go`, `internal/agent/http/activation_result_test.go`,
+`internal/store/postgres/agent_lease_activation_result_test.go`; new
+`internal/store/postgres/activation_late_report.go`, `activation_late_report_unit_test.go`,
+`agent_lease_activation_late_report_test.go`.
+
+State as measured by the orchestrator, not reported by the agent:
+- `go build ./...` and `go vet -tags=integration ./...` are CLEAN, so the tree is coherent.
+- The narrowed integration run FAILS 2 of 3 packages' worth of tests — specifically **2 tests, both
+  pre-existing 10c-2a tests, and both failures are EXPECTED rather than defects:**
+  - `agent_lease_activation_block_failure_test.go:562` —
+    `block won but the success report err=agent lease activation report recorded as reconciliation evidence;
+    awaiting operator resolution, want ErrAgentLeaseStale`
+  - `agent_lease_activation_finalize_failure_test.go:262` —
+    `replay err=agent lease activation report recorded as reconciliation evidence; awaiting operator
+    resolution, want ErrAgentLeaseStale`
+  Both assert `ErrAgentLeaseStale` for a report against an already-blocked operation. **That stale answer was
+  the explicit placeholder 10c-2a left for this step** — its own code comment called it "the 10c-2b hook". So
+  step E is correctly replacing it, and these two tests must be RE-POINTED at the new late-report sentinel,
+  not "fixed". Worth a moment's thought on the first one: it is a RACE test where the block won and the
+  success report lost; recording that report as evidence is better than answering stale, but confirm that is
+  the intended semantics before re-pointing.
+- The agent's dying note said "M8 and M9 exit 1 with 0 fails: likely compile errors" — those were mutation
+  runs; build/vet are clean now, so the restore landed, but **which mutation proofs actually ran is unknown.**
+
+**Because no report exists, the next session must re-derive step E's decisions by READING the code** — do not
+assume: append-vs-replace for `outcome_summary` (and the 2048-byte/rune-boundary truncation rule), how a
+replay is detected, what the `failed` case now returns, the chosen sentinel and wire code, the
+statement-by-statement lock order, and the rule for which attempt shapes accept evidence. Then: finish the
+mutation proofs, re-point the two tests above, run the full bar, get an independent review, commit.
+
+**HARD PREREQUISITES FOR STEP G** (confirmed against source; see the step D block for detail):
+1. G must close the attempt in the SAME transaction as the resolution — once the operation becomes terminal
+   while the attempt is still `leased`, the discovery exclusion stops applying and the sweeper runs the
+   ordinary close (fence advance, slot flag, job retry) on the attempt G just resolved.
+2. G must add an explicit unresolved-activation check to `Reconcile` **as** it adds the leased-attempt branch.
+   `Reconcile` is protected today only INCIDENTALLY by `attemptState == "leased" || closedAt == nil`, which is
+   exactly a diverted attempt's shape, and it answers the generic `ErrServerAuthorizationDenied`. The planned
+   branch targets that shape, so it removes the protection and reopens the invisible wedge through the agent
+   door that D closed on the admin door.
+3. G's path must be operator-only where a revoked server is involved — a revoked server can never
+   authenticate, so no agent `Reconcile` can resolve its diverted attempt.
+4. Between D and G an activation-caused block has NO resolution path; `MarkReconciled` refuses by design.
+
+**Remaining steps:** E (finish the WIP), F (finalize parameterization — partly done in B via `fromState`),
+G (resolution paths; see prerequisites), H (HTTP/admin/form wiring — invoke `/impeccable`, pastel palette),
+I (docs: ADR 0004's amendment around line 655 still says no code implements the sweeper diversion).
