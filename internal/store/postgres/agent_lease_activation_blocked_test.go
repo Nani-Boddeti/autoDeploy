@@ -330,18 +330,71 @@ func TestIsUniqueViolationOfDistinguishesConstraints(t *testing.T) {
 	}
 }
 
-// strandedByRealCalls drives the production path to the stranded state with
-// no forced operation or flag state: a real Activate, a real ambiguous
-// ReportActivationResult (tx2 sets BOTH the operation and the route-head
-// flag), the stranded attempt's authority lapsing and being closed by the
-// real sweeper (ExpireBatch), and the administrator clearing the SLOT flag
-// with the real MarkReconciled (which touches only the slot). What is left is
-// exactly what a later Activate meets: route_heads.reconciliation_required
-// set, the old operation reconciliation_required, and a free slot.
-//
-// Only the lapse of time is simulated (the attempt's deadlines are moved into
-// the past); no state the code under test reads is written directly.
-func (a activatedFixture) strandedByRealCalls(t *testing.T) {
+// forceLegacySweeperClose writes, in SQL, exactly what the pre-step-D sweeper
+// (closeAttemptOrdinary) did to an attempt whose activation was unresolved: the
+// attempt closes expired, the fence advances, the slot is vacated and flagged
+// with reconciliation_attempt_id, and the job goes to retry_wait. Since step D
+// NO production path leaves a stranded-but-activatable environment (the
+// sweeper now records the block and leaves the attempt leased and the slot
+// occupied) and nothing resolves one until step G, so this shape can only be
+// forced. It is kept as a real shape because it is what already-deployed
+// databases could hold, and the Activate refusal must hold for it. Using it
+// replaces ONLY the sweeper step of the old scenario; every assertion that
+// followed is unchanged.
+func (a activatedFixture) forceLegacySweeperClose(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`UPDATE agent_job_attempts SET state='expired', closed_at=clock_timestamp() WHERE id=$1`,
+		`UPDATE environment_slots SET fence=fence+1, current_attempt_id=NULL, reconciliation_required=true, reconciliation_attempt_id=$1, updated_at=clock_timestamp() WHERE environment_id=(SELECT environment_id FROM agent_job_attempts WHERE id=$1)`,
+		`UPDATE agent_jobs SET state='retry_wait', available_at=clock_timestamp(), updated_at=clock_timestamp() WHERE id=(SELECT job_id FROM agent_job_attempts WHERE id=$1)`,
+	} {
+		if _, err := a.pool.Exec(ctx, stmt, a.attemptID); err != nil {
+			t.Fatalf("force legacy sweeper close (%s): %v", stmt, err)
+		}
+	}
+	a.requireAttemptExpired(t)
+}
+
+// lapseAndExpireOne lapses the attempt's deadlines (the only simulated thing:
+// time) and runs the real sweeper's per-candidate transaction (expireOne)
+// DIRECTLY on this attempt. Going through ExpireBatch would not discriminate:
+// its discovery already excludes a recorded attempt, so the attempt would stay
+// leased with the diversion deleted. expireOne bypasses discovery, so only the
+// diversion can keep the attempt leased. It reports expireOne's "closed" bool.
+func (a activatedFixture) lapseAndExpireOne(t *testing.T) bool {
+	t.Helper()
+	if _, err := a.pool.Exec(context.Background(), `UPDATE agent_job_attempts SET lease_expires_at=now()-interval '2 seconds', authority_expires_at=now()-interval '2 seconds' WHERE id=$1`, a.attemptID); err != nil {
+		t.Fatalf("lapse attempt deadlines: %v", err)
+	}
+	closed, err := a.repo.expireOne(context.Background(), a.attemptID)
+	if err != nil {
+		t.Fatalf("expireOne: %v", err)
+	}
+	return closed
+}
+
+// clearSlotFlagForcedInSQL stands in for the operator's MarkReconciled, which
+// since step D REFUSES while an unresolved activation exists (see
+// TestMarkReconciledRefusesWhileActivationUnresolved). The stranded shapes
+// these tests need (unresolved operation, free and clear slot) are therefore
+// no longer reachable through MarkReconciled and are forced in SQL.
+func (a activatedFixture) clearSlotFlagForcedInSQL(t *testing.T) {
+	t.Helper()
+	if _, err := a.pool.Exec(context.Background(), `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=clock_timestamp() WHERE environment_id=$1`, a.envID); err != nil {
+		t.Fatalf("force slot flag clear: %v", err)
+	}
+}
+
+// strandedAsLegacySweeperLeftIt builds the stranded state a later Activate
+// meets: a real Activate, a real ambiguous ReportActivationResult (tx2 sets
+// BOTH the operation and the route-head flag), the real sweeper run with the
+// authority lapsed (expireOne called directly, which since step D must DIVERT,
+// asserted here), then the legacy close and the slot flag clear forced in SQL
+// (see forceLegacySweeperClose and clearSlotFlagForcedInSQL). What is left is exactly what a later Activate meets:
+// route_heads.reconciliation_required set, the old operation
+// reconciliation_required, and a free slot.
+func (a activatedFixture) strandedAsLegacySweeperLeftIt(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 	if err := a.report(ctx, false, "reload timed out"); err != nil {
@@ -354,24 +407,22 @@ func (a activatedFixture) strandedByRealCalls(t *testing.T) {
 	if _, _, flagged := a.routeHead(t); !flagged {
 		t.Fatal("route head flag not set by tx2")
 	}
-	if _, err := a.pool.Exec(ctx, `UPDATE agent_job_attempts SET lease_expires_at=now()-interval '2 seconds', authority_expires_at=now()-interval '2 seconds' WHERE id=$1`, a.attemptID); err != nil {
-		t.Fatalf("lapse attempt deadlines: %v", err)
+	// Step D: the real per-candidate sweep, called directly so discovery
+	// cannot mask it, must NOT close the attempt. If it did, the forced close
+	// below would be redundant and this proof would be rerouted silently.
+	if closed := a.lapseAndExpireOne(t); closed {
+		t.Fatal("expireOne reported the attempt closed; the diversion must not count it")
 	}
-	// ExpireBatch is global: in a shared database it may also expire other
-	// tests' lapsed attempts, so assert THIS attempt was closed rather than
-	// that exactly one was.
-	if _, err := a.repo.ExpireBatch(ctx, 10); err != nil {
-		t.Fatalf("ExpireBatch: %v", err)
+	if state, _, _, _, _ := a.attemptRow(t, a.attemptID); state != "leased" {
+		t.Fatalf("attempt state=%s after expireOne, want leased (diverted)", state)
 	}
-	a.requireAttemptExpired(t)
-	if err := a.repo.MarkReconciled(ctx, a.principal, a.envID, "operator break-glass: verified clean"); err != nil {
-		t.Fatalf("MarkReconciled: %v", err)
-	}
+	a.forceLegacySweeperClose(t)
+	a.clearSlotFlagForcedInSQL(t)
 	if _, current, _, slotFlag := a.slotRow(t); current != nil || slotFlag {
 		t.Fatalf("slot current=%v flagged=%v, want free and clear", current, slotFlag)
 	}
 	if _, _, flagged := a.routeHead(t); !flagged {
-		t.Fatal("route head flag must still be set (MarkReconciled clears only the slot)")
+		t.Fatal("route head flag must still be set (only the slot flag was cleared)")
 	}
 }
 
@@ -382,7 +433,7 @@ func (a activatedFixture) requireAttemptExpired(t *testing.T) {
 		t.Fatal(err)
 	}
 	if state != "expired" {
-		t.Fatalf("stranded attempt state=%s, want expired (closed by the real sweeper)", state)
+		t.Fatalf("stranded attempt state=%s, want expired (closed by the forced legacy close)", state)
 	}
 }
 
@@ -406,10 +457,10 @@ func (a activatedFixture) requireStrandedPrecondition(t *testing.T) {
 
 // THE test the step exists for. The old gate answered ErrAgentLeaseStale here
 // because the route head flag stops Activate before the INSERT is reached.
-func TestActivateStrandedEnvironmentIsBlockedEndToEnd(t *testing.T) {
+func TestActivateStrandedEnvironmentIsBlockedAfterLegacySweeperClose(t *testing.T) {
 	ctx := context.Background()
 	a := newActivatedFixture(t, 210, false)
-	a.strandedByRealCalls(t)
+	a.strandedAsLegacySweeperLeftIt(t)
 
 	// Full triple BEFORE the second attempt is set up: leasing it occupies the
 	// slot, which is part of the triple.
@@ -463,32 +514,28 @@ func TestActivateRouteHeadFlagWithoutUnresolvedOperationStaysStale(t *testing.T)
 	}
 }
 
-// Reachable TODAY through the real sweeper: it closes an attempt whose
-// operation is still switch_authorized (the step D gap), leaving the operation
-// unresolved with the route-head flag CLEAR and the slot flagged. The admin's
-// MarkReconciled then frees the slot. A new attempt without a candidate release
-// row must still get the typed refusal, not a corrupt-state error.
-//
-// STEP D WILL REMOVE THIS SCENARIO (the sweeper will divert instead of
-// closing). When it lands, re-point this test at whatever then strands an
-// operation with the flag clear, or delete it with the other step-D coupling.
-func TestActivateSweeperStrandedSwitchAuthorizedFlagClearIsBlocked(t *testing.T) {
+// The flag-clear scenario: an operation still switch_authorized, route-head
+// flag CLEAR, slot flagged then freed by MarkReconciled. The pre-step-D sweeper
+// produced it by closing an attempt whose operation was switch_authorized.
+// STEP D REMOVED THAT PATH: the real sweeper now diverts and nothing else
+// produces this shape until step G, so the close is forced in SQL (forceLegacySweeperClose) -- the shape an already-deployed
+// database may hold. The Activate refusal it pins is unchanged: a new attempt
+// without a candidate release row must get the typed refusal, not a
+// corrupt-state error.
+func TestActivateSwitchAuthorizedFlagClearIsBlockedAfterLegacySweeperClose(t *testing.T) {
 	ctx := context.Background()
 	a := newActivatedFixture(t, 240, false)
+	// The real sweeper is deliberately NOT run: since step D it would move the
+	// operation to reconciliation_required (covered by the sweeper diversion
+	// tests), and that transition cannot be undone to recreate this shape.
 	if _, err := a.pool.Exec(ctx, `UPDATE agent_job_attempts SET lease_expires_at=now()-interval '2 seconds', authority_expires_at=now()-interval '2 seconds' WHERE id=$1`, a.attemptID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.repo.ExpireBatch(ctx, 10); err != nil {
-		t.Fatalf("ExpireBatch: %v", err)
-	}
-	a.requireAttemptExpired(t)
-	if err := a.repo.MarkReconciled(ctx, a.principal, a.envID, "operator break-glass: verified clean"); err != nil {
-		t.Fatalf("MarkReconciled: %v", err)
-	}
-	// Precondition (step-D coupling): operation still switch_authorized, flag
-	// clear, slot free and clear.
+	a.forceLegacySweeperClose(t)
+	a.clearSlotFlagForcedInSQL(t)
+	// Precondition: operation switch_authorized, flag clear, slot free and clear.
 	if state, _, _ := a.operation(t); state != "switch_authorized" {
-		t.Fatalf("operation=%s, want switch_authorized (sweeper gap)", state)
+		t.Fatalf("operation=%s, want switch_authorized (legacy shape)", state)
 	}
 	if _, _, flagged := a.routeHead(t); flagged {
 		t.Fatal("route head flag unexpectedly set")

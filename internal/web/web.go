@@ -817,7 +817,14 @@ func (h *Handler) environmentsMarkReconciled(w http.ResponseWriter, r *http.Requ
 		badRequest(w)
 		return
 	}
-	if h.config.ServerAdmin.MarkReconciled(r.Context(), p, v.Get("environment_id"), v.Get("reason")) != nil {
+	if err := h.config.ServerAdmin.MarkReconciled(r.Context(), p, v.Get("environment_id"), v.Get("reason")); err != nil {
+		if errors.Is(err, postgres.ErrAgentLeaseActivationUnresolved) {
+			// 409, not the generic 400: the environment holds an unresolved
+			// activation that only a declared outcome can resolve, so retrying
+			// the same request can never succeed.
+			plain(w, http.StatusConflict, "environment holds an unresolved activation; it cannot be mark-reconciled\n")
+			return
+		}
 		badRequest(w)
 		return
 	}

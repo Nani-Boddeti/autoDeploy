@@ -15,10 +15,13 @@ import (
 	"autodeploy/internal/store/postgres"
 )
 
-// TestAgentHTTPStrandedEnvironmentActivateIsBlocked drives the whole stranded
-// scenario through real HTTP and the real repositories, forcing no operation,
-// flag or slot state: claim -> activate -> ambiguous activation-result ->
-// the stranded attempt's authority lapses and the real sweeper closes it ->
+// TestAgentHTTPStrandedEnvironmentActivateIsBlockedAfterLegacySweeperClose
+// drives the stranded scenario through real HTTP and the real repositories.
+// The final stranded state is NOT reachable through production code since step
+// D, so the legacy sweeper close is forced in SQL (hence the name): claim ->
+// activate -> ambiguous activation-result -> the stranded attempt's authority
+// lapses, the batch sweep leaves it leased and the pre-step-D close is forced
+// in SQL (see the comment at that step) ->
 // the agent's real reconcile clears the slot flag -> a DIFFERENT attempt on
 // the same environment calls activate. The route-head flag and the stranded
 // operation are what remain, and the answer must be 409
@@ -26,7 +29,7 @@ import (
 //
 // Coupled to steps D/E/G: the precondition triple is asserted right before the
 // final call so a later change to the sweeper or reconcile fails loudly.
-func TestAgentHTTPStrandedEnvironmentActivateIsBlocked(t *testing.T) {
+func TestAgentHTTPStrandedEnvironmentActivateIsBlockedAfterLegacySweeperClose(t *testing.T) {
 	ctx := context.Background()
 	f := newAgentHTTPFixture(t)
 	leases := postgres.NewAgentLeaseRepository(f.pool, postgres.NewDeploymentRepository(f.pool))
@@ -72,10 +75,14 @@ func TestAgentHTTPStrandedEnvironmentActivateIsBlocked(t *testing.T) {
 		}
 	}
 	imageDigest := hexOf(digestFixture(7))
+	// route_heads.hostname is globally unique and route_heads rows cannot be
+	// deleted (trigger route_heads_no_delete), and this fixture never resets
+	// shared tables (see newAgentHTTPFixture), so a re-run against a
+	// non-recreated database must use a fresh hostname instead of a cleanup.
 
 	attempt1, fence1 := claim(f.jobID)
 	toHealthChecking(attempt1, fence1)
-	if _, err := f.pool.Exec(ctx, `INSERT INTO route_heads(environment_id, hostname, route_revision) VALUES ($1,'app.example.com',0)`, f.envID); err != nil {
+	if _, err := f.pool.Exec(ctx, `INSERT INTO route_heads(environment_id, hostname, route_revision) VALUES ($1,$2,0)`, f.envID, "app-"+randomSuffix(t)+".example.com"); err != nil {
 		t.Fatal(err)
 	}
 	resp, body = postJSON(t, srv, pathActivate, token, f.serverID, activateRequest{AttemptID: attempt1, Fence: fence1, ImageDigest: imageDigest})
@@ -97,20 +104,38 @@ func TestAgentHTTPStrandedEnvironmentActivateIsBlocked(t *testing.T) {
 		t.Fatalf("route head flagged=%v err=%v, want true", flagged, err)
 	}
 
-	// Only time is simulated: the stranded attempt's deadlines lapse, and the
-	// real sweeper closes it. The second job is queued at a higher priority
-	// than the retry-waiting first one so the next claim takes it.
+	// Only time is simulated: the stranded attempt's deadlines lapse. Since
+	// step D the sweeper does not close such an attempt (it records the block
+	// and leaves the attempt leased), so it no longer produces a
+	// stranded-but-activatable environment, and nothing does until step G. The
+	// real batch sweep is run and the attempt is asserted to be LEFT LEASED
+	// (through the batch path, which is what this test exercises; discovery
+	// alone already excludes a recorded attempt, so this does not by itself
+	// prove the diversion -- the store tests drive expireOne directly for
+	// that). The pre-step-D close it used to perform (attempt expired, fence
+	// advanced, slot vacated and flagged, job retry_wait) is then forced in
+	// SQL, which is the shape an already-deployed database may hold. Everything
+	// after it (the real reconcile, the second claim, the assertions) is
+	// unchanged.
 	if _, err := f.pool.Exec(ctx, `UPDATE agent_job_attempts SET lease_expires_at=now()-interval '2 seconds', authority_expires_at=now()-interval '2 seconds' WHERE id=$1`, attempt1); err != nil {
 		t.Fatal(err)
 	}
-	// ExpireBatch is global; assert THIS attempt was expired, not that exactly
-	// one attempt was.
+	// ExpireBatch is global; assert on THIS attempt.
 	if _, err := leases.ExpireBatch(ctx, 10); err != nil {
 		t.Fatalf("ExpireBatch: %v", err)
 	}
 	var attemptState string
-	if err := f.pool.QueryRow(ctx, `SELECT state FROM agent_job_attempts WHERE id=$1`, attempt1).Scan(&attemptState); err != nil || attemptState != "expired" {
-		t.Fatalf("stranded attempt state=%q err=%v, want expired", attemptState, err)
+	if err := f.pool.QueryRow(ctx, `SELECT state FROM agent_job_attempts WHERE id=$1`, attempt1).Scan(&attemptState); err != nil || attemptState != "leased" {
+		t.Fatalf("stranded attempt state=%q err=%v, want left leased by the batch sweep", attemptState, err)
+	}
+	for _, stmt := range []string{
+		`UPDATE agent_job_attempts SET state='expired', closed_at=clock_timestamp() WHERE id=$1`,
+		`UPDATE environment_slots SET fence=fence+1, current_attempt_id=NULL, reconciliation_required=true, reconciliation_attempt_id=$1, updated_at=clock_timestamp() WHERE environment_id=(SELECT environment_id FROM agent_job_attempts WHERE id=$1)`,
+		`UPDATE agent_jobs SET state='retry_wait', available_at=clock_timestamp(), updated_at=clock_timestamp() WHERE id=(SELECT job_id FROM agent_job_attempts WHERE id=$1)`,
+	} {
+		if _, err := f.pool.Exec(ctx, stmt, attempt1); err != nil {
+			t.Fatalf("force legacy sweeper close: %v", err)
+		}
 	}
 	resp, body = postJSON(t, srv, pathReconcile, token, f.serverID, reconcileRequest{EnvironmentID: f.envID, AttemptID: attempt1, Fence: fence1, OutcomeDigest: hexOf(digestFixture(8))})
 	if resp.StatusCode != http.StatusOK {

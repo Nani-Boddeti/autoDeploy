@@ -762,15 +762,35 @@ func validOperationID(id string) bool {
 // revoked (ADR 0004's revocation paragraph, called from
 // revokeInFlightLeases).
 //
-// KNOWN GAP, deliberately deferred to Step 10c-2b (step D): this function
-// (reached from expireOne and revokeInFlightLeases) still closes an attempt
-// that has an unresolved activation operation (see unresolvedActivation),
-// which ADR 0005 forbids ("an in-flight syscall cannot be preempted"). 10c-2b
-// adds the diversion; do not treat its absence as an oversight.
+// DIVERSION (step D). An attempt that holds an UNRESOLVED activation (the rule
+// unresolvedActivationSQL: an activate operation not in a terminal state, so
+// switch_authorized and reconciliation_required today and any state added
+// later) is NOT closed: the host may already have switched live traffic and
+// ADR 0005 forbids resolving that by closing the attempt. Instead the
+// operation is recorded as reconciliation_required (with the route head and
+// slot flags) through the shared blockActivationForReconciliation, and the
+// attempt, fence, slot occupant, job and deployment are left exactly as they
+// are so a late genuine report can still be evaluated. The diversion is keyed
+// on the rule and not on switch_authorized: after the first sweep the
+// operation is reconciliation_required and the attempt is still leased, so a
+// state-named guard would let the next sweep run the ordinary close path.
+// A second sweep finds the operation already reconciliation_required and is a
+// pure no-op (no write, no event). The returned bool reports that the attempt
+// was diverted (whether this call recorded the block or found it recorded), so
+// the caller must not count it as closed.
 //
-// Both cases get identical effects: the attempt
-// closes as cancelled (if the job's cancellation was already requested) or
-// expired; the environment fence advances and the slot is marked
+// FORWARD CONSTRAINT for step G (not implemented here): once G moves the
+// operation to succeeded/failed while the attempt is still leased, the
+// discovery exclusion in ExpireBatch stops applying and the sweeper would run
+// the ORDINARY close (fence advance, slot flag, job retry). Step G must
+// therefore close the attempt in the SAME transaction as the resolution. A
+// revoked server can never authenticate, so no agent Reconcile can resolve its
+// diverted attempt: G's resolution path must be operator-only.
+//
+// Every other attempt (no unresolved activation) is closed by
+// closeAttemptOrdinary, and both of its cases (expired and revoked) get
+// identical effects: the attempt closes as cancelled (if the job's
+// cancellation was already requested) or expired; the environment fence advances and the slot is marked
 // reconciliation_required with its occupant cleared (an already-executing
 // host syscall cannot be preempted, so no new work may use the slot until
 // the agent reconciles); and the job is terminalized/retried/dead-lettered
@@ -779,8 +799,65 @@ func validOperationID(id string) bool {
 //
 // The caller must already hold FOR UPDATE locks (in ADR order: slot, job,
 // attempt) and have revalidated that the attempt is still leased and still
-// the slot's current occupant; this function only writes.
-func closeExpiredOrRevokedAttempt(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, inject func(string) error, jobID, attemptID int64, environmentID string, attemptNumber int, deploymentID string, cancelRequested bool, now time.Time) error {
+// the slot's current occupant. The only lock taken here is the activation
+// operation (position 5, after the attempt, still under the caller's slot
+// lock, which is what ADR 0004's forward constraint on release_operations
+// writers requires).
+func closeExpiredOrRevokedAttempt(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, inject func(string) error, jobID, attemptID int64, environmentID string, attemptNumber int, deploymentID string, cancelRequested bool, now time.Time) (diverted bool, err error) {
+	diverted, err = divertUnresolvedActivation(ctx, tx, inject, jobID, attemptID, environmentID)
+	if err != nil || diverted {
+		return diverted, err
+	}
+	return false, closeAttemptOrdinary(ctx, tx, deployments, inject, jobID, attemptID, environmentID, attemptNumber, deploymentID, cancelRequested, now)
+}
+
+// activationBlockedByAuthorityEndSummary is the operation's outcome_summary
+// when the sweeper (not an agent report) records the block. It is a fixed
+// string: bounded, no control characters, no caller-supplied text.
+const activationBlockedByAuthorityEndSummary = "attempt authority ended (expired or server revoked) while the activation was unresolved; live traffic may already have switched; operator reconciliation required"
+
+// divertUnresolvedActivation implements the diversion described on
+// closeExpiredOrRevokedAttempt. It reports diverted=true when the attempt
+// holds an unresolved activate operation, after recording the block if it was
+// not yet recorded. It locks the operation row FOR UPDATE (position 5) and then
+// delegates to blockActivationForReconciliation (route head, slot, event).
+func divertUnresolvedActivation(ctx context.Context, tx pgx.Tx, inject func(string) error, jobID, attemptID int64, environmentID string) (bool, error) {
+	var operationID int64
+	var operationState string
+	// environment_id is redundant with attempt_id but lets the planner use
+	// the partial open-activation index (its predicate is this same rule).
+	err := tx.QueryRow(ctx, `SELECT id, state FROM release_operations WHERE attempt_id=$1 AND environment_id=$2 AND `+unresolvedActivationSQL+` FOR UPDATE`,
+		attemptID, environmentID).Scan(&operationID, &operationState)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lock unresolved activation operation for closure: %w", err)
+	}
+	// The hook name "operation_lock" is deliberately shared with
+	// ReportActivationResult (tx2). The collision is safe: the sites run on
+	// disjoint code paths (this one only inside the sweeper/revocation
+	// diversion, that one only inside tx2), and a test that arms the stage
+	// drives exactly one of those paths per run.
+	if err = inject("operation_lock"); err != nil {
+		return false, err
+	}
+	// Only switch_authorized has a legal transition into
+	// reconciliation_required. Any other unresolved state is already past it
+	// (reconciliation_required: recorded by an earlier sweep or by tx2, so a
+	// repeat sweep is a deliberate no-op) or cannot be recorded (a started
+	// activate row is unreachable through code and has no legal transition;
+	// failing closed means it still must not be closed here).
+	if operationState != activationStateSwitchAuthorized {
+		return true, nil
+	}
+	if err = blockActivationForReconciliation(ctx, tx, inject, jobID, attemptID, operationID, environmentID, activationBlockedByAuthorityEndSummary); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func closeAttemptOrdinary(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, inject func(string) error, jobID, attemptID int64, environmentID string, attemptNumber int, deploymentID string, cancelRequested bool, now time.Time) error {
 	closedState := "expired"
 	if cancelRequested {
 		closedState = "cancelled"
@@ -1273,7 +1350,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	// answer cannot change before this transaction ends.
 	//
 	// The refusal is returned right here, independent of the route-head flag
-	// (the sweeper can strand an operation with the flag clear until step D),
+	// (an operation stranded by the pre-step-D sweeper has the flag clear),
 	// so no deployment write happens and no later check (candidate readiness,
 	// frozen execution read, render) can mask it with a retryable error. The
 	// replay block above has already won for the same attempt.
@@ -1462,6 +1539,12 @@ var ErrAgentLeaseActivationEnvironmentBlocked = errors.New("agent lease activati
 // releaseOperationsOpenActivationIndex is the unique index (migration 000021)
 // enforcing one unresolved activate operation per environment.
 const releaseOperationsOpenActivationIndex = "release_operations_environment_open_activation_idx"
+
+// ErrAgentLeaseActivationUnresolved reports that MarkReconciled was refused
+// because the environment holds an unresolved activate operation (the rule
+// unresolvedActivationSQL). Non-retryable: only a declared activation outcome
+// can resolve it, never clearing a flag.
+var ErrAgentLeaseActivationUnresolved = errors.New("agent lease environment holds an unresolved activation; it cannot be mark-reconciled")
 
 // ErrAgentLeaseActivationRouteMoved reports that the route head no longer
 // matches the route_revision/active_release_id tx1 recorded on the
@@ -2065,7 +2148,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 	// fresh transaction.
 	refuseAmbiguous := func(evidence string, refusal error) error {
 		evidence = sanitizeOutcomeSummary(evidence)
-		if err := r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, op.id, environmentID, evidence); err != nil {
+		if err := blockActivationForReconciliation(ctx, tx, r.inject, jobID, attemptID, op.id, environmentID, evidence); err != nil {
 			return blockUnrecorded(err)
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -2081,7 +2164,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 	}
 
 	if !succeeded {
-		if err = r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, op.id, environmentID, summary); err != nil {
+		if err = blockActivationForReconciliation(ctx, tx, r.inject, jobID, attemptID, op.id, environmentID, summary); err != nil {
 			return blockUnrecorded(err)
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -2216,7 +2299,7 @@ func (r *AgentLeaseRepository) blockAfterFinalizeFailure(ctx context.Context, tx
 		return blockUnrecorded(fmt.Errorf("rollback to savepoint for reconciliation block failed: %w (after %v)", err, cause))
 	}
 	evidence := sanitizeOutcomeSummary("activation finalize failed: " + cause.Error())
-	if err := r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, operationID, environmentID, evidence); err != nil {
+	if err := blockActivationForReconciliation(ctx, tx, r.inject, jobID, attemptID, operationID, environmentID, evidence); err != nil {
 		return blockUnrecorded(fmt.Errorf("record activation reconciliation block after %v: %w", cause, err))
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -2324,12 +2407,12 @@ func (r *AgentLeaseRepository) recordBlockInFreshTransaction(ctx context.Context
 	if opState == "succeeded" {
 		return activationBlockNoopSucceeded, nil
 	}
-	if opState != "switch_authorized" || attemptState != "leased" || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+	if opState != activationStateSwitchAuthorized || attemptState != "leased" || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
 		// Already blocked by a concurrent writer, or the slot moved on:
 		// nothing left for this report to record.
 		return activationBlockNoopOther, nil
 	}
-	if err = r.blockActivationForReconciliation(ctx, tx, jobID, attemptID, operationID, environmentID, evidence); err != nil {
+	if err = blockActivationForReconciliation(ctx, tx, r.inject, jobID, attemptID, operationID, environmentID, evidence); err != nil {
 		return activationBlockNoopOther, blockUnrecorded(err)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -2357,7 +2440,15 @@ func optionalStringForSummary(v *string) string {
 // success. The route head's revision does not move (validate_route_head_update
 // exempts a flag-only update, migration 000020): the desired route state did
 // not change. The caller must hold the slot, job, attempt and operation locks.
-func (r *AgentLeaseRepository) blockActivationForReconciliation(ctx context.Context, tx pgx.Tx, jobID, attemptID, operationID int64, environmentID, summary string) error {
+//
+// It is a free function taking the inject hook so the sweeper paths
+// (closeExpiredOrRevokedAttempt, reached from expireOne and
+// revokeInFlightLeases, neither of which is a method) share the ONE
+// definition of "blocked" with tx2. The operation UPDATE is the transition
+// switch_authorized -> reconciliation_required; an operation already
+// reconciliation_required is NOT handled here (it returns ErrAgentLeaseStale),
+// the sweeper decides that case itself and never calls this for it.
+func blockActivationForReconciliation(ctx context.Context, tx pgx.Tx, inject func(string) error, jobID, attemptID, operationID int64, environmentID, summary string) error {
 	// Lock the route head (position 6b) and read its flag. The operation row
 	// is already locked by the caller, so taking this lock first changes
 	// nothing about lock ORDER; what it does is (1) serialize this block
@@ -2381,14 +2472,14 @@ func (r *AgentLeaseRepository) blockActivationForReconciliation(ctx context.Cont
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return fmt.Errorf("agent lease activation block canonical time: %w", err)
 	}
-	tag, err := tx.Exec(ctx, `UPDATE release_operations SET state='reconciliation_required', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state='switch_authorized'`, operationID, now, summary)
+	tag, err := tx.Exec(ctx, `UPDATE release_operations SET state='reconciliation_required', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state='`+activationStateSwitchAuthorized+`'`, operationID, now, summary)
 	if err != nil {
 		return fmt.Errorf("close activation operation for reconciliation: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
 		return ErrAgentLeaseStale
 	}
-	if err = r.inject("operation_close"); err != nil {
+	if err = inject("operation_close"); err != nil {
 		return err
 	}
 	// Migration 000020 exempts a flag-only update from the revision bump only
@@ -2404,6 +2495,9 @@ func (r *AgentLeaseRepository) blockActivationForReconciliation(ctx context.Cont
 		if tag.RowsAffected() != 1 {
 			return fmt.Errorf("%w: route head for environment %s vanished during activation reconciliation", ErrAgentLeaseCorruptState, environmentID)
 		}
+		if err = inject("route_head_flag"); err != nil {
+			return err
+		}
 	}
 	tag, err = tx.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=$3 WHERE environment_id=$1`, environmentID, attemptID, now)
 	if err != nil {
@@ -2412,13 +2506,13 @@ func (r *AgentLeaseRepository) blockActivationForReconciliation(ctx context.Cont
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("%w: environment slot %s vanished during activation reconciliation", ErrAgentLeaseCorruptState, environmentID)
 	}
-	if err = r.inject("slot_reconcile"); err != nil {
+	if err = inject("slot_reconcile"); err != nil {
 		return err
 	}
 	if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, "activation_reconciliation_required"); err != nil {
 		return err
 	}
-	return r.inject("job_event")
+	return inject("job_event")
 }
 
 // RequestCancellation cancels jobID on behalf of an owner-scoped, live
@@ -2691,6 +2785,19 @@ func (r *AgentLeaseRepository) AcknowledgeCancellation(ctx context.Context, serv
 // anything. It returns the number of attempts actually closed; a candidate
 // that a concurrent renewal, completion, or another sweeper run already
 // resolved is silently skipped, not counted, and not an error.
+//
+// Discovery excludes an attempt whose diversion would be a NO-OP: it holds an
+// unresolved activate operation (unresolvedActivationSQL) whose state is not
+// the block routine's source state (activationStateSwitchAuthorized), exactly
+// the case divertUnresolvedActivation returns from without writing. Such an
+// attempt stays leased with a lapsed deadline by design (see
+// closeExpiredOrRevokedAttempt), so without the exclusion it would match every
+// tick, sort first by its old authority_expires_at, and fill the LIMIT,
+// starving every other expired lease. The exclusion is derived from the same
+// two facts the diversion tests, never from a proxy such as closed_at (which
+// disagrees for a started operation and any future open state). An unresolved
+// operation still in the source state IS discovered: that is the sweep that
+// records the block.
 func (r *AgentLeaseRepository) ExpireBatch(ctx context.Context, limit int) (int, error) {
 	if r == nil || r.pool == nil || limit <= 0 {
 		return 0, nil
@@ -2699,7 +2806,9 @@ func (r *AgentLeaseRepository) ExpireBatch(ctx context.Context, limit int) (int,
 		limit = expireBatchMaxLimit
 	}
 
-	rows, err := r.pool.Query(ctx, `SELECT id FROM agent_job_attempts WHERE state='leased' AND authority_expires_at <= clock_timestamp() ORDER BY authority_expires_at, id LIMIT $1`, limit)
+	rows, err := r.pool.Query(ctx, `SELECT id FROM agent_job_attempts a WHERE a.state='leased' AND a.authority_expires_at <= clock_timestamp()
+		AND NOT EXISTS (SELECT 1 FROM release_operations WHERE attempt_id=a.id AND environment_id=a.environment_id AND `+unresolvedActivationSQL+` AND state <> '`+activationStateSwitchAuthorized+`')
+		ORDER BY a.authority_expires_at, a.id LIMIT $1`, limit)
 	if err != nil {
 		return 0, fmt.Errorf("discover expired agent job attempts: %w", err)
 	}
@@ -2793,13 +2902,15 @@ func (r *AgentLeaseRepository) expireOne(ctx context.Context, attemptID int64) (
 	}
 
 	cancelRequested := jobCancelRequestedAt != nil
-	if err = closeExpiredOrRevokedAttempt(ctx, tx, r.deployments, r.inject, jobID, attemptID, environmentID, attemptNumber, deploymentID, cancelRequested, now); err != nil {
+	diverted, err := closeExpiredOrRevokedAttempt(ctx, tx, r.deployments, r.inject, jobID, attemptID, environmentID, attemptNumber, deploymentID, cancelRequested, now)
+	if err != nil {
 		return false, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit agent lease expiry: %w", err)
 	}
-	return true, nil
+	// A diverted attempt was recorded (or already recorded), not closed.
+	return !diverted, nil
 }
 
 // Reconcile clears environmentID's reconciliation flag once the owning
@@ -2984,6 +3095,30 @@ func (r *AgentLeaseRepository) MarkReconciled(ctx context.Context, principal aut
 		return ErrServerAuthorizationDenied
 	}
 
+	// An activation-caused block is resolved by a DECLARED OUTCOME (step G:
+	// activated / not_activated), never by clearing a flag. The rule is "an
+	// unresolved activate operation exists for this environment" (the same
+	// rule that gates Activate), not "the pending attempt is leased": the
+	// operation is the durable fact that live traffic may have switched, while
+	// attempt state is a consequence that step G may change. Without this
+	// refusal the sweeper's diversion (which leaves the attempt leased and the
+	// slot occupied) would be cleared here into an INVISIBLE wedge: the sweeper
+	// excludes the attempt, ListReconcilingEnvironments stops listing it and
+	// Claim skips the occupied slot. Checked after the ownership check so a
+	// foreign owner still gets the generic denial, and under the slot lock
+	// (ADR order; operation writers hold it too).
+	// CONSEQUENCE: between step D and step G an activation-caused block has NO
+	// resolution path. That is deliberate (refuse loudly rather than
+	// half-clear); both feature gates are false so no real environment is
+	// affected.
+	var unresolved bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE environment_id=$1 AND `+unresolvedActivationSQL+`)`, environmentID).Scan(&unresolved); err != nil {
+		return fmt.Errorf("check unresolved activation for mark-reconciled: %w", err)
+	}
+	if unresolved {
+		return ErrAgentLeaseActivationUnresolved
+	}
+
 	var now time.Time
 	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return fmt.Errorf("environment mark-reconciled canonical time: %w", err)
@@ -3076,7 +3211,7 @@ func revokeInFlightLeases(ctx context.Context, tx pgx.Tx, deployments *Deploymen
 			continue
 		}
 		cancelRequested := jobCancelRequestedAt != nil
-		if err = closeExpiredOrRevokedAttempt(ctx, tx, deployments, inject, c.jobID, c.attemptID, c.environmentID, attemptNumber, deploymentID, cancelRequested, now); err != nil {
+		if _, err = closeExpiredOrRevokedAttempt(ctx, tx, deployments, inject, c.jobID, c.attemptID, c.environmentID, attemptNumber, deploymentID, cancelRequested, now); err != nil {
 			return err
 		}
 	}

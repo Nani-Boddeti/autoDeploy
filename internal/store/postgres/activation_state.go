@@ -9,6 +9,20 @@ const (
 	activationStateFailed    = "failed"
 )
 
+// activationStateSwitchAuthorized is the SOURCE state of the block routine's
+// transition (switch_authorized -> reconciliation_required, see
+// blockActivationForReconciliation). Naming a single open state is correct
+// HERE, and only here, because it is a transition's source state, not a
+// stand-in for "unresolved" (that rule is unresolvedActivationSQL and stays
+// terminal-based). Every place that asks "can the block be recorded from this
+// state?" must use this constant: the block UPDATE's WHERE, the sweeper
+// diversion's no-op branch, recordBlockInFreshTransaction's guard, and
+// ExpireBatch's discovery exclusion (which excludes an unresolved operation
+// whose state is NOT this one, i.e. exactly "the diversion would be a
+// no-op"). It must stay in step with the block routine's UPDATE: if that
+// UPDATE ever accepts another source state, this changes with it.
+const activationStateSwitchAuthorized = "switch_authorized"
+
 // activationTerminalStates is the single definition of "resolved".
 var activationTerminalStates = []string{activationStateSucceeded, activationStateFailed}
 

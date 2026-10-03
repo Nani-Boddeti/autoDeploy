@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -379,6 +380,15 @@ func TestEnvironmentsMarkReconciledRoute(t *testing.T) {
 	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "reason": {"r"}}, p, h))
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("denied mark-reconciled = %d", rr.Code)
+	}
+
+	// An unresolved activation is refused with a distinct, non-retryable 409
+	// (not the generic 400, never a retryable 5xx), also when wrapped.
+	admin.markErr = fmt.Errorf("mark: %w", postgres.ErrAgentLeaseActivationUnresolved)
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "reason": {"r"}}, p, h))
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "unresolved activation") {
+		t.Fatalf("unresolved-activation mark-reconciled = %d body=%q, want 409", rr.Code, rr.Body.String())
 	}
 
 	// A malformed environment_id is rejected before the repository call.

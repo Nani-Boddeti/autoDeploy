@@ -3541,3 +3541,86 @@ step D touches `Activate` again, and the whole area is behind `activationEnabled
 files have NO git recovery path, and "I rebuilt it and it passes" is not evidence that what it previously
 asserted survived. The orchestrator read it rather than trusting the report; it was faithful and in fact
 stronger than described (it asserts the wire code, not merely the 409).
+
+#### 10c-2b step D committed: sweeper diversion (2026-10-04)
+
+**This is the step that closes the hazard the whole slice is about.** The sweeper no longer destroys the
+record of a traffic switch that may already have happened. `closeExpiredOrRevokedAttempt` now diverts when an
+unresolved activate operation exists: it records the reconciliation block and leaves the attempt `leased`, the
+slot occupied with the fence unchanged, the job leased and the deployment `activating`. Reused the shipped
+`blockActivationForReconciliation` (now a free function taking `inject`) rather than hand-rolling the writes.
+Review verdict: PASS on production logic — lock order, idempotence, over-reach and post-state all correct.
+
+**The approved plan was wrong and the step fixed it.** Item 2 specified diverting on `switch_authorized`;
+after the first sweep the operation is `reconciliation_required` and the attempt is still leased, so the
+SECOND sweep would have run the ordinary close path and reintroduced the bug. Mutation proof:
+`repeat expireOne #1 = (true, <nil>), want (false, nil)`. **Fourth appearance of the instance-naming defect
+in slice 10, and the first caught before shipping.**
+
+**A proxy replaced by a construction.** The discovery exclusion (which stops diverted attempts starving
+`ExpireBatch`'s LIMIT) first keyed on `closed_at IS NOT NULL` as a stand-in for "already recorded". Via
+`check1` that means "not in either open state" — i.e. it enumerated the open states INDIRECTLY, exactly what
+`activation_state.go` exists to prevent, in disguise. It also livelocked: a `started` activate row has
+`closed_at IS NULL`, so it was never excluded, was re-discovered every tick, diverted with no writes, and
+permanently held a discovery slot — `min(limit,100)` such rows starve a batch completely (only 2 at the
+starvation test's own `limit=2`), plus `FOR UPDATE` lock churn on four tables every tick. Now keyed on the
+block routine's transition-SOURCE state via one shared constant (`activationStateSwitchAuthorized`) used by
+all four sites that previously hard-coded the literal. The exclusion now equals "the diversion would be a
+no-op" BY CONSTRUCTION, and the livelock is gone by construction rather than patched. Mutation proof:
+reverting gives `plain expired lease state=leased after one tick, want expired: started activations starve
+the batch`.
+**The distinction that resolves this, now established twice:** naming a single state is legitimate when it is
+a TRANSITION'S SOURCE state; illegitimate when it stands in for "unresolved". (Step B established it;
+step D's exclusion is the second application.)
+
+**A regression step D introduced, contained in step D.** Before D, the legacy close freed the slot and
+`Activate` refused loudly. After D the diversion leaves the slot OCCUPIED by a still-`leased` attempt, so if
+`MarkReconciled` cleared only the slot flag the sweeper would exclude that attempt forever,
+`ListReconcilingEnvironments` would stop listing it and `Claim` would skip it — **the wedge becomes
+INVISIBLE**. `MarkReconciled` now refuses with the typed `ErrAgentLeaseActivationUnresolved` while an
+unresolved activate operation exists for the environment, keyed on the durable fact (traffic may have
+switched) rather than on the attempt being `leased`, which step G will change. Correct semantics, not just a
+guard: an activation-caused block must be resolved by a DECLARED OUTCOME, never by clearing a flag. The admin
+path does not use the agent `mapError`; it goes through `environmentsMarkReconciled` in `internal/web/web.go`,
+where every error used to be a bare 400 — now 409 for this one.
+**Honest consequence, stated in a comment:** between step D and step G an activation-caused block has NO
+resolution path at all. Refusing loudly beats half-clearing into an invisible wedge, and both gates are false.
+
+**First test in this slice that discriminates WHICH lock serializes.**
+`TestSweeperDiversionWaitsForOperationHoldingTheSlot` holds the operation row and probes the slot with NOWAIT
+from a third connection, expecting 55P03 — proving the slot lock is HELD WHILE waiting on the operation. Three
+earlier reviews flagged that every concurrency test here could show only that *some* lock was requested.
+Caveat recorded: `TestSweeperDiversionTakesSlotLockFirst` re-verifies the CALLERS' SKIP LOCKED vs blocking
+behaviour (the diversion takes no slot lock itself), so its comment was corrected; nothing proves the
+operation is locked before the route head (low value — the slot serializes every writer).
+
+**Vacuous-assertion shape, third appearance: two mechanisms both keep the attempt open.** The diversion AND
+the discovery exclusion each suffice, so three "the sweeper diverts" assertions passed with the diversion
+DELETED (they only checked `state=='leased'`, which the exclusion guarantees). Two were made discriminating by
+calling `expireOne` directly (bypassing discovery). The third — the HTTP test — exercises the real batch path,
+so contorting it would have distorted what it tests; its comment and failure message were corrected to say
+"left leased by the batch sweep" instead. **An accurate claim about weaker coverage beats a test bent into
+proving something it structurally cannot.**
+
+A deviation from the orchestrator's instruction that was better than the instruction: asked to add
+`route_heads` to the HTTP fixture cleanup, the implementer found that fixture deliberately never resets shared
+tables and that `route_heads` carries a no-delete trigger — so it gave the test a unique hostname instead.
+
+**HARD PREREQUISITES FOR STEP G** (both confirmed against the source by the orchestrator):
+1. **G must close the attempt in the SAME transaction as the resolution.** The moment G moves the operation to
+   `succeeded`/`failed` while the attempt is still `leased`, the discovery exclusion stops applying and the
+   sweeper runs the ORDINARY close — fence advance, slot flag, job retry — on an attempt G just resolved.
+2. **G must add an explicit unresolved-activation check to `Reconcile` AS it adds the leased-attempt branch.**
+   `Reconcile` is protected today only INCIDENTALLY: its guard refuses when
+   `attemptState == "leased" || closedAt == nil`, which is exactly a diverted attempt's shape — but it answers
+   the generic `ErrServerAuthorizationDenied`, not a typed error. The approved plan has G add a branch for
+   precisely that shape, which REMOVES the incidental protection and reopens the invisible wedge through the
+   agent door that step D just closed on the admin door.
+3. A revoked server can never authenticate, so no agent `Reconcile` can resolve its diverted attempt — G's
+   path must be operator-only for that case.
+
+**Open/recorded, not fixed:** a `started` activate row still has no programmatic resolution path (pre-existing;
+the livelock is fixed but the row remains unresolvable); untested paths are a missing route head under the
+sweeper, and a pre-flagged head with a `switch_authorized` operation; `ExpireBatch` returns on the first
+`expireOne` error so one persistently failing candidate stalls the batch (pre-existing, but the diversion adds
+new error sources); the `operation_lock` hook name is shared with tx2's (disjoint code paths, commented).
