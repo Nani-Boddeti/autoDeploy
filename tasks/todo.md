@@ -3317,3 +3317,83 @@ contention all remain untested. These are recorded rather than closed because 10
 `activationBlockNoopOther` window, and the fact that nothing clears a block cleanly today), and 10d must add
 a **persistent** retry for the result report — the client really retries 5 times over ~3s, so "503 retried
 forever" is false today and the sweeper gap bounds every retryable bucket by authority expiry.
+
+## Step 10c-2b — design pass reviewed, plan amended, owner-approved 2026-10-03
+
+Design pass ran first (no code), per the rule that a risky step gets a reviewed design before implementation.
+Full document `.tmp/10c-2b-design.md`, proposed SQL `.tmp/10c-2b-000021-proposed.sql` (both gitignored).
+It materially changed the previously approved plan, so the amended plan was re-approved by the owner.
+
+**What the design found that the approved plan did not:**
+
+1. **A fourth schema wall.** Item 3 (record a late report as evidence) needs
+   `reconciliation_required -> reconciliation_required`, refused today. The migration is **000021**, not 000020.
+2. **A real hole, proven by experiment, not argued.** The "one open activation per environment" unique index is
+   partial on `state='switch_authorized'` ONLY:
+   `release_operations_environment_open_activation_idx ON release_operations(environment_id) WHERE kind='activate' AND state='switch_authorized'`.
+   With a second occupant forced, slot flagged and route head unflagged, **`Activate` succeeded and inserted a
+   second operation** — only `Claim` incidentally refuses, and `Activate` never reads the slot flag. So the index
+   and the slot flag guard two DIFFERENT windows. Owner approved recreating it as a rule:
+   `WHERE kind='activate' AND state NOT IN ('succeeded','failed')`. Consequence accepted: an unresolved
+   activation hard-wedges new activations for that environment until an operator resolves it, with item 1's
+   typed 409 explaining why.
+3. **The approved plan carried the instance-naming bug itself (D1).** Item 2's diversion keyed on
+   `switch_authorized`, so the SECOND sweep sees `reconciliation_required` and runs the ordinary close path —
+   reintroducing the exact hazard 10c-2a spent four rounds closing. The same instance-naming is in three
+   **shipped** 10c-2a sites: `Complete`, `recordBlockInFreshTransaction`'s `opState != 'switch_authorized'`, and
+   tx2's `switch op.state`. Rule: divert on any activate op with `state NOT IN ('succeeded','failed')`, via one
+   shared predicate (step B). Third occurrence of this spec-defect class in slice 10.
+4. **Nothing in the codebase ever clears `route_heads.reconciliation_required`** (D6), so `activated` must clear
+   it or every later `Activate` dies at the route-head flag check — a second silent wedge.
+5. `transitionDeployment` locks the deployment row only when it SAVES, so it must be called before the
+   route-head lock in `not_activated`.
+6. D1b: diverted attempts match `ExpireBatch`'s discovery query every tick, sort first, and can starve the
+   100-row LIMIT — exclude `reconciliation_required` ops from discovery.
+
+**Orchestrator decisions:**
+
+- **U1 attempt shape on `not_activated` = `expired`, and this is SCHEMA-FORCED, not a preference.**
+  `agent_job_attempts_check3` requires `state='failed'` to carry BOTH `result_operation_id` and `result_digest`.
+  In the stranded case no agent report ever arrived, so there is no digest — attempt-`failed` would mean
+  fabricating evidence. `expired` requires all three NULL and fits exactly. (My own first instinct was `failed`;
+  the schema overruled it.)
+- **`closed_at` preserved** via `COALESCE(closed_at, $now)` and immutable once set: it records when the
+  ambiguity was recorded, which is forensic. Resolution time lives on the attempt row, the job events and the
+  audit row.
+- **U2: an operator-declared `activated` does NOT require a matching route digest** (owner-approved). Requiring
+  one makes the path unusable in exactly the case it exists for — a stranded activation where no report ever
+  arrived. Any digest that does exist is recorded as evidence. ADR 0005 forbids blind resolution by the SYSTEM,
+  not operator-declared resolution.
+- **U3: the candidate release stays `ready` on `not_activated`.** The artifact is valid; only the activation
+  failed, so it stays redeployable without a rebuild. Precedent: `Complete` never touches releases.
+- **U4: the audit outcome goes in the structured reason**, not new `server_audit_events_action_check` literals —
+  the action is still "mark reconciled" and the outcome is its parameter. No migration needed for it.
+- **Branch C ("attempt closed but operation unresolved") is REFUSED with a typed error in both paths.** That
+  shape is only creatable by today's buggy sweeper, which step D fixes, and nothing has ever executed, so there
+  are no legacy rows. Recourse if it ever appears is owner SQL, consistent with the existing spurious-block note.
+- Migration review by the orchestrator before dispatch: the proposed identity block and non-activate branch are
+  **byte-identical to the live `prosrc`**; `succeeded`/`failed`/`started` still raise via the ELSE branch; and
+  `closed_at` immutability is consistent with `release_operations_check1` on every transition. Two amendments
+  issued: the new branch's error message must state the permitted set accurately (it omitted that `rr -> rr` is
+  allowed), and the index recreation must note that it FAILS if an environment already holds two unresolved
+  activate operations — intended, since it surfaces corruption rather than hiding it.
+
+**Also corrected a recorded claim.** `tasks/todo.md` and the project memory said "`failed` is not even a legal
+state for an `activate` operation". `release_operations_state_check` permits `failed` for EVERY kind; the
+exclusion lives in the trigger's `NEW.state` list. Right conclusion, wrong mechanism — the error class that
+sends the next reader to the wrong place.
+
+**Steps, one subagent each, independent review between them (owner chose the full sequence):**
+A migration 000021 + test (must land first) -> B shared unresolved-op predicate + block-routine refactor, no
+behaviour change -> C item 1 typed 23505 refusal -> D item 2 sweeper diversion + discovery exclusion -> E item 3
+late report -> F finalize-helper parameterization -> G `Reconcile`/`MarkReconciled` resolution, both outcomes,
+with real contention tests -> H item 5 HTTP/admin/form wiring -> I docs (orchestrator). A, F and G need the
+migration in place.
+
+Known stale references in the pre-existing plan text, corrected by the design pass: the `Activate` INSERT is at
+`agent_lease_repository.go:1360-1367` (not :1318), and `Reconcile`'s denial of a still-leased attempt is at
+`:2769` (not :1747).
+
+**Pre-existing risk recorded, not fixed here:** `AssignRouteHostname` ignores the reconciliation flag entirely,
+so it can move the hostname or revision while an activation is open, which then makes `activated` fail with
+route_moved.
