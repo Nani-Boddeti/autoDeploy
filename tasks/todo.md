@@ -3397,3 +3397,79 @@ Known stale references in the pre-existing plan text, corrected by the design pa
 **Pre-existing risk recorded, not fixed here:** `AssignRouteHostname` ignores the reconciliation flag entirely,
 so it can move the hostname or revision while an activation is open, which then makes `activated` fail with
 route_moved.
+
+#### 10c-2b step A committed (1354760); step B reviewed, PASS, fix round in flight (2026-10-03)
+
+**Step A** committed after one fix round that closed four mutation holes (any of which would have let a
+production rule be deleted with every test green): the `id` identity clause — `UPDATE ... SET id=DEFAULT`
+DOES reach the trigger, unlike `SET id=<value>`, which the orchestrator initially got wrong and corrected;
+the index's rule-versus-enumeration claim (the mutation `state IN ('switch_authorized','reconciliation_required')`
+— the exact enumeration the comment says was rejected — passed every test until a `started` collision case
+was added); and two weakenings of the `closed_at` comparison (`<>` and `>` for `IS DISTINCT FROM`). Also
+fixed an impossible documented remedy: the SQL told an operator to resolve duplicates "by hand and re-run",
+but the pre-000021 trigger forbids exactly that UPDATE — it now gives the DISABLE TRIGGER path and a
+detection query. Full bar green incl. 6 sweeps, 9 concurrency tests at `-race -count=20`, Linux
+amd64/arm64 cross-builds.
+
+**Step B** introduced `internal/store/postgres/activation_state.go`: `activationTerminalStates =
+{succeeded, failed}` defined ONCE, `unresolvedActivation(state)` derived by negation, and
+`unresolvedActivationSQL` **generated from the same Go slice** so the two forms cannot drift. Deriving from
+terminal states (rather than listing open ones) is what makes a future state unresolved by default — it
+fails closed. Matches 000021's index predicate.
+
+**Accurate bookkeeping:** exactly ONE production site uses the predicate (`Complete`'s guard, `:976`).
+`finalizeActivationSucceeded` was PARAMETERIZED (`WHERE id=$1 AND state=$4` via a new `fromState`), not
+routed. An earlier report said "2 of 5 routed"; that was loose.
+
+**Step B's most useful output was a REFUSAL.** Three of the five sites the orchestrator named must NOT use
+the predicate, and the design doc was wrong to say otherwise. They are a different KIND of state test:
+- `Activate`'s replay (`:1209`) tests whether the AUTHORIZATION is live. With the predicate a
+  `reconciliation_required` row would take the replay branch and hand the agent a success-shaped "you may
+  switch" response for a blocked environment — the opposite of the rule. -> step C's typed refusal.
+- tx2's `switch op.state` (`:1918-1950`) is a DISPATCH over specific states.
+- `recordBlockInFreshTransaction` (`:2246`) guards the SOURCE state of the `switch_authorized ->
+  reconciliation_required` transition; with the predicate a `reconciliation_required` row would reach an
+  UPDATE whose `WHERE state='switch_authorized'` matches nothing, return `ErrAgentLeaseStale`, get wrapped
+  by `blockUnrecorded` into a RETRYABLE error, and the agent would retry forever on a block that already
+  exists.
+**Lesson: "is this operation unresolved?" and "is this operation in the source state this transition
+requires?" are different questions.** The orchestrator's own brief conflated them by listing five sites as
+instances of one rule — the enumeration defect recurring one level up, in the instructions this time.
+
+**Real behaviour change, stated precisely:** `Complete`'s guard now also covers `started`.
+`validate_release_operation_insert` does NOT constrain `state` (introspected), so a `started` activate row is
+insertable by direct SQL, though `Activate` only ever inserts `switch_authorized`. Blocking `Complete` on it
+is the fail-safe reading (`check1` ties `started` to `closed_at IS NULL`, so it genuinely is unresolved) and
+it is unreachable through code.
+
+**MUST FIX BEFORE / DURING THE NAMED LATER STEPS** (from the step B review):
+1. **tx2 needs an explicit `failed` case** (step E). After 000021 makes `reconciliation_required -> failed`
+   legal, an operator declaring `not_activated` means a late or retried agent report falls to tx2's
+   `default` and returns `ErrAgentLeaseCorruptState` — mislabelling an operator-resolved state as
+   corruption, non-retryably, so the agent stops on a misleading error.
+2. **Typed refusal in `Activate`** for an existing unresolved-but-not-authorized row (step C). Today the
+   caller gets a generic `ErrAgentLeaseStale`, and a stranded row surfaces as a raw 23505 at `:1363`.
+3. **`MarkReconciled` (`:2872`) clears `environment_slots.reconciliation_required` with NO check that an
+   unresolved activate operation exists** — an admin can clear the slot flag while the operation stays
+   unresolved and the route-head flag stays set, desynchronizing the two. `Reconcile` (`:2740`) is only
+   INCIDENTALLY protected by its `attemptState == "leased"` denial. Decide explicitly in step G; defence in
+   depth is to refuse when `EXISTS(... unresolvedActivationSQL)`.
+4. **A `started` activate row has NO resolution path after 000021** — the update trigger rejects every
+   transition out of it ("is closed"), and the widened index blocks all further activations for that
+   environment. The only exit is the manual trigger-disable surgery 000021 documents. An honest cost of the
+   orchestrator-approved index widening. Either constrain activate rows to insert as `switch_authorized`, or
+   give the resolver a path. Unreachable via code today.
+5. **`RequestCancellation` (`:2449`) uses `deploymentStatus == activating` as a PROXY** for an in-flight
+   activation, consistent only because tx2 leaves the deployment `activating`. Re-review when step G moves
+   the deployment. `Activate`'s route-head flag check (`:1266`) is the same kind of proxy.
+6. `closeExpiredOrRevokedAttempt` (comment `:759`, called from `expireOne` `:2715` and `revokeInFlightLeases`
+   `:2998`) is the single choke point for step D's diversion; it should use `unresolvedActivationSQL` and
+   take the operation lock after the attempt lock, which fits the shipped order.
+
+**Drift gap being closed in the step B fix round:** 000021's index predicate is hand-written SQL with nothing
+tying it to the Go slice, and the agreement test is largely tautological for state membership because both
+forms derive from the same slice (its real value is catching fragment-shape bugs like `IN` vs `NOT IN`, plus a
+state-count tripwire). A test reading the index predicate from `pg_get_expr` and agreeing it with the Go
+fragment per state closes the more important half. Also in that round: parenthesize the fragment (it
+misbinds after `OR `), validate `fromState` (empty silently matches no row -> misleading Stale), and fix the
+comments at `:759`/`:1395` that still name one state where the rule is meant.

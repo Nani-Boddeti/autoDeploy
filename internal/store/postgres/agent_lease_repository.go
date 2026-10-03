@@ -757,8 +757,8 @@ func validOperationID(id string) bool {
 }
 
 // KNOWN GAP, deliberately deferred to Step 10c-2b: this function (reached
-// from expireOne and revokeInFlightLeases) still closes an attempt that has a
-// switch_authorized/reconciliation_required activation operation open, which
+// from expireOne and revokeInFlightLeases) still closes an attempt that has an
+// unresolved activation operation (see unresolvedActivation), which
 // ADR 0005 forbids ("an in-flight syscall cannot be preempted"). 10c-2b adds
 // the diversion; do not treat its absence as an oversight.
 // closeExpiredOrRevokedAttempt closes a leased attempt whose authority has
@@ -973,7 +973,7 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 	// arrives after a successful tx2 never reaches this point -- the attempt
 	// is then closed and takes the replay-or-conflict branch above.
 	var activationOpen bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND kind='activate' AND state IN ('switch_authorized','reconciliation_required'))`, attemptID, fence).Scan(&activationOpen); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND `+unresolvedActivationSQL+`)`, attemptID, fence).Scan(&activationOpen); err != nil {
 		return fmt.Errorf("check open activation for complete: %w", err)
 	}
 	if activationOpen {
@@ -1393,7 +1393,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 }
 
 // ErrAgentLeaseActivationOpen reports a Complete call refused because a
-// switch_authorized activation operation is still open for the attempt/fence:
+// unresolved activation operation exists for the attempt/fence:
 // only ReportActivationResult (tx2) may close that attempt, free its slot
 // and close its job, since the host switch may already be in flight (ADR
 // 0005 "An in-flight syscall cannot be preempted").
@@ -1452,6 +1452,24 @@ type activationFinalizeInput struct {
 	resultDigest [32]byte
 	summary      string
 	now          time.Time
+	// fromState is the operation state the success close requires (the
+	// UPDATE's WHERE state=$). Today's caller passes switch_authorized; the
+	// operator-declared "activated" resolution passes reconciliation_required.
+	// Anything else is a programming error (validateFinalizeFromState).
+	fromState string
+}
+
+// validateFinalizeFromState rejects a fromState that could never match a row
+// the success close is allowed to start from. Without it a zero value would
+// match no row and surface as ErrAgentLeaseStale, which tx2 treats as
+// non-transient and would turn a genuine success report into a
+// reconciliation block.
+func validateFinalizeFromState(fromState string) error {
+	switch fromState {
+	case "switch_authorized", "reconciliation_required":
+		return nil
+	}
+	return fmt.Errorf("finalizeActivationSucceeded: programming error: fromState %q must be switch_authorized or reconciliation_required", fromState)
 }
 
 // finalizeActivationSucceeded is the activation success write sequence, ADR
@@ -1459,12 +1477,15 @@ type activationFinalizeInput struct {
 // transitionDeployment) -> route head (6b) -> release rows by id ascending,
 // then the writes. The caller must already hold the credential (SHARE),
 // environment slot, job and attempt locks and have verified the operation is
-// switch_authorized for this attempt/fence. Because it IS the completion
+// in in.fromState for this attempt/fence. Because it IS the completion
 // transaction for a successful activation (ADR 0004 "Transaction
 // boundaries": completion, slot release, deployment transition and events
 // commit atomically), it also closes the attempt, frees the slot and closes
 // the job; Complete is never called afterwards. It does not commit.
 func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, tx pgx.Tx, in activationFinalizeInput) error {
+	if err := validateFinalizeFromState(in.fromState); err != nil {
+		return err
+	}
 	if err := transitionDeployment(ctx, tx, r.deployments, in.deploymentID, deployment.StatusHealthy, in.now, r.inject); err != nil {
 		return err
 	}
@@ -1553,7 +1574,7 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 		return err
 	}
 
-	tag, err = tx.Exec(ctx, `UPDATE release_operations SET state='succeeded', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state='switch_authorized'`, in.operationID, in.now, in.summary)
+	tag, err = tx.Exec(ctx, `UPDATE release_operations SET state='succeeded', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state=$4`, in.operationID, in.now, in.summary, in.fromState)
 	if err != nil {
 		return fmt.Errorf("close activation operation: %w", err)
 	}
@@ -2096,6 +2117,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		resultDigest:            observedRouteDigest,
 		summary:                 "activated route_digest=sha256:" + hex.EncodeToString(observedRouteDigest[:]),
 		now:                     now,
+		fromState:               "switch_authorized",
 	}); err != nil {
 		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, err)
 	}
