@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"testing"
 
@@ -163,3 +164,30 @@ func TestHandleActivateRequestShapes(t *testing.T) {
 // (unlike internal/store/postgres's own test-only digest()), so this file
 // defines its own.
 func digestFixture(b byte) [32]byte { var d [32]byte; d[0] = b; return d }
+
+// TestHandleActivateEnvironmentBlockedIsNonRetryable pins the wire contract
+// for an environment holding an unresolved activation: 409 with the dedicated
+// code, never the retryable 503 service_unavailable the agent client retries
+// (a raw 23505 used to fall through to that default). The wrapped case proves
+// errors.Is matching, not identity.
+func TestHandleActivateEnvironmentBlockedIsNonRetryable(t *testing.T) {
+	tok, _ := server.NewCredentialToken(rand.Reader)
+	body, _ := json.Marshal(activateRequest{AttemptID: 1, Fence: 1, ImageDigest: hexDigest(digestFixture(1))})
+	for name, err := range map[string]error{
+		"bare":    postgres.ErrAgentLeaseActivationEnvironmentBlocked,
+		"wrapped": fmt.Errorf("activate: %w", postgres.ErrAgentLeaseActivationEnvironmentBlocked),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := Handler{Activator: &fakeActivator{err: err}}
+			w := do(h, newRequestTLS(newRequest(t, pathActivate, string(body), bearerPrefix+string(tok), "server_1")))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status=%d, want %d", w.Code, http.StatusConflict)
+			}
+			var got errorBody
+			decodeBody(t, w, &got)
+			if got.Error != "environment_activation_blocked" {
+				t.Fatalf("code=%q, want environment_activation_blocked", got.Error)
+			}
+		})
+	}
+}

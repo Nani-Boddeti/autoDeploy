@@ -349,6 +349,12 @@ func (h Handler) mapError(w http.ResponseWriter, err error) {
 		// service_unavailable (the client maps any non-stale_lease 409 to
 		// the non-retryable ErrIntegrityConflict).
 		h.writeError(w, http.StatusConflict, "activation_open")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationEnvironmentBlocked):
+		// 409, not 503: the environment holds an unresolved activation that
+		// only an operator can resolve; retrying can never help. Distinct
+		// from activation_open (Complete refused) and from stale_lease (the
+		// client maps any other 409 to the non-retryable ErrIntegrityConflict).
+		h.writeError(w, http.StatusConflict, "environment_activation_blocked")
 	case errors.Is(err, postgres.ErrAgentLeaseActivationRouteMoved):
 		// 409: the route head no longer matches what the operation
 		// recorded; a retry of the same report will see the same mismatch.

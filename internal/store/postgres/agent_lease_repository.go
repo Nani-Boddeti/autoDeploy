@@ -756,16 +756,19 @@ func validOperationID(id string) bool {
 	return n >= 1 && n <= 128
 }
 
-// KNOWN GAP, deliberately deferred to Step 10c-2b: this function (reached
-// from expireOne and revokeInFlightLeases) still closes an attempt that has an
-// unresolved activation operation (see unresolvedActivation), which
-// ADR 0005 forbids ("an in-flight syscall cannot be preempted"). 10c-2b adds
-// the diversion; do not treat its absence as an oversight.
 // closeExpiredOrRevokedAttempt closes a leased attempt whose authority has
 // ended for a reason the agent never reported: it either authority-expired
 // (the sweeper/expireOne) or its server's credential/identity was just
 // revoked (ADR 0004's revocation paragraph, called from
-// revokeInFlightLeases). Both cases get identical effects: the attempt
+// revokeInFlightLeases).
+//
+// KNOWN GAP, deliberately deferred to Step 10c-2b (step D): this function
+// (reached from expireOne and revokeInFlightLeases) still closes an attempt
+// that has an unresolved activation operation (see unresolvedActivation),
+// which ADR 0005 forbids ("an in-flight syscall cannot be preempted"). 10c-2b
+// adds the diversion; do not treat its absence as an oversight.
+//
+// Both cases get identical effects: the attempt
 // closes as cancelled (if the job's cancellation was already requested) or
 // expired; the environment fence advances and the slot is marked
 // reconciliation_required with its occupant cleared (an already-executing
@@ -1095,6 +1098,15 @@ var ErrAgentLeaseActivationNoRouteHead = errors.New("agent lease activation envi
 // route head (UPDATE, new position 6b) -> candidate release (UPDATE) ->
 // append-only inserts (release_operations, agent_job_events).
 //
+// Environment-scoped refusal: after the attempt-scoped replay check, one
+// non-locking read asks whether ANY attempt of this environment holds an
+// unresolved activate operation. If so Activate returns the typed,
+// non-retryable ErrAgentLeaseActivationEnvironmentBlocked immediately,
+// before any deployment write and independent of the route-head flag; the
+// INSERT's unique-index violation is a second, defence-in-depth enforcement
+// point. A route-head flag set with NO unresolved operation stays
+// ErrAgentLeaseStale.
+//
 // Idempotency: two concurrent /activate calls for the same attempt/fence
 // necessarily name the same environment (an attempt belongs to exactly one
 // environment_slots row for its whole lifetime), so the earliest lock both
@@ -1172,12 +1184,12 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	}
 
 	// Every ADR 0005 recheck this endpoint owns, mirroring Complete's own
-	// combined fence/slot/authority check exactly (line ~937 of this file):
+	// combined fence/slot/authority check exactly (see Complete's combined check):
 	// attempt must still be the leased, currently-occupying attempt for this
 	// fence, with unexpired authority, and no cancellation must have been
 	// requested against its job. Unlike Complete there is no "attempt already
 	// closed" replay branch here at all: tx1 never closes the attempt (only
-	// Complete-on-failure or the not-yet-implemented tx2 do), so an attempt
+	// Complete-on-failure or tx2 do), so an attempt
 	// that is not 'leased' when Activate reaches it is simply stale.
 	if attemptState != "leased" || attemptFence != fence || slotFence != fence ||
 		slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID || !authorityExpiresAt.After(now) {
@@ -1206,9 +1218,21 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		return queue.ActivationResult{}, fmt.Errorf("check existing activation operation: %w", err)
 	}
 	if err == nil {
+		// Three cases, in this order. Authorization liveness ("may this call
+		// still be handed the switch?") and "is this activation unresolved?"
+		// are different questions: only switch_authorized may replay a full
+		// authorization, so it is tested first and by name.
 		if existingState != "switch_authorized" {
-			// Already resolved by a (not-yet-implemented in this slice) tx2,
-			// or otherwise closed: this call is stale, not a live replay.
+			if unresolvedActivation(existingState) {
+				// Unresolved but no longer authorized (reconciliation_required):
+				// the host may already have switched. Never answer with a
+				// success-shaped authorization, and a bare stale error would
+				// tell the agent nothing true.
+				return queue.ActivationResult{}, ErrAgentLeaseActivationEnvironmentBlocked
+			}
+			// Resolved (tx2 produces succeeded; failed comes only from the
+			// operator), or otherwise closed: this call is stale, not a live
+			// replay.
 			return queue.ActivationResult{}, ErrAgentLeaseStale
 		}
 		if len(existingDigest) != 32 || [32]byte(existingDigest) != imageDigest {
@@ -1235,6 +1259,31 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 			return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate replay: %w", err)
 		}
 		return result, nil
+	}
+
+	// Does this ENVIRONMENT hold an unresolved activate operation, from ANY
+	// attempt? The query above is keyed on attempt_id and fence, so it cannot
+	// see another attempt's stranded row; this one is environment-scoped. It
+	// is read here, at the release_operations position of the lock order
+	// (after the attempt row, before the deployment and route head), as a
+	// plain non-locking SELECT; no release_operations READ happens after the
+	// route head lock (the INSERT below is a write at ADR position 8). A plain
+	// read is sufficient because the environment_slots row locked above is
+	// held by every writer of this environment's activation operations, so the
+	// answer cannot change before this transaction ends.
+	//
+	// The refusal is returned right here, independent of the route-head flag
+	// (the sweeper can strand an operation with the flag clear until step D),
+	// so no deployment write happens and no later check (candidate readiness,
+	// frozen execution read, render) can mask it with a retryable error. The
+	// replay block above has already won for the same attempt.
+	var environmentHoldsUnresolvedActivation bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE environment_id=$1 AND `+unresolvedActivationSQL+`)`, environmentID).
+		Scan(&environmentHoldsUnresolvedActivation); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("check environment unresolved activation: %w", err)
+	}
+	if environmentHoldsUnresolvedActivation {
+		return queue.ActivationResult{}, ErrAgentLeaseActivationEnvironmentBlocked
 	}
 
 	// Fresh authorization. Deployment first (position 6, via the existing
@@ -1264,6 +1313,9 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		return queue.ActivationResult{}, fmt.Errorf("lock route head for activate: %w", err)
 	}
 	if reconciliationRequired {
+		// Flag set with NO unresolved operation (the unresolved case was
+		// refused above): a different, so far unexplained condition that keeps
+		// the generic stale answer.
 		return queue.ActivationResult{}, ErrAgentLeaseStale
 	}
 
@@ -1356,14 +1408,16 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	}
 
 	var operationID int64
-	// KNOWN GAP, deliberately deferred to Step 10c-2b: a stranded open
-	// activation makes this INSERT fail on release_operations_environment_
-	// open_activation_idx with a raw 23505, which is not yet mapped to a typed
-	// non-retryable refusal (10c-2b).
+	// A stranded unresolved activation in this environment (any attempt)
+	// collides here on the widened unique index; it is a deterministic,
+	// non-retryable condition, never a raw 23505.
 	err = tx.QueryRow(ctx, `INSERT INTO release_operations(release_id, job_id, attempt_id, fence, kind, digest, state, environment_id, expected_active_release_id, expected_route_revision, route_digest)
 		VALUES ($1,$2,$3,$4,'activate',$5,'switch_authorized',$6,$7,$8,$9) RETURNING id`,
 		releaseID, jobID, attemptID, fence, imageDigest[:], environmentID, expectedActiveReleaseID, routeRevision, routeDigestRaw).Scan(&operationID)
 	if err != nil {
+		if isUniqueViolationOf(err, releaseOperationsOpenActivationIndex) {
+			return queue.ActivationResult{}, ErrAgentLeaseActivationEnvironmentBlocked
+		}
 		return queue.ActivationResult{}, fmt.Errorf("insert activation operation: %w", err)
 	}
 	if err = r.inject("operation_insert"); err != nil {
@@ -1398,6 +1452,16 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 // and close its job, since the host switch may already be in flight (ADR
 // 0005 "An in-flight syscall cannot be preempted").
 var ErrAgentLeaseActivationOpen = errors.New("agent lease activation operation is open")
+
+// ErrAgentLeaseActivationEnvironmentBlocked reports that Activate was refused
+// because the environment holds an unresolved activation operation (see
+// unresolvedActivation): the host may already have switched, so no further
+// activation may start until an operator resolves it. Non-retryable.
+var ErrAgentLeaseActivationEnvironmentBlocked = errors.New("agent lease activation environment is blocked by an unresolved activation")
+
+// releaseOperationsOpenActivationIndex is the unique index (migration 000021)
+// enforcing one unresolved activate operation per environment.
+const releaseOperationsOpenActivationIndex = "release_operations_environment_open_activation_idx"
 
 // ErrAgentLeaseActivationRouteMoved reports that the route head no longer
 // matches the route_revision/active_release_id tx1 recorded on the

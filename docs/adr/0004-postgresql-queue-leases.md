@@ -659,6 +659,15 @@ position in a total lock order cannot introduce a cycle with a transaction that 
   the lock-order and ordering consequences that ship with 10c-1; the sweeper diversion itself is
   deferred, tracked in `tasks/todo.md` Step 10c-2, and must not be assumed already handled by this
   amendment's presence.
+- **Forward constraint on every writer of `release_operations`.** `Activate` decides whether an
+  environment holds an unresolved activate operation with a plain, non-locking `EXISTS` read taken
+  after the `environment_slots` lock. That read is sound, not a time-of-check/time-of-use race,
+  only because every transaction that creates or changes an activate operation's state takes the
+  `environment_slots` lock first (tx1 and tx2 both do). Any future writer that mutates
+  `release_operations` -- the sweeper diversion (step D), the late agent report (step E), and the
+  operator resolution paths (step G) -- MUST take the `environment_slots` row lock before the
+  mutation. A writer that skips it would silently invalidate the read; the unique index on the
+  environment's open activation remains only a backstop, not the primary guarantee.
 
 ## References
 

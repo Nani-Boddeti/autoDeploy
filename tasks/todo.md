@@ -3473,3 +3473,71 @@ state-count tripwire). A test reading the index predicate from `pg_get_expr` and
 fragment per state closes the more important half. Also in that round: parenthesize the fragment (it
 misbinds after `OR `), validate `fromState` (empty silently matches no row -> misleading Stale), and fix the
 comments at `:759`/`:1395` that still name one state where the rule is meant.
+
+#### 10c-2b step C committed: typed refusal for a stranded environment (2026-10-04)
+
+Took three rounds, and the pattern is the slice's recurring one at finer grain each time: **each round fixed
+the hazard and left a smaller version of it one level earlier.**
+- Round 1 raised the typed sentinel at the INSERT (23505 by constraint name) and in the replay branch. But
+  `Activate`'s route-head gate returns stale at `:1277`, ~100 lines BEFORE the INSERT at `:1373`, and tx2 sets
+  BOTH the operation state and the route-head flag — so the real stranded path never reached it. Round 1's
+  tests only reached the typed paths by forcing operation state WITHOUT the flag, a state production never
+  produces. **The step fixed a path that does not occur.**
+- Round 2 moved the refusal into the gate — but consumed the environment-scoped check only INSIDE the flag
+  branch, so the rule stayed flag-gated. Reachable consequence: flag clear + unresolved operation (what the
+  step D sweeper gap really produces) fell through to `transitionDeployment`, the candidate checks, the
+  frozen-execution read and the render, any of which yields `candidate_not_ready`, a wrong-coded
+  `integrity_conflict`, or a wrapped read error that becomes a RETRYABLE 503.
+- Round 3 returns the sentinel immediately after the environment-scoped EXISTS, before `transitionDeployment`,
+  independent of the flag. The replay block still precedes it, so a same-attempt replay on its own
+  `switch_authorized` operation still replays. INSERT backstop kept as defence in depth.
+
+**A new vacuity shape for the list: two observationally identical enforcement points.** The gate and the
+INSERT backstop return the same sentinel with the same rollback, so NO outcome distinguished them — which is
+why hardcoding the gate's query to `state='reconciliation_required'`, and deleting its flag condition
+outright, both survived the entire suite. Not a weak assertion; a test that passes while the point it claims
+to cover is dead. Fixed by constructing the state where only one can fire (flag clear + unresolved operation)
+and by giving the second attempt no candidate release, so anything getting past the refusal fails with
+corrupt-state instead of the typed error.
+
+Mutation proofs that now pin it: reverting the round-3 hoist fails the flag-clear matrix cases and the
+sweeper-gap test with `corrupt state: deployment ... has no release row, want
+ErrAgentLeaseActivationEnvironmentBlocked`; hardcoding the query to `reconciliation_required` fails three
+tests; deleting the early return fails six including both end-to-end tests; disabling the 23505 mapping fails
+the backstop test with the raw unique violation.
+
+**Reachability finding (important for D):** after an ambiguous tx2 the slot keeps its occupant and `Claim`
+skips a reconciling slot, so a second attempt CANNOT reach `Activate` until the sweeper closes the stranded
+attempt and `Reconcile`/`MarkReconciled` clears the slot flag. So the end-to-end proof is built on the very
+defects D and G remove. Both end-to-end tests now assert the full precondition triple (operation still
+unresolved, route-head flag still set, slot free/clear then held by the second attempt) immediately before
+the final call, so a later step changing any of it fails LOUDLY instead of silently re-routing the proof
+through the backstop. `TestActivateSweeperStrandedSwitchAuthorizedFlagClearIsBlocked` captures the
+flag-clear scenario while it is still reachable; it carries a comment saying step D removes it and the test
+must be re-pointed.
+
+Also in step C: `isUniqueViolationOf(err, constraint)` added beside `isUniqueViolation` (unchanged — six
+callers rely on its any-23505 meaning); `mapError` -> 409 `environment_activation_blocked`, verified
+non-retryable on both sides (`mapStatus` maps any non-`stale_lease` 409 to a terminal integrity conflict;
+the client retries only service-unavailable/transport-failure); a false comment corrected (the INSERT IS a
+`release_operations` access after the route-head lock — it is a write at ADR position 8, so the claim is
+"no READ"); and ADR 0004 gains the **forward constraint**: any future `release_operations` writer (D/E/G)
+must take the `environment_slots` lock first — that is what makes the plain non-locking EXISTS read sound
+rather than a TOCTOU. Four prior reviews cleared the lock order and the early return only skips later
+locks, so it cannot invert.
+
+**Intentional behaviour change:** an environment with an unresolved operation and no route head now returns
+the blocked refusal instead of `ErrAgentLeaseActivationNoRouteHead`. The unresolved operation is the more
+fundamental problem; the no-route-head case is unreachable in practice since tx1 required a head.
+
+**Open, not closed:** the `MarkReconciled`-clears-the-route-flag guard in the precondition triple is NOT
+mutation-proven (it is a tripwire for step G, so its value lands then); item 8's `expired`-instead-of-`n==1`
+assertion was not mutation-tested; and no third independent review was run on round 3 — a deliberate scope
+call, since the mutation proofs directly pin the moved enforcement point, the remainder is comment-level,
+step D touches `Activate` again, and the whole area is behind `activationEnabled = false`.
+
+**Process risk worth recording:** a subagent truncated the untracked
+`internal/agent/http/activation_blocked_integration_test.go` and rebuilt it from an earlier read. Untracked
+files have NO git recovery path, and "I rebuilt it and it passes" is not evidence that what it previously
+asserted survived. The orchestrator read it rather than trusting the report; it was faithful and in fact
+stronger than described (it asserts the wire code, not merely the 409).

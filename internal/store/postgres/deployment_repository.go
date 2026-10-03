@@ -256,6 +256,14 @@ func isUniqueViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
+// isUniqueViolationOf is the constraint-aware sibling of isUniqueViolation: it
+// matches only a 23505 raised by the named constraint/index, so a different
+// unique violation is never reclassified as the caller's domain condition.
+func isUniqueViolationOf(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
+}
+
 func isForeignKeyViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23503"
