@@ -1542,9 +1542,11 @@ const releaseOperationsOpenActivationIndex = "release_operations_environment_ope
 
 // ErrAgentLeaseActivationUnresolved reports that MarkReconciled was refused
 // because the environment holds an unresolved activate operation (the rule
-// unresolvedActivationSQL). Non-retryable: only a declared activation outcome
-// can resolve it, never clearing a flag.
-var ErrAgentLeaseActivationUnresolved = errors.New("agent lease environment holds an unresolved activation; it cannot be mark-reconciled")
+// unresolvedActivationSQL), or that ResolveActivation was refused because that
+// operation is still switch_authorized. Non-retryable: only a declared
+// activation outcome on a reconciliation_required operation can resolve it,
+// never clearing a flag.
+var ErrAgentLeaseActivationUnresolved = errors.New("agent lease environment holds an unresolved activation that is not yet reconciliation_required; it cannot be resolved")
 
 // ErrAgentLeaseActivationLateReportRecorded is what tx2 returns when an agent
 // report arrives for an activation operation that is ALREADY at
@@ -3261,29 +3263,7 @@ func (r *AgentLeaseRepository) MarkReconciled(ctx context.Context, principal aut
 		return ErrAgentLeaseActivationUnresolved
 	}
 
-	var now time.Time
-	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
-		return fmt.Errorf("environment mark-reconciled canonical time: %w", err)
-	}
-	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1`, environmentID, now); err != nil {
-		return fmt.Errorf("clear environment slot reconciliation: %w", err)
-	}
-	if err = r.inject("slot_reconcile_clear"); err != nil {
-		return err
-	}
-
-	actor := administratorActor(principal)
-	if err = insertServerAuditEvent(ctx, tx, actor, "environment_mark_reconciled", nil, nil, "success", reason); err != nil {
-		return err
-	}
-	if err = r.inject("audit_insert"); err != nil {
-		return err
-	}
-
-	if err = appendAgentJobEvent(ctx, tx, attemptJobID, reconciliationAttemptID, "reconciled"); err != nil {
-		return err
-	}
-	if err = r.inject("job_event"); err != nil {
+	if err = r.clearPlainReconciliation(ctx, tx, principal, environmentID, attemptJobID, reconciliationAttemptID, reason); err != nil {
 		return err
 	}
 
