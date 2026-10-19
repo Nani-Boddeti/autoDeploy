@@ -3734,3 +3734,30 @@ build, vet both tag sets, `diff --check`, Linux amd64/arm64, `make check`, `go t
 6/6 fresh-database PG18 sweeps (3 normal + 3 `-race`), 14 activation concurrency tests at `-race -count=20`.
 Accepted, not fixed: a retried success report whose own failure created the block adds one entry; an entry
 cut exactly at the cap may end in a space. Next: step F.
+
+#### 10c-2b step F committed: finalize helper works from reconciliation_required (2026-10-19)
+
+`finalizeActivationSucceeded` now serves both source states (live-schema introspection confirmed each rule):
+- op `closed_at=COALESCE(closed_at,$now)` — 000021 makes an rr op's closed_at immutable.
+- route head UPDATE clears `reconciliation_required` (the only place it is ever cleared); a FLAGGED head with
+  `fromState=switch_authorized` is refused as `ErrAgentLeaseCorruptState` BEFORE any write (review finding:
+  the unconditional clear would erase an unresolved flag on tx2). Not required for rr: unflagged head resolves.
+- slot UPDATE frees + clears the flag pair in one statement only when the flag is NULL or owned by this
+  attempt (rule = owner, not fromState; a foreign flag matches 0 rows -> corrupt).
+- RowsAffected checks on attempt (`AND state='leased'`), slot, job -> `ErrAgentLeaseCorruptState`; on tx2 these
+  are deterministic -> durable block via `blockAfterFinalizeFailure` (proved end to end by
+  `TestReportActivationResultCorrupt{FlaggedHead,SlotFlaggedByOtherAttempt}Blocks`).
+Mutations F-M1..F-M8 killed. Independent review PASS. Full bar green (same stages as step E).
+
+**For step G (from review + implementer):**
+- G writes the `reconciled` event and audit row itself; take locks in documented order; read the clock AFTER locks
+  (slot/job/release `updated_at` use a bare `$now`).
+- On `ErrAgentLeaseActivationRouteMoved` or any finalize error: roll back, NO new block (do not route through
+  `blockAfterFinalizeFailure` — `blockActivationForReconciliation` requires `switch_authorized`).
+- Pre-verify the slot flag belongs to this attempt (helper only refuses a FOREIGN flag).
+- Helper requires attempt+job still `leased`; decide whether any legitimate rr shape violates that.
+- `outcome_summary` is overwritten by `in.summary`: G must pass block evidence + late evidence + declared text,
+  bounded to 2048 bytes, or the evidence is lost.
+- Pass a deliberate `resultDigest` (op.route_digest per design 6.4).
+- Known, pinned, unchanged: `blockActivationForReconciliation` overwrites a foreign `reconciliation_attempt_id`
+  (reachable only on already-corrupt state).
