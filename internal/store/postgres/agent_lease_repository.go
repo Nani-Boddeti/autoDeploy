@@ -1667,7 +1667,8 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 
 	var routeRevision int64
 	var activeReleaseID *string
-	if err := tx.QueryRow(ctx, `SELECT route_revision, active_release_id FROM route_heads WHERE environment_id=$1 FOR UPDATE`, in.environmentID).Scan(&routeRevision, &activeReleaseID); err != nil {
+	var headFlagged bool
+	if err := tx.QueryRow(ctx, `SELECT route_revision, active_release_id, reconciliation_required FROM route_heads WHERE environment_id=$1 FOR UPDATE`, in.environmentID).Scan(&routeRevision, &activeReleaseID, &headFlagged); err != nil {
 		// Currently unreachable, kept as defence in depth: the caller
 		// (reportActivationResult) already looked the route head up FOR UPDATE
 		// before the savepoint and routes a missing head through
@@ -1682,6 +1683,14 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 		(activeReleaseID != nil && in.expectedActiveReleaseID != nil && *activeReleaseID == *in.expectedActiveReleaseID)
 	if routeRevision != in.expectedRouteRevision || !sameActive {
 		return ErrAgentLeaseActivationRouteMoved
+	}
+	// A switch_authorized operation never coexists with a flagged head (only
+	// the block routine sets the flag, and it moves the operation to
+	// reconciliation_required in the same transaction). Refuse before any
+	// write rather than erase a flag nobody resolved. Not required for
+	// reconciliation_required: an unflagged head there still resolves.
+	if headFlagged && in.fromState == activationStateSwitchAuthorized {
+		return fmt.Errorf("%w: route head of environment %s is flagged while operation %d is switch_authorized at activation result", ErrAgentLeaseCorruptState, in.environmentID, in.operationID)
 	}
 
 	// Release rows, ascending id (ADR 0004 position 7 rule for multiple rows
@@ -1730,8 +1739,12 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 	}
 
 	// Pointer and revision move in ONE update; validate_route_head_update
-	// enforces CAS-by-exactly-one.
-	tag, err := tx.Exec(ctx, `UPDATE route_heads SET active_release_id=$2, route_revision=route_revision+1, updated_at=GREATEST(updated_at, $3) WHERE environment_id=$1 AND route_revision=$4`,
+	// enforces CAS-by-exactly-one. reconciliation_required=false is
+	// unconditional: a flagged head was refused above for switch_authorized,
+	// and for the operator-declared "activated" resolution this is the only
+	// place the head flag is ever cleared (a flagged head makes every later
+	// Activate refuse).
+	tag, err := tx.Exec(ctx, `UPDATE route_heads SET active_release_id=$2, route_revision=route_revision+1, reconciliation_required=false, updated_at=GREATEST(updated_at, $3) WHERE environment_id=$1 AND route_revision=$4`,
 		in.environmentID, in.candidateReleaseID, in.now, in.expectedRouteRevision)
 	if err != nil {
 		return fmt.Errorf("advance route head: %w", err)
@@ -1746,7 +1759,10 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 		return err
 	}
 
-	tag, err = tx.Exec(ctx, `UPDATE release_operations SET state='succeeded', closed_at=$2, outcome_summary=$3 WHERE id=$1 AND state=$4`, in.operationID, in.now, in.summary, in.fromState)
+	// COALESCE: an operation closed into reconciliation_required already has
+	// its closed_at (when the ambiguity was recorded); migration 000021's
+	// trigger forbids moving it. A switch_authorized row has NULL and gets now.
+	tag, err = tx.Exec(ctx, `UPDATE release_operations SET state='succeeded', closed_at=COALESCE(closed_at, $2), outcome_summary=$3 WHERE id=$1 AND state=$4`, in.operationID, in.now, in.summary, in.fromState)
 	if err != nil {
 		return fmt.Errorf("close activation operation: %w", err)
 	}
@@ -1758,21 +1774,43 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 	}
 
 	// Completion, mirroring Complete's success branch: attempt, slot, job.
-	if _, err = tx.Exec(ctx, `UPDATE agent_job_attempts SET state='succeeded', closed_at=$2, failure_class=NULL, result_operation_id=$3, result_digest=$4 WHERE id=$1`,
-		in.attemptID, in.now, strconv.FormatInt(in.operationID, 10), in.resultDigest[:]); err != nil {
+	// The zero-row errors below are ErrAgentLeaseCorruptState: the caller
+	// verified the attempt/slot/job under their locks, so no row here is an
+	// invariant violation. It is a plain, non-transient error, so tx2 records
+	// the durable reconciliation block (never a retry that loses the report).
+	tag, err = tx.Exec(ctx, `UPDATE agent_job_attempts SET state='succeeded', closed_at=$2, failure_class=NULL, result_operation_id=$3, result_digest=$4 WHERE id=$1 AND state='leased'`,
+		in.attemptID, in.now, strconv.FormatInt(in.operationID, 10), in.resultDigest[:])
+	if err != nil {
 		return fmt.Errorf("close agent job attempt: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: attempt %d is not leased at activation finalize", ErrAgentLeaseCorruptState, in.attemptID)
 	}
 	if err = r.inject("attempt_close"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET current_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1 AND current_attempt_id=$3`, in.environmentID, in.now, in.attemptID); err != nil {
+	// Free the slot and clear a reconciliation flag in ONE statement (the
+	// slot CHECK ties the flag to reconciliation_attempt_id). The rule is the
+	// flag's owner, not fromState: a flag naming THIS attempt is cleared, no
+	// flag is left alone (tx2), and a flag naming another attempt matches no
+	// row, so the slot is neither freed nor stripped of a flag it does not
+	// own.
+	tag, err = tx.Exec(ctx, `UPDATE environment_slots SET current_attempt_id=NULL, reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1 AND current_attempt_id=$3 AND (reconciliation_attempt_id IS NULL OR reconciliation_attempt_id=$3)`, in.environmentID, in.now, in.attemptID)
+	if err != nil {
 		return fmt.Errorf("free environment slot: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: slot %s is not held by attempt %d, or is flagged by another attempt, at activation finalize", ErrAgentLeaseCorruptState, in.environmentID, in.attemptID)
 	}
 	if err = r.inject("slot_free"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='succeeded', updated_at=$2 WHERE id=$1 AND state='leased'`, in.jobID, in.now); err != nil {
+	tag, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='succeeded', updated_at=$2 WHERE id=$1 AND state='leased'`, in.jobID, in.now)
+	if err != nil {
 		return fmt.Errorf("close agent job: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("%w: job %d is not leased at activation finalize", ErrAgentLeaseCorruptState, in.jobID)
 	}
 	if err = r.inject("job_close"); err != nil {
 		return err
