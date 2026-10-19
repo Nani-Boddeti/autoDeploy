@@ -674,6 +674,9 @@ func TestReconcileActivationRacesLateReport(t *testing.T) {
 					// terminal arm (succeeded / failed) answers; Stale needs a
 					// fence mismatch or a missing operation.
 					t.Fatalf("report after resolution err=%v, want integrity conflict", reportErr)
+				} else {
+					// Declared outcome contradicted: traced once (step G2b).
+					p.afterEvents = ",activation_late_report"
 				}
 				a.assertAgentResolved(t, outcome, p)
 			})

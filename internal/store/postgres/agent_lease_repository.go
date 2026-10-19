@@ -2153,7 +2153,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		// Replay: the original call already finalized everything. Accept
 		// only an identical success report.
 		if !succeeded || !digestMatches {
-			return ErrAgentLeaseIntegrityConflict
+			return r.traceDeclaredContradiction(ctx, tx, jobID, attemptID)
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit agent lease activation result replay: %w", err)
@@ -2171,7 +2171,13 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		// stale_lease either: the lease is not the issue, the report contradicts
 		// (or is moot against) a declared outcome. No occupant check: the
 		// operation row alone decides, as in the succeeded arm.
-		return ErrAgentLeaseIntegrityConflict
+		//
+		// A SUCCESS report is traced (traceDeclaredContradiction): it contradicts
+		// the declaration. A failure report agrees with it and is only answered.
+		if !succeeded {
+			return ErrAgentLeaseIntegrityConflict
+		}
+		return r.traceDeclaredContradiction(ctx, tx, jobID, attemptID)
 	case "reconciliation_required":
 		// Already blocked (by an earlier report or the expiry sweeper's
 		// diversion). Nothing is finalized here, ever: only a declared

@@ -128,6 +128,7 @@ type blockedPrecondition struct {
 	releases       string
 	activatedEvent int
 	lateEvents     string // events recorded between the block and the resolution
+	afterEvents    string // events after the resolution, comma-prefixed: a contradicting report traced by step G2b
 }
 
 func (a activatedFixture) blockedPrecondition(t *testing.T) blockedPrecondition {
@@ -218,7 +219,7 @@ func (a activatedFixture) assertResolvedAudit(t *testing.T, outcome string, p bl
 		if jobState != "succeeded" {
 			t.Fatalf("job=%s, want succeeded", jobState)
 		}
-		if events != "activation_authorized,activation_reconciliation_required,"+p.lateEvents+"activated,succeeded,reconciled" {
+		if events != "activation_authorized,activation_reconciliation_required,"+p.lateEvents+"activated,succeeded,reconciled"+p.afterEvents {
 			t.Fatalf("events=%s", events)
 		}
 		if n := a.activatedRouteEvents(t); n != p.activatedEvent+1 {
@@ -247,7 +248,7 @@ func (a activatedFixture) assertResolvedAudit(t *testing.T, outcome string, p bl
 		if jobState != "failed" {
 			t.Fatalf("job=%s, want failed", jobState)
 		}
-		if events != "activation_authorized,activation_reconciliation_required,"+p.lateEvents+"activation_not_activated,failed,reconciled" {
+		if events != "activation_authorized,activation_reconciliation_required,"+p.lateEvents+"activation_not_activated,failed,reconciled"+p.afterEvents {
 			t.Fatalf("events=%s", events)
 		}
 		if n := a.activatedRouteEvents(t); n != p.activatedEvent {
@@ -876,6 +877,9 @@ func TestResolveActivationRacesLateReport(t *testing.T) {
 					// After the resolution the operation is terminal: a mismatching
 					// report is answered, never recorded.
 					t.Fatalf("report after resolution err=%v", reportErr)
+				} else if errors.Is(reportErr, ErrAgentLeaseIntegrityConflict) {
+					// Declared outcome contradicted: traced once (step G2b).
+					p.afterEvents = ",activation_late_report"
 				}
 				a.assertResolved(t, outcome, p)
 			})

@@ -232,3 +232,40 @@ func (r *AgentLeaseRepository) recordLateReport(ctx context.Context, tx pgx.Tx, 
 	}
 	return ErrAgentLeaseActivationLateReportRecorded
 }
+
+// traceDeclaredContradiction is the terminal arms' answer to a report that
+// contradicts the recorded outcome. When the attempt has a 'reconciled' event
+// the outcome was DECLARED (operator or agent) rather than finalized by tx2,
+// so the report is real evidence the declaration may be wrong: ONE
+// 'activation_late_report' event is appended for the attempt and committed
+// (the operation row is closed and stays untouched). Replays add nothing: no
+// event is appended while one with a higher sequence than the attempt's
+// 'reconciled' event exists. The answer is ErrAgentLeaseIntegrityConflict
+// either way; only a failed write or commit is returned as a plain, retryable
+// error (the caller has not classified it: occupantChecked is still false),
+// and the retry is deduped. The caller holds the job lock (event sequence) and
+// has verified the attempt's server. With no 'reconciled' event the behaviour
+// is exactly the plain conflict answer.
+func (r *AgentLeaseRepository) traceDeclaredContradiction(ctx context.Context, tx pgx.Tx, jobID, attemptID int64) error {
+	var declared, traced bool
+	if err := tx.QueryRow(ctx, `SELECT
+		EXISTS(SELECT 1 FROM agent_job_events WHERE job_id=$1 AND attempt_id=$2 AND event_type='reconciled'),
+		EXISTS(SELECT 1 FROM agent_job_events t WHERE t.job_id=$1 AND t.attempt_id=$2 AND t.event_type='activation_late_report'
+			AND t.sequence > (SELECT max(sequence) FROM agent_job_events WHERE job_id=$1 AND attempt_id=$2 AND event_type='reconciled'))`,
+		jobID, attemptID).Scan(&declared, &traced); err != nil {
+		return fmt.Errorf("look up declared reconciliation events: %w", err)
+	}
+	if !declared || traced {
+		return ErrAgentLeaseIntegrityConflict
+	}
+	if err := appendAgentJobEvent(ctx, tx, jobID, &attemptID, "activation_late_report"); err != nil {
+		return err
+	}
+	if err := r.inject("declared_late_report_event"); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit declared-outcome late report: %w", err)
+	}
+	return ErrAgentLeaseIntegrityConflict
+}

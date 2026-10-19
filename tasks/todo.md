@@ -3798,3 +3798,15 @@ HTTP test `TestAgentHTTPStrandedEnvironmentActivateIsBlockedAfterLegacySweeperCl
 `corrupt_state` on that shape and forces the legacy clear in SQL. Review PASS + follow-ups. Full bar green; the
 concurrency stage (21 tests x20 `-race`, 656s) now needs `-timeout 60m` — the default 10m killed it mid-run.
 Next: G2b (trace a late success against a declared `not_activated`).
+
+#### 10c-2b step G2b committed: trace a report that contradicts a declared outcome (2026-10-19)
+
+tx2's terminal arms: when the answer would be `integrity_conflict` AND the attempt has a `reconciled` event (outcome
+was DECLARED by `ResolveActivation`/`ReconcileActivation`), append ONE `activation_late_report` event (dedup: none
+with a sequence above the attempt's latest `reconciled`), commit, still answer `integrity_conflict`. Widened from the
+plan's single case by rule: success after `not_activated`, failure after `activated`, wrong digest after `activated`.
+tx2-finalized outcomes (no `reconciled` event) byte-identical. Commit failure stays retryable; retry deduped.
+Event sequence = `MAX+1` per job under the job lock (no wrap; smallint overflow would error, ~32k events/job).
+**For 10d:** a failure report after a declared `not_activated` agrees but is still answered `integrity_conflict`
+(the `failed` arm has no agreeing path) — misleading but terminal either way.
+Review PASS. Full bar green (concurrency 21 tests x20 `-race`, 719s).
