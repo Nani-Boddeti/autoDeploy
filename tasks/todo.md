@@ -3761,3 +3761,26 @@ Mutations F-M1..F-M8 killed. Independent review PASS. Full bar green (same stage
 - Pass a deliberate `resultDigest` (op.route_digest per design 6.4).
 - Known, pinned, unchanged: `blockActivationForReconciliation` overwrites a foreign `reconciliation_attempt_id`
   (reachable only on already-corrupt state).
+
+#### 10c-2b step G1 committed: operator resolution `ResolveActivation` (2026-10-19)
+
+Plan + owner decisions: `tasks/10c-2b-step-G-plan.md`. Repository only (no web/handler/client); `MarkReconciled`
+behaviour identical (tail factored into `clearPlainReconciliation`). Outcomes `activated | not_activated |
+no_activation`, required, checked both ways under the locks (`ErrAgentLeaseOutcomeMismatch`). Lock order: admin
+session -> slot -> [non-locking owner peek] -> job -> attempt -> op (`unresolvedActivationSQL`) -> deployment ->
+head -> releases (activated only); clock after all locks. Only exact `reconciliation_required` resolvable.
+Failure = rollback, never a new block. Audit reason `outcome=<x>; <reason>` (validReason on the combined string).
+
+Review PASS; fix round: replay anchored to the environment's highest-id attempt (agent_job_events has only a
+per-job `smallint` sequence, no global order); `no_activation` refuses a leased attempt with no unresolved op
+(corrupt); race test uses two admin sessions so both queue on the slot; clock test holds head/release rows too.
+Full bar green incl. 18 concurrency tests at `-race -count=20`.
+
+**Accepted:** after a later attempt B is itself resolved, a stale duplicate of A's outcome is judged against B
+(nothing written either way). Malformed-digest guard untestable (CHECK forbids the shape) — defence in depth.
+
+**For G2:** explicit unresolved-activation check + branch B together; agent `reconciled` events are read by
+`confirmResolvedOutcome` (anchor = latest attempt); late success vs a declared `not_activated` op still leaves NO
+trace (tx2 `failed` arm) — emit an event there. **For H:** form calls `ResolveActivation` for all three outcomes;
+bound the operator reason to ~489 bytes (prefix counts toward 512); map errors, never print `err.Error()`
+(corrupt-state texts carry ids).
