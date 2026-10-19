@@ -3686,3 +3686,51 @@ mutation proofs, re-point the two tests above, run the full bar, get an independ
 **Remaining steps:** E (finish the WIP), F (finalize parameterization — partly done in B via `fromState`),
 G (resolution paths; see prerequisites), H (HTTP/admin/form wiring — invoke `/impeccable`, pastel palette),
 I (docs: ADR 0004's amendment around line 655 still says no code implements the sweeper diversion).
+
+#### 10c-2b step E — session 2026-10-19: decisions re-derived, review FAILED, fix round in flight
+
+**Decisions re-derived from code:** late report against a `reconciliation_required` op is EVIDENCE, never
+finalizes; append `<existing> | late report #<16-hex sha256 fp>: <body>` (replace would destroy why the block
+exists); the fingerprint inside `outcome_summary` IS the replay ledger (entry + `activation_late_report` event
+in one tx); 2048-byte cap, cut on rune boundary, marker never cut; replay of the block-creating failure report
+stays idempotent nil; `failed` op -> `ErrAgentLeaseIntegrityConflict`; wire 409 `late_report_recorded`
+(client maps to non-retryable `ErrIntegrityConflict`); evidence accepted only from the leased slot occupant at
+this fence; lock order unchanged (adds only op UPDATE + event INSERT after the op row lock).
+Race case confirmed: block won, success lost -> recording as evidence beats stale (host may have switched).
+
+**Orchestrator review found:** late SUCCESS dropped once failure entries filled the column (answered
+"recorded" with nothing written) -> success-only reserve. Mutation proofs M1-M10 all killed.
+
+**Independent review FAILED (fix round F1-F4 in flight):**
+- F1 HIGH (confirmed in source): `recordBlockInFreshTransaction` returns `NoopOther,nil` when the op is already
+  rr -> `blockAfterAbortedTransaction` answers terminal `cause`, failure-commit path answers stale; report
+  lost. Window: tx2 rolled back (slot lock released) and sweeper/another report blocked in between. Fix: fresh
+  tx records late evidence with the same fingerprint.
+- F2: reserve sized for TWO success entries; `matches authorized digest` moved before the digest.
+- F3: `RowsAffected()!=1` in recordLateReport -> retryable, not stale.
+- F4: restore weakened test assertions (`assertBlocked` in result test; explicit late-event count in
+  `assertReconciliationRecorded`).
+
+**Deferred, accepted:**
+- Marker forgery: an earlier free-text body containing `late report #<fp>:` makes a distinct report look like
+  a replay. Needs an authenticated agent able to compute the hash; revisit if the ledger moves out of free text.
+- `isOriginalBlockReplay` swallows any failure report textually equal to the block text (incl. sweeper const).
+- Failure fingerprints hash the 512-byte-truncated summary; differences past 512 collide.
+- Beyond two distinct success reports, NoRoom writes nothing and still answers 409.
+- **For step G:** a success report against an operator-declared `not_activated` (`failed`) op is answered
+  `integrity_conflict` with NO trace — it contradicts the operator's verdict and traffic may have switched.
+  G should at least emit an event.
+- **For 10d:** the client collapses `late_report_recorded` into `ErrIntegrityConflict`; the agent cannot tell
+  "evidence recorded, await operator" from a real conflict. Verify what the agent caller does on
+  `ErrIntegrityConflict` (must not complete/fail the job and contradict the block); consider a dedicated
+  `ErrLateReportRecorded`.
+
+**Step E fix rounds closed 2026-10-19 — second independent review PASS.** F1-F4 landed; fresh-transaction rr
+branch now records late evidence (shared `writeLateEvidence`, same fingerprint, retry through tx2 is a replay),
+original-block replay checked before the occupant check on both paths, reserve = 512 (two success entries),
+success body puts `matches authorized digest` before the digest, `RowsAffected!=1` retryable. Mutations
+M1-M16 all killed (M13, M14 survived first; killed by new caller-level race tests). Full bar green: gofmt,
+build, vet both tag sets, `diff --check`, Linux amd64/arm64, `make check`, `go test -race ./...` (29 pkgs),
+6/6 fresh-database PG18 sweeps (3 normal + 3 `-race`), 14 activation concurrency tests at `-race -count=20`.
+Accepted, not fixed: a retried success report whose own failure created the block adds one entry; an entry
+cut exactly at the cap may end in a space. Next: step F.
