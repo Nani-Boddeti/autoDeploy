@@ -1,12 +1,12 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-09-21. Branch: main; base 177e181 (feat: add runtime configuration admin pages). The server agent/credentials/leases slice (89d01b7..8105a85) and the control-plane half of host execution (slice 9a, 2f2b427..177e181) are committed and unpushed. .tmp/ is intentionally untracked but **not gitignored**: exclude it manually and never use blanket git add. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-10-19. Branch: main at 5f14d43 (docs: record the 10c-2b step H1 result), **pushed to origin/main**; nothing is unpushed. Slices 9a, 9b and slice 10 through step 10c-2b H1 are committed. Migrations run through 000021. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
 AutoDeploy replaces Coolify for the owner's private GitHub Dockerfile applications on Hetzner. V1 has one administrator and one initial server but retains owner/project/environment/server scope. The approved stack is Go, PostgreSQL, Docker/BuildKit, and Traefik; routes require HTTPS and environments select health-gated blue/green by default or explicit stop-then-start.
 
-Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Release routing, operations UI, packaging, and end-to-end recovery remain.
+Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is in progress: the control plane's fenced activation protocol, Traefik route rendering, and the full reconciliation path for an ambiguous traffic switch are committed, but `cmd/controlplane` keeps `activationEnabled = false`, so no activation can be authorized. The agent side of activation (10d), drain/stop (10e), operations UI, observability, packaging, and end-to-end validation remain. The weighted-effort figure above was last estimated after slice 9b and has not been re-estimated.
 
 Completed outcomes:
 
@@ -151,38 +151,50 @@ One unexplained single failure is on record and was never reproduced: during Ste
 
 Checkout implementation is complete, but the top-level isolated-checkout milestone remains unchecked until an operator runs the non-cached privileged smoke on provisioned Linux: installed root helpers, XFS mounted with prjquota, delegated cgroup v2, and distinct checkout UID/GID must prove typed GitInit, quota/workspace cleanup, and no cgroup leaf remains. Linux cross-compilation/tagged-test compilation do not prove that boundary; macOS cannot substitute.
 
-No Docker/BuildKit or Traefik executor exists yet; the host agent client never claims work because no executor is registered in this slice (heartbeat reports `executor_available=false`). There is no release activation and no checkout invocation from the agent. Do not present the current queue as runnable by an agent.
+The Docker/BuildKit executor (9b) and Traefik route rendering/writing (10b) exist but are not wired live: the host agent never claims work because `executorEnabled = false` registers no executor (heartbeat reports `executor_available=false`), and `activationEnabled = false` leaves the activation endpoints answering 503. Everything in 9b and slice 10 is tested against fakes (Engine API over a unix socket, a fake `docker` binary, `httptest` servers) and live PostgreSQL 18 — never against real dockerd, BuildKit, or Traefik. Do not present the current queue as runnable by an agent.
 
-## Next slice: 9b, agent host execution
+## Current slice: 10, health-gate configuration + blue/green activation
 
-Slice 9a gave a claimed lease everything it needs: frozen configuration and secret references on the claim
-response, a fenced endpoint that turns those references into values, a phase-progress endpoint, and a
-checkout credential lifecycle the agent can drive without the App private key. What remains is the host
-side, under ADR 0001/0003/0005, wiring an Executor into `cmd/agent` so a claimed lease does real work for
-the first time:
+Approved 2026-09-22 (plan and per-step result blocks in [tasks/todo.md](../tasks/todo.md), "Approved Slice
+10"): blue/green only, a required gate Host header, and activation under the same lease as the build.
 
-1. Drive the checkout through `internal/agent/checkout`'s lease (already written and tested against the
-   `gitcheckout.Lease` interface, but not yet constructed by the real agent binary).
-2. Build with `docker buildx build --secret id=…,env=…` so values travel the BuildKit session and never
-   reach argv, an `ARG`, a build-context file, or an image layer. Missing BuildKit fails closed. Output
-   streams through `crypto.RedactingWriter` before leaving the agent.
-3. Create and start the container by image digest over the Docker Engine API (stdlib `net/http` over the
-   unix socket — the owner rejected the moby/buildkit Go SDKs to keep go.mod's four direct dependencies):
-   no published host ports, the stable environment network only, resource limits, restart policy, and the
-   immutable release/runtime-instance/attempt/fence labels ADR 0005 specifies.
-4. Health-gate with ADR 0005's default shape hard-coded: exact host/path/port, 2xx, redirects off, three
-   consecutive successes, 2s interval and timeout, 60s overall deadline, container must stay running,
-   bounded body discarded.
+Committed:
 
-A retry must find prior-attempt resources by exact label match before creating anything. `FailureClass`
-maps Docker/network blips to `transient`, a bad Dockerfile or a failed gate with the container still
-running to `permanent_configuration`, and inconsistent local label/fence state to `corrupt_state`; no new
-enum values. `internal/runtime/docker` needs `//go:build linux` files with a `!linux` stub so macOS
-development keeps building, mirroring `checkoutcontain`.
+| Step | What it delivered | Commits |
+|---|---|---|
+| 0 | Operator-configured health-gate path + required Host, frozen per attempt (migration 000017) | 668c2cc |
+| 10a | Route heads, active/retained releases, hostname assignment (migration 000018) | aa97166 |
+| 10b | The agent's Traefik file-provider route adapter: rendering, digest, atomic write (`internal/runtime/traefik`) | 353c913 |
+| 10c-1 | Fenced activation tx1, `POST /agent/v1/leases/activate` (migration 000019) | 08bd6cc |
+| 10c-2a | Activation-result tx2, `POST /agent/v1/leases/activation-result`; an ambiguous switch is recorded as a durable reconciliation block (migration 000020) | 6aa5b47 |
+| 10c-2b A–D | Migration 000021, one shared "unresolved activation" rule, typed refusal for a stranded environment, sweeper diversion off an unresolved activation | 1354760..612fcb0 |
+| 10c-2b E | Late agent reports recorded as reconciliation evidence, never finalizing | a7e5fcc |
+| 10c-2b F | Activation finalize can resolve a `reconciliation_required` operation | d9582c3 |
+| 10c-2b G1 | Operator `ResolveActivation`: declare `activated` / `not_activated` / `no_activation`; works for a revoked server | d359810 |
+| 10c-2b G2a | Agent `ReconcileActivation` (strict authorized-digest rule); `Reconcile` refuses a closed attempt holding an unresolved activation | df85e12 |
+| 10c-2b G2b | A late report contradicting a declared outcome leaves one `activation_late_report` event | 7c66ce9 |
+| 10c-2b H1 | Agent reconcile endpoint requires `outcome`; terminal 409 `outcome_mismatch` / `activation_unresolved` | 231b4ad |
 
-Release activation and Traefik routing remain out of scope; they follow in the blue/green/rollback slice
-per ADR 0005. A successful 9b attempt therefore leaves the deployment resting at `health_checking`, since
-`activating -> healthy` belongs to that later slice.
+Remaining in slice 10 ([tasks/10c-2b-step-H-plan.md](../tasks/10c-2b-step-H-plan.md)):
+
+- **10c-2b H2**: operator mark-reconciled form -> `ResolveActivation`, required outcome select (no
+  preselection), an activation column so the operator can choose. Plain HTML; the CSP stays unchanged.
+- **10c-2b H3**: delete the superseded `Reconcile` / `MarkReconciled` repository methods after porting any
+  assertion only their tests hold (owner-approved).
+- **10c-2b I**: ADR 0004 amendment (sweeper diversion implemented, `release_operations` lock-class position,
+  resolution paths).
+- **10d**: agent-side activation — render/verify the route document, switch, report; a **persistent** retry
+  for the result report (the client retries only ~3s today); the agent deciding which outcome to declare.
+- **10e**: drain and stop the previous release.
+
+Hard gates before `activationEnabled` may flip (detail in tasks/todo.md):
+
+1. The privileged Linux checkout smoke (owner only; macOS cannot substitute).
+2. 10d's persistent result-report retry.
+3. Traefik API authentication (ADR 0005 says authenticated; the 10b client is unauthenticated loopback),
+   and Traefik's JSON shapes and reload timing observed against a real Traefik.
+4. The agent reconcile path can now resolve an activation; that is safe only while no activate operations
+   exist, i.e. while the gate is false. Re-check before flipping.
 
 ## Known follow-ups
 
@@ -192,7 +204,8 @@ From the server/leases slice:
 - Server-side claim idempotency key so a lost claim response cannot orphan a lease until expiry (Step 6c).
 - Register resubmission can create an orphan unenrolled server; needs dedupe or cleanup (Step 6b).
 - Persist the reconcile outcome digest once a consumer exists; needs a migration (Step 4).
-- A revoked server cannot reconcile its own environments; those need administrator `mark-reconciled` (Step 4).
+- A revoked server cannot reconcile its own environments; those need the administrator path (Step 4). Since
+  10c-2b G1 that is `ResolveActivation`, which needs no server credential; the web form is wired to it in H2.
 - No rate limiting on `/agent/v1/` (low severity; a valid credential is still required) (Step 5).
 From slice 9a:
 
@@ -217,16 +230,28 @@ From slice 9a:
 
 - ADR 0004 amendments below (renewal events, attempt-count/expiry, claim slot pre-creation and lock order, reconciliation ownership, revocation-only attempt closure, sweeper locking) reflect what shipped; re-read them before extending the lease protocol.
 
+From slice 10 (full list with reasoning in tasks/todo.md step blocks):
+
+- 10b enforces no route-revision monotonicity: `Write` overwrites whenever the on-disk digest differs. Any
+  ownership/monotonicity guard must live in the control plane's CAS or be added to 10b (relevant to 10d).
+- `AssignRouteHostname` can move a not-yet-active route head while an activation is blocked; `activated` is
+  then refused `route_moved` and only `not_activated` remains.
+- The agent client collapses every non-`stale_lease` 409 into `ErrIntegrityConflict`, so the agent cannot yet
+  tell `late_report_recorded`, `outcome_mismatch` or `activation_unresolved` apart (10d).
+- A failure report after a declared `not_activated` agrees with it but is still answered `integrity_conflict`.
+- The concurrency verification stage (21 activation race tests at `-race -count=20`) takes ~11 minutes and
+  needs `-timeout 60m`.
+
 ## Resume order and commands
 
 1. Read this file, [tasks/todo.md](../tasks/todo.md) (its slice 9a step-result blocks record every correction and why), [MEMORY.md](../MEMORY.md), then ADR 0001, ADR 0003, ADR 0004 (including its 2026-09-17 amendments), and ADR 0005. For webhook changes also read ADR 0002 and migration checks.
 2. Before relying on checkout from agent execution, run/preflight the pending privileged Linux checkout smoke with Makefile's explicit test-checkout-integration contract on provisioned XFS prjquota plus delegated cgroup v2; keep the top-level checkout milestone unchecked until it passes.
-3. Inspect git status --short, touched migrations, and focused tests before editing. Do not reset, clean, overwrite shared uncommitted files, or use blanket git add because .tmp/ is not ignored.
+3. Inspect git status --short, touched migrations, and focused tests before editing. Do not reset, clean, overwrite shared uncommitted files, or use blanket git add.
 4. Create/approve a detailed plan in tasks/todo.md for a nontrivial slice, including transaction ownership, lock order, negative tests, migration, and rollback behavior.
 5. Run make check, go test -race ./..., and a fresh PostgreSQL 18 integration run using CI's AUTODEPLOY_TEST_DATABASE_URL contract (`-p 1` across internal/store/postgres, internal/agent/http, internal/web, and migrations). Run Linux cross-builds where tagged code changes; finish with git diff --check and independent review/QA.
 
-Commits are atomic and descriptive (feat:, fix:, refactor:, chore:), manually exclude .tmp/ (it is untracked, not ignored), credentials, and incidental worktree changes, and never include generated attribution.
+Commits are atomic and descriptive (feat:, fix:, refactor:, chore:), exclude credentials and incidental worktree changes, and never include generated attribution.
 
-## Definition of done for slice 9b
+## Definition of done for slice 9b (code-complete; not yet run on a real host)
 
 A claimed lease drives a real checkout, build, and container start on the target host, gated by the ADR 0005 default health check, with no release activation or traffic change; every host operation is idempotent, fenced, and labeled so recovery/reconciliation can identify and clean up partial work; secrets reach the build only through BuildKit mounts and runtime environment injection inside the trusted-host boundary, never logs or job payloads; failures leave the currently healthy release untouched; recovery is proven with live PostgreSQL concurrency tests plus host-side idempotency tests; docs updated to 9/18, and the top-level isolated-checkout milestone ticked only after the privileged Linux smoke passes.

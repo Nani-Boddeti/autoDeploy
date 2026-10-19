@@ -2,8 +2,12 @@
 
 ## Status
 
-- Implementation is active on `main`; scaffold, deployment domain, and deployment persistence
-  slices are committed and synchronized with `origin/main` through `d6fb873`.
+- 2026-10-19: `main` is pushed to `origin/main` at `5f14d43`. Slices 9a, 9b and slice 10 through
+  10c-2b step H1 are committed. 8/18 implementation-sequence outcomes complete; nothing has executed
+  on a real host (`executorEnabled` and `activationEnabled` both false).
+- Next: 10c-2b H2 (operator form), H3 (delete superseded `Reconcile`/`MarkReconciled`), I (docs),
+  then 10d (agent activation) and 10e (drain/stop). Current state per step:
+  [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10".
 
 ## Product Goal
 
@@ -131,7 +135,7 @@ State transitions must be validated in the domain layer and committed transactio
 - [x] Implement GitHub App installation flow and short-lived clone authentication.
 - [x] Implement raw-body webhook verification, delivery idempotency, repository/branch filtering,
       and durable job creation.
-- [ ] Implement server registration, scoped agent credentials, heartbeat, job leasing, renewal,
+- [x] Implement server registration, scoped agent credentials, heartbeat, job leasing, renewal,
       cancellation, and recovery.
 - [ ] Implement isolated checkout of the exact commit with repository and size controls.
 - [ ] Implement Docker/BuildKit build execution, secret mounts, resource/time limits, labels,
@@ -421,9 +425,11 @@ Approved by the user:
       QA-verified, and security-reviewed.
 - [x] Administrator-authentication PostgreSQL migration and typed persistence workflows are
       implemented, live-integration/race-tested, independently QA-verified, and security-reviewed.
-- Progress snapshot: 7/18 top-level implementation-sequence items complete (38.9%, approximately
-  39%). Weighted evidence estimate remains approximately 35–40%; the isolated-checkout top-level
-  milestone stays unchecked until its privileged Linux operational smoke passes.
+- Progress snapshot (2026-10-19): 8/18 top-level implementation-sequence items complete (~44%),
+  matching docs/IMPLEMENTATION_STATUS.md. Checkout, build, runtime, health (9b) and Traefik routing
+  plus activation (slice 10, in progress) are written and tested against fakes but stay unchecked
+  until they run on a real host; the isolated-checkout milestone additionally needs the privileged
+  Linux operational smoke.
 
 ## Approved Administrator Authentication Slice
 

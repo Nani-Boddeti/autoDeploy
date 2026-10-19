@@ -379,7 +379,49 @@
   forbids selecting it during release cleanup; and a release-scoped selector requires the resource's
   full identity rather than broadening to find leftovers.
 - A successful gate stops the deployment at `health_checking`. `activating -> healthy` and Traefik
-  routing belong to the activation slice, which has not started.
+  routing belong to slice 10 (below).
+- Prerequisite 2 (health-gate path) was closed by slice 10 Step 0 (migration 000017).
+
+## Slice 10 — blue/green activation: in progress, never run
+
+- State 2026-10-19: pushed through 10c-2b H1 (`5f14d43`); migrations through 000021. Next H2 (operator
+  form -> `ResolveActivation`), H3 (delete superseded `Reconcile`/`MarkReconciled`, owner-approved), I
+  (ADR 0004 amendment), then 10d (agent activation), 10e (drain/stop). Per-step table:
+  docs/IMPLEMENTATION_STATUS.md "Current slice: 10"; reasoning: tasks/todo.md step blocks and
+  tasks/10c-2b-step-{G,H}-plan.md.
+- `cmd/controlplane` has `const activationEnabled = false` (guard test). Hard gates before flipping:
+  privileged Linux smoke; 10d **persistent** result-report retry (client retries only ~3s); Traefik API
+  auth + real Traefik observed; the agent reconcile path can now resolve activations, safe only while
+  no activate operations exist.
+- **The recurring hazard (6 instances in 10c):** a success report lost — nothing durable written, the
+  agent told something final — after the host already switched live traffic. Every review found one
+  level further out (the block's own error paths, savepoint rollback wrapping, shared credential lock,
+  the fresh-transaction fallback finding the op already blocked). Audit every new path for it.
+- Decisions not to relitigate:
+  - The control plane renders the route document and its digest; the agent re-renders and refuses on
+    mismatch. Replay key `(attempt, fence, image_digest)`.
+  - `isDeterministicActivationFailure` is a NEGATIVE definition (block on anything not known
+    transient): losing the durable record is worse than a spurious block an operator can clear.
+  - `classifyActivationResultError` is POSITIONAL: terminal 409 only after the occupant check.
+  - A network error at COMMIT has an unknown outcome: stay retryable, let replay answer.
+  - "Unresolved activation" is a RULE (`unresolvedActivationSQL`, derived from terminal states), never
+    a state name; a single state name is legitimate only as a transition's SOURCE state.
+  - Late reports against `reconciliation_required` are evidence, appended (never replace) with a
+    fingerprint replay ledger; 512-byte reserve for two late success entries.
+  - Resolution closes op + attempt + slot + job + deployment + both flags in ONE transaction (else the
+    sweeper double-closes); any failure rolls back with NO new block. Only exact
+    `reconciliation_required` is resolvable (`switch_authorized` may still be switching).
+  - Owner decisions: `not_activated` -> attempt expired + job failed, release stays `ready`; agent
+    `activated` needs digest == `op.route_digest`; audit reason `outcome=<x>; <reason>`; operator UI
+    plain HTML, CSP unchanged.
+- Lock order (ADR 0004 + amendment): creds SHARE -> environment_slots -> agent_jobs ->
+  agent_job_attempts -> release_operations -> deployments -> route_heads -> releases by id asc ->
+  inserts. Both activation races serialize at the slot row. Clock read AFTER all locks.
+- Pitfalls: introspect the live schema before SQL (the design was wrong about triggers 3 times); one
+  `clock_timestamp()` per statement when a CHECK compares two columns; `agent_job_events` has only a
+  per-job `smallint` sequence (no global order); the concurrency verification stage needs
+  `-timeout 60m`; keep `internal/runtime/traefik` free of `internal/runtime/docker`
+  (`go list -deps`).
 
 ## Persistence Invariants and Lessons
 
