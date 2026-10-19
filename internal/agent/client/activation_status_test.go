@@ -10,7 +10,7 @@ import (
 // non-retryable ErrIntegrityConflict, never a retryable service error.
 func TestMapStatusActivationRefusalsAreNonRetryable(t *testing.T) {
 	c := &Client{}
-	for _, code := range []string{"activation_open", "route_moved", "corrupt_state", "constraint_violation", "candidate_not_ready", "no_route_head", "integrity_conflict", "environment_activation_blocked", "late_report_recorded"} {
+	for _, code := range []string{"activation_open", "route_moved", "corrupt_state", "constraint_violation", "candidate_not_ready", "no_route_head", "integrity_conflict", "environment_activation_blocked", "late_report_recorded", "outcome_mismatch", "activation_unresolved"} {
 		err := c.mapStatus(409, []byte(`{"error":"`+code+`"}`))
 		if !errors.Is(err, ErrIntegrityConflict) {
 			t.Fatalf("409 %s mapped to %v, want ErrIntegrityConflict", code, err)

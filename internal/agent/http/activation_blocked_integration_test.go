@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,7 +142,7 @@ func TestAgentHTTPStrandedEnvironmentActivateIsBlockedAfterLegacySweeperClose(t 
 	// Since step G2a the real reconcile refuses this legacy shape (closed
 	// attempt, unresolved activation) as corrupt state instead of clearing the
 	// flag, so the clear it used to perform is forced in SQL as well.
-	resp, body = postJSON(t, srv, pathReconcile, token, f.serverID, reconcileRequest{EnvironmentID: f.envID, AttemptID: attempt1, Fence: fence1, OutcomeDigest: hexOf(digestFixture(8))})
+	resp, body = postJSON(t, srv, pathReconcile, token, f.serverID, reconcileRequest{EnvironmentID: f.envID, AttemptID: attempt1, Fence: fence1, Outcome: postgres.ActivationOutcomeNotActivated, OutcomeDigest: hexOf(digestFixture(8))})
 	if resp.StatusCode != http.StatusConflict || body["error"] != "corrupt_state" {
 		t.Fatalf("reconcile on the legacy shape: status=%d body=%v, want 409 corrupt_state", resp.StatusCode, body)
 	}
@@ -215,4 +216,175 @@ func (f agentHTTPFixture) insertSecondJob(t *testing.T) int64 {
 		t.Fatal(err)
 	}
 	return jobID
+}
+
+// TestAgentHTTPDeclaredResolution{Activated,NotActivated} drive the whole
+// resolution path over real HTTP and the real repositories, for each outcome
+// an activation block can be declared with: claim -> activate (the switch is
+// authorized) -> the attempt's authority lapses and the REAL sweeper records
+// the block -> the agent POSTs reconcile with its declared outcome -> the
+// environment is unblocked and a new attempt claims it.
+func TestAgentHTTPDeclaredResolutionActivated(t *testing.T) {
+	testAgentHTTPDeclaredResolution(t, postgres.ActivationOutcomeActivated)
+}
+
+func TestAgentHTTPDeclaredResolutionNotActivated(t *testing.T) {
+	testAgentHTTPDeclaredResolution(t, postgres.ActivationOutcomeNotActivated)
+}
+
+func testAgentHTTPDeclaredResolution(t *testing.T, outcome string) {
+	ctx := context.Background()
+	f := newAgentHTTPFixture(t)
+	leases := postgres.NewAgentLeaseRepository(f.pool, postgres.NewDeploymentRepository(f.pool))
+	h := newTestHandler(f.pool)
+	h.Activator = leases
+	h.ActivationReporter = leases
+	srv := httptest.NewServer(withTLS(h))
+	defer srv.Close()
+
+	token, err := server.NewCredentialToken(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := server.CredentialTokenDigest(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body := postJSON(t, srv, pathEnroll, "", "", enrollRequest{ServerID: f.serverID, EnrollmentToken: string(f.issueEnrollment(t)), CredentialDigest: hexOf(digest)})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("enroll: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	claim := func(wantJob int64) (attemptID, fence int64) {
+		t.Helper()
+		resp, body := postJSON(t, srv, pathClaim, token, f.serverID, claimRequest{Limit: 1, ExecutorAvailable: true})
+		leasesBody, _ := body["leases"].([]any)
+		if resp.StatusCode != http.StatusOK || len(leasesBody) != 1 {
+			t.Fatalf("claim: status=%d body=%v", resp.StatusCode, body)
+		}
+		lease := leasesBody[0].(map[string]any)
+		if int64(lease["job_id"].(float64)) != wantJob {
+			t.Fatalf("claimed job %v, want %d", lease["job_id"], wantJob)
+		}
+		return int64(lease["attempt_id"].(float64)), int64(lease["fence"].(float64))
+	}
+
+	attempt1, fence1 := claim(f.jobID)
+	for _, phase := range []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusStarting, deployment.StatusHealthChecking} {
+		resp, body := postJSON(t, srv, pathProgress, token, f.serverID, progressRequest{AttemptID: attempt1, Fence: fence1, Phase: string(phase)})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("progress %s: status=%d body=%v", phase, resp.StatusCode, body)
+		}
+	}
+	// route_heads rows cannot be deleted and hostname is globally unique, so
+	// a fresh hostname per run (see the sibling test).
+	if _, err := f.pool.Exec(ctx, `INSERT INTO route_heads(environment_id, hostname, route_revision) VALUES ($1,$2,0)`, f.envID, "app-"+randomSuffix(t)+".example.com"); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = postJSON(t, srv, pathActivate, token, f.serverID, activateRequest{AttemptID: attempt1, Fence: fence1, ImageDigest: hexOf(digestFixture(7))})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("activate: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// The real sweeper records the block: ExpireBatch is global, so assert
+	// on THIS attempt's own rows.
+	if _, err := f.pool.Exec(ctx, `UPDATE agent_job_attempts SET lease_expires_at=now()-interval '2 seconds', authority_expires_at=now()-interval '2 seconds' WHERE id=$1`, attempt1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := leases.ExpireBatch(ctx, 10); err != nil {
+		t.Fatalf("ExpireBatch: %v", err)
+	}
+	var opState string
+	var routeDigest []byte
+	if err := f.pool.QueryRow(ctx, `SELECT state, route_digest FROM release_operations WHERE attempt_id=$1 AND kind='activate'`, attempt1).Scan(&opState, &routeDigest); err != nil || opState != "reconciliation_required" {
+		t.Fatalf("operation state=%q err=%v, want reconciliation_required (recorded by the sweeper)", opState, err)
+	}
+	var flagged bool
+	if err := f.pool.QueryRow(ctx, `SELECT reconciliation_required FROM route_heads WHERE environment_id=$1`, f.envID).Scan(&flagged); err != nil || !flagged {
+		t.Fatalf("route head flagged=%v err=%v, want blocked", flagged, err)
+	}
+	var slotFlag bool
+	if err := f.pool.QueryRow(ctx, `SELECT reconciliation_required FROM environment_slots WHERE environment_id=$1`, f.envID).Scan(&slotFlag); err != nil || !slotFlag {
+		t.Fatalf("slot flagged=%v err=%v, want blocked", slotFlag, err)
+	}
+
+	// The agent proves it observed this very activation by presenting the
+	// digest the operation authorized (required for activated only).
+	var outcomeDigest [32]byte
+	copy(outcomeDigest[:], routeDigest)
+	var releaseID string
+	var headBefore struct {
+		active   *string
+		revision int64
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT release_id FROM release_operations WHERE attempt_id=$1 AND kind='activate'`, attempt1).Scan(&releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT active_release_id, route_revision FROM route_heads WHERE environment_id=$1`, f.envID).Scan(&headBefore.active, &headBefore.revision); err != nil {
+		t.Fatal(err)
+	}
+	resp, body = postJSON(t, srv, pathReconcile, token, f.serverID, reconcileRequest{EnvironmentID: f.envID, AttemptID: attempt1, Fence: fence1, Outcome: outcome, OutcomeDigest: hexOf(outcomeDigest)})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("reconcile %s: status=%d body=%v, want 200", outcome, resp.StatusCode, body)
+	}
+
+	if err := f.pool.QueryRow(ctx, `SELECT reconciliation_required FROM route_heads WHERE environment_id=$1`, f.envID).Scan(&flagged); err != nil || flagged {
+		t.Fatalf("route head flagged=%v err=%v, want unblocked", flagged, err)
+	}
+	var slotCurrent *int64
+	if err := f.pool.QueryRow(ctx, `SELECT current_attempt_id, reconciliation_required FROM environment_slots WHERE environment_id=$1`, f.envID).Scan(&slotCurrent, &slotFlag); err != nil || slotCurrent != nil || slotFlag {
+		t.Fatalf("slot current=%v flagged=%v err=%v, want free and clear", slotCurrent, slotFlag, err)
+	}
+	// The declared outcome must decide what is recorded, not merely unblock.
+	wantOp, wantDeployment, wantAttempt, wantJob := "succeeded", "healthy", "succeeded", "succeeded"
+	if outcome == postgres.ActivationOutcomeNotActivated {
+		wantOp, wantDeployment, wantAttempt, wantJob = "failed", "failed", "expired", "failed"
+	}
+	var gotOp, gotSummary, gotDeployment, gotAttempt, gotJob string
+	if err := f.pool.QueryRow(ctx, `SELECT o.state, o.outcome_summary, d.status, a.state, j.state FROM release_operations o JOIN agent_job_attempts a ON a.id=o.attempt_id JOIN agent_jobs j ON j.id=a.job_id JOIN deployments d ON d.id=j.deployment_id WHERE o.attempt_id=$1 AND o.kind='activate'`, attempt1).Scan(&gotOp, &gotSummary, &gotDeployment, &gotAttempt, &gotJob); err != nil {
+		t.Fatal(err)
+	}
+	if gotOp != wantOp || gotDeployment != wantDeployment || gotAttempt != wantAttempt || gotJob != wantJob {
+		t.Fatalf("%s: operation=%s deployment=%s attempt=%s job=%s, want %s/%s/%s/%s", outcome, gotOp, gotDeployment, gotAttempt, gotJob, wantOp, wantDeployment, wantAttempt, wantJob)
+	}
+	if !strings.HasSuffix(gotSummary, " | declared "+outcome) {
+		t.Fatalf("%s: summary %q does not end with the declared outcome", outcome, gotSummary)
+	}
+	var headAfter struct {
+		active   *string
+		revision int64
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT active_release_id, route_revision FROM route_heads WHERE environment_id=$1`, f.envID).Scan(&headAfter.active, &headAfter.revision); err != nil {
+		t.Fatal(err)
+	}
+	if outcome == postgres.ActivationOutcomeActivated {
+		if headAfter.active == nil || *headAfter.active != releaseID || headAfter.revision != headBefore.revision+1 {
+			t.Fatalf("activated: head active=%v revision=%d, want release %s revision %d", headAfter.active, headAfter.revision, releaseID, headBefore.revision+1)
+		}
+	} else if (headAfter.active == nil) != (headBefore.active == nil) || (headAfter.active != nil && *headAfter.active != *headBefore.active) || headAfter.revision != headBefore.revision {
+		t.Fatalf("not_activated: head changed from %v/%d to %v/%d", headBefore.active, headBefore.revision, headAfter.active, headAfter.revision)
+	}
+	var opCount int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM release_operations WHERE environment_id=$1 AND kind='activate' AND state IN ('switch_authorized','reconciliation_required')`, f.envID).Scan(&opCount); err != nil || opCount != 0 {
+		t.Fatalf("unresolved activations=%d err=%v, want none", opCount, err)
+	}
+
+	job2 := f.insertSecondJob(t)
+	attempt2, fence2 := claim(job2)
+	if attempt2 == attempt1 {
+		t.Fatal("second claim returned the resolved attempt")
+	}
+	// The block is gone only if the new attempt can itself start an
+	// activation: it must not be refused as blocked or stale.
+	for _, phase := range []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusStarting, deployment.StatusHealthChecking} {
+		resp, body := postJSON(t, srv, pathProgress, token, f.serverID, progressRequest{AttemptID: attempt2, Fence: fence2, Phase: string(phase)})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("second attempt progress %s: status=%d body=%v", phase, resp.StatusCode, body)
+		}
+	}
+	resp, body = postJSON(t, srv, pathActivate, token, f.serverID, activateRequest{AttemptID: attempt2, Fence: fence2, ImageDigest: hexOf(digestFixture(9))})
+	t.Logf("%s: second attempt activate: status=%d body=%v", outcome, resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second attempt activate: status=%d body=%v, want 200 (block gone)", resp.StatusCode, body)
+	}
 }

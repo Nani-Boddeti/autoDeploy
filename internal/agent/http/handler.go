@@ -108,8 +108,13 @@ type LeaseCompleter interface {
 type LeaseCanceller interface {
 	AcknowledgeCancellation(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, resultDigest [32]byte) error
 }
+
+// EnvironmentReconciler clears one environment's reconciliation block under a
+// declared outcome (one of the postgres.ActivationOutcome* values). Its
+// signature also matches (*postgres.AgentLeaseRepository).ReconcileActivation
+// exactly, so production wiring passes the repository directly.
 type EnvironmentReconciler interface {
-	Reconcile(ctx context.Context, serverID string, presentedDigest [32]byte, environmentID string, attemptID, fence int64, outcomeDigest [32]byte) error
+	ReconcileActivation(ctx context.Context, serverID string, presentedDigest [32]byte, environmentID string, attemptID, fence int64, outcome string, outcomeDigest [32]byte) error
 }
 
 // Handler deliberately has no browser session or CSRF dependency and takes
@@ -367,6 +372,17 @@ func (h Handler) mapError(w http.ResponseWriter, err error) {
 		// 409: the route head no longer matches what the operation
 		// recorded; a retry of the same report will see the same mismatch.
 		h.writeError(w, http.StatusConflict, "route_moved")
+	case errors.Is(err, postgres.ErrAgentLeaseOutcomeMismatch):
+		// 409: the declared outcome contradicts the kind of block (an
+		// activation outcome for a plain block, or the reverse); the same
+		// declaration will be refused again, so it must not be retryable.
+		h.writeError(w, http.StatusConflict, "outcome_mismatch")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationUnresolved):
+		// 409: the activation is still switch_authorized, so the host switch
+		// may be in flight and cannot be resolved yet. Only the sweeper or the
+		// activation-result moving it on changes that; retrying the same
+		// declaration cannot.
+		h.writeError(w, http.StatusConflict, "activation_unresolved")
 	case errors.Is(err, postgres.ErrAgentLeaseCorruptState):
 		// 409: durable state violates an invariant; retrying as if it were
 		// backpressure until lease expiry would only hide it.

@@ -297,14 +297,17 @@ func (c *Client) CancelAck(ctx context.Context, attemptID, fence int64, operatio
 }
 
 // Reconcile clears reconciliation_required for one environment once this
-// server reports the outcome of the operation that made it required.
-func (c *Client) Reconcile(ctx context.Context, environmentID string, attemptID, fence int64, outcomeDigest [32]byte) error {
+// server reports the outcome of the operation that made it required. outcome
+// is required and says what the block was ("activated", "not_activated" or
+// "no_activation"); the control plane refuses a missing or unknown value.
+func (c *Client) Reconcile(ctx context.Context, environmentID string, attemptID, fence int64, outcome string, outcomeDigest [32]byte) error {
 	req := struct {
 		EnvironmentID string `json:"environment_id"`
 		AttemptID     int64  `json:"attempt_id"`
 		Fence         int64  `json:"fence"`
+		Outcome       string `json:"outcome"`
 		OutcomeDigest string `json:"outcome_digest"`
-	}{EnvironmentID: environmentID, AttemptID: attemptID, Fence: fence, OutcomeDigest: hex.EncodeToString(outcomeDigest[:])}
+	}{EnvironmentID: environmentID, AttemptID: attemptID, Fence: fence, Outcome: outcome, OutcomeDigest: hex.EncodeToString(outcomeDigest[:])}
 	return c.post(ctx, pathReconcile, req, nil, true)
 }
 

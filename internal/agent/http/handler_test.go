@@ -105,9 +105,19 @@ func (f *fakeCanceller) AcknowledgeCancellation(_ context.Context, _ string, _ [
 	return f.err
 }
 
-type fakeReconciler struct{ err error }
+type fakeReconciler struct {
+	err         error
+	calls       int
+	gotOutcome  string
+	gotEnv      string
+	gotAttempt  int64
+	gotFence    int64
+	gotOutDigst [32]byte
+}
 
-func (f *fakeReconciler) Reconcile(_ context.Context, _ string, _ [32]byte, _ string, _, _ int64, _ [32]byte) error {
+func (f *fakeReconciler) ReconcileActivation(_ context.Context, _ string, _ [32]byte, environmentID string, attemptID, fence int64, outcome string, outcomeDigest [32]byte) error {
+	f.calls++
+	f.gotEnv, f.gotAttempt, f.gotFence, f.gotOutcome, f.gotOutDigst = environmentID, attemptID, fence, outcome, outcomeDigest
 	return f.err
 }
 
@@ -339,6 +349,14 @@ func TestErrorMapping(t *testing.T) {
 		{"integrity conflict", postgres.ErrAgentLeaseIntegrityConflict, http.StatusConflict, "integrity_conflict"},
 		{"activation candidate not ready", postgres.ErrAgentLeaseActivationCandidateNotReady, http.StatusConflict, "candidate_not_ready"},
 		{"activation no route head", postgres.ErrAgentLeaseActivationNoRouteHead, http.StatusConflict, "no_route_head"},
+		{"outcome mismatch", postgres.ErrAgentLeaseOutcomeMismatch, http.StatusConflict, "outcome_mismatch"},
+		{"wrapped outcome mismatch", wrap(postgres.ErrAgentLeaseOutcomeMismatch), http.StatusConflict, "outcome_mismatch"},
+		{"activation unresolved", postgres.ErrAgentLeaseActivationUnresolved, http.StatusConflict, "activation_unresolved"},
+		{"wrapped activation unresolved", wrap(postgres.ErrAgentLeaseActivationUnresolved), http.StatusConflict, "activation_unresolved"},
+		// An unrecorded block must stay retryable whatever it wraps, so the new
+		// terminal cases must not shadow it.
+		{"unrecorded block wrapping outcome mismatch", errors.Join(postgres.ErrActivationBlockUnrecorded, postgres.ErrAgentLeaseOutcomeMismatch), http.StatusServiceUnavailable, "service_unavailable"},
+		{"unrecorded block wrapping unresolved", errors.Join(postgres.ErrActivationBlockUnrecorded, postgres.ErrAgentLeaseActivationUnresolved), http.StatusServiceUnavailable, "service_unavailable"},
 		{"invalid input", postgres.ErrAgentLeaseInvalidInput, http.StatusBadRequest, "invalid_request"},
 		{"infra error", errors.New("boom secret db dsn"), http.StatusServiceUnavailable, "service_unavailable"},
 	}
