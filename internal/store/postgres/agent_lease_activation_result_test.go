@@ -236,6 +236,14 @@ func TestReportActivationResultIgnoresLapsedAuthority(t *testing.T) {
 // still activating, route head revision/active release unchanged.
 func (a activatedFixture) assertBlocked(t *testing.T, wantRevision int64, wantActive, wantSummaryContains string) {
 	t.Helper()
+	a.assertBlockedWithLate(t, wantRevision, wantActive, wantSummaryContains, 0)
+}
+
+// assertBlockedWithLate is assertBlocked after wantLate late reports: the
+// flags, rows and the single block event are unchanged; only
+// activation_late_report events may follow it, exactly wantLate of them.
+func (a activatedFixture) assertBlockedWithLate(t *testing.T, wantRevision int64, wantActive, wantSummaryContains string, wantLate int) {
+	t.Helper()
 	state, closedAt, summary := a.operation(t)
 	if state != "reconciliation_required" || closedAt == nil {
 		t.Fatalf("operation state=%s closedAt=%v", state, closedAt)
@@ -276,8 +284,20 @@ func (a activatedFixture) assertBlocked(t *testing.T, wantRevision int64, wantAc
 		t.Fatalf("activated route events=%d, want 0", n)
 	}
 	events := a.jobEvents(t)
-	if events[len(events)-1] != "activation_reconciliation_required" {
-		t.Fatalf("job events=%v", events)
+	blocks, lates, last := 0, 0, ""
+	for _, e := range events {
+		switch e {
+		case "activation_reconciliation_required":
+			blocks++
+		case "activation_late_report":
+			lates++
+		}
+		if e != "activation_late_report" {
+			last = e
+		}
+	}
+	if blocks != 1 || lates != wantLate || last != "activation_reconciliation_required" {
+		t.Fatalf("job events=%v, want one block event (last non-late) and %d late reports", events, wantLate)
 	}
 	for _, e := range events {
 		if e == "failed" || e == "dead" || e == "retry_scheduled" || e == "succeeded" || e == "activated" {
@@ -307,15 +327,21 @@ func TestReportActivationResultFailureBlocksEnvironment(t *testing.T) {
 	if got := len(a.jobEvents(t)); got != eventsBefore {
 		t.Fatalf("replay appended events: %d -> %d", eventsBefore, got)
 	}
-	// A conflicting failure summary is an integrity conflict; a success
-	// report against the blocked operation is stale (10c-2b's hook).
-	if err := a.report(ctx, false, "a different story"); !errors.Is(err, ErrAgentLeaseIntegrityConflict) {
-		t.Fatalf("conflicting failure err=%v, want ErrAgentLeaseIntegrityConflict", err)
+	// Any other report against the blocked operation is a LATE report
+	// (10c-2b step E): recorded as evidence, answered with the typed
+	// non-retryable sentinel, never finalized. Full coverage of that path is in
+	// agent_lease_activation_late_report_test.go.
+	if err := a.report(ctx, false, "a different story"); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+		t.Fatalf("different failure err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
 	}
-	if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseStale) {
-		t.Fatalf("success after failure err=%v, want ErrAgentLeaseStale", err)
+	if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+		t.Fatalf("success after failure err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
 	}
-	a.assertBlocked(t, 1, a.predecessorID, "reload  timed out after 30s")
+	// Flags, rows and the single block event are unchanged by the late reports.
+	a.assertBlockedWithLate(t, 1, a.predecessorID, "reload  timed out after 30s", 2)
+	if _, _, summary := a.operation(t); !strings.HasPrefix(summary, "reload  timed out after 30s | late report #") || !strings.Contains(summary, "a different story") {
+		t.Fatalf("summary=%q", summary)
+	}
 }
 
 // TestReportActivationResultBlankFailureSummary runs against the real

@@ -21,7 +21,7 @@ import (
 // 'activation_reconciliation_required' job event, and nothing that resolves
 // the ambiguity (attempt/job/slot occupancy untouched, no 'activated' route
 // event, no terminal job event).
-func (a activatedFixture) assertReconciliationRecorded(t *testing.T, wantEvidence string) {
+func (a activatedFixture) assertReconciliationRecorded(t *testing.T, wantEvidence string, wantLateReports int) {
 	t.Helper()
 	state, closedAt, summary := a.operation(t)
 	if state != "reconciliation_required" || closedAt == nil {
@@ -43,11 +43,13 @@ func (a activatedFixture) assertReconciliationRecorded(t *testing.T, wantEvidenc
 	if n := a.activatedRouteEvents(t); n != 0 {
 		t.Fatalf("activated route events=%d, want 0", n)
 	}
-	blocks := 0
+	blocks, lates := 0, 0
 	for _, e := range a.jobEvents(t) {
 		switch e {
 		case "activation_reconciliation_required":
 			blocks++
+		case "activation_late_report":
+			lates++
 		case "activation_authorized":
 		default:
 			t.Fatalf("unexpected job event %q in %v", e, a.jobEvents(t))
@@ -55,6 +57,9 @@ func (a activatedFixture) assertReconciliationRecorded(t *testing.T, wantEvidenc
 	}
 	if blocks != 1 {
 		t.Fatalf("activation_reconciliation_required events=%d, want exactly 1 (%v)", blocks, a.jobEvents(t))
+	}
+	if lates != wantLateReports {
+		t.Fatalf("activation_late_report events=%d, want %d (%v)", lates, wantLateReports, a.jobEvents(t))
 	}
 }
 
@@ -144,7 +149,7 @@ func TestReportActivationResultDeterministicFinalizeFailuresBlock(t *testing.T) 
 		if !errors.Is(err, ErrAgentLeaseCorruptState) {
 			t.Fatalf("err=%v, want ErrAgentLeaseCorruptState", err)
 		}
-		a.assertReconciliationRecorded(t, fmt.Sprintf(`candidate release %s is "failed"`, a.candidateID))
+		a.assertReconciliationRecorded(t, fmt.Sprintf(`candidate release %s is "failed"`, a.candidateID), 0)
 		// Everything finalize wrote before it noticed was rolled back.
 		if got := a.deploymentStatus(t); got != deployment.StatusActivating {
 			t.Fatalf("deployment=%s, want activating", got)
@@ -172,7 +177,7 @@ func TestReportActivationResultDeterministicFinalizeFailuresBlock(t *testing.T) 
 		if !errors.Is(err, ErrAgentLeaseCorruptState) {
 			t.Fatalf("err=%v, want ErrAgentLeaseCorruptState", err)
 		}
-		a.assertReconciliationRecorded(t, fmt.Sprintf(`predecessor release %s is "retained"`, a.predecessorID))
+		a.assertReconciliationRecorded(t, fmt.Sprintf(`predecessor release %s is "retained"`, a.predecessorID), 0)
 		if st, _ := a.releaseState(t, a.candidateID); st != "ready" {
 			t.Fatalf("candidate=%s, want ready", st)
 		}
@@ -188,7 +193,7 @@ func TestReportActivationResultDeterministicFinalizeFailuresBlock(t *testing.T) 
 		if !errors.Is(err, ErrAgentLeaseCorruptState) || !errors.Is(err, deployment.ErrTerminalState) {
 			t.Fatalf("err=%v, want ErrAgentLeaseCorruptState wrapping ErrTerminalState", err)
 		}
-		a.assertReconciliationRecorded(t, "transition deployment to healthy")
+		a.assertReconciliationRecorded(t, "transition deployment to healthy", 0)
 		if got := a.deploymentStatus(t); got != deployment.StatusFailed {
 			t.Fatalf("deployment=%s, want the pre-existing failed untouched", got)
 		}
@@ -205,7 +210,7 @@ func TestReportActivationResultDeterministicFinalizeFailuresBlock(t *testing.T) 
 		if !errors.Is(err, ErrAgentLeaseCorruptState) {
 			t.Fatalf("err=%v, want ErrAgentLeaseCorruptState", err)
 		}
-		a.assertReconciliationRecorded(t, fmt.Sprintf("environment %s has no route head", a.envID))
+		a.assertReconciliationRecorded(t, fmt.Sprintf("environment %s has no route head", a.envID), 0)
 		var heads int
 		if err := a.pool.QueryRow(ctx, `SELECT count(*) FROM route_heads WHERE environment_id=$1`, a.envID).Scan(&heads); err != nil || heads != 0 {
 			t.Fatalf("route heads=%d err=%v, want none", heads, err)
@@ -254,14 +259,29 @@ func TestReportActivationResultCommitTimeFailureBlocksInFreshTransaction(t *test
 	if _, _, summary := a.operation(t); !strings.Contains(summary, "test deferred trigger refuses operation "+a.operationID) {
 		t.Fatalf("evidence %q does not name the deferred trigger's message", summary)
 	}
-	a.assertReconciliationRecorded(t, "test deferred trigger refuses operation")
+	a.assertReconciliationRecorded(t, "test deferred trigger refuses operation", 0)
 
-	// Replay of the same success report finds the blocked operation: the
-	// documented stale refusal, and no second block.
-	if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseStale) {
-		t.Fatalf("replay err=%v, want ErrAgentLeaseStale", err)
+	// Replay of the same success report finds the blocked operation: it is
+	// recorded once as late evidence (the host may have switched), and no
+	// second block is written.
+	if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+		t.Fatalf("replay err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
 	}
-	a.assertReconciliationRecorded(t, "test deferred trigger refuses operation")
+	a.assertReconciliationRecorded(t, "test deferred trigger refuses operation", 1)
+	_, _, afterFirst := a.operation(t)
+	if strings.Count(afterFirst, "late report #") != 1 || countEvents(a.jobEvents(t), "activation_late_report") != 1 {
+		t.Fatalf("summary=%q, want exactly one late entry and one late event", afterFirst)
+	}
+	// A second replay hits the fingerprint ledger: same answer, no write.
+	if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+		t.Fatalf("second replay err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
+	}
+	if _, _, again := a.operation(t); again != afterFirst {
+		t.Fatalf("second replay changed the summary:\n%q\n%q", afterFirst, again)
+	}
+	if n := countEvents(a.jobEvents(t), "activation_late_report"); n != 1 {
+		t.Fatalf("late report events=%d after the second replay, want 1", n)
+	}
 }
 
 // TestReportActivationResultCommitTimeBlockFailureIsRetryableNotTerminal: when
@@ -318,7 +338,7 @@ func TestReportActivationResultCommitTimeBlockFailureIsRetryableNotTerminal(t *t
 			if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseConstraintViolation) {
 				t.Fatalf("retry err=%v, want ErrAgentLeaseConstraintViolation", err)
 			}
-			a.assertReconciliationRecorded(t, "test deferred trigger refuses operation")
+			a.assertReconciliationRecorded(t, "test deferred trigger refuses operation", 0)
 		})
 	}
 }
@@ -331,7 +351,7 @@ func TestBlockAfterCommitFailureIsIdempotentAndTolerant(t *testing.T) {
 	ctx := context.Background()
 	cause := errors.New("original commit failure")
 	call := func(a activatedFixture) error {
-		return a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause)
+		return a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause, a.successReportInput())
 	}
 
 	t.Run("already reconciliation_required", func(t *testing.T) {
@@ -340,13 +360,14 @@ func TestBlockAfterCommitFailureIsIdempotentAndTolerant(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := a.jobEvents(t)
-		if err := call(a); err != cause {
-			t.Fatalf("err=%v, want the original error unchanged", err)
+		// Already blocked: the report is recorded as late evidence, not lost.
+		if err := call(a); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+			t.Fatalf("err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
 		}
-		if after := a.jobEvents(t); len(after) != len(before) {
-			t.Fatalf("events %v -> %v, want no second block", before, after)
+		if after := a.jobEvents(t); len(after) != len(before)+1 {
+			t.Fatalf("events %v -> %v, want exactly the late report event and no second block", before, after)
 		}
-		a.assertBlocked(t, 1, a.predecessorID, "reload timed out")
+		a.assertBlockedWithLate(t, 1, a.predecessorID, "reload timed out", 1)
 	})
 
 	// Another writer finalized this very operation: this report's intent is
@@ -371,10 +392,12 @@ func TestBlockAfterCommitFailureIsIdempotentAndTolerant(t *testing.T) {
 			t.Fatalf("err=%v, want the original error unchanged", err)
 		}
 		a.assertBlocked(t, 1, a.predecessorID, "activation finalize failed at commit: original commit failure")
-		if err := call(a); err != cause {
-			t.Fatalf("second call err=%v, want the original error unchanged", err)
+		// The same report again finds the block this call created: recorded
+		// once as late evidence, never a second block.
+		if err := call(a); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+			t.Fatalf("second call err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
 		}
-		a.assertReconciliationRecorded(t, "original commit failure")
+		a.assertReconciliationRecorded(t, "original commit failure", 1)
 	})
 
 	// Authentication happened in tx1; the block grants the agent nothing, so
@@ -391,14 +414,14 @@ func TestBlockAfterCommitFailureIsIdempotentAndTolerant(t *testing.T) {
 		if err := call(a); err != cause {
 			t.Fatalf("err=%v, want the original error unchanged", err)
 		}
-		a.assertReconciliationRecorded(t, "original commit failure")
+		a.assertReconciliationRecorded(t, "original commit failure", 0)
 	})
 
 	// Ownership is still enforced: another server's id cannot record a block
 	// on this attempt.
 	t.Run("wrong server id records nothing and fails retryably", func(t *testing.T) {
 		a := newActivatedFixture(t, 163, true)
-		err := a.repo.blockAfterCommitFailure(ctx, "someone-else", a.attemptID, 1, mustParseInt(t, a.operationID), cause)
+		err := a.repo.blockAfterCommitFailure(ctx, "someone-else", a.attemptID, 1, mustParseInt(t, a.operationID), cause, a.successReportInput())
 		if err == nil || errors.Is(err, cause) || !errors.Is(err, ErrActivationBlockUnrecorded) {
 			t.Fatalf("err=%v, want ErrActivationBlockUnrecorded without wrapping the cause", err)
 		}

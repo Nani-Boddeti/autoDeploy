@@ -160,7 +160,7 @@ func TestBlockAfterCommitFailureRefusesNonOccupant(t *testing.T) {
 		t.Run(how, func(t *testing.T) {
 			a := newActivatedFixture(t, byte(110+i), true)
 			a.breakOccupancy(t, how)
-			if err := a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause); err != cause {
+			if err := a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause, a.successReportInput()); err != cause {
 				t.Fatalf("err=%v, want the original error unchanged", err)
 			}
 			a.assertNothingRecorded(t)
@@ -183,7 +183,7 @@ func TestBlockAfterFinalizeFailureRollbackToSavepointFailureIsRetryable(t *testi
 			t.Fatal(err)
 		}
 		defer tx.Rollback(bg) //nolint:errcheck
-		return a.repo.blockAfterFinalizeFailure(callCtx, tx, a.serverID, a.jobID, a.attemptID, 1, mustParseInt(t, a.operationID), a.envID, cause)
+		return a.repo.blockAfterFinalizeFailure(callCtx, tx, a.serverID, a.jobID, a.attemptID, 1, mustParseInt(t, a.operationID), a.envID, cause, a.successReportInput())
 	}
 	check := func(t *testing.T, a activatedFixture, err error) {
 		t.Helper()
@@ -300,7 +300,7 @@ func TestReportActivationResultFreshBlockCommitFailureIsRetryableNotTerminal(t *
 	if err := a.report(ctx, true, ""); !errors.Is(err, ErrAgentLeaseConstraintViolation) {
 		t.Fatalf("retry err=%v, want the typed error with the block recorded", err)
 	}
-	a.assertReconciliationRecorded(t, "test deferred trigger refuses operation")
+	a.assertReconciliationRecorded(t, "test deferred trigger refuses operation", 0)
 }
 
 // TestReportActivationResultBlockCommitFailureFallsBackToFreshTransaction: a
@@ -342,8 +342,86 @@ func TestReportActivationResultBlockCommitFailureFallsBackToFreshTransaction(t *
 		if !errors.Is(err, ErrAgentLeaseCorruptState) {
 			t.Fatalf("err=%v, want the typed ErrAgentLeaseCorruptState", err)
 		}
-		a.assertReconciliationRecorded(t, fmt.Sprintf(`candidate release %s is "failed"`, a.candidateID))
+		a.assertReconciliationRecorded(t, fmt.Sprintf(`candidate release %s is "failed"`, a.candidateID), 0)
 	})
+}
+
+// TestReportActivationResultFailureCommitFallbackFindsOperationAlreadyBlocked:
+// a failure report whose own block COMMIT fails deterministically, while
+// another writer's block queued on the slot lock (confirmed in pg_stat_activity)
+// and wins it the moment this transaction rolls back. The fresh transaction
+// finds the operation already reconciliation_required: the report is recorded
+// as late evidence and answered with the late sentinel, not lost and not
+// reported as stale.
+func TestReportActivationResultFailureCommitFallbackFindsOperationAlreadyBlocked(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := newActivatedFixture(t, 144, true)
+	a.installBlockCommitFailureOnce(t)
+	opID := mustParseInt(t, a.operationID)
+	done := make(chan error, 1)
+	started := false
+	a.repo.failAfter = func(stage string) error {
+		if stage != "operation_close" || started {
+			return nil
+		}
+		started = true
+		go func() {
+			_, err := a.repo.recordBlockInFreshTransaction(ctx, a.serverID, a.attemptID, 1, opID, "other writer block", a.failureReportInput("other writer block"))
+			done <- err
+		}()
+		waitForLockWaiters(t, ctx, a.pool, "FROM environment_slots%FOR UPDATE", 1)
+		return nil
+	}
+	if err := a.report(ctx, false, "reload timed out"); !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+		t.Fatalf("err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("other writer's block: %v", err)
+	}
+	a.assertBlockedWithLate(t, 1, a.predecessorID, "other writer block", 1)
+	if _, _, summary := a.operation(t); !strings.HasPrefix(summary, "other writer block | late report #") || !strings.Contains(summary, "reload timed out") {
+		t.Fatalf("summary=%q, want the other block followed by this report as late evidence", summary)
+	}
+}
+
+// Same race as the failure-report test above, through refuseAmbiguous: a
+// success report with the wrong digest whose ambiguity-block COMMIT fails
+// while another writer's block wins the slot. The report is recorded as late
+// evidence and answered with the late sentinel, not the ambiguity refusal.
+func TestReportActivationResultAmbiguityCommitFallbackFindsOperationAlreadyBlocked(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := newActivatedFixture(t, 145, true)
+	a.installBlockCommitFailureOnce(t)
+	opID := mustParseInt(t, a.operationID)
+	done := make(chan error, 1)
+	started := false
+	a.repo.failAfter = func(stage string) error {
+		if stage != "operation_close" || started {
+			return nil
+		}
+		started = true
+		go func() {
+			_, err := a.repo.recordBlockInFreshTransaction(ctx, a.serverID, a.attemptID, 1, opID, "other writer block", a.failureReportInput("other writer block"))
+			done <- err
+		}()
+		waitForLockWaiters(t, ctx, a.pool, "FROM environment_slots%FOR UPDATE", 1)
+		return nil
+	}
+	wrong := a.routeDigest
+	wrong[0] ^= 0xff
+	err := a.repo.ReportActivationResult(ctx, a.serverID, a.cred, a.attemptID, 1, a.operationID, true, wrong, "")
+	if !errors.Is(err, ErrAgentLeaseActivationLateReportRecorded) {
+		t.Fatalf("err=%v, want ErrAgentLeaseActivationLateReportRecorded", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("other writer's block: %v", err)
+	}
+	a.assertBlockedWithLate(t, 1, a.predecessorID, "other writer block", 1)
+	if _, _, summary := a.operation(t); !strings.Contains(summary, "matches authorized digest: false") {
+		t.Fatalf("summary=%q, want the wrong-digest success recorded as late evidence", summary)
+	}
 }
 
 // TestReportActivationResultFailuresAroundTheSavepointAreRouted covers the
@@ -479,7 +557,7 @@ func TestBlockAfterCommitFailureLocksGenuinelyContend(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				blockErr = a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause)
+				blockErr = a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause, a.successReportInput())
 			}()
 			waitForLockWaiters(t, ctx, a.pool, "FROM "+row.table+"%FOR UPDATE", 1)
 			// Still blocked: nothing may have been recorded yet.
@@ -495,8 +573,15 @@ func TestBlockAfterCommitFailureLocksGenuinelyContend(t *testing.T) {
 				t.Fatal(err)
 			}
 			wg.Wait()
-			if blockErr != cause {
-				t.Fatalf("block err=%v, want the original cause (recorded or no-op alike)", blockErr)
+			// A holder that already blocked the operation (release_operations
+			// row) does not make the report a no-op: it is recorded as late
+			// evidence. Every other winner leaves the original cause.
+			wantErr := cause
+			if row.table == "release_operations" {
+				wantErr = ErrAgentLeaseActivationLateReportRecorded
+			}
+			if !errors.Is(blockErr, wantErr) {
+				t.Fatalf("block err=%v, want %v (recorded or no-op alike)", blockErr, wantErr)
 			}
 			if row.holderWins {
 				if _, _, _, reconciling := a.slotRow(t); reconciling {
@@ -505,17 +590,19 @@ func TestBlockAfterCommitFailureLocksGenuinelyContend(t *testing.T) {
 				if _, _, routeReconciling := a.routeHead(t); routeReconciling {
 					t.Fatal("route head flagged on top of the holder's committed change")
 				}
-				if events := a.jobEvents(t); len(events) != 1 {
-					t.Fatalf("job events=%v, want no block event", events)
-				}
+				wantEvents := 1
 				if row.table == "release_operations" {
-					if _, _, summary := a.operation(t); summary != "holder won" {
-						t.Fatalf("summary=%q, want the holder's", summary)
+					wantEvents = 2 // authorization + the late report, never a block
+					if _, _, summary := a.operation(t); !strings.HasPrefix(summary, "holder won | late report #") {
+						t.Fatalf("summary=%q, want the holder's followed by the late entry", summary)
 					}
+				}
+				if events := a.jobEvents(t); len(events) != wantEvents || countEvents(events, "activation_reconciliation_required") != 0 {
+					t.Fatalf("job events=%v, want no block event", events)
 				}
 				return
 			}
-			a.assertReconciliationRecorded(t, "original commit failure")
+			a.assertReconciliationRecorded(t, "original commit failure", 0)
 		})
 	}
 }
@@ -544,7 +631,7 @@ func TestBlockAfterCommitFailureGenuinelyRacesSuccessReport(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		blockErr = a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause)
+		blockErr = a.repo.blockAfterCommitFailure(ctx, a.serverID, a.attemptID, 1, mustParseInt(t, a.operationID), cause, a.successReportInput())
 	}()
 	go func() {
 		defer wg.Done()
@@ -557,11 +644,19 @@ func TestBlockAfterCommitFailureGenuinelyRacesSuccessReport(t *testing.T) {
 	wg.Wait()
 	switch {
 	case blockErr == cause:
-		// The block won: the success report must be refused as stale.
-		if !errors.Is(reportErr, ErrAgentLeaseStale) {
-			t.Fatalf("block won but the success report err=%v, want ErrAgentLeaseStale", reportErr)
+		// The block won. The success report is NOT stale: the host may have
+		// switched, so it is evidence that must reach the operator. It is
+		// recorded after the original block evidence, not instead of it.
+		if !errors.Is(reportErr, ErrAgentLeaseActivationLateReportRecorded) {
+			t.Fatalf("block won but the success report err=%v, want ErrAgentLeaseActivationLateReportRecorded", reportErr)
 		}
-		a.assertReconciliationRecorded(t, "original commit failure")
+		a.assertReconciliationRecorded(t, "original commit failure", 1)
+		if _, _, summary := a.operation(t); !strings.Contains(summary, "late report #") {
+			t.Fatalf("summary=%q lacks the late success report entry", summary)
+		}
+		if n := countEvents(a.jobEvents(t), "activation_late_report"); n != 1 {
+			t.Fatalf("late report events=%d, want exactly 1", n)
+		}
 	case blockErr == nil:
 		// The report won: the block saw the succeeded operation (idempotent nil).
 		if reportErr != nil {

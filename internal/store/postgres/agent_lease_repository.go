@@ -1546,6 +1546,15 @@ const releaseOperationsOpenActivationIndex = "release_operations_environment_ope
 // can resolve it, never clearing a flag.
 var ErrAgentLeaseActivationUnresolved = errors.New("agent lease environment holds an unresolved activation; it cannot be mark-reconciled")
 
+// ErrAgentLeaseActivationLateReportRecorded is what tx2 returns when an agent
+// report arrives for an activation operation that is ALREADY at
+// reconciliation_required: the report was recorded as evidence for the
+// operator (or had already been) and nothing was finalized. It is neither a
+// success (the ambiguity is not resolved; answering 200 would let the agent
+// proceed as if the switch were confirmed) nor corruption. Non-retryable: the
+// agent has reported truthfully and repeating cannot change the outcome.
+var ErrAgentLeaseActivationLateReportRecorded = errors.New("agent lease activation report recorded as reconciliation evidence; awaiting operator resolution")
+
 // ErrAgentLeaseActivationRouteMoved reports that the route head no longer
 // matches the route_revision/active_release_id tx1 recorded on the
 // operation, so tx2 cannot finalize the activation against it.
@@ -1563,6 +1572,13 @@ const (
 // (the column's CHECK rejects [\x00-\x1f\x7f]; Unicode control runes are
 // dropped as well), trimmed and truncated on a rune boundary.
 func sanitizeOutcomeSummary(summary string) string {
+	return sanitizeBoundedText(summary, maxActivationFailureSummaryBytes)
+}
+
+// sanitizeBoundedText is sanitizeOutcomeSummary with the byte bound as a
+// parameter, so the late-report evidence path can bound a whole entry by the
+// room the 2048-byte column actually has left. The cut never splits a rune.
+func sanitizeBoundedText(summary string, maxBytes int) string {
 	summary = strings.ToValidUTF8(summary, "?")
 	summary = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
@@ -1571,14 +1587,23 @@ func sanitizeOutcomeSummary(summary string) string {
 		return r
 	}, summary)
 	summary = strings.TrimSpace(summary)
-	if len(summary) > maxActivationFailureSummaryBytes {
-		cut := maxActivationFailureSummaryBytes
-		for cut > 0 && !utf8.RuneStart(summary[cut]) {
-			cut--
-		}
-		summary = summary[:cut]
+	return truncateOnRuneBoundary(summary, maxBytes)
+}
+
+// truncateOnRuneBoundary cuts s to at most maxBytes bytes without splitting a
+// multi-byte rune. s must already be valid UTF-8.
+func truncateOnRuneBoundary(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
 	}
-	return summary
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // activationFinalizeInput is everything finalizeActivationSucceeded needs,
@@ -1950,9 +1975,12 @@ func isDeterministicActivationFailure(err error) bool {
 // ambiguous: the host may have switched to something unauthorized, so it is
 // recorded durably the same way (evidence in outcome_summary) and the typed
 // refusal is still returned. Replays: an identical success report for a
-// succeeded operation, and an identical failure report (same sanitized
-// summary) for a reconciliation_required one, are idempotent successes; any
-// other disagreement is ErrAgentLeaseIntegrityConflict.
+// succeeded operation, and a replay of the failure report that created a
+// reconciliation_required block, are idempotent successes; any other report
+// against a succeeded or failed operation is ErrAgentLeaseIntegrityConflict.
+// Any other report against a reconciliation_required operation is a LATE
+// report: recorded as evidence (recordLateReport) and answered with
+// ErrAgentLeaseActivationLateReportRecorded; it never finalizes.
 //
 // RULE: once a success report has passed the fence, occupant and authority
 // checks, ANY deterministic failure to finalize is recorded as the same
@@ -2078,6 +2106,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 	}
 	digestMatches := [32]byte(op.routeDigest) == observedRouteDigest
 	summary := failureOutcomeSummary(failureSummary)
+	report := activationReport{succeeded: succeeded, digestMatches: digestMatches, observedRouteDigest: observedRouteDigest, failureSummary: summary}
 
 	switch op.state {
 	case "succeeded":
@@ -2090,24 +2119,41 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 			return fmt.Errorf("commit agent lease activation result replay: %w", err)
 		}
 		return nil
+	case "failed":
+		// Resolved by an operator's declared "not_activated" (10c-2b step G;
+		// tx2 itself never produces failed). Nothing an agent now reports can
+		// change or add to a closed operation, so the report is answered, not
+		// recorded: ErrAgentLeaseIntegrityConflict, the same non-retryable
+		// answer the succeeded arm gives any report that disagrees with the
+		// durable outcome (409 integrity_conflict, terminal for the client).
+		// NOT corrupt state: failed is a legitimate, operator-resolved state,
+		// and mislabelling it would stop the agent on a misleading error. Not
+		// stale_lease either: the lease is not the issue, the report contradicts
+		// (or is moot against) a declared outcome. No occupant check: the
+		// operation row alone decides, as in the succeeded arm.
+		return ErrAgentLeaseIntegrityConflict
 	case "reconciliation_required":
-		// Already blocked (by an earlier report or, in 10c-2b, the expiry
-		// sweeper). An identical failure report is an idempotent replay so
-		// an agent whose response was lost can tell "already recorded" from
-		// "lost lease". Nothing is finalized here.
-		// 10c-2b insertion point: a late genuine report (especially a
-		// success report) should be recorded as reconciliation evidence
-		// (outcome_summary + event) instead of being refused.
-		if succeeded {
-			return ErrAgentLeaseStale
+		// Already blocked (by an earlier report or the expiry sweeper's
+		// diversion). Nothing is finalized here, ever: only a declared
+		// operator outcome may resolve the ambiguity (ADR 0005).
+		//
+		// (1) A replay of the failure report that CREATED the block is an
+		// idempotent success, so an agent whose response was lost can tell
+		// "already recorded" from "lost lease". It is recognised against the
+		// block's own summary, which later late-report evidence may follow.
+		if !succeeded && isOriginalBlockReplay(op.outcomeSummary, summary) {
+			if err = tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit agent lease activation result failure replay: %w", err)
+			}
+			return nil
 		}
-		if summary != op.outcomeSummary {
-			return ErrAgentLeaseIntegrityConflict
-		}
-		if err = tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit agent lease activation result failure replay: %w", err)
-		}
-		return nil
+		// (2) Any other report is a LATE report: real information about the
+		// host that must reach the operator, recorded as evidence.
+		return r.recordLateReport(ctx, tx, lateReportInput{
+			jobID: jobID, attemptID: attemptID, fence: fence, environmentID: environmentID,
+			attemptState: attemptState, slotFence: slotFence, slotCurrentAttemptID: slotCurrentAttemptID,
+			operationID: op.id, existingSummary: op.outcomeSummary, report: report,
+		})
 	case "switch_authorized":
 	default:
 		return fmt.Errorf("%w: activation operation %d in state %q", ErrAgentLeaseCorruptState, op.id, op.state)
@@ -2135,7 +2181,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 			return err
 		}
 		_ = tx.Rollback(ctx)
-		return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, op.id, "activation finalize failed: ", err)
+		return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, op.id, "activation finalize failed: ", err, report)
 	}
 
 	// refuseAmbiguous records a success report that disagrees with what was
@@ -2156,8 +2202,14 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 			if !isDeterministicActivationFailure(err) {
 				return commitErr
 			}
-			if _, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, evidence); freshErr != nil {
+			outcome, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, evidence, report)
+			if freshErr != nil {
 				return fmt.Errorf("%w (after %v)", freshErr, commitErr)
+			}
+			// Blocked by someone else meanwhile: this report is already
+			// recorded as evidence (or refused as stale), not refused as ambiguous.
+			if err := lateOutcomeError(outcome); err != nil {
+				return err
 			}
 		}
 		return refusal
@@ -2172,7 +2224,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 			if !isDeterministicActivationFailure(err) {
 				return commitErr
 			}
-			outcome, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, summary)
+			outcome, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, summary, report)
 			if freshErr != nil {
 				return fmt.Errorf("%w (after %v)", freshErr, commitErr)
 			}
@@ -2181,6 +2233,8 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 				return nil
 			case activationBlockNoopSucceeded:
 				return ErrAgentLeaseIntegrityConflict
+			case activationBlockLateRecorded:
+				return ErrAgentLeaseActivationLateReportRecorded
 			default:
 				return ErrAgentLeaseStale
 			}
@@ -2250,7 +2304,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		err = r.inject("finalize_clock")
 	}
 	if err != nil {
-		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, fmt.Errorf("agent lease activation result canonical time: %w", err))
+		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, fmt.Errorf("agent lease activation result canonical time: %w", err), report)
 	}
 	if err = r.finalizeActivationSucceeded(ctx, tx, activationFinalizeInput{
 		jobID:                   jobID,
@@ -2266,12 +2320,12 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		now:                     now,
 		fromState:               "switch_authorized",
 	}); err != nil {
-		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, err)
+		return r.blockAfterFinalizeFailure(ctx, tx, serverID, jobID, attemptID, fence, op.id, environmentID, err, report)
 	}
 	if err = tx.Commit(ctx); err != nil {
 		commitErr := fmt.Errorf("commit agent lease activation result: %w", err)
 		if isDeterministicActivationFailure(err) {
-			return r.blockAfterCommitFailure(ctx, serverID, attemptID, fence, op.id, commitErr)
+			return r.blockAfterCommitFailure(ctx, serverID, attemptID, fence, op.id, commitErr, report)
 		}
 		return commitErr
 	}
@@ -2291,7 +2345,7 @@ const activationFinalizeSavepoint = "activation_finalize"
 // text only, so it can never be misclassified as the terminal error); a
 // deterministic COMMIT error of the block transaction falls back to a fresh
 // transaction.
-func (r *AgentLeaseRepository) blockAfterFinalizeFailure(ctx context.Context, tx pgx.Tx, serverID string, jobID, attemptID, fence, operationID int64, environmentID string, cause error) error {
+func (r *AgentLeaseRepository) blockAfterFinalizeFailure(ctx context.Context, tx pgx.Tx, serverID string, jobID, attemptID, fence, operationID int64, environmentID string, cause error, report activationReport) error {
 	if !isDeterministicActivationFailure(cause) {
 		return cause
 	}
@@ -2306,7 +2360,7 @@ func (r *AgentLeaseRepository) blockAfterFinalizeFailure(ctx context.Context, tx
 		if !isDeterministicActivationFailure(err) {
 			return blockUnrecorded(fmt.Errorf("commit activation reconciliation block after %v: %w", cause, err))
 		}
-		return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, operationID, "activation finalize failed: ", cause)
+		return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, operationID, "activation finalize failed: ", cause, report)
 	}
 	return cause
 }
@@ -2319,21 +2373,24 @@ func (r *AgentLeaseRepository) blockAfterFinalizeFailure(ctx context.Context, tx
 // operation as succeeded -> nil (this report's intent is satisfied, the
 // idempotent answer); the fresh transaction failed for any reason ->
 // that failure, retryable, with cause as text only.
-func (r *AgentLeaseRepository) blockAfterCommitFailure(ctx context.Context, serverID string, attemptID, fence, operationID int64, cause error) error {
-	return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, operationID, "activation finalize failed at commit: ", cause)
+func (r *AgentLeaseRepository) blockAfterCommitFailure(ctx context.Context, serverID string, attemptID, fence, operationID int64, cause error, report activationReport) error {
+	return r.blockAfterAbortedTransaction(ctx, serverID, attemptID, fence, operationID, "activation finalize failed at commit: ", cause, report)
 }
 
 // blockAfterAbortedTransaction is blockAfterCommitFailure's body, shared with
 // the failures that occur before the savepoint exists. evidencePrefix says
 // where the failure happened.
-func (r *AgentLeaseRepository) blockAfterAbortedTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, evidencePrefix string, cause error) error {
+func (r *AgentLeaseRepository) blockAfterAbortedTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, evidencePrefix string, cause error, report activationReport) error {
 	evidence := sanitizeOutcomeSummary(evidencePrefix + cause.Error())
-	outcome, err := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, operationID, evidence)
+	outcome, err := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, operationID, evidence, report)
 	if err != nil {
 		return fmt.Errorf("%w (after %v)", err, cause)
 	}
 	if outcome == activationBlockNoopSucceeded {
 		return nil
+	}
+	if lateErr := lateOutcomeError(outcome); lateErr != nil {
+		return lateErr
 	}
 	return cause
 }
@@ -2349,7 +2406,28 @@ const (
 	// activationBlockNoopOther: already blocked/closed by a concurrent
 	// writer, or the attempt no longer occupies the slot at this fence.
 	activationBlockNoopOther
+	// activationBlockLateRecorded: the operation was already
+	// reconciliation_required and this report was recorded (or recognised as
+	// already recorded) as late evidence in the fresh transaction; answered
+	// with ErrAgentLeaseActivationLateReportRecorded.
+	activationBlockLateRecorded
+	// activationBlockStale: already reconciliation_required but the attempt
+	// is no longer the leased occupant; nothing written, ErrAgentLeaseStale.
+	activationBlockStale
 )
+
+// lateOutcomeError maps the two outcomes that mean "the operation was already
+// blocked when the fresh transaction looked" to their typed answer, nil for
+// every other outcome.
+func lateOutcomeError(outcome activationBlockOutcome) error {
+	switch outcome {
+	case activationBlockLateRecorded:
+		return ErrAgentLeaseActivationLateReportRecorded
+	case activationBlockStale:
+		return ErrAgentLeaseStale
+	}
+	return nil
+}
 
 // recordBlockInFreshTransaction writes the reconciliation block in a new
 // transaction, re-taking the documented lock order minus the credential:
@@ -2373,7 +2451,7 @@ const (
 // TAUTOLOGY (always true) if a future caller (10c-2b, e.g. the sweeper) passes
 // a serverID read from the attempt row itself; such a caller must establish
 // authority some other way.
-func (r *AgentLeaseRepository) recordBlockInFreshTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, evidence string) (activationBlockOutcome, error) {
+func (r *AgentLeaseRepository) recordBlockInFreshTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, evidence string, report activationReport) (activationBlockOutcome, error) {
 	fail := func(what string, err error) (activationBlockOutcome, error) {
 		return activationBlockNoopOther, blockUnrecorded(fmt.Errorf("%s: %w", what, err))
 	}
@@ -2400,14 +2478,40 @@ func (r *AgentLeaseRepository) recordBlockInFreshTransaction(ctx context.Context
 	if err = tx.QueryRow(ctx, `SELECT state FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).Scan(&attemptState); err != nil {
 		return fail("lock agent job attempt for activation reconciliation block", err)
 	}
-	var opState string
-	if err = tx.QueryRow(ctx, `SELECT state FROM release_operations WHERE id=$1 AND attempt_id=$2 AND fence=$3 AND kind='activate' FOR UPDATE`, operationID, attemptID, fence).Scan(&opState); err != nil {
+	var opState, opSummary string
+	if err = tx.QueryRow(ctx, `SELECT state, outcome_summary FROM release_operations WHERE id=$1 AND attempt_id=$2 AND fence=$3 AND kind='activate' FOR UPDATE`, operationID, attemptID, fence).Scan(&opState, &opSummary); err != nil {
 		return fail("lock activation operation for reconciliation block", err)
 	}
 	if opState == "succeeded" {
 		return activationBlockNoopSucceeded, nil
 	}
-	if opState != activationStateSwitchAuthorized || attemptState != "leased" || slotFence != fence || slotCurrentAttemptID == nil || *slotCurrentAttemptID != attemptID {
+	occupant := leasedOccupant(attemptState, slotFence, fence, slotCurrentAttemptID, attemptID)
+	if opState == "reconciliation_required" {
+		// Blocked by a concurrent writer (the sweeper's diversion or another
+		// report) between the caller's rollback and this lock. This report
+		// still describes the host: record it as late evidence here, with the
+		// same fingerprint and body as tx2's late path so a retry through tx2
+		// is a replay.
+		if !report.succeeded && isOriginalBlockReplay(opSummary, report.failureSummary) {
+			// Replay of the failure report that created the block: durable
+			// already, so answered like tx2's rr arm, before the occupant check.
+			return activationBlockRecorded, nil
+		}
+		if !occupant {
+			return activationBlockStale, nil
+		}
+		appended, werr := r.writeLateEvidence(ctx, tx, jobID, attemptID, operationID, opSummary, report)
+		if werr != nil {
+			return activationBlockNoopOther, blockUnrecorded(werr)
+		}
+		if appended {
+			if err = tx.Commit(ctx); err != nil {
+				return fail("commit late activation report", err)
+			}
+		}
+		return activationBlockLateRecorded, nil
+	}
+	if opState != activationStateSwitchAuthorized || !occupant {
 		// Already blocked by a concurrent writer, or the slot moved on:
 		// nothing left for this report to record.
 		return activationBlockNoopOther, nil
