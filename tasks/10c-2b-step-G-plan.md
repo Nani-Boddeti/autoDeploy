@@ -78,3 +78,48 @@ for `leased` + `closed_at IS NULL` with server/env/fence/slot-flag/op checks, au
 - Q3 `not_activated`: candidate release stays `ready` (matches `Complete(failed)`); releases not locked on that path.
 - Q4 audit: keep action `environment_mark_reconciled`, reason stored as `outcome=<x>; <reason>`, `validReason`
   (<=512 bytes, no controls) applied to the COMBINED string.
+
+## G2 detailed plan (2026-10-19, after G1 `d359810`)
+
+**Deviation from the outline (orchestrator call):** a NEW method `ReconcileActivation(ctx, serverID,
+presentedDigest, environmentID, attemptID, fence, outcome, outcomeDigest)` instead of a branch inside `Reconcile`.
+Why: adding branch B inside `Reconcile` removes its incidental protection (`attemptState == "leased"` denial) in the
+same edit that must replace it; a separate method leaves `Reconcile` protected while the new path is proven, mirrors
+G1 (`ResolveActivation` beside `MarkReconciled`), and keeps G2 repository-only. Step H rewires the agent endpoint
+to the new method (wire gains `outcome`) and retires the old one.
+
+### G2a scope
+1. **`Reconcile` hardening (prerequisite 2), behaviour otherwise identical:** on its existing closed-attempt path,
+   an unresolved activate op for this attempt -> `ErrAgentLeaseCorruptState` (explicit, by rule via
+   `unresolvedActivationSQL`), never the generic denial and never a flag clear.
+2. **Shared core:** factor G1's post-lock verify + resolve (`activated` / `not_activated` routines, summary marker,
+   RowsAffected checks) so `ResolveActivation` and `ReconcileActivation` call ONE implementation (design D5/D10).
+   `ResolveActivation` behaviour must stay identical (its tests unchanged and green).
+3. **`ReconcileActivation`:** lock order creds SHARE (`lockActiveServerCredential`) -> slot -> job -> attempt -> op
+   -> deployment -> head -> releases; clock after locks. Accepts all three outcomes:
+   - `no_activation`: today's `Reconcile` semantics (closed attempt, slot flagged by it, no unresolved op).
+   - `activated` / `not_activated` (branch B): attempt `leased`, `closed_at IS NULL`, `server_id == serverID`,
+     `environment_id` and `fence` match the request and `op.fence`; slot `reconciliation_attempt_id == attempt`;
+     op exactly `reconciliation_required`. Authority deliberately NOT checked (it has usually lapsed).
+   - `activated` requires `outcomeDigest == op.route_digest` (owner decision Q2); mismatch ->
+     `ErrAgentLeaseIntegrityConflict`, nothing written.
+   - Revoked server: credential lock fails -> denied; operator path is the only way out (by design).
+   - No server audit row (today's agent `Reconcile` writes none); events as G1 (`reconciled` last).
+   - Any failure: rollback, no new block.
+4. **Idempotency:** the attempt is explicit, so a repeat is anchored to IT: attempt closed + `reconciled` event for
+   it + outcome agrees with its op (for `activated`, digest agrees too) -> nil; disagreement -> integrity conflict;
+   no event -> denied. Nothing written.
+
+### G2a tests
+Post-state matrix {activated, not_activated} x {tx2 failure, ambiguous success, sweeper expiry} (revoke: agent is
+refused; operator path covered by G1); digest mismatch refused; refusal matrix (wrong server, env, fence, foreign
+slot flag, `switch_authorized`, outcome kind both ways, unknown outcome, revoked credential); `Reconcile` explicit
+check (closed attempt + unresolved op, raw SQL) -> corrupt, nothing written, plus a mutation proving it is the
+explicit check and not the old incidental denial that refuses; end to end: block -> agent resolves -> new Claim +
+Activate; races: agent vs operator `ResolveActivation`, agent vs sweeper, agent vs tx2 late report, all queued on
+the slot with waiter confirmation; mutation proofs on every guard.
+
+### G2b (separate step, after G2a): trace a late success against a declared `not_activated`
+tx2's `failed` arm answers `integrity_conflict` with no record while traffic may have switched. Append ONE
+`activation_late_report` event per attempt after the `reconciled` event (dedup: none with a higher sequence than
+that attempt's `reconciled` event), commit, still answer `integrity_conflict`. Op row untouched (closed).

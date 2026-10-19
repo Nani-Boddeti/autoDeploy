@@ -3111,6 +3111,21 @@ func (r *AgentLeaseRepository) Reconcile(ctx context.Context, serverID string, p
 		return ErrServerAuthorizationDenied
 	}
 
+	// A closed attempt must never carry an unresolved activate operation: that
+	// is a block only a declared outcome (ReconcileActivation / the operator's
+	// ResolveActivation) may clear, so a plain reconcile is corrupt state, not
+	// a denial and never a flag clear. Explicit by rule (unresolvedActivationSQL),
+	// not the incidental leased-attempt denial above. The operation is locked
+	// AFTER the attempt (creds -> slot -> attempt -> operation: a subsequence
+	// of the documented order; Reconcile takes no job lock).
+	var unresolvedOperationID int64
+	switch err = tx.QueryRow(ctx, `SELECT id FROM release_operations WHERE attempt_id=$1 AND environment_id=$2 AND `+unresolvedActivationSQL+` FOR UPDATE`, attemptID, environmentID).Scan(&unresolvedOperationID); {
+	case err == nil:
+		return fmt.Errorf("%w: attempt %d is closed but activation operation %d is unresolved", ErrAgentLeaseCorruptState, attemptID, unresolvedOperationID)
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("lock unresolved activation operation for reconcile: %w", err)
+	}
+
 	if slotReconciliationAttemptID == nil || *slotReconciliationAttemptID != attemptID {
 		var alreadyReconciled bool
 		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_job_events WHERE job_id=$1 AND attempt_id=$2 AND event_type='reconciled')`, attemptJobID, attemptID).Scan(&alreadyReconciled); err != nil {

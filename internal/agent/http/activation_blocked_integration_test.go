@@ -22,7 +22,8 @@ import (
 // activate -> ambiguous activation-result -> the stranded attempt's authority
 // lapses, the batch sweep leaves it leased and the pre-step-D close is forced
 // in SQL (see the comment at that step) ->
-// the agent's real reconcile clears the slot flag -> a DIFFERENT attempt on
+// the agent's real reconcile is refused as corrupt state (step G2a) and its
+// former slot-flag clear is forced in SQL too -> a DIFFERENT attempt on
 // the same environment calls activate. The route-head flag and the stranded
 // operation are what remain, and the answer must be 409
 // environment_activation_blocked: not 409 stale_lease, not the retryable 503.
@@ -137,9 +138,15 @@ func TestAgentHTTPStrandedEnvironmentActivateIsBlockedAfterLegacySweeperClose(t 
 			t.Fatalf("force legacy sweeper close: %v", err)
 		}
 	}
+	// Since step G2a the real reconcile refuses this legacy shape (closed
+	// attempt, unresolved activation) as corrupt state instead of clearing the
+	// flag, so the clear it used to perform is forced in SQL as well.
 	resp, body = postJSON(t, srv, pathReconcile, token, f.serverID, reconcileRequest{EnvironmentID: f.envID, AttemptID: attempt1, Fence: fence1, OutcomeDigest: hexOf(digestFixture(8))})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("reconcile: status=%d body=%v", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusConflict || body["error"] != "corrupt_state" {
+		t.Fatalf("reconcile on the legacy shape: status=%d body=%v, want 409 corrupt_state", resp.StatusCode, body)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=clock_timestamp() WHERE environment_id=$1`, f.envID); err != nil {
+		t.Fatalf("force legacy reconcile clear: %v", err)
 	}
 
 	// Slot must be free and clear before the second claim takes it.

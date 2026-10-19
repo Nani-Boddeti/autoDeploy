@@ -14,6 +14,7 @@ import (
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/deployment"
+	"autodeploy/internal/queue"
 )
 
 // Step G1: ResolveActivation, the operator's declared resolution of a blocked
@@ -160,6 +161,13 @@ func (a activatedFixture) blockedPrecondition(t *testing.T) blockedPrecondition 
 // job event list.
 func (a activatedFixture) assertResolved(t *testing.T, outcome string, p blockedPrecondition) {
 	t.Helper()
+	a.assertResolvedAudit(t, outcome, p, true)
+}
+
+// assertResolvedAudit is assertResolved with the audit expectation explicit:
+// the operator path writes exactly one row, the agent path none.
+func (a activatedFixture) assertResolvedAudit(t *testing.T, outcome string, p blockedPrecondition, wantAudit bool) {
+	t.Helper()
 	state, closedAt, summary := a.operation(t)
 	if closedAt == nil || !closedAt.Equal(*p.opClosedAt) {
 		t.Fatalf("operation closed_at %v -> %v, want unchanged", p.opClosedAt, closedAt)
@@ -182,8 +190,11 @@ func (a activatedFixture) assertResolved(t *testing.T, outcome string, p blocked
 	jobState, _, _, _ := a.jobRow(t)
 	events := strings.Join(a.jobEvents(t), ",")
 	audit := a.auditRows(t)
-	if len(audit) != 1 || !strings.HasSuffix(audit[0], "|environment_mark_reconciled|success|outcome="+outcome+"; "+resolveReason) {
+	if wantAudit && (len(audit) != 1 || !strings.HasSuffix(audit[0], "|environment_mark_reconciled|success|outcome="+outcome+"; "+resolveReason)) {
 		t.Fatalf("audit rows=%v, want exactly one with outcome=%s", audit, outcome)
+	}
+	if !wantAudit && len(audit) != 0 {
+		t.Fatalf("audit rows=%v, want none", audit)
 	}
 	switch outcome {
 	case ActivationOutcomeActivated:
@@ -688,43 +699,50 @@ func TestResolveActivationUnwedgesEnvironment(t *testing.T) {
 				if err != nil || len(leases) != 1 || leases[0].JobID != next {
 					t.Fatalf("claim after resolution: leases=%+v err=%v", leases, err)
 				}
-				lease := leases[0]
-				f2 := a.leaseFixture
-				f2.jobID = next
-				depRepo := NewDeploymentRepository(a.pool)
-				for _, target := range []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusStarting, deployment.StatusHealthChecking} {
-					dep, err := depRepo.GetByID(ctx, deployment.ID(lease.DeploymentID))
-					if err != nil {
-						t.Fatal(err)
-					}
-					var now time.Time
-					if err := a.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
-						t.Fatal(err)
-					}
-					nextDep, err := dep.Transition(target, now)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if err := depRepo.Save(ctx, nextDep); err != nil {
-						t.Fatal(err)
-					}
-				}
-				result, err := a.repo.Activate(ctx, a.serverID, a.cred, lease.AttemptID, lease.Fence, digest(77))
-				if err != nil {
-					t.Fatalf("Activate after resolution: %v", err)
-				}
-				wantRevision := int64(1)
-				if outcome == ActivationOutcomeActivated {
-					wantRevision = 2
-				}
-				if state, _, expectedRev, _ := f2.activationOperationRow(t, lease.AttemptID); state != "switch_authorized" || expectedRev == nil || *expectedRev != wantRevision {
-					t.Fatalf("new operation state=%s expectedRevision=%v, want switch_authorized %d", state, expectedRev, wantRevision)
-				}
-				if result.OperationID == "" {
-					t.Fatal("no operation id")
-				}
+				a.assertNewAttemptActivates(t, outcome, next, leases[0])
 			})
 		}
+	}
+}
+
+// assertNewAttemptActivates drives a freshly claimed lease through the
+// execution states and Activate: after a resolution the wedge is gone.
+func (a activatedFixture) assertNewAttemptActivates(t *testing.T, outcome string, next int64, lease queue.ClaimedLease) {
+	t.Helper()
+	ctx := context.Background()
+	f2 := a.leaseFixture
+	f2.jobID = next
+	depRepo := NewDeploymentRepository(a.pool)
+	for _, target := range []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusStarting, deployment.StatusHealthChecking} {
+		dep, err := depRepo.GetByID(ctx, deployment.ID(lease.DeploymentID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var now time.Time
+		if err := a.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+			t.Fatal(err)
+		}
+		nextDep, err := dep.Transition(target, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := depRepo.Save(ctx, nextDep); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := a.repo.Activate(ctx, a.serverID, a.cred, lease.AttemptID, lease.Fence, digest(77))
+	if err != nil {
+		t.Fatalf("Activate after resolution: %v", err)
+	}
+	wantRevision := int64(1)
+	if outcome == ActivationOutcomeActivated {
+		wantRevision = 2
+	}
+	if state, _, expectedRev, _ := f2.activationOperationRow(t, lease.AttemptID); state != "switch_authorized" || expectedRev == nil || *expectedRev != wantRevision {
+		t.Fatalf("new operation state=%s expectedRevision=%v, want switch_authorized %d", state, expectedRev, wantRevision)
+	}
+	if result.OperationID == "" {
+		t.Fatal("no operation id")
 	}
 }
 
