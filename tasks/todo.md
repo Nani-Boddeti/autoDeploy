@@ -3784,3 +3784,17 @@ Full bar green incl. 18 concurrency tests at `-race -count=20`.
 trace (tx2 `failed` arm) — emit an event there. **For H:** form calls `ResolveActivation` for all three outcomes;
 bound the operator reason to ~489 bytes (prefix counts toward 512); map errors, never print `err.Error()`
 (corrupt-state texts carry ids).
+
+#### 10c-2b step G2a committed: agent `ReconcileActivation` + `Reconcile` hardening (2026-10-19)
+
+New method beside `Reconcile` (deviation from the outline, recorded in the plan): keeps `Reconcile`'s incidental
+leased-attempt denial intact until H rewires the endpoint. Shared post-lock core `resolveDeclared` used by both
+`ResolveActivation` (unchanged; G1 tests untouched) and `ReconcileActivation`. Agent path: creds SHARE -> [peek:
+server/env/fence denied BEFORE the job lock] -> slot -> job -> attempt -> op -> deployment -> head -> releases;
+branch B for a leased attempt at exactly `reconciliation_required`; `activated` requires digest == op.route_digest;
+no audit row; replay anchored to the named attempt. `Reconcile` now refuses a closed attempt with an unresolved
+activate op as `ErrAgentLeaseCorruptState` (explicit, by rule); without it Reconcile silently cleared the flag.
+HTTP test `TestAgentHTTPStrandedEnvironmentActivateIsBlockedAfterLegacySweeperClose` now asserts 409
+`corrupt_state` on that shape and forces the legacy clear in SQL. Review PASS + follow-ups. Full bar green; the
+concurrency stage (21 tests x20 `-race`, 656s) now needs `-timeout 60m` — the default 10m killed it mid-run.
+Next: G2b (trace a late success against a declared `not_activated`).
