@@ -3810,3 +3810,16 @@ Event sequence = `MAX+1` per job under the job lock (no wrap; smallint overflow 
 **For 10d:** a failure report after a declared `not_activated` agrees but is still answered `integrity_conflict`
 (the `failed` arm has no agreeing path) — misleading but terminal either way.
 Review PASS. Full bar green (concurrency 21 tests x20 `-race`, 719s).
+
+#### 10c-2b step H1 committed: agent reconcile endpoint declares an outcome (2026-10-19)
+
+`POST /agent/v1/environments/reconcile` body gains required `outcome` (allow-listed, no default; repository
+re-checks). `EnvironmentReconciler` -> `ReconcileActivation` (repository wired directly, `main.go` unchanged).
+`mapError`: `ErrAgentLeaseOutcomeMismatch` -> 409 `outcome_mismatch`, `ErrAgentLeaseActivationUnresolved` -> 409
+`activation_unresolved` (both terminal; `ErrActivationBlockUnrecorded` stays first, pinned by joined-error rows).
+`Client.Reconcile` sends `outcome`; still no caller (10d). E2E HTTP tests: real sweeper block -> agent declares ->
+per-outcome post-state -> a new attempt activates (200). Review PASS + test-strength follow-ups; full bar green.
+**Relied on (review medium):** the agent path can now resolve an activation; safe only while `activationEnabled`
+is false, because no activate operations are created then. Re-check before flipping the gate.
+**For 10d:** client collapses every non-`stale_lease` 409 into `ErrIntegrityConflict`; the agent cannot tell
+`outcome_mismatch`/`activation_unresolved` apart yet.
