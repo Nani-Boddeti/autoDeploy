@@ -2,10 +2,10 @@
 
 ## Status
 
-- 2026-10-26: `origin/main` is at `2844981` (through H1); H2 is committed locally, unpushed. Slices 9a, 9b and slice 10 through
+- 2026-10-27: `origin/main` is at `ad8fc3c` (through H2). H3 phase 1 committed locally, unpushed. Slices 9a, 9b and slice 10 through
   10c-2b step H2 are committed. 8/18 implementation-sequence outcomes complete; nothing has executed
   on a real host (`executorEnabled` and `activationEnabled` both false).
-- Next: 10c-2b H3 (delete superseded `Reconcile`/`MarkReconciled`), I (docs),
+- Next: finish 10c-2b H3 (phase 1 done, owner decision pending — see H3 block), I (docs),
   then 10d (agent activation) and 10e (drain/stop). Current state per step:
   [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10".
 
@@ -3854,3 +3854,19 @@ outcome (comment at the query). The "not in a terminal state" half of the column
 **For 10d / gate review:** an administrator can `AssignRouteHostname` on a flagged route head (no predecessor), which
 bumps the revision and makes `activated` impossible to declare even if the host really switched — the operator is then
 forced to `not_activated`. Decide whether hostname assignment must refuse while the head is flagged.
+
+#### 10c-2b step H3 IN PROGRESS: phase 1 done, phase 2 not started (paused 2026-10-27)
+
+Phase 1 (inventory + ports, nothing deleted): 25 assertions from the 5 test files calling `Reconcile` /
+`MarkReconciled` classified in `tasks/10c-2b-step-H3-inventory.md` (a covered 12, b ported 6, a/b 2, c 3, c/b 1,
+d 1). Ports P1-P5 in **untracked** `internal/store/postgres/agent_lease_h3_ports_test.go`, each mutation-proved;
+PG18 normal + `-race` green. No production caller of either method (scratch-copy build with both deleted passes).
+**Pending owner decision before phase 2:** leased attempt + `failed` activate op + flagged slot (forced-SQL only):
+old `MarkReconciled` cleared it; new methods refuse (operator CorruptState 500, agent denial), chosen in the G1
+review fix round to avoid a hidden leased attempt holding the slot. Recommendation: approve. Accepted as following
+from recorded rules: closed attempt + unresolved op now answers OutcomeMismatch / ActivationUnresolved instead of
+CorruptState (P4/P5 pin it).
+**Phase 2:** switch the 4 setup/oracle uses to the new methods (mapping in the inventory), delete the 3 old-only tests,
+`markReconciledRefusalSnapshot` and both methods; reword comments (list in inventory report: agent_lease_repository.go
+~787/~1543/~3190, activation_resolution.go 20/42/101/529/538/626, environment_runtime_config_repository.go ~193/~196,
+several test headers); never edit migrations. Then review, full bar, commit; docs in step I.
