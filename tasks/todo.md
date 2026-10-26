@@ -2,10 +2,10 @@
 
 ## Status
 
-- 2026-10-19: `main` is pushed to `origin/main` at `5f14d43`. Slices 9a, 9b and slice 10 through
-  10c-2b step H1 are committed. 8/18 implementation-sequence outcomes complete; nothing has executed
+- 2026-10-26: `origin/main` is at `2844981` (through H1); H2 is committed locally, unpushed. Slices 9a, 9b and slice 10 through
+  10c-2b step H2 are committed. 8/18 implementation-sequence outcomes complete; nothing has executed
   on a real host (`executorEnabled` and `activationEnabled` both false).
-- Next: 10c-2b H2 (operator form), H3 (delete superseded `Reconcile`/`MarkReconciled`), I (docs),
+- Next: 10c-2b H3 (delete superseded `Reconcile`/`MarkReconciled`), I (docs),
   then 10d (agent activation) and 10e (drain/stop). Current state per step:
   [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10".
 
@@ -3829,3 +3829,28 @@ per-outcome post-state -> a new attempt activates (200). Review PASS + test-stre
 is false, because no activate operations are created then. Re-check before flipping the gate.
 **For 10d:** client collapses every non-`stale_lease` 409 into `ErrIntegrityConflict`; the agent cannot tell
 `outcome_mismatch`/`activation_unresolved` apart yet.
+
+#### 10c-2b step H2 committed: operator form declares an outcome (2026-10-26)
+
+`POST /environments/mark-reconciled` -> `POST /environments/resolve` (old path 404). `ServerAdmin.MarkReconciled` ->
+`ResolveActivation` (adapter calls `leases.ResolveActivation`). Handler: exactly `csrf`/`environment_id`/`outcome`/
+`reason` once each; outcome allow-listed, no default; reason non-blank (owner decision) and <= `maxResolveReasonBytes`
+= 512 - len("outcome=not_activated; ") = 489 bytes (form `maxlength` wired from the same constant; UTF-16 hint only).
+`resolveError` fixed texts, never `err`: CorruptState 500 (checked first, wrapped); OutcomeMismatch 409 with the
+direction taken from the declared outcome; ActivationUnresolved / RouteMoved / IntegrityConflict (replay with a
+different outcome) 409; denial / invalid input 400; anything else 500 "could not be resolved; retry".
+`ReconcilingEnvironment.Activation` from `unresolvedActivationSQL` scoped to the pending attempt; page shows an
+Activation column ("none" for ""); select `required`, empty first option, nothing preselected, `autocomplete="off"`
+on select + reason. E2E through real handler + repository (blocks from real Activate + sweeper, no forced SQL):
+activated, not_activated, no_activation, mismatch writes nothing, audit reason exact, replay same = 303 / different
+= 409, RouteMoved via a real `AssignRouteHostname` on a flagged head. Review PASS with notes; one fix round; full bar
+green (6 sweeps, concurrency `-race -count=20`, Linux cross-builds).
+
+**Unreachable through the form:** `ActivationUnresolved` — only the block routine flags a slot, and it moves the op to
+`reconciliation_required` first, so the column never shows `switch_authorized` in practice (G1 tests force it).
+**Deferred (owner decision):** web package has no logger; CorruptState / infra 500 detail is recorded nowhere. Own step.
+**Accepted:** corrupt state "slot flagged by attempt A, unresolved op on attempt B" shows "none" and 500s on every
+outcome (comment at the query). The "not in a terminal state" half of the column rule has no discriminating fixture.
+**For 10d / gate review:** an administrator can `AssignRouteHostname` on a flagged route head (no predecessor), which
+bumps the revision and makes `activated` impossible to declare even if the host really switched — the operator is then
+forced to `not_activated`. Decide whether hostname assignment must refuse while the head is flagged.
