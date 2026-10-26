@@ -42,10 +42,11 @@ type serverAdminStub struct {
 	revokeReason string
 	revokeCalls  int
 
-	markErr    error
-	markEnv    string
-	markReason string
-	markCalls  int
+	resolveErr     error
+	resolveEnv     string
+	resolveOutcome string
+	resolveReason  string
+	resolveCalls   int
 }
 
 func (s *serverAdminStub) ListServers(context.Context, auth.Principal) ([]postgres.ServerSummary, error) {
@@ -79,10 +80,10 @@ func (s *serverAdminStub) RevokeServer(_ context.Context, _ auth.Principal, serv
 func (s *serverAdminStub) ListReconcilingEnvironments(context.Context, auth.Principal) ([]postgres.ReconcilingEnvironment, error) {
 	return s.environments, s.envListErr
 }
-func (s *serverAdminStub) MarkReconciled(_ context.Context, _ auth.Principal, environmentID, reason string) error {
-	s.markCalls++
-	s.markEnv, s.markReason = environmentID, reason
-	return s.markErr
+func (s *serverAdminStub) ResolveActivation(_ context.Context, _ auth.Principal, environmentID, outcome, reason string) error {
+	s.resolveCalls++
+	s.resolveEnv, s.resolveOutcome, s.resolveReason = environmentID, outcome, reason
+	return s.resolveErr
 }
 
 func serversHandler(t *testing.T) (*Handler, *serverAdminStub, auth.Principal) {
@@ -125,7 +126,7 @@ func serversCSRF(t *testing.T, h *Handler, p auth.Principal) string {
 // and /environments route 404s instead of panicking on a nil interface call.
 func TestServersDisabledWithoutAdmin(t *testing.T) {
 	h := testHandler(t, &repositoryStub{})
-	for _, target := range []string{"/servers", "/servers/register", "/servers/enrollment", "/servers/revoke", "/environments/mark-reconciled"} {
+	for _, target := range []string{"/servers", "/servers/register", "/servers/enrollment", "/servers/revoke", "/environments/resolve"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "https://admin.example.test"+target, nil))
 		if rr.Code != http.StatusNotFound {
@@ -144,7 +145,7 @@ func TestServersRoutesRequireSessionAndCorrectMethod(t *testing.T) {
 		{http.MethodPost, "/servers/register", url.Values{"csrf": {"x"}, "name": {"host-1"}}},
 		{http.MethodPost, "/servers/enrollment", url.Values{"csrf": {"x"}, "server_id": {"server_a"}}},
 		{http.MethodPost, "/servers/revoke", url.Values{"csrf": {"x"}, "server_id": {"server_a"}, "reason": {"r"}, "confirm": {"revoke"}}},
-		{http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {"x"}, "environment_id": {"environment_a"}, "reason": {"r"}}},
+		{http.MethodPost, "/environments/resolve", url.Values{"csrf": {"x"}, "environment_id": {"environment_a"}, "outcome": {"no_activation"}, "reason": {"r"}}},
 	}
 	for _, tc := range cases {
 		// No session cookie at all -> redirected to /login, never mutated.
@@ -180,7 +181,7 @@ func TestServersRoutesRequireSessionAndCorrectMethod(t *testing.T) {
 			t.Fatalf("%s wrong method = %d", tc.target, wrr.Code)
 		}
 	}
-	if admin.registerCalls != 0 || admin.issueCalls != 0 || admin.revokeCalls != 0 || admin.markCalls != 0 {
+	if admin.registerCalls != 0 || admin.issueCalls != 0 || admin.revokeCalls != 0 || admin.resolveCalls != 0 {
 		t.Fatal("unauthenticated/wrong-method requests reached the repository")
 	}
 	_ = p
@@ -362,42 +363,187 @@ func TestServersRevokeRequiresConfirmationAndReason(t *testing.T) {
 	}
 }
 
-func TestEnvironmentsMarkReconciledRoute(t *testing.T) {
+// resolveForm is a well-formed resolve body; tests override single keys.
+func resolveForm(csrf string, override map[string][]string) url.Values {
+	v := url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "outcome": {postgres.ActivationOutcomeNoActivation}, "reason": {"agent lost, manually verified clean"}}
+	for k, val := range override {
+		if val == nil {
+			delete(v, k)
+		} else {
+			v[k] = val
+		}
+	}
+	return v
+}
+
+func postResolve(h *Handler, p auth.Principal, form url.Values) *httptest.ResponseRecorder {
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/resolve", form, p, h))
+	return rr
+}
+
+func TestEnvironmentsResolveForwardsEachOutcome(t *testing.T) {
+	for _, outcome := range []string{postgres.ActivationOutcomeActivated, postgres.ActivationOutcomeNotActivated, postgres.ActivationOutcomeNoActivation} {
+		t.Run(outcome, func(t *testing.T) {
+			h, admin, p := serversHandler(t)
+			csrf := serversCSRF(t, h, p)
+			rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"outcome": {outcome}}))
+			if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/servers" || admin.resolveCalls != 1 {
+				t.Fatalf("resolve = %d location=%q calls=%d", rr.Code, rr.Header().Get("Location"), admin.resolveCalls)
+			}
+			if admin.resolveEnv != "environment_a" || admin.resolveOutcome != outcome || admin.resolveReason != "agent lost, manually verified clean" {
+				t.Fatalf("resolve forwarded env=%q outcome=%q reason=%q", admin.resolveEnv, admin.resolveOutcome, admin.resolveReason)
+			}
+		})
+	}
+}
+
+func TestEnvironmentsResolveRefusesMalformedBodiesWithoutRepositoryCall(t *testing.T) {
 	h, admin, p := serversHandler(t)
 	csrf := serversCSRF(t, h, p)
-	ok := serversRequest(http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "reason": {"agent lost, manually verified clean"}}, p, h)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, ok)
-	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/servers" || admin.markCalls != 1 {
-		t.Fatalf("mark-reconciled = %d location=%q calls=%d", rr.Code, rr.Header().Get("Location"), admin.markCalls)
+	cases := map[string]url.Values{
+		"no outcome key":        resolveForm(csrf, map[string][]string{"outcome": nil}),
+		"extra key":             resolveForm(csrf, map[string][]string{"extra": {"x"}}),
+		"duplicate outcome":     resolveForm(csrf, map[string][]string{"outcome": {"no_activation", "no_activation"}}),
+		"duplicate reason":      resolveForm(csrf, map[string][]string{"reason": {"a", "b"}}),
+		"duplicate environment": resolveForm(csrf, map[string][]string{"environment_id": {"environment_a", "environment_a"}}),
+		"empty outcome":         resolveForm(csrf, map[string][]string{"outcome": {""}}),
+		"unknown outcome":       resolveForm(csrf, map[string][]string{"outcome": {"reconciled"}}),
+		"outcome wrong case":    resolveForm(csrf, map[string][]string{"outcome": {"Activated"}}),
+		"outcome padded":        resolveForm(csrf, map[string][]string{"outcome": {"activated "}}),
+		"empty environment":     resolveForm(csrf, map[string][]string{"environment_id": {""}}),
+		"empty reason":          resolveForm(csrf, map[string][]string{"reason": {""}}),
+		"spaces-only reason":    resolveForm(csrf, map[string][]string{"reason": {"   "}}),
+		"tab-only reason":       resolveForm(csrf, map[string][]string{"reason": {"\t"}}),
 	}
-	if admin.markEnv != "environment_a" || admin.markReason != "agent lost, manually verified clean" {
-		t.Fatal("mark-reconciled did not forward environment/reason")
+	for name, form := range cases {
+		t.Run(name, func(t *testing.T) {
+			rr := postResolve(h, p, form)
+			if rr.Code != http.StatusBadRequest || admin.resolveCalls != 0 {
+				t.Fatalf("%s = %d calls=%d, want 400 and no repository call", name, rr.Code, admin.resolveCalls)
+			}
+		})
 	}
+}
 
-	admin.markErr = errors.New("denied")
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "reason": {"r"}}, p, h))
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("denied mark-reconciled = %d", rr.Code)
+// A non-blank reason is forwarded exactly as posted, spaces included.
+func TestEnvironmentsResolveForwardsReasonUntrimmed(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	rr := postResolve(h, p, resolveForm(serversCSRF(t, h, p), map[string][]string{"reason": {"  padded reason  "}}))
+	if rr.Code != http.StatusSeeOther || admin.resolveCalls != 1 || admin.resolveReason != "  padded reason  " {
+		t.Fatalf("padded reason = %d calls=%d forwarded=%q", rr.Code, admin.resolveCalls, admin.resolveReason)
 	}
+}
 
-	// An unresolved activation is refused with a distinct, non-retryable 409
-	// (not the generic 400, never a retryable 5xx), also when wrapped.
-	admin.markErr = fmt.Errorf("mark: %w", postgres.ErrAgentLeaseActivationUnresolved)
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "reason": {"r"}}, p, h))
-	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "unresolved activation") {
-		t.Fatalf("unresolved-activation mark-reconciled = %d body=%q, want 409", rr.Code, rr.Body.String())
+func TestEnvironmentsResolveReasonBoundIsInBytes(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	csrf := serversCSRF(t, h, p)
+	// Together with the longest outcome prefix the maximum reason is exactly
+	// the repository's 512-byte audit bound.
+	if got := len("outcome="+postgres.ActivationOutcomeNotActivated+"; ") + maxResolveReasonBytes; got != 512 {
+		t.Fatalf("longest prefix + max reason = %d bytes, want 512", got)
 	}
+	atMax := strings.Repeat("a", maxResolveReasonBytes)
+	if rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"reason": {atMax}})); rr.Code != http.StatusSeeOther || admin.resolveCalls != 1 {
+		t.Fatalf("reason at max = %d calls=%d", rr.Code, admin.resolveCalls)
+	}
+	// One byte over.
+	admin.resolveCalls = 0
+	if rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"reason": {atMax + "a"}})); rr.Code != http.StatusBadRequest || admin.resolveCalls != 0 {
+		t.Fatalf("reason one byte over = %d calls=%d", rr.Code, admin.resolveCalls)
+	}
+	// Multibyte: fewer characters than the maximum but more bytes. Two-byte
+	// runes, so max/2+1 of them is max+1 bytes (max is odd) while
+	// being well under max characters.
+	multi := strings.Repeat("é", maxResolveReasonBytes/2+1)
+	if len([]rune(multi)) >= maxResolveReasonBytes || len(multi) != maxResolveReasonBytes+1 {
+		t.Fatalf("setup: %d runes %d bytes", len([]rune(multi)), len(multi))
+	}
+	if rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"reason": {multi}})); rr.Code != http.StatusBadRequest || admin.resolveCalls != 0 {
+		t.Fatalf("multibyte reason over the byte bound = %d calls=%d", rr.Code, admin.resolveCalls)
+	}
+	// Multibyte exactly at the bound is accepted.
+	exact := strings.Repeat("é", maxResolveReasonBytes/2) + "a"
+	if len(exact) != maxResolveReasonBytes {
+		t.Fatalf("setup: %d bytes", len(exact))
+	}
+	if rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"reason": {exact}})); rr.Code != http.StatusSeeOther || admin.resolveCalls != 1 {
+		t.Fatalf("multibyte reason at the byte bound = %d calls=%d", rr.Code, admin.resolveCalls)
+	}
+}
 
-	// A malformed environment_id is rejected before the repository call.
-	admin.markErr = nil
-	admin.markCalls = 0
+func TestEnvironmentsResolveErrorMapping(t *testing.T) {
+	noActivation := map[string][]string{"outcome": {postgres.ActivationOutcomeNoActivation}}
+	notActivated := map[string][]string{"outcome": {postgres.ActivationOutcomeNotActivated}}
+	activated := map[string][]string{"outcome": {postgres.ActivationOutcomeActivated}}
+	cases := []struct {
+		name     string
+		err      error
+		override map[string][]string
+		status   int
+		body     string
+	}{
+		{"mismatch no_activation declared", postgres.ErrAgentLeaseOutcomeMismatch, noActivation, http.StatusConflict, "this block was caused by an activation; declare activated or not_activated\n"},
+		{"mismatch not_activated declared", postgres.ErrAgentLeaseOutcomeMismatch, notActivated, http.StatusConflict, "this block was not caused by an activation; declare no_activation\n"},
+		{"mismatch activated declared", fmt.Errorf("x: %w", postgres.ErrAgentLeaseOutcomeMismatch), activated, http.StatusConflict, "this block was not caused by an activation; declare no_activation\n"},
+		{"unresolved", postgres.ErrAgentLeaseActivationUnresolved, activated, http.StatusConflict, "the activation switch is still authorized and cannot be resolved yet; retry once it requires reconciliation\n"},
+		{"route moved", fmt.Errorf("x: %w", postgres.ErrAgentLeaseActivationRouteMoved), activated, http.StatusConflict, "the route moved since the activation was authorized, so activated is impossible; declare not_activated\n"},
+		{"integrity conflict", postgres.ErrAgentLeaseIntegrityConflict, notActivated, http.StatusConflict, "this environment was already resolved with a different outcome\n"},
+		{"corrupt state", postgres.ErrAgentLeaseCorruptState, activated, http.StatusInternalServerError, "environment is in an inconsistent state; it cannot be resolved from this form\n"},
+		{"wrapped corrupt state leaks no detail", fmt.Errorf("%w: attempt 77 secret-detail", postgres.ErrAgentLeaseCorruptState), activated, http.StatusInternalServerError, "environment is in an inconsistent state; it cannot be resolved from this form\n"},
+		{"corrupt state joined with mismatch", errors.Join(postgres.ErrAgentLeaseOutcomeMismatch, fmt.Errorf("%w: d", postgres.ErrAgentLeaseCorruptState)), activated, http.StatusInternalServerError, "environment is in an inconsistent state; it cannot be resolved from this form\n"},
+		{"denied", postgres.ErrServerAuthorizationDenied, activated, http.StatusBadRequest, "bad request\n"},
+		{"wrapped denial", fmt.Errorf("lock: %w", postgres.ErrServerAuthorizationDenied), activated, http.StatusBadRequest, "bad request\n"},
+		{"wrapped invalid input", fmt.Errorf("x: %w", postgres.ErrAgentLeaseInvalidInput), activated, http.StatusBadRequest, "bad request\n"},
+		{"invalid input", postgres.ErrAgentLeaseInvalidInput, activated, http.StatusBadRequest, "bad request\n"},
+		{"unexpected failure", errors.New("db down: password=hunter2"), activated, http.StatusInternalServerError, "the environment could not be resolved; retry\n"},
+		{"cancelled context", context.Canceled, activated, http.StatusInternalServerError, "the environment could not be resolved; retry\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, admin, p := serversHandler(t)
+			admin.resolveErr = tc.err
+			rr := postResolve(h, p, resolveForm(serversCSRF(t, h, p), tc.override))
+			if rr.Code != tc.status || rr.Body.String() != tc.body {
+				t.Fatalf("%s = %d %q, want %d %q", tc.name, rr.Code, rr.Body.String(), tc.status, tc.body)
+			}
+			if admin.resolveCalls != 1 {
+				t.Fatalf("repository calls = %d, want 1", admin.resolveCalls)
+			}
+			if strings.Contains(rr.Body.String(), "db down") || strings.Contains(rr.Body.String(), "hunter2") {
+				t.Fatalf("body leaks the error: %q", rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestEnvironmentsResolveRequiresSessionCSRFAndProvenance(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	rr := postResolve(h, p, resolveForm("not-a-csrf-token", nil))
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/login" || admin.resolveCalls != 0 {
+		t.Fatalf("bad csrf = %d location=%q calls=%d", rr.Code, rr.Header().Get("Location"), admin.resolveCalls)
+	}
+	r := serversRequest(http.MethodPost, "/environments/resolve", resolveForm(serversCSRF(t, h, p), nil), p, h)
+	r.Header.Set("Origin", "https://evil.example.test")
 	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/mark-reconciled", url.Values{"csrf": {csrf}, "environment_id": {""}, "reason": {"r"}}, p, h))
-	if rr.Code != http.StatusBadRequest || admin.markCalls != 0 {
-		t.Fatalf("empty environment_id = %d calls=%d", rr.Code, admin.markCalls)
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusBadRequest || admin.resolveCalls != 0 {
+		t.Fatalf("foreign origin = %d calls=%d", rr.Code, admin.resolveCalls)
+	}
+}
+
+// The old path is no longer routed: the form posts only to /environments/resolve.
+func TestEnvironmentsMarkReconciledPathIsGone(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	rr := postResolve(h, p, resolveForm(serversCSRF(t, h, p), nil))
+	if rr.Code != http.StatusSeeOther {
+		t.Fatalf("setup: resolve = %d", rr.Code)
+	}
+	admin.resolveCalls = 0
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, serversRequest(http.MethodPost, "/environments/mark-reconciled", resolveForm(serversCSRF(t, h, p), nil), p, h))
+	if rr.Code != http.StatusNotFound || admin.resolveCalls != 0 {
+		t.Fatalf("old path = %d calls=%d, want 404 and no call", rr.Code, admin.resolveCalls)
 	}
 }
 
@@ -408,6 +554,7 @@ func TestServersListRendersAndEscapesNamesAndRepositoryDenialIsGeneric(t *testin
 	}
 	admin.environments = []postgres.ReconcilingEnvironment{
 		{EnvironmentID: "environment_a", AttemptID: 5, JobID: 9, ServerID: "server_abc", Since: time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)},
+		{EnvironmentID: "environment_b", AttemptID: 6, JobID: 10, ServerID: "server_abc", Since: time.Date(2026, 9, 18, 0, 0, 0, 0, time.UTC), Activation: "reconciliation_required"},
 	}
 	r := serversRequest(http.MethodGet, "/servers", nil, p, h)
 	rr := httptest.NewRecorder()
@@ -427,6 +574,35 @@ func TestServersListRendersAndEscapesNamesAndRepositoryDenialIsGeneric(t *testin
 	}
 	if !strings.Contains(body, "name=\"csrf\"") {
 		t.Fatal("list forms are missing CSRF tokens")
+	}
+	// The resolve form: a required select whose first option is the empty
+	// "Choose outcome" and nothing is preselected, the three exact values,
+	// the byte-derived maxlength, and the Activation column.
+	if got := strings.Count(body, `action="/environments/resolve"`); got != 2 {
+		t.Fatalf("resolve forms = %d, want one per reconciling environment", got)
+	}
+	if strings.Contains(body, "mark-reconciled") {
+		t.Fatal("page still references the old mark-reconciled path")
+	}
+	if got := strings.Count(body, `<select name="outcome" required autocomplete="off"><option value="">Choose outcome</option>`); got != 2 {
+		t.Fatalf("required outcome selects with an empty first option = %d, want 2", got)
+	}
+	if strings.Contains(body, "selected") {
+		t.Fatal("an outcome option is preselected")
+	}
+	for _, value := range []string{`value="activated"`, `value="not_activated"`, `value="no_activation"`} {
+		if got := strings.Count(body, "<option "+value+">"); got != 2 {
+			t.Fatalf("option %s appears %d times, want 2", value, got)
+		}
+	}
+	if want := fmt.Sprintf(`<input name="reason" required autocomplete="off" maxlength="%d">`, maxResolveReasonBytes); strings.Count(body, want) != 2 {
+		t.Fatalf("resolve reason input with maxlength %d not rendered for both rows", maxResolveReasonBytes)
+	}
+	if !strings.Contains(body, "<th>Activation</th>") || !strings.Contains(body, "<td>none</td>") || !strings.Contains(body, "<td>reconciliation_required</td>") {
+		t.Fatal("Activation column missing or does not render none / the activation state")
+	}
+	if !strings.Contains(body, ">Resolve</button>") {
+		t.Fatal("resolve button missing")
 	}
 
 	// A repository read failure renders the generic error page, not a

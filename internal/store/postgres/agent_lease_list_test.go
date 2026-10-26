@@ -39,6 +39,11 @@ func TestAgentLeaseListReconcilingEnvironmentsOwnerScoped(t *testing.T) {
 		t.Fatalf("environment=%+v attemptID=%d jobID=%d serverID=%s", got, attemptID, f.jobID, f.serverID)
 	}
 
+	// An ordinary expiry close is not an activation block.
+	if got.Activation != "" {
+		t.Fatalf("plain block Activation=%q, want empty", got.Activation)
+	}
+
 	// A different owner's principal must never see this owner's reconciling
 	// environments -- cross-owner isolation.
 	otherPrincipal := secondOwnerPrincipal(t, f.pool, NewAuthRepository(f.pool), 251)
@@ -69,4 +74,36 @@ func TestAgentLeaseListReconcilingEnvironmentsInvalidPrincipalDenied(t *testing.
 	if _, err := repo.ListReconcilingEnvironments(context.Background(), auth.Principal{}); !errors.Is(err, ErrServerAuthorizationDenied) {
 		t.Fatalf("invalid principal err=%v", err)
 	}
+}
+
+// TestAgentLeaseListReconcilingEnvironmentsReportsActivation proves the list
+// names the activation state of an activation-caused block (every cause the
+// resolution tests use, each produced by the real Activate and the real
+// tx2 / sweeper / RevokeServer) and nothing for a plain one. It is the same
+// rule ResolveActivation applies: an unresolved activate operation of the
+// slot's pending attempt.
+func TestAgentLeaseListReconcilingEnvironmentsReportsActivation(t *testing.T) {
+	for i, cause := range blockCauses {
+		t.Run(cause.name, func(t *testing.T) {
+			a := newActivatedFixture(t, byte(60+i*3), true)
+			cause.block(t, a)
+			environments, err := a.repo.ListReconcilingEnvironments(context.Background(), a.principal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(environments) != 1 || environments[0].EnvironmentID != a.envID || environments[0].Activation != "reconciliation_required" {
+				t.Fatalf("environments=%+v, want one with Activation=reconciliation_required", environments)
+			}
+		})
+	}
+	t.Run("plain", func(t *testing.T) {
+		a := plainBlock(t, 90)
+		environments, err := a.repo.ListReconcilingEnvironments(context.Background(), a.principal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(environments) != 1 || environments[0].Activation != "" {
+			t.Fatalf("environments=%+v, want one with an empty Activation", environments)
+		}
+	})
 }

@@ -49,7 +49,7 @@ type Repository interface {
 }
 
 // ServerAdmin is the narrow deployment-agent server administration surface
-// the /servers and /environments/mark-reconciled routes use. Every method
+// the /servers and /environments/resolve routes use. Every method
 // takes the session principal and is owner-scoped by the repository itself;
 // this interface never exposes a credential or enrollment digest, only
 // caller-supplied digests going in. A nil ServerAdmin disables all of these
@@ -60,7 +60,7 @@ type ServerAdmin interface {
 	IssueEnrollment(context.Context, auth.Principal, string, [32]byte, int) (time.Time, error)
 	RevokeServer(context.Context, auth.Principal, string, string) error
 	ListReconcilingEnvironments(context.Context, auth.Principal) ([]postgres.ReconcilingEnvironment, error)
-	MarkReconciled(context.Context, auth.Principal, string, string) error
+	ResolveActivation(ctx context.Context, principal auth.Principal, environmentID, outcome, reason string) error
 }
 
 // RuntimeConfigAdmin is the narrow surface the runtime-configuration admin
@@ -238,7 +238,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.serversRevoke(w, r)
-	case "/environments/mark-reconciled":
+	case "/environments/resolve":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)
 			return
@@ -247,7 +247,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodPost)
 			return
 		}
-		h.environmentsMarkReconciled(w, r)
+		h.environmentsResolve(w, r)
 	case "/environments/config":
 		if h.config.RuntimeConfigAdmin == nil {
 			http.NotFound(w, r)
@@ -675,12 +675,12 @@ func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	view := serversView{CSRF: csrf}
+	view := serversView{CSRF: csrf, ResolveReasonMax: maxResolveReasonBytes}
 	for _, s := range summaries {
 		view.Servers = append(view.Servers, serverRow{ID: s.ID, Name: s.Name, Status: string(s.Status), CreatedAt: formatTimestamp(s.CreatedAt), LastHeartbeatAt: formatTimestamp(s.LastHeartbeatAt), ActiveCredentialVersion: formatCredentialVersion(s.ActiveCredentialVersion), Enrollment: string(s.Enrollment)})
 	}
 	for _, e := range environments {
-		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since)})
+		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since), Activation: activationLabel(e.Activation)})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = serversTemplate.Execute(w, view)
@@ -795,16 +795,25 @@ func (h *Handler) serversRevoke(w http.ResponseWriter, r *http.Request) {
 	redirect(w, "/servers")
 }
 
-// environmentsMarkReconciled is the audited administrator break-glass path
-// (ADR 0004 Decision 6) for an environment whose owning server cannot (or
-// has not) reconciled it itself.
-func (h *Handler) environmentsMarkReconciled(w http.ResponseWriter, r *http.Request) {
+// maxResolveReasonBytes is the longest reason the resolve form accepts. The
+// repository records "outcome=<outcome>; <reason>" as the audit reason and
+// refuses more than 512 bytes of it (validReason), so the reason gets what the
+// longest outcome prefix leaves. The form's maxlength counts UTF-16 units, not
+// bytes, so the byte check in environmentsResolve is the authoritative one.
+const maxResolveReasonBytes = 512 - len("outcome="+postgres.ActivationOutcomeNotActivated+"; ")
+
+// environmentsResolve is the audited administrator path (ADR 0004 Decision 6)
+// for an environment whose owning server cannot (or has not) reconciled it
+// itself. The administrator declares what the block really was: an activation
+// that did (activated) or did not (not_activated) switch the route, or a block
+// no activation caused (no_activation). There is no default outcome.
+func (h *Handler) environmentsResolve(w http.ResponseWriter, r *http.Request) {
 	if h.provenance(r) != nil {
 		badRequest(w)
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 3 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["reason"]) != 1 {
+	if err != nil || len(v) != 4 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["outcome"]) != 1 || len(v["reason"]) != 1 {
 		badRequest(w)
 		return
 	}
@@ -813,22 +822,54 @@ func (h *Handler) environmentsMarkReconciled(w http.ResponseWriter, r *http.Requ
 		redirect(w, "/login")
 		return
 	}
-	if !github.ValidOpaqueID(v.Get("environment_id")) {
+	outcome, reason := v.Get("outcome"), v.Get("reason")
+	if !github.ValidOpaqueID(v.Get("environment_id")) || !validResolveOutcome(outcome) || len(reason) > maxResolveReasonBytes || strings.TrimSpace(reason) == "" {
 		badRequest(w)
 		return
 	}
-	if err := h.config.ServerAdmin.MarkReconciled(r.Context(), p, v.Get("environment_id"), v.Get("reason")); err != nil {
-		if errors.Is(err, postgres.ErrAgentLeaseActivationUnresolved) {
-			// 409, not the generic 400: the environment holds an unresolved
-			// activation that only a declared outcome can resolve, so retrying
-			// the same request can never succeed.
-			plain(w, http.StatusConflict, "environment holds an unresolved activation; it cannot be mark-reconciled\n")
-			return
-		}
-		badRequest(w)
+	if err := h.config.ServerAdmin.ResolveActivation(r.Context(), p, v.Get("environment_id"), outcome, reason); err != nil {
+		resolveError(w, err, outcome)
 		return
 	}
 	redirect(w, "/servers")
+}
+
+func validResolveOutcome(outcome string) bool {
+	switch outcome {
+	case postgres.ActivationOutcomeActivated, postgres.ActivationOutcomeNotActivated, postgres.ActivationOutcomeNoActivation:
+		return true
+	}
+	return false
+}
+
+// resolveError renders a fixed, operator-actionable text per refusal; it never
+// echoes err. CorruptState is checked first because the repository wraps it
+// with %w and a detail that must not reach the page. The web package has no
+// logger, so the detail is not recorded here.
+func resolveError(w http.ResponseWriter, err error, outcome string) {
+	switch {
+	case errors.Is(err, postgres.ErrAgentLeaseCorruptState):
+		plain(w, http.StatusInternalServerError, "environment is in an inconsistent state; it cannot be resolved from this form\n")
+	case errors.Is(err, postgres.ErrAgentLeaseOutcomeMismatch):
+		if outcome == postgres.ActivationOutcomeNoActivation {
+			plain(w, http.StatusConflict, "this block was caused by an activation; declare activated or not_activated\n")
+			return
+		}
+		plain(w, http.StatusConflict, "this block was not caused by an activation; declare no_activation\n")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationUnresolved):
+		plain(w, http.StatusConflict, "the activation switch is still authorized and cannot be resolved yet; retry once it requires reconciliation\n")
+	case errors.Is(err, postgres.ErrAgentLeaseActivationRouteMoved):
+		plain(w, http.StatusConflict, "the route moved since the activation was authorized, so activated is impossible; declare not_activated\n")
+	case errors.Is(err, postgres.ErrAgentLeaseIntegrityConflict):
+		plain(w, http.StatusConflict, "this environment was already resolved with a different outcome\n")
+	case errors.Is(err, postgres.ErrServerAuthorizationDenied), errors.Is(err, postgres.ErrAgentLeaseInvalidInput):
+		badRequest(w)
+	default:
+		// Not a refusal of the operator's input (a database failure, a
+		// cancelled context, a failed commit): saying "bad request" would
+		// send the operator to fix a form that is fine.
+		plain(w, http.StatusInternalServerError, "the environment could not be resolved; retry\n")
+	}
 }
 
 // validRuntimeConfigFields mirrors migration 000014/000017's
@@ -1675,12 +1716,23 @@ type serverRow struct {
 	ID, Name, Status, CreatedAt, LastHeartbeatAt, ActiveCredentialVersion, Enrollment string
 }
 type reconcilingRow struct {
-	EnvironmentID, AttemptID, JobID, ServerID, Since string
+	EnvironmentID, AttemptID, JobID, ServerID, Since, Activation string
 }
 type serversView struct {
 	CSRF                    string
 	Servers                 []serverRow
 	ReconcilingEnvironments []reconcilingRow
+	// ResolveReasonMax is the resolve form's maxlength (UTF-16 units, so only
+	// a hint: environmentsResolve enforces maxResolveReasonBytes in bytes).
+	ResolveReasonMax int
+}
+
+// activationLabel renders "" (a block no activation caused) as "none".
+func activationLabel(state string) string {
+	if state == "" {
+		return "none"
+	}
+	return state
 }
 
 // formatTimestamp renders a possibly-zero time.Time as UTC RFC 3339, or "" -
@@ -1713,7 +1765,7 @@ func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expire
 
 // serversTemplate lists registered servers with a registration form, a
 // reissue-enrollment and revoke form per server, and reconciling
-// environments with a mark-reconciled form per environment. Rotate is
+// environments with a resolve form per environment. Rotate is
 // intentionally absent here: Step 6 Decision 4 changed credential issuance
 // so the agent, not the control plane, generates its own credential and
 // sends only its digest at enrollment (internal/agent/http Enroll); a
@@ -1723,7 +1775,7 @@ func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expire
 // 000012). Rotation is deferred to a follow-up agent-initiated rotation
 // protocol; this slice ships register, reissue-before-enrollment, and
 // revoke only.
-var serversTemplate = template.Must(template.New("servers").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy servers</title></head><body><main><h1>Servers</h1><form method="post" action="/servers/register"><label>Name <input name="name" required maxlength="128"></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Register server</button></form><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Last heartbeat</th><th>Active credential</th><th>Enrollment</th><th>Actions</th></tr></thead><tbody>{{range .Servers}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.CreatedAt}}</td><td>{{.LastHeartbeatAt}}</td><td>{{.ActiveCredentialVersion}}</td><td>{{.Enrollment}}</td><td><form method="post" action="/servers/enrollment"><input type="hidden" name="server_id" value="{{.ID}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Reissue enrollment token</button></form><form method="post" action="/servers/revoke"><input type="hidden" name="server_id" value="{{.ID}}"><label>Reason <input name="reason" required maxlength="512"></label><label><input type="checkbox" name="confirm" value="revoke" required> Confirm revoke</label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Revoke</button></form></td></tr>{{end}}</tbody></table><h2>Reconciling environments</h2><table><thead><tr><th>Environment</th><th>Attempt</th><th>Job</th><th>Server</th><th>Since</th><th>Actions</th></tr></thead><tbody>{{range .ReconcilingEnvironments}}<tr><td>{{.EnvironmentID}}</td><td>{{.AttemptID}}</td><td>{{.JobID}}</td><td>{{.ServerID}}</td><td>{{.Since}}</td><td><form method="post" action="/environments/mark-reconciled"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><label>Reason <input name="reason" required maxlength="512"></label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Mark reconciled</button></form></td></tr>{{end}}</tbody></table><h2>Runtime configuration</h2><form method="get" action="/environments/config"><label>Environment ID <input name="environment_id" required maxlength="128"></label><button type="submit">View / edit configuration</button></form><p><a href="/">Back</a></p></main></body></html>`))
+var serversTemplate = template.Must(template.New("servers").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy servers</title></head><body><main><h1>Servers</h1><form method="post" action="/servers/register"><label>Name <input name="name" required maxlength="128"></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Register server</button></form><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Last heartbeat</th><th>Active credential</th><th>Enrollment</th><th>Actions</th></tr></thead><tbody>{{range .Servers}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.CreatedAt}}</td><td>{{.LastHeartbeatAt}}</td><td>{{.ActiveCredentialVersion}}</td><td>{{.Enrollment}}</td><td><form method="post" action="/servers/enrollment"><input type="hidden" name="server_id" value="{{.ID}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Reissue enrollment token</button></form><form method="post" action="/servers/revoke"><input type="hidden" name="server_id" value="{{.ID}}"><label>Reason <input name="reason" required maxlength="512"></label><label><input type="checkbox" name="confirm" value="revoke" required> Confirm revoke</label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Revoke</button></form></td></tr>{{end}}</tbody></table><h2>Reconciling environments</h2><table><thead><tr><th>Environment</th><th>Attempt</th><th>Job</th><th>Server</th><th>Since</th><th>Activation</th><th>Actions</th></tr></thead><tbody>{{range .ReconcilingEnvironments}}<tr><td>{{.EnvironmentID}}</td><td>{{.AttemptID}}</td><td>{{.JobID}}</td><td>{{.ServerID}}</td><td>{{.Since}}</td><td>{{.Activation}}</td><td><form method="post" action="/environments/resolve"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><label>Outcome <select name="outcome" required autocomplete="off"><option value="">Choose outcome</option><option value="activated">activated: the route switched</option><option value="not_activated">not_activated: the route did not switch</option><option value="no_activation">no_activation: no activation caused this block</option></select></label><label>Reason <input name="reason" required autocomplete="off" maxlength="{{$.ResolveReasonMax}}"></label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Resolve</button></form></td></tr>{{end}}</tbody></table><h2>Runtime configuration</h2><form method="get" action="/environments/config"><label>Environment ID <input name="environment_id" required maxlength="128"></label><button type="submit">View / edit configuration</button></form><p><a href="/">Back</a></p></main></body></html>`))
 
 // runtimeConfigView and bindingRow are pre-formatted the same way
 // serverRow/reconcilingRow are: every field is already rendered to text

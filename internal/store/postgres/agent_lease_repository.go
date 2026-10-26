@@ -3170,15 +3170,19 @@ func (r *AgentLeaseRepository) Reconcile(ctx context.Context, serverID string, p
 
 // ReconcilingEnvironment is one environment currently blocked on
 // reconciliation, as the web admin /servers page renders it: the pending
-// attempt and job it is waiting on, the server that must reconcile it (or be
-// broken-glassed via MarkReconciled), and since (the slot's last update,
-// i.e. when reconciliation became required).
+// attempt and job it is waiting on, the server that must reconcile it (or the
+// administrator who resolves it via ResolveActivation), and since (the slot's
+// last update, i.e. when reconciliation became required). Activation is "" when
+// no activation caused the block (the administrator declares no_activation),
+// else the state of the attempt's unresolved activate operation
+// (switch_authorized: not yet resolvable; reconciliation_required).
 type ReconcilingEnvironment struct {
 	EnvironmentID string
 	AttemptID     int64
 	JobID         int64
 	ServerID      string
 	Since         time.Time
+	Activation    string
 }
 
 // ListReconcilingEnvironments returns every environment currently requiring
@@ -3198,7 +3202,15 @@ func (r *AgentLeaseRepository) ListReconcilingEnvironments(ctx context.Context, 
 	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
 		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT es.environment_id, a.id, a.job_id, a.server_id, es.updated_at FROM environment_slots es JOIN agent_job_attempts a ON a.id = es.reconciliation_attempt_id JOIN agent_jobs j ON j.id = a.job_id WHERE es.reconciliation_required AND j.owner_id=$1 ORDER BY es.updated_at ASC, es.environment_id`, principal.OwnerID)
+	// The scalar subquery applies the same rule ResolveActivation uses for
+	// "activation-caused": an unresolved activate operation of the pending
+	// attempt. If the slot is flagged by attempt A while the unresolved operation
+	// belongs to attempt B (corruption), this column is empty but
+	// ResolveActivation answers CorruptState for every outcome. The 000021
+	// unique index allows at most one per environment, so it yields at most
+	// one row. The rule's unqualified kind/state columns bind
+	// to the innermost FROM (o), so no outer table can capture them.
+	rows, err := tx.Query(ctx, `SELECT es.environment_id, a.id, a.job_id, a.server_id, es.updated_at, COALESCE((SELECT o.state FROM release_operations o WHERE o.attempt_id = a.id AND o.environment_id = es.environment_id AND `+unresolvedActivationSQL+`), '') FROM environment_slots es JOIN agent_job_attempts a ON a.id = es.reconciliation_attempt_id JOIN agent_jobs j ON j.id = a.job_id WHERE es.reconciliation_required AND j.owner_id=$1 ORDER BY es.updated_at ASC, es.environment_id`, principal.OwnerID)
 	if err != nil {
 		return nil, fmt.Errorf("query reconciling environments: %w", err)
 	}
@@ -3206,7 +3218,7 @@ func (r *AgentLeaseRepository) ListReconcilingEnvironments(ctx context.Context, 
 	var environments []ReconcilingEnvironment
 	for rows.Next() {
 		var e ReconcilingEnvironment
-		if err = rows.Scan(&e.EnvironmentID, &e.AttemptID, &e.JobID, &e.ServerID, &e.Since); err != nil {
+		if err = rows.Scan(&e.EnvironmentID, &e.AttemptID, &e.JobID, &e.ServerID, &e.Since, &e.Activation); err != nil {
 			return nil, fmt.Errorf("scan reconciling environment row: %w", err)
 		}
 		environments = append(environments, e)

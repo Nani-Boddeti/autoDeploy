@@ -166,7 +166,7 @@ func run(ctx context.Context) error {
 		checkoutStore = githubRepository
 	}
 	// serverRepository and leaseRepository back the session/CSRF-protected
-	// web /servers and /environments/mark-reconciled admin routes (Step 6b);
+	// web /servers and /environments/resolve admin routes (Step 6b);
 	// an administrator can register and manage servers whether or not the
 	// unauthenticated /agent/v1 protocol below is itself enabled, so these
 	// are constructed unconditionally, not gated by agentConfig.Enabled.
@@ -344,8 +344,8 @@ func (a serverAdmin) RevokeServer(ctx context.Context, p auth.Principal, serverI
 func (a serverAdmin) ListReconcilingEnvironments(ctx context.Context, p auth.Principal) ([]postgres.ReconcilingEnvironment, error) {
 	return a.leases.ListReconcilingEnvironments(ctx, p)
 }
-func (a serverAdmin) MarkReconciled(ctx context.Context, p auth.Principal, environmentID, reason string) error {
-	return a.leases.MarkReconciled(ctx, p, environmentID, reason)
+func (a serverAdmin) ResolveActivation(ctx context.Context, p auth.Principal, environmentID, outcome, reason string) error {
+	return a.leases.ResolveActivation(ctx, p, environmentID, outcome, reason)
 }
 
 // serverAuthenticator adapts (*postgres.ServerRepository).Authenticate, which
