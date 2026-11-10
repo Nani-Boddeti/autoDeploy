@@ -81,3 +81,17 @@ gates; the Hetzner end-to-end bar remains the proof.
 - False probe failure on first-deploy ACME -> spurious block with route rolled forward: generous deadline,
   stated in summary.
 - `activation_open` from a stray `Complete`: outcome shape prevents the call.
+
+## Progress
+- 10d-1 `59e116d` client typed conflicts + Activate/ReportActivationResult.
+- 10d-2 `cfec942` HTTPS data-plane probe (reuses healthgate.ValidRouteHostname).
+- 10d-3 durable activation + route-revision stores. Review 1 FAILED (invalid-UTF-8 summary self-corrupted on
+  reload -> List fails closed for all records; new dirs not fsynced into parent); fixed, re-review PASS. Shared
+  per-directory lock (EvalSymlinks-canonical dir), concurrency tests mutation-proved (per-call lock fails both).
+  Single agent process per state dir (no cross-process exclusion). Missing route-revision file reads 0 (accepted:
+  guard is defence in depth over server CAS).
+
+## Follow-ups
+- Fence `Store.path`: ValidOpaqueID allows 128 bytes and encodeName can expand x3, exceeding the 255-byte file
+  name limit for long environment ids (route-revision store already refuses these). Pre-existing; fix before
+  activationEnabled flips.

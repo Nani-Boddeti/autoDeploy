@@ -73,6 +73,17 @@ func New(dir string) (Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return Store{}, fmt.Errorf("create agent fence state directory: %w", err)
 	}
+	// Canonicalize so every spelling of the path (symlinks, /var vs
+	// /private/var) yields the same Store.dir and per-directory lock key.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return Store{}, fmt.Errorf("resolve agent state directory: %w", err)
+	}
+	dir = resolved
+	// The directory entry may exist from a crashed run that never synced it.
+	if err := syncDirAndParent(dir); err != nil {
+		return Store{}, fmt.Errorf("sync agent state directory: %w", err)
+	}
 	return Store{dir: dir}, nil
 }
 
@@ -258,7 +269,7 @@ func (s Store) addToIndex(environmentID string) error {
 }
 
 func writeFileAtomic(dir, path string, contents []byte) error {
-	tmp, err := os.CreateTemp(dir, ".fence-*.tmp")
+	tmp, err := os.CreateTemp(dir, atomicTempPrefix+"*"+atomicTempSuffix)
 	if err != nil {
 		return err
 	}
