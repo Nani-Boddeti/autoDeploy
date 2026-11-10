@@ -31,6 +31,8 @@ const (
 	pathComplete      = "/agent/v1/leases/complete"
 	pathCancelAck     = "/agent/v1/leases/cancel-ack"
 	pathReconcile     = "/agent/v1/environments/reconcile"
+	pathActivate      = "/agent/v1/leases/activate"
+	pathActivationRes = "/agent/v1/leases/activation-result"
 	pathMaterialize   = "/agent/v1/leases/materialize-secrets"
 	pathProgress      = "/agent/v1/leases/progress"
 	pathCheckoutBegin = "/agent/v1/checkout/begin"
@@ -78,7 +80,57 @@ var (
 	ErrInvalidRequest     = errors.New("invalid request")
 	ErrServiceUnavailable = errors.New("control plane unavailable")
 	ErrTransportFailure   = errors.New("control plane request failed")
+	// ErrMalformedResponse means the control plane answered 200 with a body
+	// that decoded but violates the wire contract (a missing or malformed
+	// field). From our own server that is a protocol violation, not a
+	// transient fault: it is never retried and must not be treated as a
+	// confirmed outcome.
+	ErrMalformedResponse = errors.New("malformed control-plane response")
 )
+
+// Non-stale 409 codes the control plane sends (internal/agent/http
+// handler.go mapError). "stale_lease" is deliberately absent: it maps to
+// ErrStaleLease, never a ConflictError. There is no test tying this list to
+// the server (that would need a source parse or a server import); keep it in
+// step with mapError by hand.
+const (
+	ConflictIntegrity            = "integrity_conflict"
+	ConflictCandidateNotReady    = "candidate_not_ready"
+	ConflictNoRouteHead          = "no_route_head"
+	ConflictActivationOpen       = "activation_open"
+	ConflictEnvironmentBlocked   = "environment_activation_blocked"
+	ConflictLateReportRecorded   = "late_report_recorded"
+	ConflictRouteMoved           = "route_moved"
+	ConflictOutcomeMismatch      = "outcome_mismatch"
+	ConflictActivationUnresolved = "activation_unresolved"
+	ConflictCorruptState         = "corrupt_state"
+	ConflictConstraintViolation  = "constraint_violation"
+	conflictStaleLease           = "stale_lease"
+)
+
+// ConflictError is a non-retryable 409 carrying the server's code (empty when
+// the body was unparseable). It matches ErrIntegrityConflict under errors.Is
+// so callers that only care about the class keep working.
+type ConflictError struct{ Code string }
+
+func (e *ConflictError) Error() string {
+	if e.Code == "" {
+		return ErrIntegrityConflict.Error()
+	}
+	return fmt.Sprintf("%s: %s", ErrIntegrityConflict.Error(), e.Code)
+}
+
+// Is reports a match with ErrIntegrityConflict.
+func (e *ConflictError) Is(target error) bool { return target == ErrIntegrityConflict }
+
+// ConflictCode returns the 409 code carried by err, if any.
+func ConflictCode(err error) (string, bool) {
+	var ce *ConflictError
+	if errors.As(err, &ce) {
+		return ce.Code, true
+	}
+	return "", false
+}
 
 // Client is a narrow, testable wrapper around one control-plane origin and
 // one server identity. Enroll deliberately never uses the credential/
@@ -201,10 +253,10 @@ func (c *Client) mapStatus(status int, body []byte) error {
 		c.logger.Print("agent credential rejected")
 		return ErrUnauthorized
 	case http.StatusConflict:
-		if parsed.Error == "stale_lease" {
+		if parsed.Error == conflictStaleLease {
 			return ErrStaleLease
 		}
-		return ErrIntegrityConflict
+		return &ConflictError{Code: parsed.Error}
 	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
 		return ErrInvalidRequest
 	case http.StatusServiceUnavailable:

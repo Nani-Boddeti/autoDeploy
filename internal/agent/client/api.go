@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	agentcheckout "autodeploy/internal/agent/checkout"
@@ -309,6 +310,130 @@ func (c *Client) Reconcile(ctx context.Context, environmentID string, attemptID,
 		OutcomeDigest string `json:"outcome_digest"`
 	}{EnvironmentID: environmentID, AttemptID: attemptID, Fence: fence, Outcome: outcome, OutcomeDigest: hex.EncodeToString(outcomeDigest[:])}
 	return c.post(ctx, pathReconcile, req, nil, true)
+}
+
+const (
+	routeDigestPrefix              = "sha256:"
+	maxActivationFailureSummaryLen = 2048
+)
+
+// ActivateResponse is the control plane's tx1 answer: the route the agent
+// must render and compare against RouteDigest before switching.
+type ActivateResponse struct {
+	OperationID              string
+	RouteRevision            int64
+	Hostname                 string
+	EntrypointName           string
+	CertResolverName         string
+	BackendRuntimeInstanceID string
+	RouteDigest              [32]byte
+}
+
+// Activate asks the control plane to authorize the traffic switch for
+// attemptID/fence and image imageDigest. Replaying the same
+// (attempt, fence, image digest) is the server's idempotency key. A 200 whose
+// fields are missing or malformed yields ErrMalformedResponse.
+//
+// A 409 (ConflictError / ErrStaleLease) is a definite refusal. Any other
+// error -- ErrTransportFailure or ErrServiceUnavailable after retries, a 200
+// that fails decoding, or ErrMalformedResponse -- leaves the server-side
+// operation state UNKNOWN: tx1 may have committed and the response been lost,
+// so callers must not treat it as "certainly not authorized". Retrying
+// Activate is safe because the server replays on (attempt, fence,
+// image_digest).
+func (c *Client) Activate(ctx context.Context, attemptID, fence int64, imageDigest [32]byte) (ActivateResponse, error) {
+	req := struct {
+		AttemptID   int64  `json:"attempt_id"`
+		Fence       int64  `json:"fence"`
+		ImageDigest string `json:"image_digest"`
+	}{AttemptID: attemptID, Fence: fence, ImageDigest: hex.EncodeToString(imageDigest[:])}
+	var resp struct {
+		OperationID              string `json:"operation_id"`
+		RouteRevision            int64  `json:"route_revision"`
+		Hostname                 string `json:"hostname"`
+		EntrypointName           string `json:"entrypoint_name"`
+		CertResolverName         string `json:"cert_resolver_name"`
+		BackendRuntimeInstanceID string `json:"backend_runtime_instance_id"`
+		RouteDigest              string `json:"route_digest"`
+	}
+	if err := c.post(ctx, pathActivate, req, &resp, true); err != nil {
+		return ActivateResponse{}, err
+	}
+	if resp.OperationID == "" || resp.RouteRevision <= 0 || resp.Hostname == "" || resp.EntrypointName == "" ||
+		resp.CertResolverName == "" || resp.BackendRuntimeInstanceID == "" {
+		return ActivateResponse{}, fmt.Errorf("%w: activate response missing a required field", ErrMalformedResponse)
+	}
+	digest, ok := parseRouteDigest(resp.RouteDigest)
+	if !ok {
+		return ActivateResponse{}, fmt.Errorf("%w: activate response route digest", ErrMalformedResponse)
+	}
+	return ActivateResponse{
+		OperationID: resp.OperationID, RouteRevision: resp.RouteRevision, Hostname: resp.Hostname,
+		EntrypointName: resp.EntrypointName, CertResolverName: resp.CertResolverName,
+		BackendRuntimeInstanceID: resp.BackendRuntimeInstanceID, RouteDigest: digest,
+	}, nil
+}
+
+// parseRouteDigest accepts exactly "sha256:" + 64 lowercase hex.
+func parseRouteDigest(s string) ([32]byte, bool) {
+	var d [32]byte
+	hexPart, found := strings.CutPrefix(s, routeDigestPrefix)
+	if !found || len(hexPart) != hex.EncodedLen(len(d)) || hexPart != strings.ToLower(hexPart) {
+		return d, false
+	}
+	b, err := hex.DecodeString(hexPart)
+	if err != nil || len(b) != len(d) {
+		return d, false
+	}
+	copy(d[:], b)
+	return d, true
+}
+
+// ActivationResult is the agent's declared outcome of a traffic switch. It
+// can only be built through ActivationSucceeded or ActivationFailed, so a
+// success without a digest, a failure without a summary, or both together
+// cannot be represented; the zero value is rejected by ReportActivationResult.
+type ActivationResult struct {
+	valid          bool
+	succeeded      bool
+	observedDigest [32]byte
+	failureSummary string
+}
+
+// ActivationSucceeded declares the switch observed with routeDigest.
+func ActivationSucceeded(observedRouteDigest [32]byte) ActivationResult {
+	return ActivationResult{valid: true, succeeded: true, observedDigest: observedRouteDigest}
+}
+
+// ActivationFailed declares failure or ambiguity with a non-empty summary of
+// at most 2048 bytes; otherwise it returns ErrInvalidRequest.
+func ActivationFailed(summary string) (ActivationResult, error) {
+	if summary == "" || len(summary) > maxActivationFailureSummaryLen {
+		return ActivationResult{}, fmt.Errorf("%w: activation failure summary must be 1-%d bytes", ErrInvalidRequest, maxActivationFailureSummaryLen)
+	}
+	return ActivationResult{valid: true, failureSummary: summary}, nil
+}
+
+// ReportActivationResult reports tx2 for operationID. It rejects a zero
+// ActivationResult or invalid ids with ErrInvalidRequest before sending.
+// The control plane answers 409 late_report_recorded when the report arrived
+// after the operation was blocked (recorded as evidence, never finalized).
+func (c *Client) ReportActivationResult(ctx context.Context, attemptID, fence int64, operationID string, result ActivationResult) error {
+	if !result.valid || attemptID <= 0 || fence <= 0 || operationID == "" || len(operationID) > 128 {
+		return fmt.Errorf("%w: activation result", ErrInvalidRequest)
+	}
+	req := struct {
+		AttemptID           int64  `json:"attempt_id"`
+		Fence               int64  `json:"fence"`
+		OperationID         string `json:"operation_id"`
+		Succeeded           bool   `json:"succeeded"`
+		ObservedRouteDigest string `json:"observed_route_digest,omitempty"`
+		FailureSummary      string `json:"failure_summary,omitempty"`
+	}{AttemptID: attemptID, Fence: fence, OperationID: operationID, Succeeded: result.succeeded, FailureSummary: result.failureSummary}
+	if result.succeeded {
+		req.ObservedRouteDigest = routeDigestPrefix + hex.EncodeToString(result.observedDigest[:])
+	}
+	return c.post(ctx, pathActivationRes, req, nil, true)
 }
 
 // MaterializedSecret is one decrypted value for this attempt. It exists only
