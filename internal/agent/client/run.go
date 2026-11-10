@@ -26,6 +26,19 @@ type Outcome struct {
 	FailureClass queue.FailureClass
 	OperationID  string
 	ResultDigest [32]byte
+
+	// HandedOff means an authorized traffic-switch activation was started: the
+	// executor persisted a result_ready record and handed it to the activation
+	// reporter, which closes the attempt server-side. reportOutcome then sends
+	// neither Complete nor CancelAck (a Complete after an authorized
+	// activation would be answered activation_open and could mask the report).
+	HandedOff bool
+	// AuthorizationUnknown means Activate could not be answered definitively,
+	// so the server may or may not have authorized the switch. Nothing was
+	// written to the host. reportOutcome sends neither Complete nor CancelAck:
+	// the attempt expires, the sweeper blocks an authorized operation (the
+	// operator declares not_activated) and an unauthorized one retries normally.
+	AuthorizationUnknown bool
 }
 
 // Executor performs the actual deployment work for one claimed lease.
@@ -207,6 +220,12 @@ func (a *Agent) runLease(ctx context.Context, lease Lease) {
 func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome, cancelled bool) {
 	var err error
 	switch {
+	case outcome.HandedOff:
+		a.logger().Print("agent activation handed off to the reporter; sending no completion")
+		return
+	case outcome.AuthorizationUnknown:
+		a.logger().Print("agent activation authorization unknown; sending no completion or cancel acknowledgement, the attempt will expire")
+		return
 	case cancelled:
 		err = a.Client.CancelAck(ctx, lease.AttemptID, lease.Fence, outcome.OperationID, outcome.ResultDigest)
 	case outcome.Succeeded:

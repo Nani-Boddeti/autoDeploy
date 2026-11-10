@@ -243,6 +243,18 @@ func (r *ActivationReporter) pass(ctx context.Context, tracks map[int64]*reportT
 	return max(next.Sub(r.clock()), 0)
 }
 
+// ReportAnswerIsTerminal reports whether an activation-result answer proves the
+// server durably holds the report or a final decision for the operation (the
+// only answers on which a pending record may be dropped). It is the single
+// definition shared by the reporter and the executor's direct-report fallback.
+func ReportAnswerIsTerminal(err error) bool {
+	if err == nil {
+		return true
+	}
+	code, ok := ConflictCode(err)
+	return ok && deleteOnConflict(code)
+}
+
 // deleteOnConflict is an allow-list: only codes meaning the server durably
 // recorded our report or holds a final decision for the operation. Every other
 // 409 (including unknown or empty codes) keeps the record.

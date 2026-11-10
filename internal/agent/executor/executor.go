@@ -78,6 +78,13 @@ type Config struct {
 	// value discards build output.
 	BuildOutput io.Writer
 	Logger      *log.Logger
+	// Activation configures the post-health-gate traffic switch. When nil the
+	// Executor FAILS CLOSED: Execute refuses every lease
+	// (permanent_configuration) before any work, rather than reporting
+	// success after the health gate as a pre-10d executor did -- that success
+	// would close the attempt via Complete with no activation. cmd/agent does
+	// not set it yet (10d-5b); executorEnabled stays false until it does.
+	Activation *ActivationConfig
 }
 
 // Executor implements agentclient.Executor. Every dependency is a narrow
@@ -93,6 +100,7 @@ type Executor struct {
 	network      string
 	buildOutput  io.Writer
 	logger       *log.Logger
+	activation   *activationRunner // nil: Execute fails closed.
 }
 
 // NewExecutor validates cfg, runs the startup capability probe (Docker
@@ -118,7 +126,15 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 	if buildOutput == nil {
 		buildOutput = io.Discard
 	}
+	var activation *activationRunner
+	if cfg.Activation != nil {
+		var err error
+		if activation, err = newActivationRunner(*cfg.Activation, logger); err != nil {
+			return nil, err
+		}
+	}
 	return &Executor{
+		activation:   activation,
 		checkout:     newProductionCheckout(cfg.ControlPlane, cfg.CheckoutRunner),
 		docker:       cfg.Docker,
 		build:        docker.Build,
@@ -132,8 +148,8 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 
 // Execute drives one lease through checkout -> build -> run -> health gate,
 // reporting progress at each phase, and returns promptly once ctx is
-// cancelled. A successful run stops at health_checking; activating/healthy
-// belongs to a later slice.
+// cancelled -- except after a successful Activate, when the switch runs to a
+// persisted result on its own detached context (see activate).
 func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentclient.Outcome {
 	// Fail closed before any container work at all -- checkout, build, and
 	// run all happen after this point. Migration 000017 makes both
@@ -156,6 +172,11 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	// resend of the same corrupt lease would fail identically.
 	if lease.HealthGatePath == "" || lease.HealthGateHost == "" {
 		return e.outcome(lease, false, queue.FailureClassCorruptState)
+	}
+
+	if e.activation == nil {
+		e.logger.Print("agent executor: activation is not configured; refusing the lease (fail closed)")
+		return e.outcome(lease, false, queue.FailureClassPermanentConfiguration)
 	}
 
 	progress := newProgressReporter(e.controlPlane)
@@ -268,7 +289,10 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		return e.outcome(lease, false, docker.ClassifyHealthGateResult(gateResult))
 	}
 
-	return e.outcome(lease, true, queue.FailureClassTransient) // FailureClass ignored on success.
+	// Health gate passed: run the activation sequence. A completed sequence
+	// is never reported through Complete -- the activation-result report
+	// closes the attempt server-side.
+	return e.activate(ctx, lease, buildResult.ImageDigest)
 }
 
 // containerEnv merges runtime-scoped materialized secrets with runtime-

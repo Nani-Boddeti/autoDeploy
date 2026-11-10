@@ -159,6 +159,7 @@ func testLease() agentclient.Lease {
 
 func newTestExecutor(cp *fakeControlPlane, co *fakeCheckout, dk *fakeDocker, build func(context.Context, docker.BuildRequest) (docker.BuildResult, error)) *Executor {
 	return &Executor{
+		activation:   newActFake(testLease()).runner(),
 		checkout:     co,
 		docker:       dk,
 		build:        build,
@@ -191,13 +192,13 @@ func TestExecuteHappyPathReachesHealthChecking(t *testing.T) {
 		gateResult:   docker.HealthGateResult{Success: true},
 	}
 	var buildReq docker.BuildRequest
-	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, &buildReq)
+	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, &buildReq)
 
 	e := newTestExecutor(cp, co, dk, build)
 	outcome := e.Execute(context.Background(), lease)
 
-	if !outcome.Succeeded {
-		t.Fatalf("Execute did not succeed: %+v", outcome)
+	if !outcome.HandedOff || outcome.Succeeded {
+		t.Fatalf("Execute did not hand the activation off: %+v", outcome)
 	}
 	wantPhases := []deployment.Status{deployment.StatusFetching, deployment.StatusBuilding, deployment.StatusStarting, deployment.StatusHealthChecking}
 	if len(cp.progressCalls) != len(wantPhases) {
@@ -259,12 +260,12 @@ func TestExecuteHealthGateTargetUsesConfiguredPathAndHostNeverSynthesized(t *tes
 		ensureResult: testInspect("networkabc123"),
 		gateResult:   docker.HealthGateResult{Success: true},
 	}
-	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
 	e := newTestExecutor(cp, co, dk, build)
 
 	outcome := e.Execute(context.Background(), lease)
-	if !outcome.Succeeded {
-		t.Fatalf("Execute did not succeed: %+v", outcome)
+	if !outcome.HandedOff || outcome.Succeeded {
+		t.Fatalf("Execute did not hand the activation off: %+v", outcome)
 	}
 
 	if dk.lastTarget.Host != lease.HealthGateHost {
@@ -306,7 +307,7 @@ func assertFailsClosedBeforeContainerWork(t *testing.T, lease agentclient.Lease)
 		ensureResult: testInspect("networkabc123"),
 		gateResult:   docker.HealthGateResult{Success: true},
 	}
-	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
 	e := newTestExecutor(cp, co, dk, build)
 
 	outcome := e.Execute(context.Background(), lease)
@@ -442,7 +443,7 @@ func TestExecuteFailurePointsMapToExpectedFailureClass(t *testing.T) {
 		cp := &fakeControlPlane{secrets: fullSecrets()}
 		co := &fakeCheckout{result: happyCheckoutResult()}
 		dk := &fakeDocker{ensureErr: docker.ErrInconsistentLocalState}
-		build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+		build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
 		e := newTestExecutor(cp, co, dk, build)
 		outcome := e.Execute(context.Background(), lease)
 		if outcome.Succeeded || outcome.FailureClass != queue.FailureClassCorruptState {
@@ -461,7 +462,7 @@ func TestExecuteFailurePointsMapToExpectedFailureClass(t *testing.T) {
 			ensureResult: testInspect("networkabc123"),
 			gateResult:   docker.HealthGateResult{Success: false, Reason: docker.HealthGateFailureDeadlineExceeded},
 		}
-		build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+		build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
 		e := newTestExecutor(cp, co, dk, build)
 		outcome := e.Execute(context.Background(), lease)
 		if outcome.Succeeded || outcome.FailureClass != queue.FailureClassPermanentConfiguration {
@@ -480,7 +481,7 @@ func TestExecuteFailurePointsMapToExpectedFailureClass(t *testing.T) {
 			ensureResult: testInspect("networkabc123"),
 			gateResult:   docker.HealthGateResult{Success: false, Reason: docker.HealthGateFailureContainerNotRunning, OOMKilled: true},
 		}
-		build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+		build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
 		e := newTestExecutor(cp, co, dk, build)
 		outcome := e.Execute(context.Background(), lease)
 		if outcome.Succeeded || outcome.FailureClass != queue.FailureClassTransient {
@@ -556,7 +557,7 @@ func TestExecuteReturnsPromptlyOnContextCancellationDuringHealthGate(t *testing.
 	cp := &fakeControlPlane{}
 	co := &fakeCheckout{result: happyCheckoutResult()}
 	dk := &fakeDocker{ensureResult: testInspect("networkabc123"), blockGate: true}
-	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + zeros(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
+	build := fakeBuildFunc(docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil, nil)
 	e := newTestExecutor(cp, co, dk, build)
 
 	ctx, cancel := context.WithCancel(context.Background())

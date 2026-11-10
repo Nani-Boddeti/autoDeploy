@@ -27,14 +27,20 @@ import (
 type fakeExecutor struct {
 	started chan Lease
 	done    chan Outcome
+	// ctxDone is closed once Execute observes its context cancelled.
+	ctxDone chan struct{}
 }
 
 func newFakeExecutor() *fakeExecutor {
-	return &fakeExecutor{started: make(chan Lease, 1), done: make(chan Outcome, 1)}
+	return &fakeExecutor{started: make(chan Lease, 1), done: make(chan Outcome, 1), ctxDone: make(chan struct{})}
 }
 
-func (f *fakeExecutor) Execute(_ context.Context, lease Lease) Outcome {
+func (f *fakeExecutor) Execute(ctx context.Context, lease Lease) Outcome {
 	f.started <- lease
+	go func() {
+		<-ctx.Done()
+		close(f.ctxDone)
+	}()
 	return <-f.done
 }
 
@@ -49,10 +55,11 @@ type fakeControlPlane struct {
 	completeCalls  int32
 	cancelAckCalls int32
 
-	leaseToOffer   *leaseWire // nil once claimed, so a second claim returns none
-	renewSequences []int
-	renewStatus    func(callNumber int) int // 200 unless overridden
-	renewCallCount int
+	leaseToOffer    *leaseWire // nil once claimed, so a second claim returns none
+	renewSequences  []int
+	renewStatus     func(callNumber int) int // 200 unless overridden
+	renewCallCount  int
+	cancelRequested bool // renew answers cancel_requested
 }
 
 func (f *fakeControlPlane) mux() *http.ServeMux {
@@ -91,7 +98,7 @@ func (f *fakeControlPlane) mux() *http.ServeMux {
 			return
 		}
 		expires := time.Now().Add(90 * time.Second).UTC().Format(time.RFC3339Nano)
-		writeJSON(w, http.StatusOK, map[string]any{"lease_expires_at": expires, "authority_expires_at": expires, "cancel_requested": false})
+		writeJSON(w, http.StatusOK, map[string]any{"lease_expires_at": expires, "authority_expires_at": expires, "cancel_requested": f.cancelRequested})
 	})
 	mux.HandleFunc(pathComplete, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&f.completeCalls, 1)
@@ -405,4 +412,89 @@ func corruptFenceFile(t *testing.T, dir string) {
 		return
 	}
 	t.Fatal("no fence state file found to corrupt")
+}
+
+// outcomeSendsNothing runs one lease whose executor returns outcome and
+// asserts neither Complete nor CancelAck was sent.
+func outcomeSendsNothing(t *testing.T, env string, cancelRequested bool, outcome Outcome) {
+	t.Helper()
+	fake := &fakeControlPlane{leaseToOffer: fixtureLease(t, env, 1), cancelRequested: cancelRequested}
+	srv := httptest.NewTLSServer(fake.mux())
+	defer srv.Close()
+	executor := newFakeExecutor()
+	agent := newTestAgent(t, srv, executor, nil)
+
+	done := make(chan struct{})
+	go func() { agent.claimAndRun(context.Background()); close(done) }()
+	<-executor.started
+	if cancelRequested {
+		waitForCtxDone(t, executor) // runLease saw the cancel request
+	}
+	executor.done <- outcome
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runLease did not return")
+	}
+	if c, a := atomic.LoadInt32(&fake.completeCalls), atomic.LoadInt32(&fake.cancelAckCalls); c != 0 || a != 0 {
+		t.Fatalf("complete=%d cancelAck=%d, want neither", c, a)
+	}
+}
+
+func TestHandedOffOutcomeSendsNoCompleteOrCancelAck(t *testing.T) {
+	outcomeSendsNothing(t, "env_ho", false, Outcome{HandedOff: true, OperationID: "9001"})
+}
+
+func TestAuthorizationUnknownOutcomeSendsNoCompleteOrCancelAck(t *testing.T) {
+	outcomeSendsNothing(t, "env_au", false, Outcome{AuthorizationUnknown: true, OperationID: "op-1-1"})
+}
+
+func TestHandedOffOutcomeAfterCancelRequestSendsNoCancelAck(t *testing.T) {
+	outcomeSendsNothing(t, "env_hc", true, Outcome{HandedOff: true, OperationID: "9001"})
+}
+
+func TestAuthorizationUnknownAfterCancelRequestSendsNoCancelAck(t *testing.T) {
+	outcomeSendsNothing(t, "env_ac", true, Outcome{AuthorizationUnknown: true})
+}
+
+// A stale renewal cancels the executor's ctx; runLease must still wait for
+// the executor (whose authorized work runs on a detached, deadline-bound
+// context) and then return without reporting anything.
+func TestStaleLeaseWaitsForDetachedExecutorThenReportsNothing(t *testing.T) {
+	fake := &fakeControlPlane{
+		leaseToOffer: fixtureLease(t, "env_sd", 2),
+		renewStatus:  func(int) int { return http.StatusConflict },
+	}
+	srv := httptest.NewTLSServer(fake.mux())
+	defer srv.Close()
+	executor := newFakeExecutor()
+	agent := newTestAgent(t, srv, executor, nil)
+
+	done := make(chan struct{})
+	go func() { agent.claimAndRun(context.Background()); close(done) }()
+	<-executor.started
+	waitForCtxDone(t, executor) // the stale renewal cancelled the executor
+	select {
+	case <-done:
+		t.Fatal("runLease returned before the executor finished")
+	default:
+	}
+	executor.done <- Outcome{HandedOff: true, OperationID: "9001"}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runLease did not return after the executor finished")
+	}
+	if c, a := atomic.LoadInt32(&fake.completeCalls), atomic.LoadInt32(&fake.cancelAckCalls); c != 0 || a != 0 {
+		t.Fatalf("complete=%d cancelAck=%d", c, a)
+	}
+}
+
+func waitForCtxDone(t *testing.T, e *fakeExecutor) {
+	t.Helper()
+	select {
+	case <-e.ctxDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor context was never cancelled")
+	}
 }

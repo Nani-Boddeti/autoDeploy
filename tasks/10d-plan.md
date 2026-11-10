@@ -102,6 +102,12 @@ gates; the Hetzner end-to-end bar remains the proof.
   record files no longer block good ones (state.ScanActivations; corrupt files untouched, logged hourly). Outage
   stops a pass; deferred records not charged; round-robin by last try. Re-review PASS.
 
+- 10d-5a executor activation sequence. Review 1 NEEDS CHANGES: a 409 after an earlier unknown Activate try was
+  treated as a definite refusal (fixed: sawUnknown -> AuthorizationUnknown); result-save failure reported a verified
+  success as a failure (fixed: save retried, direct report sends the real result, terminal rule shared via
+  agentclient.ReportAnswerIsTerminal). Re-review PASS. Carried into 10d-5b: startup recovery converts stranded
+  `authorized` records; delete the `authorized` record after a terminal direct report so recovery cannot re-report it.
+
 ## Follow-ups
 - Fence `Store.path`: ValidOpaqueID allows 128 bytes and encodeName can expand x3, exceeding the 255-byte file
   name limit for long environment ids (route-revision store already refuses these). Pre-existing; fix before
