@@ -374,11 +374,11 @@ func (a activatedFixture) lapseAndExpireOne(t *testing.T) bool {
 	return closed
 }
 
-// clearSlotFlagForcedInSQL stands in for the operator's MarkReconciled, which
-// since step D REFUSES while an unresolved activation exists (see
-// TestMarkReconciledRefusesWhileActivationUnresolved). The stranded shapes
-// these tests need (unresolved operation, free and clear slot) are therefore
-// no longer reachable through MarkReconciled and are forced in SQL.
+// clearSlotFlagForcedInSQL stands in for an operator resolution, which since
+// step D REFUSES a no_activation outcome while an unresolved activation exists
+// (see TestResolveActivationRefusals). The stranded shapes these tests need
+// (unresolved operation, free and clear slot) are therefore no longer
+// reachable through the operator path and are forced in SQL.
 func (a activatedFixture) clearSlotFlagForcedInSQL(t *testing.T) {
 	t.Helper()
 	if _, err := a.pool.Exec(context.Background(), `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=clock_timestamp() WHERE environment_id=$1`, a.envID); err != nil {
@@ -439,7 +439,7 @@ func (a activatedFixture) requireAttemptExpired(t *testing.T) {
 
 // requireStrandedPrecondition asserts the full triple the end-to-end proofs
 // rely on, immediately before the final Activate. It is the explicit coupling
-// to step D/E/G: if a later step changes what the sweeper or MarkReconciled
+// to step D/E/G: if a later step changes what the sweeper or the operator resolution
 // leave behind, this fails loudly instead of the proof silently re-routing
 // through the INSERT backstop.
 func (a activatedFixture) requireStrandedPrecondition(t *testing.T) {
@@ -515,7 +515,7 @@ func TestActivateRouteHeadFlagWithoutUnresolvedOperationStaysStale(t *testing.T)
 }
 
 // The flag-clear scenario: an operation still switch_authorized, route-head
-// flag CLEAR, slot flagged then freed by MarkReconciled. The pre-step-D sweeper
+// flag CLEAR, slot flagged then freed by the old operator break-glass. The pre-step-D sweeper
 // produced it by closing an attempt whose operation was switch_authorized.
 // STEP D REMOVED THAT PATH: the real sweeper now diverts and nothing else
 // produces this shape until step G, so the close is forced in SQL (forceLegacySweeperClose) -- the shape an already-deployed

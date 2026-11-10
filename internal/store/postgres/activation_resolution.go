@@ -17,7 +17,7 @@ import (
 // Step 10c-2b step G1: the operator's DECLARED resolution of a blocked
 // environment. The operator states what really happened to the activation
 // (activated / not_activated) or that no activation was involved
-// (no_activation, today's MarkReconciled behaviour). There is no default: the
+// (no_activation, the plain break-glass clear). There is no default: the
 // declaration is the only thing that may clear an activation-caused block.
 const (
 	ActivationOutcomeActivated    = "activated"
@@ -39,10 +39,10 @@ func validActivationOutcome(outcome string) bool {
 	return false
 }
 
-// clearPlainReconciliation is the tail MarkReconciled and ResolveActivation
-// (no_activation) share: clear the slot flag, write the audit row and the
-// 'reconciled' event. The caller holds the admin session, slot and job locks
-// and commits. reason is stored verbatim in the audit row.
+// clearPlainReconciliation is the tail of ResolveActivation (no_activation):
+// clear the slot flag, write the audit row and the 'reconciled' event. The
+// caller holds the admin session, slot and job locks and commits. reason is
+// stored verbatim in the audit row.
 func (r *AgentLeaseRepository) clearPlainReconciliation(ctx context.Context, tx pgx.Tx, principal auth.Principal, environmentID string, jobID int64, attemptID *int64, reason string) error {
 	var now time.Time
 	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
@@ -98,8 +98,8 @@ type resolvedActivationOperation struct {
 // ResolveActivation is the operator path (administrator session, owner
 // scoped, NO server credential: a revoked server can never authenticate, so
 // for a revoke-diverted block this is the only way out) that clears a blocked
-// environment by a declared outcome. MarkReconciled is unchanged and keeps
-// refusing activation-caused blocks.
+// environment by a declared outcome. no_activation still refuses
+// activation-caused blocks.
 //
 // Lock order (ADR 0004 + 10c-2a amendment): admin session/user -> environment
 // slot -> agent job -> attempt -> release operation -> deployment -> route head
@@ -526,7 +526,7 @@ func agreeResolvedOutcome(ctx context.Context, tx pgx.Tx, attemptID int64, outco
 // ReconcileActivation is the agent path of the declared resolution: the server
 // that held the blocked attempt declares what really happened (activated /
 // not_activated) or that no activation was involved (no_activation, the
-// semantics of Reconcile plus the outcome-kind checks in both directions).
+// plain clear plus the outcome-kind checks in both directions).
 // Authority is deliberately NOT checked (it has usually lapsed); the attempt's
 // server, environment and fence, the operation's fence, the slot's pending
 // flag and the operation's exact state are. A revoked server fails the
@@ -535,7 +535,7 @@ func agreeResolvedOutcome(ctx context.Context, tx pgx.Tx, attemptID int64, outco
 // Lock order: server credential (SHARE) -> environment slot -> agent job ->
 // attempt -> release operation -> deployment -> route head -> releases
 // ascending (activated only) -> writes; the clock is read after every lock.
-// No server audit row (Reconcile writes none); events as ResolveActivation,
+// No server audit row (the agent path writes none); events as ResolveActivation,
 // 'reconciled' last. Any failure rolls back and writes NOTHING, no new block.
 //
 // Idempotency is anchored to the GIVEN attempt: once resolved the slot no
@@ -623,7 +623,7 @@ func (r *AgentLeaseRepository) ReconcileActivation(ctx context.Context, serverID
 		outcome:              outcome,
 		authorize:            authorize,
 		outcomeDigest:        &outcomeDigest,
-		// Reconcile's own rule: only a closed attempt's flag is cleared.
+		// Agent-path rule: only a closed attempt's flag is cleared.
 		plainAttemptRefusal: func(att lockedAttempt) error {
 			if att.state == "leased" || att.closedAt == nil {
 				return ErrServerAuthorizationDenied

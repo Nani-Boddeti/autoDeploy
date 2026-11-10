@@ -784,7 +784,7 @@ func validOperationID(id string) bool {
 // discovery exclusion in ExpireBatch stops applying and the sweeper would run
 // the ORDINARY close (fence advance, slot flag, job retry). Step G must
 // therefore close the attempt in the SAME transaction as the resolution. A
-// revoked server can never authenticate, so no agent Reconcile can resolve its
+// revoked server can never authenticate, so no agent ReconcileActivation can resolve its
 // diverted attempt: G's resolution path must be operator-only.
 //
 // Every other attempt (no unresolved activation) is closed by
@@ -1540,10 +1540,10 @@ var ErrAgentLeaseActivationEnvironmentBlocked = errors.New("agent lease activati
 // enforcing one unresolved activate operation per environment.
 const releaseOperationsOpenActivationIndex = "release_operations_environment_open_activation_idx"
 
-// ErrAgentLeaseActivationUnresolved reports that MarkReconciled was refused
-// because the environment holds an unresolved activate operation (the rule
-// unresolvedActivationSQL), or that ResolveActivation was refused because that
-// operation is still switch_authorized. Non-retryable: only a declared
+// ErrAgentLeaseActivationUnresolved reports that ResolveActivation or
+// ReconcileActivation was refused
+// because the environment holds an unresolved activate operation that is still
+// switch_authorized (the rule unresolvedActivationSQL). Non-retryable: only a declared
 // activation outcome on a reconciliation_required operation can resolve it,
 // never clearing a flag.
 var ErrAgentLeaseActivationUnresolved = errors.New("agent lease environment holds an unresolved activation that is not yet reconciliation_required; it cannot be resolved")
@@ -3063,111 +3063,6 @@ func (r *AgentLeaseRepository) expireOne(ctx context.Context, attemptID int64) (
 	return !diverted, nil
 }
 
-// Reconcile clears environmentID's reconciliation flag once the owning
-// server reports the closed reconciliation attempt's outcome (ADR 0004
-// Decision 6). Only the server that holds attemptID, at the exact fence it
-// closed with, may clear the flag it left behind; any other caller is
-// denied generically. outcomeDigest is accepted as the sanitized-outcome
-// input the wire protocol (Step 5) will carry, but this schema slice has no
-// column to durably record it without a new migration -- reconciliation
-// itself is proven by the attempt already being closed, and the outcome
-// digest is validated shape-only here.
-//
-// Idempotency: once cleared, environment_slots.reconciliation_attempt_id no
-// longer names this attempt, so a second call cannot re-check "is this still
-// the pending attempt". Instead it is detected by the durable 'reconciled'
-// job event this call appends the first time: if one already exists for
-// this exact attempt, the call is an idempotent no-op; otherwise a caller
-// naming an attempt that was never the pending one is denied.
-func (r *AgentLeaseRepository) Reconcile(ctx context.Context, serverID string, presentedDigest [32]byte, environmentID string, attemptID, fence int64, outcomeDigest [32]byte) error {
-	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || !github.ValidOpaqueID(environmentID) || attemptID <= 0 || fence <= 0 {
-		return ErrAgentLeaseInvalidInput
-	}
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		return fmt.Errorf("begin agent lease reconcile: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	if _, err = lockActiveServerCredential(ctx, tx, serverID, presentedDigest); err != nil {
-		return err
-	}
-
-	var slotReconciliationAttemptID *int64
-	if err = tx.QueryRow(ctx, `SELECT reconciliation_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&slotReconciliationAttemptID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrServerAuthorizationDenied
-		}
-		return fmt.Errorf("lock environment slot for reconcile: %w", err)
-	}
-
-	var attemptJobID int64
-	var attemptServerID, attemptEnvironmentID string
-	var attemptFence int64
-	var attemptState string
-	var closedAt *time.Time
-	if err = tx.QueryRow(ctx, `SELECT job_id, server_id, environment_id, fence, state, closed_at FROM agent_job_attempts WHERE id=$1 FOR UPDATE`, attemptID).
-		Scan(&attemptJobID, &attemptServerID, &attemptEnvironmentID, &attemptFence, &attemptState, &closedAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrServerAuthorizationDenied
-		}
-		return fmt.Errorf("lock agent job attempt for reconcile: %w", err)
-	}
-	if attemptServerID != serverID || attemptEnvironmentID != environmentID || attemptFence != fence || attemptState == "leased" || closedAt == nil {
-		return ErrServerAuthorizationDenied
-	}
-
-	// A closed attempt must never carry an unresolved activate operation: that
-	// is a block only a declared outcome (ReconcileActivation / the operator's
-	// ResolveActivation) may clear, so a plain reconcile is corrupt state, not
-	// a denial and never a flag clear. Explicit by rule (unresolvedActivationSQL),
-	// not the incidental leased-attempt denial above. The operation is locked
-	// AFTER the attempt (creds -> slot -> attempt -> operation: a subsequence
-	// of the documented order; Reconcile takes no job lock).
-	var unresolvedOperationID int64
-	switch err = tx.QueryRow(ctx, `SELECT id FROM release_operations WHERE attempt_id=$1 AND environment_id=$2 AND `+unresolvedActivationSQL+` FOR UPDATE`, attemptID, environmentID).Scan(&unresolvedOperationID); {
-	case err == nil:
-		return fmt.Errorf("%w: attempt %d is closed but activation operation %d is unresolved", ErrAgentLeaseCorruptState, attemptID, unresolvedOperationID)
-	case !errors.Is(err, pgx.ErrNoRows):
-		return fmt.Errorf("lock unresolved activation operation for reconcile: %w", err)
-	}
-
-	if slotReconciliationAttemptID == nil || *slotReconciliationAttemptID != attemptID {
-		var alreadyReconciled bool
-		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_job_events WHERE job_id=$1 AND attempt_id=$2 AND event_type='reconciled')`, attemptJobID, attemptID).Scan(&alreadyReconciled); err != nil {
-			return fmt.Errorf("check prior agent lease reconciliation: %w", err)
-		}
-		if !alreadyReconciled {
-			return ErrServerAuthorizationDenied
-		}
-		if err = tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit agent lease reconcile no-op: %w", err)
-		}
-		return nil
-	}
-
-	var now time.Time
-	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
-		return fmt.Errorf("agent lease reconcile canonical time: %w", err)
-	}
-	if _, err = tx.Exec(ctx, `UPDATE environment_slots SET reconciliation_required=false, reconciliation_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1`, environmentID, now); err != nil {
-		return fmt.Errorf("clear environment slot reconciliation: %w", err)
-	}
-	if err = r.inject("slot_reconcile_clear"); err != nil {
-		return err
-	}
-	if err = appendAgentJobEvent(ctx, tx, attemptJobID, &attemptID, "reconciled"); err != nil {
-		return err
-	}
-	if err = r.inject("job_event"); err != nil {
-		return err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit agent lease reconcile: %w", err)
-	}
-	return nil
-}
-
 // ReconcilingEnvironment is one environment currently blocked on
 // reconciliation, as the web admin /servers page renders it: the pending
 // attempt and job it is waiting on, the server that must reconcile it (or the
@@ -3187,7 +3082,7 @@ type ReconcilingEnvironment struct {
 
 // ListReconcilingEnvironments returns every environment currently requiring
 // reconciliation whose pending attempt's job belongs to principal.OwnerID --
-// the same ownership derivation MarkReconciled uses, so a caller can never
+// the same ownership derivation ResolveActivation uses, so a caller can never
 // list (or later break-glass) an environment it could not already resolve.
 func (r *AgentLeaseRepository) ListReconcilingEnvironments(ctx context.Context, principal auth.Principal) ([]ReconcilingEnvironment, error) {
 	if r == nil || r.pool == nil || principal.Validate() != nil {
@@ -3230,80 +3125,6 @@ func (r *AgentLeaseRepository) ListReconcilingEnvironments(ctx context.Context, 
 		return nil, fmt.Errorf("commit list reconciling environments: %w", err)
 	}
 	return environments, nil
-}
-
-// MarkReconciled is the audited administrator break-glass path for a
-// wedged environment (ADR 0004 Decision 6 owner decisions). environment_slots
-// carries no owner column, so ownership is derived from the job that the
-// pending reconciliation attempt belongs to; an environment with nothing
-// pending, or whose pending attempt's job belongs to a different owner, is
-// denied generically either way.
-func (r *AgentLeaseRepository) MarkReconciled(ctx context.Context, principal auth.Principal, environmentID, reason string) error {
-	if r == nil || r.pool == nil || principal.Validate() != nil || !github.ValidOpaqueID(environmentID) || !validReason(reason) {
-		return ErrServerAuthorizationDenied
-	}
-	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		return fmt.Errorf("begin environment mark-reconciled: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
-		return err
-	}
-
-	var reconciliationAttemptID *int64
-	if err = tx.QueryRow(ctx, `SELECT reconciliation_attempt_id FROM environment_slots WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&reconciliationAttemptID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrServerAuthorizationDenied
-		}
-		return fmt.Errorf("lock environment slot for mark-reconciled: %w", err)
-	}
-	if reconciliationAttemptID == nil {
-		return ErrServerAuthorizationDenied
-	}
-
-	var attemptJobID int64
-	var jobOwnerID string
-	if err = tx.QueryRow(ctx, `SELECT a.job_id, j.owner_id FROM agent_job_attempts a JOIN agent_jobs j ON j.id = a.job_id WHERE a.id=$1`, *reconciliationAttemptID).Scan(&attemptJobID, &jobOwnerID); err != nil {
-		return fmt.Errorf("locate agent lease reconciliation attempt job: %w", err)
-	}
-	if jobOwnerID != principal.OwnerID {
-		return ErrServerAuthorizationDenied
-	}
-
-	// An activation-caused block is resolved by a DECLARED OUTCOME (step G:
-	// activated / not_activated), never by clearing a flag. The rule is "an
-	// unresolved activate operation exists for this environment" (the same
-	// rule that gates Activate), not "the pending attempt is leased": the
-	// operation is the durable fact that live traffic may have switched, while
-	// attempt state is a consequence that step G may change. Without this
-	// refusal the sweeper's diversion (which leaves the attempt leased and the
-	// slot occupied) would be cleared here into an INVISIBLE wedge: the sweeper
-	// excludes the attempt, ListReconcilingEnvironments stops listing it and
-	// Claim skips the occupied slot. Checked after the ownership check so a
-	// foreign owner still gets the generic denial, and under the slot lock
-	// (ADR order; operation writers hold it too).
-	// CONSEQUENCE: between step D and step G an activation-caused block has NO
-	// resolution path. That is deliberate (refuse loudly rather than
-	// half-clear); both feature gates are false so no real environment is
-	// affected.
-	var unresolved bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE environment_id=$1 AND `+unresolvedActivationSQL+`)`, environmentID).Scan(&unresolved); err != nil {
-		return fmt.Errorf("check unresolved activation for mark-reconciled: %w", err)
-	}
-	if unresolved {
-		return ErrAgentLeaseActivationUnresolved
-	}
-
-	if err = r.clearPlainReconciliation(ctx, tx, principal, environmentID, attemptJobID, reconciliationAttemptID, reason); err != nil {
-		return err
-	}
-
-	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit environment mark-reconciled: %w", err)
-	}
-	return nil
 }
 
 // revokeInFlightLeases closes every currently leased attempt of serverID

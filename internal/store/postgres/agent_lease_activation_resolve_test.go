@@ -324,32 +324,19 @@ func plainBlock(t *testing.T, seed byte) activatedFixture {
 	return a
 }
 
-func TestResolveActivationNoActivationMatchesMarkReconciled(t *testing.T) {
-	ctx := context.Background()
-	// Fixtures cannot coexist (each resets the tables), so the two paths run
-	// one after the other on identical shapes and their effects are compared.
-	type effect struct {
-		fence   int64
-		current *int64
-		rec     *int64
-		flagged bool
-		events  string
-	}
-	observe := func(a activatedFixture) effect {
-		fence, current, rec, flagged := a.slotRow(t)
-		return effect{fence, current, rec, flagged, strings.Join(a.jobEvents(t), ",")}
-	}
-	a := plainBlock(t, 130)
-	if err := a.repo.MarkReconciled(ctx, a.principal, a.envID, "operator break-glass"); err != nil {
-		t.Fatal(err)
-	}
-	want := observe(a)
+// no_activation on an ordinary expiry block clears the flag only: the fence
+// is not advanced, nothing is current or reconciling, one reconciled event and
+// one audit row result.
+func TestResolveActivationNoActivationClearsPlainBlock(t *testing.T) {
 	b := plainBlock(t, 131)
-	if err := b.repo.ResolveActivation(ctx, b.principal, b.envID, ActivationOutcomeNoActivation, "operator break-glass"); err != nil {
+	fenceBefore, _, _, _ := b.slotRow(t)
+	if err := b.repo.ResolveActivation(context.Background(), b.principal, b.envID, ActivationOutcomeNoActivation, "operator break-glass"); err != nil {
 		t.Fatalf("ResolveActivation(no_activation) on a plain block: %v", err)
 	}
-	if got := observe(b); got != want || got.flagged || got.current != nil || got.rec != nil || !strings.HasSuffix(got.events, ",reconciled") {
-		t.Fatalf("effect %+v, want %+v", got, want)
+	fence, current, rec, flagged := b.slotRow(t)
+	events := strings.Join(b.jobEvents(t), ",")
+	if fence != fenceBefore || flagged || current != nil || rec != nil || !strings.HasSuffix(events, ",reconciled") {
+		t.Fatalf("fence=%d (before %d) current=%v rec=%v flagged=%v events=%s", fence, fenceBefore, current, rec, flagged, events)
 	}
 	audit := b.auditRows(t)
 	if len(audit) != 1 || !strings.HasSuffix(audit[0], "|environment_mark_reconciled|success|outcome=no_activation; operator break-glass") {

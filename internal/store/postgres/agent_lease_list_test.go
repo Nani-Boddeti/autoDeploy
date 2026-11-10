@@ -15,7 +15,7 @@ import (
 // admin /servers page's reconciling-environments read: an environment only
 // appears once its leased attempt has actually expired and the slot flagged
 // reconciliation_required, ownership is derived from the pending attempt's
-// job (mirroring MarkReconciled), a different owner sees none of it, and
+// job (mirroring the operator no_activation resolution), a different owner sees none of it, and
 // resolving the reconciliation removes it from the list.
 func TestAgentLeaseListReconcilingEnvironmentsOwnerScoped(t *testing.T) {
 	f := newLeaseFixture(t, 250)
@@ -56,7 +56,7 @@ func TestAgentLeaseListReconcilingEnvironmentsOwnerScoped(t *testing.T) {
 	}
 
 	// Resolving the reconciliation removes it from the list.
-	if err = repo.MarkReconciled(ctx, f.principal, f.envID, "operator break-glass: verified clean"); err != nil {
+	if err = repo.ResolveActivation(ctx, f.principal, f.envID, ActivationOutcomeNoActivation, "operator break-glass: verified clean"); err != nil {
 		t.Fatal(err)
 	}
 	cleared, err := repo.ListReconcilingEnvironments(ctx, f.principal)

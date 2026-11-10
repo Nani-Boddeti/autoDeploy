@@ -190,10 +190,11 @@ func (in BindingInput) valid() bool {
 // without locking anything: environment_id carries no owner column of its
 // own anywhere in this schema (migration 000014's comment: "this codebase
 // has no projects/environments tables yet"), so ownership is derived the
-// same way agent_lease_repository.go's MarkReconciled derives it -- from
+// same way activation_resolution.go's ResolveActivation derives it -- from
 // agent_jobs.owner_id, the one durable place an environment_id is ever
 // paired with an owner independent of any config row. Unlike
-// MarkReconciled, this is a plain SELECT with no FOR SHARE/FOR UPDATE: it
+// ResolveActivation, which goes on to lock that job row FOR UPDATE, this is
+// a plain SELECT with no FOR SHARE/FOR UPDATE: it
 // only ever needs to observe that at least one such pairing exists, never
 // to hold it stable across a multi-statement decision, and agent_jobs is
 // on the explicit list of tables this write path must never lock (ADR 0004

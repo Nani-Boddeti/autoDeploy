@@ -3855,18 +3855,30 @@ outcome (comment at the query). The "not in a terminal state" half of the column
 bumps the revision and makes `activated` impossible to declare even if the host really switched — the operator is then
 forced to `not_activated`. Decide whether hostname assignment must refuse while the head is flagged.
 
-#### 10c-2b step H3 IN PROGRESS: phase 1 done, phase 2 not started (paused 2026-10-27)
+#### 10c-2b step H3 DONE 2026-11-10 (phase 1 2026-10-27, phase 2 2026-11-10)
 
 Phase 1 (inventory + ports, nothing deleted): 25 assertions from the 5 test files calling `Reconcile` /
 `MarkReconciled` classified in `tasks/10c-2b-step-H3-inventory.md` (a covered 12, b ported 6, a/b 2, c 3, c/b 1,
-d 1). Ports P1-P5 in **untracked** `internal/store/postgres/agent_lease_h3_ports_test.go`, each mutation-proved;
+d 1). Ports P1-P5 in `internal/store/postgres/agent_lease_h3_ports_test.go` (committed `1e92f75`), each mutation-proved;
 PG18 normal + `-race` green. No production caller of either method (scratch-copy build with both deleted passes).
 **Pending owner decision before phase 2:** leased attempt + `failed` activate op + flagged slot (forced-SQL only):
 old `MarkReconciled` cleared it; new methods refuse (operator CorruptState 500, agent denial), chosen in the G1
-review fix round to avoid a hidden leased attempt holding the slot. Recommendation: approve. Accepted as following
+review fix round to avoid a hidden leased attempt holding the slot. Recommendation: approve. **OWNER APPROVED 2026-11-10** (refusal stands; P3 pins it). Accepted as following
 from recorded rules: closed attempt + unresolved op now answers OutcomeMismatch / ActivationUnresolved instead of
 CorruptState (P4/P5 pin it).
 **Phase 2:** switch the 4 setup/oracle uses to the new methods (mapping in the inventory), delete the 3 old-only tests,
 `markReconciledRefusalSnapshot` and both methods; reword comments (list in inventory report: agent_lease_repository.go
 ~787/~1543/~3190, activation_resolution.go 20/42/101/529/538/626, environment_runtime_config_repository.go ~193/~196,
 several test headers); never edit migrations. Then review, full bar, commit; docs in step I.
+
+H3 phase 2 result (2026-11-10): `Reconcile` and `MarkReconciled` deleted (no production caller; no interface/fake listed
+them; no other symbol became dead). Deleted old-only tests: TestEnvironmentSlotReconciliationGateBlocksClaimUntilReconciled,
+TestAgentLeaseMarkReconciledCrossOwnerDeniedAndAudited, TestReconcileRefusesClosedAttemptWithUnresolvedActivation,
+TestMarkReconciledRefusesWhileActivationUnresolved, TestMarkReconciledStillClearsNonActivationBlock (+ helper
+`markReconciledRefusalSnapshot`). Oracle test renamed TestResolveActivationNoActivationClearsPlainBlock (absolute checks,
+fence before/after). List test setup now calls ResolveActivation(no_activation). Comments reworded. Independent review
+PASS (no lost coverage, comments verified true); its nits fixed. Bar chosen by risk (deletion only, per owner
+2026-11-10): build, both vets, `diff --check`, `make check`, `go test -race ./...`, Linux amd64/arm64, affected
+integration packages on fresh PG18 normal + `-race`. Sweeps/concurrency stage skipped: no production logic changed.
+Next: step I docs, closing 10c-2b.
+

@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-// Step H3 phase 1: properties the superseded Reconcile / MarkReconciled tests
+// Step H3 phase 1: properties the removed Reconcile / MarkReconciled tests (superseded by ReconcileActivation / ResolveActivation)
 // asserted that no ReconcileActivation / ResolveActivation test asserted on an
 // equivalent state. Each test drives the no_activation outcome (the old plain
 // behaviour) or the shapes the old methods were tested against.
@@ -119,7 +119,7 @@ func TestResolveActivationNoActivationIsOwnerScopedAndAuditedOnce(t *testing.T) 
 }
 
 // no_activation over an attempt whose activate operation is TERMINAL. The
-// succeeded shape (attempt closed) clears the flag on both paths, as the old
+// succeeded shape (attempt closed) clears the flag on both paths, as the removed
 // MarkReconciled did. The failed shape (operation forced failed under a still
 // leased attempt) is DELIBERATELY refused now: clearing it would leave a leased
 // attempt holding the slot (G1 fix round, tasks/todo.md "G1 committed").

@@ -16,7 +16,7 @@ import (
 )
 
 // Step G2a: ReconcileActivation, the agent path of the declared resolution,
-// and the explicit unresolved-activation check in Reconcile. Every block is
+// and its explicit unresolved-activation check. Every block is
 // produced by the real Activate and the real tx2 / sweeper / RevokeServer;
 // the only forced SQL is stated at its use.
 
@@ -382,7 +382,7 @@ func TestReconcileActivationRefusals(t *testing.T) {
 		a := activatedFixture{leaseFixture: f, attemptID: attemptID, repo: NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))}
 		a.cred = f.withCredential(t, 200)
 		// Forced in SQL: flag the slot over a still-leased occupant with no
-		// operation; Reconcile's rule (only a closed attempt) denies it.
+		// operation; the agent path's rule (only a closed attempt) denies it.
 		a.mustExec(t, `UPDATE environment_slots SET reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=clock_timestamp() WHERE environment_id=$1`, f.envID, attemptID)
 		a.assertAgentRefused(t, a.agentCall(ActivationOutcomeNoActivation), ErrServerAuthorizationDenied)
 		a.assertAgentRefused(t, a.agentCall(ActivationOutcomeActivated), ErrAgentLeaseOutcomeMismatch)
@@ -458,7 +458,7 @@ func TestReconcileActivationRollsBackAtEveryStage(t *testing.T) {
 	}
 }
 
-// no_activation carries Reconcile's semantics: the closed attempt's flag is
+// no_activation is the agent path's plain clear: the closed attempt's flag is
 // cleared, 'reconciled' appended, no audit row; the repeat is idempotent.
 func TestReconcileActivationNoActivation(t *testing.T) {
 	ctx := context.Background()
@@ -482,45 +482,6 @@ func TestReconcileActivationNoActivation(t *testing.T) {
 	a.assertAgentRefused(t, a.agentCall(ActivationOutcomeActivated), ErrAgentLeaseIntegrityConflict)
 	if after := a.resolveState(t); !reflect.DeepEqual(before, after) {
 		t.Fatal("repeat wrote state")
-	}
-}
-
-// Reconcile (no outcome) must refuse a closed attempt that still carries an
-// unresolved activation: corrupt state, nothing written, never a flag clear.
-func TestReconcileRefusesClosedAttemptWithUnresolvedActivation(t *testing.T) {
-	ctx := context.Background()
-	for i, state := range []string{"reconciliation_required", "switch_authorized"} {
-		t.Run(state, func(t *testing.T) {
-			a := newActivatedFixture(t, byte(200+2*i), true)
-			if state == "reconciliation_required" {
-				a.blockViaTx2Failure(t)
-			} else {
-				// Forced in SQL: the real code never flags a slot over a
-				// switch_authorized operation.
-				a.mustExec(t, `UPDATE environment_slots SET reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=clock_timestamp() WHERE environment_id=$1`, a.envID, a.attemptID)
-			}
-			reconcile := func() error {
-				return a.repo.Reconcile(ctx, a.serverID, a.cred, a.envID, a.attemptID, 1, digest(3))
-			}
-			// A leased attempt is still denied, as before.
-			before := a.resolveState(t)
-			if err := reconcile(); !errors.Is(err, ErrServerAuthorizationDenied) {
-				t.Fatalf("leased attempt err=%v, want denied", err)
-			}
-			if after := a.resolveState(t); !reflect.DeepEqual(before, after) {
-				t.Fatal("denied Reconcile of a leased attempt wrote state")
-			}
-			// Forced in SQL: close the attempt without resolving the operation
-			// (the shape a missed close leaves behind).
-			a.mustExec(t, `UPDATE agent_job_attempts SET state='expired', closed_at=clock_timestamp() WHERE id=$1`, a.attemptID)
-			before = a.resolveState(t)
-			if err := reconcile(); !errors.Is(err, ErrAgentLeaseCorruptState) {
-				t.Fatalf("closed attempt with an unresolved activation err=%v, want corrupt state", err)
-			}
-			if after := a.resolveState(t); !reflect.DeepEqual(before, after) {
-				t.Fatal("refused Reconcile wrote state")
-			}
-		})
 	}
 }
 
