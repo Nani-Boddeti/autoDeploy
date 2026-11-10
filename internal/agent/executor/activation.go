@@ -29,7 +29,7 @@ import (
 //
 // An `authorized` record left behind (a crash, or the result save and the
 // direct report both failing) is converted into a result_ready failure with
-// on-disk evidence by startup recovery in 10d-5b. The reporter intentionally
+// on-disk evidence by RecoverActivations (recovery.go) at agent startup. The reporter intentionally
 // ignores `authorized` records because the executor may still own them.
 //
 // After authorization nothing is ever rolled back or rewritten (D4 / ADR 0005:
@@ -81,6 +81,7 @@ type RouteObserver interface {
 // state.ActivationStore satisfies it.
 type ActivationStore interface {
 	SaveActivation(p state.PendingActivation) error
+	DeleteActivation(attemptID int64) error
 }
 
 // RouteRevisionStore is the local route-revision guard (D-C).
@@ -233,10 +234,23 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		// ignores `authorized` records (the executor may still own them), so
 		// it has nothing to send. Report the REAL result directly, bounded.
 		// If that also fails, the `authorized` record stays on disk and
-		// startup recovery (10d-5b) converts it into a result_ready failure
-		// with on-disk evidence for the reporter.
+		// startup recovery converts it into a result_ready failure with
+		// on-disk evidence for the reporter.
 		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the result record after retries: %v", lease.AttemptID, err)
-		a.reportDirect(dctx, rec, resultFromRecord(rec))
+		if a.reportDirect(dctx, rec, resultFromRecord(rec)) {
+			// The server holds the report or a final decision: drop the
+			// leftover `authorized` record so recovery cannot later re-report
+			// it as a failure. If the delete fails, recovery converts it to a
+			// failure report; the server already holds this attempt's result,
+			// so ReportActivationResult answers that re-send terminally: an
+			// identical replay -> 200, a report contradicting a succeeded or
+			// failed operation -> integrity_conflict, any report on a
+			// reconciliation_required operation -> late_report_recorded
+			// (store/postgres ReportActivationResult; traced in 10d-4 review).
+			if derr := a.cfg.Store.DeleteActivation(rec.AttemptID); derr != nil {
+				a.logger.Printf("agent activation ERROR attempt %d: cannot delete the authorized record after a terminal direct report; startup recovery will re-report it and the server will answer terminally: %v", lease.AttemptID, derr)
+			}
+		}
 	}
 	if a.cfg.Kicker != nil {
 		a.cfg.Kicker.Kick()
@@ -341,8 +355,9 @@ func classifyActivateRefusal(err error) (queue.FailureClass, bool) {
 // reportDirect sends result straight to the control plane when no
 // result_ready record could be persisted: bounded retries on its own
 // detached deadline (ctx's cancellation and expiry are ignored), stopping at
-// any answer the reporter would treat as terminal.
-func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingActivation, result agentclient.ActivationResult) {
+// any answer the reporter would treat as terminal. It reports whether such a
+// terminal answer was received.
+func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingActivation, result agentclient.ActivationResult) bool {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directReportTimeout)
 	defer cancel()
 	backoff := a.reportBackoff
@@ -361,10 +376,11 @@ func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingAc
 			backoff = min(backoff*2, maxReportBackoff)
 		}
 		if err = a.cfg.Client.ReportActivationResult(rctx, rec.AttemptID, rec.Fence, rec.OperationID, result); agentclient.ReportAnswerIsTerminal(err) {
-			return
+			return true
 		}
 	}
-	a.logger.Printf("agent activation ERROR attempt %d: direct report did not land (last: %v); the authorized record stays on disk for startup recovery (10d-5b) to convert", rec.AttemptID, err)
+	a.logger.Printf("agent activation ERROR attempt %d: direct report did not land (last: %v); the authorized record stays on disk for startup recovery to convert", rec.AttemptID, err)
+	return false
 }
 
 // switchRoute runs re-render, revision guard, write, verify and probe. It

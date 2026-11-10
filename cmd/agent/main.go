@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/agent/executor"
@@ -31,6 +32,7 @@ import (
 	"autodeploy/internal/checkoutquota"
 	"autodeploy/internal/gitcheckout"
 	"autodeploy/internal/runtime/docker"
+	"autodeploy/internal/runtime/traefik"
 )
 
 // agentVersion is reported on every heartbeat. It has no runtime effect in
@@ -40,10 +42,10 @@ const agentVersion = "0.1.0-dev"
 
 // executorEnabled gates whether runAgent registers the real Executor Step
 // 6b assembled. See the package doc above: this is the one line a later,
-// separately reviewed commit flips to true. Everything else -- flag
-// parsing, executor construction, the capability probe -- is fully wired
-// and runs its own validation even while this stays false, so flipping it
-// requires no other code change.
+// separately reviewed commit flips to true. Flag parsing runs today; executor
+// and activation construction, their validation (validateActivationFlags,
+// NewExecutor) and the capability probe are wired but run ONLY when this is
+// true -- they are covered by unit tests, not exercised at startup.
 //
 // Prerequisites for that flip (both outside this commit's scope):
 //  1. The privileged Linux checkout smoke, already called out as pending
@@ -68,6 +70,15 @@ const (
 	defaultCheckoutQuotaInodes     = 2_000_000
 	defaultCheckoutSpawnTimeoutSec = 120
 	defaultCheckoutSpawnMaxOutput  = 1 << 20 // matches checkoutcontain's own upper bound
+)
+
+// Defaults for the activation flags (tasks/10d-plan.md, D-D). The route
+// directory has no safe universal default and is required instead.
+const (
+	defaultTraefikAPIURL          = "http://127.0.0.1:8080"
+	defaultTraefikHTTPSAddr       = "127.0.0.1:443"
+	defaultActivationProbePath    = "/"
+	defaultActivationProbeTimeout = 3 * time.Minute
 )
 
 func main() {
@@ -110,6 +121,16 @@ type command struct {
 	checkoutSpawnSocket string
 	checkoutAgentGID    uint32
 	environmentNetwork  string
+
+	// Activation (Step 10d-5b). Like the fields above they are parsed for
+	// "run" regardless of executorEnabled but validated and used only when it
+	// is true (see validateActivationFlags).
+	traefikRouteDir        string // required when the executor is enabled; no default
+	traefikAPIURL          string // loopback only
+	traefikHTTPSAddr       string // literal loopback host:port
+	activationProbePath    string
+	activationProbeTimeout time.Duration // > 0
+	activationTimeout      time.Duration // 0 = derived default
 }
 
 func parseArgs(args []string) (command, error) {
@@ -164,6 +185,44 @@ func parseArgs(args []string) (command, error) {
 				return command{}, errors.New("--environment-network is only valid for run")
 			}
 			c.environmentNetwork = value
+		case "--traefik-route-dir":
+			if c.action != "run" {
+				return command{}, errors.New("--traefik-route-dir is only valid for run")
+			}
+			c.traefikRouteDir = value
+		case "--traefik-api-url":
+			if c.action != "run" {
+				return command{}, errors.New("--traefik-api-url is only valid for run")
+			}
+			c.traefikAPIURL = value
+		case "--traefik-https-addr":
+			if c.action != "run" {
+				return command{}, errors.New("--traefik-https-addr is only valid for run")
+			}
+			c.traefikHTTPSAddr = value
+		case "--activation-probe-path":
+			if c.action != "run" {
+				return command{}, errors.New("--activation-probe-path is only valid for run")
+			}
+			c.activationProbePath = value
+		case "--activation-probe-timeout":
+			if c.action != "run" {
+				return command{}, errors.New("--activation-probe-timeout is only valid for run")
+			}
+			d, err := time.ParseDuration(value)
+			if err != nil {
+				return command{}, fmt.Errorf("invalid --activation-probe-timeout: %w", err)
+			}
+			c.activationProbeTimeout = d
+		case "--activation-timeout":
+			if c.action != "run" {
+				return command{}, errors.New("--activation-timeout is only valid for run")
+			}
+			d, err := time.ParseDuration(value)
+			if err != nil {
+				return command{}, fmt.Errorf("invalid --activation-timeout: %w", err)
+			}
+			c.activationTimeout = d
 		default:
 			return command{}, fmt.Errorf("unknown flag %q", flag)
 		}
@@ -171,10 +230,99 @@ func parseArgs(args []string) (command, error) {
 	if c.baseURL == "" || c.serverID == "" || c.stateDir == "" || !filepath.IsAbs(c.stateDir) {
 		return command{}, errors.New("--base-url, --server-id, and an absolute --state-dir are required")
 	}
-	if c.action == "run" && c.dockerSocket == "" {
-		c.dockerSocket = "/var/run/docker.sock"
+	if c.action == "run" {
+		if c.dockerSocket == "" {
+			c.dockerSocket = "/var/run/docker.sock"
+		}
+		if c.traefikAPIURL == "" {
+			c.traefikAPIURL = defaultTraefikAPIURL
+		}
+		if c.traefikHTTPSAddr == "" {
+			c.traefikHTTPSAddr = defaultTraefikHTTPSAddr
+		}
+		if c.activationProbePath == "" {
+			c.activationProbePath = defaultActivationProbePath
+		}
+		if c.activationProbeTimeout == 0 {
+			c.activationProbeTimeout = defaultActivationProbeTimeout
+		}
 	}
 	return c, nil
+}
+
+// validateActivationFlags checks the activation flags. runAgent calls it only
+// when executorEnabled is true; it is a separate function so it is unit-tested
+// directly. Errors name the flag and never echo secrets (none are involved).
+func validateActivationFlags(c command) error {
+	if c.traefikRouteDir == "" || !filepath.IsAbs(c.traefikRouteDir) {
+		return errors.New("--traefik-route-dir is required and must be an absolute path when the executor is enabled")
+	}
+	if fi, err := os.Stat(c.traefikRouteDir); err != nil || !fi.IsDir() {
+		return errors.New("--traefik-route-dir must be an existing directory")
+	}
+	if _, err := traefik.NewObserver(c.traefikAPIURL); err != nil {
+		return fmt.Errorf("invalid --traefik-api-url: %w", err)
+	}
+	if err := traefik.ValidateProbeAddress(c.traefikHTTPSAddr); err != nil {
+		return fmt.Errorf("invalid --traefik-https-addr: %w", err)
+	}
+	if err := traefik.ValidateProbePath(c.activationProbePath); err != nil {
+		return fmt.Errorf("invalid --activation-probe-path: %w", err)
+	}
+	if c.activationProbeTimeout <= 0 {
+		return errors.New("--activation-probe-timeout must be greater than zero")
+	}
+	if c.activationTimeout < 0 {
+		return errors.New("--activation-timeout must not be negative")
+	}
+	return nil
+}
+
+// activationParts is everything the activation sequence needs from cmd/agent.
+type activationParts struct {
+	config   executor.ActivationConfig
+	reporter *agentclient.ActivationReporter
+	recover  func()
+}
+
+// buildActivation validates the activation flags and assembles the durable
+// stores, Traefik observer, reporter, recovery hook and a complete
+// executor.ActivationConfig. Only reached when executorEnabled is true.
+func buildActivation(c command, client *agentclient.Client, stateStore state.Store, logger *log.Logger) (activationParts, error) {
+	if err := validateActivationFlags(c); err != nil {
+		return activationParts{}, err
+	}
+	activations, err := stateStore.Activations()
+	if err != nil {
+		return activationParts{}, fmt.Errorf("open pending activation state: %w", err)
+	}
+	revisions, err := stateStore.RouteRevisions()
+	if err != nil {
+		return activationParts{}, fmt.Errorf("open route revision state: %w", err)
+	}
+	observer, err := traefik.NewObserver(c.traefikAPIURL)
+	if err != nil {
+		return activationParts{}, fmt.Errorf("configure traefik observer: %w", err)
+	}
+	reporter := &agentclient.ActivationReporter{Client: client, Store: activations, Logger: logger}
+	return activationParts{
+		config: executor.ActivationConfig{
+			Client:       client,
+			Observer:     observer,
+			Store:        activations,
+			Revisions:    revisions,
+			Kicker:       reporter,
+			RouteDir:     c.traefikRouteDir,
+			ProbeAddress: c.traefikHTTPSAddr,
+			ProbePath:    c.activationProbePath,
+			ProbeTimeout: c.activationProbeTimeout,
+			Timeout:      c.activationTimeout,
+		},
+		reporter: reporter,
+		recover: func() {
+			executor.RecoverActivations(activations, c.traefikRouteDir, logger)
+		},
+	}, nil
 }
 
 func runEnroll(c command, stdin io.Reader, stderr io.Writer) error {
@@ -220,11 +368,17 @@ func runAgent(c command, stderr io.Writer) error {
 	// claim/lease path never runs. Flipping the constant is the only change
 	// needed to start calling buildExecutor.
 	if executorEnabled {
-		exec, err := buildExecutor(ctx, c, client, logger)
+		parts, err := buildActivation(c, client, fenceStore, logger)
+		if err != nil {
+			return fmt.Errorf("configure activation: %w", err)
+		}
+		exec, err := buildExecutor(ctx, c, client, logger, parts.config)
 		if err != nil {
 			return fmt.Errorf("build agent executor: %w", err)
 		}
 		agent.Executor = exec
+		agent.Reporter = parts.reporter
+		agent.Recover = parts.recover
 	}
 
 	stopped := make(chan os.Signal, 1)
@@ -250,7 +404,7 @@ func runAgent(c command, stderr io.Writer) error {
 // executor.NewExecutor, which runs the fail-closed capability probe
 // (Engine API version compatibility, then buildx) before returning. It is
 // only ever called when executorEnabled is true.
-func buildExecutor(ctx context.Context, c command, client *agentclient.Client, logger *log.Logger) (agentclient.Executor, error) {
+func buildExecutor(ctx context.Context, c command, client *agentclient.Client, logger *log.Logger, activation executor.ActivationConfig) (agentclient.Executor, error) {
 	if c.checkoutQuotaSocket == "" || c.checkoutSpawnSocket == "" || c.checkoutAgentGID == 0 || c.environmentNetwork == "" {
 		return nil, errors.New("--checkout-quota-socket, --checkout-spawn-socket, --checkout-agent-gid, and --environment-network are required when the executor is enabled")
 	}
@@ -279,6 +433,7 @@ func buildExecutor(ctx context.Context, c command, client *agentclient.Client, l
 		Network:        c.environmentNetwork,
 		BuildOutput:    logWriter{logger},
 		Logger:         logger,
+		Activation:     &activation,
 	})
 }
 

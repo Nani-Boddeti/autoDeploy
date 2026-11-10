@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -588,6 +589,7 @@ func TestNewExecutorFailsClosedWhenEngineProbeFails(t *testing.T) {
 		CheckoutRunner: fakeCheckoutRunner{},
 		ServerID:       "server1",
 		Network:        "env-network",
+		Activation:     testActivationConfig(),
 	}
 	if _, err := NewExecutor(context.Background(), cfg); err == nil {
 		t.Fatal("want NewExecutor to fail closed when the engine probe fails")
@@ -605,6 +607,7 @@ func TestNewExecutorFailsClosedWhenBuildxProbeFails(t *testing.T) {
 		CheckoutRunner: fakeCheckoutRunner{},
 		ServerID:       "server1",
 		Network:        "env-network",
+		Activation:     testActivationConfig(),
 	}
 	if _, err := NewExecutor(context.Background(), cfg); err == nil {
 		t.Fatal("want NewExecutor to fail closed when the buildx probe fails")
@@ -622,6 +625,7 @@ func TestNewExecutorSucceedsWhenBothProbesPass(t *testing.T) {
 		CheckoutRunner: fakeCheckoutRunner{},
 		ServerID:       "server1",
 		Network:        "env-network",
+		Activation:     testActivationConfig(),
 	}
 	e, err := NewExecutor(context.Background(), cfg)
 	if err != nil {
@@ -629,6 +633,32 @@ func TestNewExecutorSucceedsWhenBothProbesPass(t *testing.T) {
 	}
 	if e == nil {
 		t.Fatal("NewExecutor returned nil Executor with no error")
+	}
+}
+
+func testActivationConfig() *ActivationConfig {
+	f := newActFake(testLease())
+	return &ActivationConfig{
+		Client: f, Observer: f, Store: f, Revisions: f,
+		RouteDir: "/route-dir", ProbeAddress: "127.0.0.1:443", ProbePath: "/", ProbeTimeout: time.Second,
+	}
+}
+
+func TestNewExecutorRequiresActivationConfig(t *testing.T) {
+	orig := probeBuildxFunc
+	probeBuildxFunc = func(context.Context) error { return nil }
+	defer func() { probeBuildxFunc = orig }()
+
+	cfg := Config{
+		ControlPlane:   &fakeControlPlane{},
+		Docker:         &fakeDocker{},
+		CheckoutRunner: fakeCheckoutRunner{},
+		ServerID:       "server1",
+		Network:        "env-network",
+	}
+	_, err := NewExecutor(context.Background(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "activation configuration is required") {
+		t.Fatalf("err = %v, want a clear activation-required error", err)
 	}
 }
 

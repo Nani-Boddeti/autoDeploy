@@ -191,15 +191,8 @@ func timeoutError(last *probeFailure) error {
 }
 
 func normalizeProbeConfig(cfg ProbeConfig) (ProbeConfig, error) {
-	host, port, err := net.SplitHostPort(cfg.Address)
-	if err != nil {
-		return cfg, fmt.Errorf("%w: address must be a loopback ip host:port", ErrProbeConfig)
-	}
-	if n, perr := strconv.ParseUint(port, 10, 16); perr != nil || n == 0 {
-		return cfg, fmt.Errorf("%w: address port must be numeric 1-65535", ErrProbeConfig)
-	}
-	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
-		return cfg, fmt.Errorf("%w: address host must be a literal loopback ip", ErrProbeConfig)
+	if err := ValidateProbeAddress(cfg.Address); err != nil {
+		return cfg, err
 	}
 	if err := validateProbeHostname(cfg.Hostname); err != nil {
 		return cfg, err
@@ -207,8 +200,8 @@ func normalizeProbeConfig(cfg ProbeConfig) (ProbeConfig, error) {
 	if cfg.Path == "" {
 		cfg.Path = defaultProbePath
 	}
-	if !strings.HasPrefix(cfg.Path, "/") || strings.ContainsAny(cfg.Path, " \t\r\n#") {
-		return cfg, fmt.Errorf("%w: path must start with / and contain no whitespace or fragment", ErrProbeConfig)
+	if err := ValidateProbePath(cfg.Path); err != nil {
+		return cfg, err
 	}
 	if cfg.Timeout <= 0 {
 		return cfg, fmt.Errorf("%w: timeout must be positive", ErrProbeConfig)
@@ -326,4 +319,31 @@ func boundReason(s string) string {
 		s = strings.ToValidUTF8(s[:probeMaxReasonBytes], "") + "..."
 	}
 	return s
+}
+
+// ValidateProbeAddress reports whether addr is an acceptable ProbeConfig.Address:
+// a host:port with a literal loopback IP host and a numeric port 1-65535. The
+// error wraps ErrProbeConfig.
+func ValidateProbeAddress(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%w: address must be a loopback ip host:port", ErrProbeConfig)
+	}
+	if n, perr := strconv.ParseUint(port, 10, 16); perr != nil || n == 0 {
+		return fmt.Errorf("%w: address port must be numeric 1-65535", ErrProbeConfig)
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("%w: address host must be a literal loopback ip", ErrProbeConfig)
+	}
+	return nil
+}
+
+// ValidateProbePath reports whether p is an acceptable ProbeConfig.Path: it
+// starts with "/" and contains no whitespace or fragment. The error wraps
+// ErrProbeConfig.
+func ValidateProbePath(p string) error {
+	if !strings.HasPrefix(p, "/") || strings.ContainsAny(p, " \t\r\n#") {
+		return fmt.Errorf("%w: path must start with / and contain no whitespace or fragment", ErrProbeConfig)
+	}
+	return nil
 }

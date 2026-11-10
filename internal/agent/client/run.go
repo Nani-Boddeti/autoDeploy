@@ -56,6 +56,13 @@ type Executor interface {
 	Execute(ctx context.Context, lease Lease) Outcome
 }
 
+// ActivationDelivery is the persistent activation-result reporter the Agent
+// starts. *ActivationReporter satisfies it.
+type ActivationDelivery interface {
+	Run(ctx context.Context) error
+	Kick()
+}
+
 // Agent runs the heartbeat loop, and -- only when Executor is non-nil -- the
 // claim/renew/complete lease loop, for one enrolled server identity.
 type Agent struct {
@@ -65,6 +72,14 @@ type Agent struct {
 	Logger   *log.Logger
 	Version  string // agent build version reported on every heartbeat.
 	StateDir string // used only for the best-effort disk-free capability read.
+
+	// Reporter, when non-nil, is started as a goroutine by Run (before any
+	// claim) and stopped by ctx; Run waits for it to return.
+	Reporter ActivationDelivery
+	// Recover, when non-nil, runs once at the start of Run, before the
+	// reporter starts and before any Claim, so no executor can own a record it
+	// inspects. The Reporter is kicked right after it.
+	Recover func()
 
 	// RenewInterval overrides the ADR 0004 30s renewal cadence; zero/negative
 	// uses renewInterval. Production leaves this unset -- it exists so
@@ -92,6 +107,20 @@ func (a *Agent) logger() *log.Logger {
 // heartbeat/claim failure: those are logged and retried on the next tick so
 // a transient control-plane outage does not crash the process.
 func (a *Agent) Run(ctx context.Context) error {
+	if a.Recover != nil {
+		a.Recover()
+	}
+	if a.Reporter != nil {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := a.Reporter.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				a.logger().Printf("agent activation reporter stopped: %v", err)
+			}
+		}()
+		defer func() { <-done }()
+		a.Reporter.Kick()
+	}
 	ticker := time.NewTicker(defaultHeartbeatInterval)
 	defer ticker.Stop()
 	for {

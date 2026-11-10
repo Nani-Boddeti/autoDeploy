@@ -61,7 +61,9 @@ type actFake struct {
 	diskAfter string // when set, overrides what is on disk after a write
 	readErr   error
 
-	kicks int
+	kicks     int
+	deleted   []int64
+	deleteErr error
 
 	// ordering violations observed inside the write seam.
 	wroteBeforePersist bool
@@ -129,6 +131,16 @@ func (f *actFake) SaveActivation(p state.PendingActivation) error {
 		return errors.New("disk full")
 	}
 	f.saved = append(f.saved, p)
+	return nil
+}
+
+func (f *actFake) DeleteActivation(attemptID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	f.deleted = append(f.deleted, attemptID)
 	return nil
 }
 
@@ -502,6 +514,61 @@ func TestActivateDirectReportStopsOnTerminalConflict(t *testing.T) {
 		if len(f.reports) != 1 {
 			t.Fatalf("%s: reports=%d, want 1", code, len(f.reports))
 		}
+	}
+}
+
+func TestActivateDirectReportTerminalDeletesAuthorizedRecord(t *testing.T) {
+	for name, answer := range map[string]error{
+		"200":                  nil,
+		"late_report_recorded": &agentclient.ConflictError{Code: agentclient.ConflictLateReportRecorded},
+		"route_moved":          &agentclient.ConflictError{Code: agentclient.ConflictRouteMoved},
+	} {
+		lease := testLease()
+		f := newActFake(lease)
+		f.saveErrFrom = 2
+		f.reportErrs = []error{answer}
+		f.executor().activate(context.Background(), lease, testImageDigest)
+		if len(f.deleted) != 1 || f.deleted[0] != lease.AttemptID {
+			t.Fatalf("%s: deleted=%v, want the authorized record of attempt %d deleted", name, f.deleted, lease.AttemptID)
+		}
+	}
+}
+
+func TestActivateDirectReportNonTerminalKeepsAuthorizedRecord(t *testing.T) {
+	lease := testLease()
+	f := newActFake(lease)
+	f.saveErrFrom = 2
+	f.reportErr = agentclient.ErrTransportFailure
+	f.executor().activate(context.Background(), lease, testImageDigest)
+	if len(f.deleted) != 0 {
+		t.Fatalf("deleted=%v, want the record kept for recovery", f.deleted)
+	}
+}
+
+func TestActivateDirectReportTerminalDeleteFailureIsLogged(t *testing.T) {
+	lease := testLease()
+	f := newActFake(lease)
+	f.saveErrFrom = 2
+	f.deleteErr = errors.New("read-only filesystem")
+	var buf strings.Builder
+	e := f.executor()
+	e.activation.logger = log.New(&buf, "", 0)
+	out := e.activate(context.Background(), lease, testImageDigest)
+	if !out.HandedOff || f.kicks != 1 {
+		t.Fatalf("outcome=%+v kicks=%d", out, f.kicks)
+	}
+	if !strings.Contains(buf.String(), "cannot delete the authorized record") {
+		t.Fatalf("delete failure not logged: %q", buf.String())
+	}
+}
+
+func TestActivatePersistFailureDirectReportDeletesNothing(t *testing.T) {
+	lease := testLease()
+	f := newActFake(lease)
+	f.saveErrOn = map[int]error{1: errors.New("disk full")}
+	f.executor().activate(context.Background(), lease, testImageDigest)
+	if len(f.reports) == 0 || len(f.deleted) != 0 {
+		t.Fatalf("reports=%d deleted=%v: no record exists, nothing to delete", len(f.reports), f.deleted)
 	}
 }
 

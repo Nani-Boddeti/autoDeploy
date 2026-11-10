@@ -78,12 +78,10 @@ type Config struct {
 	// value discards build output.
 	BuildOutput io.Writer
 	Logger      *log.Logger
-	// Activation configures the post-health-gate traffic switch. When nil the
-	// Executor FAILS CLOSED: Execute refuses every lease
-	// (permanent_configuration) before any work, rather than reporting
-	// success after the health gate as a pre-10d executor did -- that success
-	// would close the attempt via Complete with no activation. cmd/agent does
-	// not set it yet (10d-5b); executorEnabled stays false until it does.
+	// Activation configures the post-health-gate traffic switch. It is
+	// REQUIRED: NewExecutor refuses a nil value, because an executor without
+	// activation would report success after the health gate and close the
+	// attempt via Complete with no traffic switch.
 	Activation *ActivationConfig
 }
 
@@ -112,6 +110,9 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 	if cfg.ControlPlane == nil || cfg.Docker == nil || cfg.CheckoutRunner == nil || cfg.ServerID == "" || cfg.Network == "" {
 		return nil, errors.New("agent executor: incomplete configuration")
 	}
+	if cfg.Activation == nil {
+		return nil, errors.New("agent executor: activation configuration is required")
+	}
 	if _, err := cfg.Docker.Probe(ctx); err != nil {
 		return nil, fmt.Errorf("agent executor: docker engine capability probe failed: %w", err)
 	}
@@ -126,12 +127,9 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 	if buildOutput == nil {
 		buildOutput = io.Discard
 	}
-	var activation *activationRunner
-	if cfg.Activation != nil {
-		var err error
-		if activation, err = newActivationRunner(*cfg.Activation, logger); err != nil {
-			return nil, err
-		}
+	activation, err := newActivationRunner(*cfg.Activation, logger)
+	if err != nil {
+		return nil, err
 	}
 	return &Executor{
 		activation:   activation,

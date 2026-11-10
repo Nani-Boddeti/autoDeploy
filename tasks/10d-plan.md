@@ -108,9 +108,21 @@ gates; the Hetzner end-to-end bar remains the proof.
   agentclient.ReportAnswerIsTerminal). Re-review PASS. Carried into 10d-5b: startup recovery converts stranded
   `authorized` records; delete the `authorized` record after a terminal direct report so recovery cannot re-report it.
 
+- 10d-5b startup recovery (authorized -> result_ready failure with on-disk evidence, before any claim), reporter
+  started in Agent.Run, delete of the leftover authorized record after a terminal direct report, activation config
+  required by NewExecutor, flags (--traefik-route-dir required; --traefik-api-url 127.0.0.1:8080;
+  --traefik-https-addr 127.0.0.1:443; --activation-probe-path /; --activation-probe-timeout 3m;
+  --activation-timeout 0=derived). Review PASS with notes. **10d COMPLETE** (gates still false).
+
 ## Follow-ups
 - Fence `Store.path`: ValidOpaqueID allows 128 bytes and encodeName can expand x3, exceeding the 255-byte file
   name limit for long environment ids (route-revision store already refuses these). Pre-existing; fix before
   activationEnabled flips.
 - Local `ReconciliationRequired` set on stale renewal (run.go) is never cleared: that environment is refused by this
   agent forever, even after an operator resolves. Pre-existing; design a clearing rule before activationEnabled flips.
+- Recovery runs only at startup: a double failure (result save + direct report) leaves an `authorized` record
+  unreported until restart. Consider a between-leases recovery pass.
+- validateActivationFlags does not check --activation-timeout against probe+verify+30s (NewExecutor does, after the
+  Docker probe) or route-dir writability; both fail closed.
+- Recovery summary truncates from the tail; with real fixed-size digests both fit, but a reason-capped builder
+  would be sturdier.
