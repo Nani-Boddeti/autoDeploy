@@ -1,6 +1,6 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-10-19. Branch: main at 5f14d43 (docs: record the 10c-2b step H1 result), **pushed to origin/main**; nothing is unpushed. Slices 9a, 9b and slice 10 through step 10c-2b H1 are committed. Migrations run through 000021. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-10. Branch: main at 6c06bfd (fix: mount the postgres 18 volume at /var/lib/postgresql), **pushed to origin/main**; nothing is unpushed. Slices 9a, 9b and slice 10 through step 10c-2b I (10c-2b complete) are committed. Migrations run through 000021. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
@@ -65,7 +65,7 @@ Read [ADR 0001](adr/0001-control-plane-agent-separation.md), [ADR 0002](adr/0002
 | Leases/fencing | agent_lease_repository.go, agent_lease_sweeper.go (migration 000013) | Lock order server/credential (SHARE) -> environment slot (UPDATE) -> job (UPDATE SKIP LOCKED) -> attempt; monotonic never-decreasing environment fence; claim/renew/complete/cancel/expire/reconcile revalidate authority from locked rows, never a discovery snapshot; expiry sets `reconciliation_required`, which blocks claims until the owning server reconciles or an audited administrator marks reconciled; sweeper uses `pg_try_advisory_xact_lock` with a bounded batch. |
 | Agent HTTP | internal/agent/http (package agenthttp) | POST-only `/agent/v1/{enroll,heartbeat,jobs/claim,leases/renew,leases/complete,leases/cancel-ack,environments/reconcile}`; webhook-identical trusted-HTTPS provenance; strict bounded JSON (`DisallowUnknownFields`); one generic 401 for every auth failure; authorization re-derived from locked rows inside each transaction; unauthenticated rejections are not audited. |
 | Agent client/state | internal/agent/client; internal/agent/state; cmd/agent | `enroll` generates the credential locally and writes it 0600, no-clobber, atomically; `run` loads the credential O_NOFOLLOW/0600/owner-checked, heartbeats with `executor_available=false`, and never claims without a registered Executor; per-environment fence state plus a `.fence-index.json` manifest fails closed on missing/unindexed/corrupt state; HTTP client is TLS-only, never follows redirects, and retries only 503/network (never claim). |
-| Server admin web | internal/web/web.go | Session+CSRF-protected `/servers`, `/servers/register`, `/servers/enrollment`, `/servers/revoke` (reason + `confirm=revoke`), `/environments/mark-reconciled`; owner-scoped; enrollment token shown once in the response body, never redirected/logged/cached; wired regardless of `AUTODEPLOY_AGENT_ENABLED`. |
+| Server admin web | internal/web/web.go | Session+CSRF-protected `/servers`, `/servers/register`, `/servers/enrollment`, `/servers/revoke` (reason + `confirm=revoke`), `/environments/resolve` (declared outcome via `ResolveActivation`); owner-scoped; enrollment token shown once in the response body, never redirected/logged/cached; wired regardless of `AUTODEPLOY_AGENT_ENABLED`. |
 | Frozen execution config | migration 000014/000015; agent_lease_execution.go | Environment runtime configuration is CAS-versioned desired state; each attempt freezes an insert-once snapshot plus its exact secret-version and literal set; attempt N>1 copies attempt N-1's frozen rows verbatim, so a rotation or config edit mid-job is never adopted; a missing config or an unusable binding fails that candidate alone. |
 | Release model | migration 000014; ensureRelease | One release per deployment (UNIQUE(deployment_id)); image digest is nullable and write-once and gates candidate->ready; terminal releases are frozen; runtime-instance and operation rows validate fence/job against the referencing attempt at insert. active/retained states do not exist yet. |
 | Secret materialization | agent_lease_materialize.go; internal/agent/http/materialize.go; internal/secret/setauthorizer.go | Authorization is re-derived from locked rows in Complete's order and returns references only; decryption happens after that transaction commits, so no KEK work holds a row lock. The frozen set is the authority — the agent names nothing. A superseded frozen version still materializes; a revoked one does not. Per-request SetAuthorizer admits exactly the authorized keys and nothing when empty. KEK material is loaded per request, never resident. |
@@ -171,18 +171,15 @@ Committed:
 | 10c-2b E | Late agent reports recorded as reconciliation evidence, never finalizing | a7e5fcc |
 | 10c-2b F | Activation finalize can resolve a `reconciliation_required` operation | d9582c3 |
 | 10c-2b G1 | Operator `ResolveActivation`: declare `activated` / `not_activated` / `no_activation`; works for a revoked server | d359810 |
-| 10c-2b G2a | Agent `ReconcileActivation` (strict authorized-digest rule); `Reconcile` refuses a closed attempt holding an unresolved activation | df85e12 |
+| 10c-2b G2a | Agent `ReconcileActivation` (strict authorized-digest rule); the old `Reconcile` refused a closed attempt holding an unresolved activation (removed in H3) | df85e12 |
 | 10c-2b G2b | A late report contradicting a declared outcome leaves one `activation_late_report` event | 7c66ce9 |
 | 10c-2b H1 | Agent reconcile endpoint requires `outcome`; terminal 409 `outcome_mismatch` / `activation_unresolved` | 231b4ad |
+| 10c-2b H2 | Operator resolve form declares an outcome via `ResolveActivation` | c030d02 |
+| 10c-2b H3 | Superseded `Reconcile` / `MarkReconciled` removed after porting unique assertions | 1e92f75..e7b55a5 |
+| 10c-2b I | ADR 0004 amendment: sweeper diversion, `release_operations` lock position, resolution paths | (this commit) |
 
-Remaining in slice 10 ([tasks/10c-2b-step-H-plan.md](../tasks/10c-2b-step-H-plan.md)):
+Remaining in slice 10:
 
-- **10c-2b H2**: operator mark-reconciled form -> `ResolveActivation`, required outcome select (no
-  preselection), an activation column so the operator can choose. Plain HTML; the CSP stays unchanged.
-- **10c-2b H3**: delete the superseded `Reconcile` / `MarkReconciled` repository methods after porting any
-  assertion only their tests hold (owner-approved).
-- **10c-2b I**: ADR 0004 amendment (sweeper diversion implemented, `release_operations` lock-class position,
-  resolution paths).
 - **10d**: agent-side activation — render/verify the route document, switch, report; a **persistent** retry
   for the result report (the client retries only ~3s today); the agent deciding which outcome to declare.
 - **10e**: drain and stop the previous release.
@@ -193,8 +190,8 @@ Hard gates before `activationEnabled` may flip (detail in tasks/todo.md):
 2. 10d's persistent result-report retry.
 3. Traefik API authentication (ADR 0005 says authenticated; the 10b client is unauthenticated loopback),
    and Traefik's JSON shapes and reload timing observed against a real Traefik.
-4. The agent reconcile path can now resolve an activation; that is safe only while no activate operations
-   exist, i.e. while the gate is false. Re-check before flipping.
+4. Both resolution paths (operator `ResolveActivation`, agent `ReconcileActivation`) can resolve an activation;
+   that is safe only while no activate operations exist, i.e. while the gate is false. Re-check before flipping.
 
 ## Known follow-ups
 
@@ -205,7 +202,7 @@ From the server/leases slice:
 - Register resubmission can create an orphan unenrolled server; needs dedupe or cleanup (Step 6b).
 - Persist the reconcile outcome digest once a consumer exists; needs a migration (Step 4).
 - A revoked server cannot reconcile its own environments; those need the administrator path (Step 4). Since
-  10c-2b G1 that is `ResolveActivation`, which needs no server credential; the web form is wired to it in H2.
+  10c-2b G1 that is `ResolveActivation`, which needs no server credential; the `/environments/resolve` web form is wired to it (H2).
 - No rate limiting on `/agent/v1/` (low severity; a valid credential is still required) (Step 5).
 From slice 9a:
 

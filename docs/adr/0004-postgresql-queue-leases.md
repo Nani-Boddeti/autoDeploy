@@ -669,6 +669,80 @@ position in a total lock order cannot introduce a cycle with a transaction that 
   mutation. A writer that skips it would silently invalidate the read; the unique index on the
   environment's open activation remains only a backstop, not the primary guarantee.
 
+## Amendments (2026-11-10)
+
+Slice 10c-2b (steps A-H3) implemented what the 2026-09-22 amendment deferred. Each statement below was
+checked against `internal/store/postgres/agent_lease_repository.go` and `activation_resolution.go`.
+
+- **Sweeper diversion is implemented (step D); this supersedes the 2026-09-22 bullet saying an in-flight
+  `switch_authorized` operation "is Step 10c-2's scope ... no code implements it yet".**
+  `closeExpiredOrRevokedAttempt` (reached from the expiry sweeper's `expireOne` and from
+  `revokeInFlightLeases` on server revocation) first calls `divertUnresolvedActivation`. An attempt that
+  holds an unresolved activate operation is never closed by the ordinary path: the attempt stays `leased`,
+  keeps its fence and slot occupancy, and its job and deployment are untouched, so a late genuine report
+  can still be evaluated. A `switch_authorized` operation is moved to `reconciliation_required` (operation,
+  route head flag, slot flag and `reconciliation_attempt_id`, and an `activation_reconciliation_required`
+  event) through the same `blockActivationForReconciliation` the activation-result transaction uses; an
+  operation already past that state is a no-op. Discovery (`ExpireBatch`) additionally excludes attempts
+  whose unresolved operation is already blocked, so they cannot fill the batch and starve other expired
+  leases; one still in `switch_authorized` is discovered, because that sweep records the block.
+  "Unresolved" is one rule, `unresolvedActivationSQL`: `kind='activate' AND state NOT IN
+  ('succeeded','failed')`, generated from the same terminal-state list as its Go form so the two cannot
+  drift. Discovery, the diversion, `Activate`, `Complete` and the resolution paths all use it.
+- **Migration 000021 widens the open-activation unique index.**
+  `release_operations_environment_open_activation_idx` was `WHERE kind='activate' AND
+  state='switch_authorized'`; it is now `WHERE kind='activate' AND state NOT IN ('succeeded','failed')`,
+  the same predicate. An unresolved activation (including `reconciliation_required`) therefore wedges new
+  activations for its environment until it is resolved, by design: the host may already have switched.
+  `Activate` refuses it with `ErrAgentLeaseActivationEnvironmentBlocked`, and a 23505 on that index at
+  insert time maps to the same typed, non-retryable refusal instead of a raw unique violation.
+- **`release_operations` sits between `agent_job_attempts` (5) and deployment (6) for every writer.**
+  Every writer takes `environment_slots` (3) before mutating `release_operations`, so the 2026-09-22
+  forward constraint holds for all of them; none violates it. The orders actually taken (a step is skipped,
+  never reordered, where a writer does not need it):
+  - Sweeper diversion (expiry and revocation): slot (the sweeper uses `SKIP LOCKED`; revocation holds the
+    servers row first) -> job -> attempt -> operation -> route head -> append-only event. The deployment
+    row is not locked.
+  - Late agent report (step E, inside the activation-result transaction): credential (SHARE) -> slot ->
+    job -> attempt -> operation (the late evidence is written on this row) -> append-only event. A
+    non-locking peek at the attempt (owner server and environment) precedes the slot lock. The
+    fresh-transaction fallback, used when the first transaction fails deterministically at commit,
+    re-takes slot -> job -> attempt -> operation -> route head without the credential, a strict
+    subsequence of the main order.
+  - `ResolveActivation` (operator): administrator session and user rows (`FOR UPDATE`) -> slot -> job ->
+    attempt -> operation -> deployment -> route head -> release rows by ID ascending (activated only) ->
+    writes. The slot's pending-attempt flag names the attempt, and a non-locking read of the attempt's
+    immutable `job_id` and the job's `owner_id` (owner check) precedes the job lock.
+  - `ReconcileActivation` (agent): credential (SHARE) -> slot -> job -> attempt -> operation -> deployment
+    -> route head -> release rows ascending (activated only) -> writes. A non-locking peek at the attempt's
+    immutable server, environment and fence precedes the job lock so a foreign server never queues on it.
+  Both resolution paths share one core (`resolveDeclared`) for everything from the job down.
+- **Resolution paths.** Both resolve only a `reconciliation_required` operation, never `switch_authorized`
+  (the host switch may still be in flight; `ErrAgentLeaseActivationUnresolved`, mapped to 409
+  `activation_unresolved` on the agent endpoint).
+  - Operator `ResolveActivation` (web form `/environments/resolve`, no server credential, so it also works
+    for a revoked server, whose own agent can never authenticate) declares `activated`, `not_activated` or
+    `no_activation`; there is no default. It writes an audit row (the outcome is encoded in the reason).
+  - Agent `ReconcileActivation` (`/agent/v1/environments/reconcile`) declares the same three outcomes but
+    must present the route digest the operation authorized for `activated` (strict authorized-digest rule;
+    a mismatch is an integrity conflict, nothing written). It writes no audit row. A revoked server fails
+    the credential lock.
+  - The outcome kind is checked both ways: an activation-caused block declared `no_activation`, or a
+    block no activation caused declared `activated` / `not_activated`, is `ErrAgentLeaseOutcomeMismatch`
+    (409 `outcome_mismatch`).
+  - Resolution closes the attempt in the same transaction. Once the operation is terminal while the
+    attempt is still `leased`, the sweeper's discovery exclusion no longer applies and its ordinary close
+    (fence advance, slot flag, job retry) would run on an already-resolved attempt.
+  - A late report that contradicts a declared outcome (a success report after `failed`, or a report after
+    `succeeded` that disagrees) is answered `ErrAgentLeaseIntegrityConflict` and leaves exactly one
+    `activation_late_report` event for the attempt (replays add nothing); the closed operation is not
+    touched (step G2b).
+  - Step H3 removed the superseded `Reconcile` and `MarkReconciled` store methods after porting their
+    unique assertions. A `no_activation` declaration against a flagged slot whose attempt is still
+    `leased` (for example one holding only a `failed` activate operation, which is no longer unresolved)
+    is refused on both paths, since clearing the flag would leave a leased attempt invisible to the
+    sweeper (owner-approved).
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

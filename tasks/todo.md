@@ -3882,3 +3882,5 @@ PASS (no lost coverage, comments verified true); its nits fixed. Bar chosen by r
 integration packages on fresh PG18 normal + `-race`. Sweeps/concurrency stage skipped: no production logic changed.
 Next: step I docs, closing 10c-2b.
 
+
+10c-2b step I DONE 2026-11-10: ADR 0004 "Amendments (2026-11-10)" (sweeper diversion supersedes the 09-22 deferral; 000021 index widening; per-writer lock orders, all slot-before-release_operations; resolution paths) and IMPLEMENTATION_STATUS refreshed. Claims spot-checked against code by the orchestrator. Docs only, no tests run. **10c-2b COMPLETE.** Next: 10d agent activation (persistent result-report retry, agent outcome choice), then 10e.
