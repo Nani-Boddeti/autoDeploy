@@ -439,6 +439,11 @@ type ContainerInspect struct {
 		// differently: an OOM kill is a host condition worth retrying,
 		// an application that exits on its own is not.
 		OOMKilled bool `json:"OOMKilled"`
+		// Restarting and Paused are read by WaitStopped: a restart-policy
+		// container between runs reports Running false for an instant, and
+		// is not stopped.
+		Restarting bool `json:"Restarting"`
+		Paused     bool `json:"Paused"`
 	} `json:"State"`
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -525,4 +530,171 @@ func (c *Client) InspectNetwork(ctx context.Context, nameOrID string) (NetworkIn
 		return NetworkInspect{}, &EngineError{Class: ErrClassMalformed, Op: "network-inspect", Err: errors.New("empty network id in inspect response")}
 	}
 	return out, nil
+}
+
+const (
+	// maxStopGrace caps StopContainer's grace period: the drain this serves
+	// is bounded to 300 seconds, and a larger value would only hold the
+	// request open longer.
+	maxStopGrace = 300 * time.Second
+	// stopRequestMargin is added to the grace period for the per-call
+	// deadline: Docker blocks the stop request until the container exits or
+	// the grace elapses and it kills the process, so the request must
+	// outlive the grace.
+	stopRequestMargin = 10 * time.Second
+	// maxStopErrorMessage bounds the daemon text kept in a stop error.
+	maxStopErrorMessage = 512
+)
+
+// ErrContainerNotFound is returned (wrapped) when the Engine API answers 404
+// for a container: it is already gone. Callers distinguish "already gone"
+// from a real failure with errors.Is.
+var ErrContainerNotFound = errors.New("docker engine: container not found")
+
+// ErrStopTimeout is returned (wrapped) by WaitStopped when the container is
+// still not stopped when the timeout elapses; the wrapping text carries the
+// last observed status.
+var ErrStopTimeout = errors.New("docker engine: container did not stop in time")
+
+// StopContainer calls POST /containers/{id}/stop?t=<seconds>. 204 (stopped)
+// and 304 (already stopped) are both success; 404 is ErrContainerNotFound.
+// grace is whole seconds in [1, 300]; 0 is refused because Docker treats it
+// as an immediate SIGKILL, never acceptable for a drain. The per-call
+// deadline is grace plus a margin (still bounded by the caller's ctx), since
+// Docker holds the request until the container stops or is killed.
+//
+// A client-side timeout or cancellation does not mean the container is still
+// running: the daemon may still complete the stop, so callers follow up with
+// WaitStopped. The 12/64-hex ID form can address any container on the host,
+// so callers must verify ownership by labels before stopping by ID.
+//
+// Removal is deliberately absent from this client (ADR 0005: predecessors
+// are stopped, never removed, in this slice); do not add a remove/kill
+// method here.
+func (c *Client) StopContainer(ctx context.Context, id string, grace time.Duration) error {
+	const op = "container-stop"
+	if err := requireContainerTarget(id); err != nil {
+		return &EngineError{Class: ErrClassConfiguration, Op: op, Err: err}
+	}
+	if grace < time.Second || grace > maxStopGrace || grace%time.Second != 0 {
+		return &EngineError{Class: ErrClassConfiguration, Op: op, Err: fmt.Errorf("grace %s must be whole seconds within 1..%d", grace, int(maxStopGrace/time.Second))}
+	}
+	ctx, cancel := context.WithTimeout(ctx, grace+stopRequestMargin)
+	defer cancel()
+	path := "/containers/" + url.PathEscape(id) + "/stop?t=" + strconv.Itoa(int(grace/time.Second))
+	resp, err := c.do(ctx, op, http.MethodPost, path)
+	if err != nil {
+		return err
+	}
+	switch resp.StatusCode {
+	case http.StatusNoContent, http.StatusNotModified:
+		resp.Body.Close()
+		return nil
+	case http.StatusNotFound:
+		defer resp.Body.Close()
+		io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
+		return fmt.Errorf("%w: %s", ErrContainerNotFound, op)
+	}
+	if err := checkStatus(resp, op); err != nil {
+		var ee *EngineError
+		if errors.As(err, &ee) {
+			ee.Err = errors.New(sanitizeStopMessage(ee.Err.Error()))
+		}
+		return err
+	}
+	resp.Body.Close()
+	return &EngineError{Class: ErrClassMalformed, Op: op, Status: resp.StatusCode, Err: errors.New("unexpected success status")}
+}
+
+// requireContainerTarget accepts exactly a Docker container ID (12 or 64
+// lowercase hex) or a name ContainerName would produce (the autodeploy-rt-
+// prefix plus an opaque runtime-instance id of at most 128 bytes, so at most
+// 142 bytes in all). Anything
+// else, including path separators, query characters and "..", is refused.
+func requireContainerTarget(id string) error {
+	if networkIDPattern.MatchString(id) {
+		return nil
+	}
+	if rest, ok := strings.CutPrefix(id, containerNamePrefix); ok {
+		if name, err := ContainerName(rest); err == nil && name == id {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: container id or name", ErrInvalidIdentifier)
+}
+
+// sanitizeStopMessage drops control characters and bounds the length of
+// daemon-authored text.
+func sanitizeStopMessage(msg string) string {
+	msg = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, msg)
+	if len(msg) > maxStopErrorMessage {
+		msg = strings.ToValidUTF8(msg[:maxStopErrorMessage], "") + "...(truncated)"
+	}
+	return msg
+}
+
+// WaitStopped polls InspectContainer every interval until the container is
+// running, restarting nor paused and reports an explicitly stopped status
+// (exited, dead, created or removing); an empty or unknown status is not
+// stopped, so a malformed reply fails closed. It polls for at most timeout.
+// A single transient inspect error returns immediately; callers may retry. A 404 is
+// ErrContainerNotFound; hitting the timeout is ErrStopTimeout wrapping the
+// last observed status; a caller ctx cancellation returns promptly with the
+// context error.
+func (c *Client) WaitStopped(ctx context.Context, id string, timeout, interval time.Duration) (ContainerInspect, error) {
+	const op = "container-wait-stopped"
+	if timeout <= 0 || interval <= 0 {
+		return ContainerInspect{}, &EngineError{Class: ErrClassConfiguration, Op: op, Err: errors.New("timeout and interval must be positive")}
+	}
+	if err := requireContainerTarget(id); err != nil {
+		return ContainerInspect{}, &EngineError{Class: ErrClassConfiguration, Op: op, Err: err}
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	lastStatus := "unknown"
+	for {
+		got, err := c.InspectContainer(waitCtx, id)
+		switch {
+		case err == nil:
+			lastStatus = got.State.Status
+			if !got.State.Running && !got.State.Restarting && !got.State.Paused && stoppedStatus(got.State.Status) {
+				return got, nil
+			}
+		case ctx.Err() != nil:
+			return ContainerInspect{}, ctx.Err()
+		case waitCtx.Err() != nil:
+			return ContainerInspect{}, fmt.Errorf("%w: container still %q after %s", ErrStopTimeout, lastStatus, timeout)
+		default:
+			var ee *EngineError
+			if errors.As(err, &ee) && ee.Status == http.StatusNotFound {
+				return ContainerInspect{}, fmt.Errorf("%w: %s", ErrContainerNotFound, op)
+			}
+			return ContainerInspect{}, err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ContainerInspect{}, ctx.Err()
+		case <-waitCtx.Done():
+			timer.Stop()
+			return ContainerInspect{}, fmt.Errorf("%w: container still %q after %s", ErrStopTimeout, lastStatus, timeout)
+		case <-timer.C:
+		}
+	}
+}
+
+// stoppedStatus reports whether an Engine container status is a stopped one.
+// Anything else, including empty, is treated as not stopped.
+func stoppedStatus(status string) bool {
+	switch status {
+	case "exited", "dead", "created", "removing":
+		return true
+	}
+	return false
 }
