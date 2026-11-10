@@ -60,6 +60,8 @@ func TestHandleActivationResultGateDistinctFromTypedRefusals(t *testing.T) {
 	}{
 		{"stale", postgres.ErrAgentLeaseStale, "stale_lease"},
 		{"integrity conflict", postgres.ErrAgentLeaseIntegrityConflict, "integrity_conflict"},
+		{"operation mismatch", postgres.ErrAgentLeaseOperationMismatch, "operation_mismatch"},
+		{"operation mismatch wrapped", fmt.Errorf("report: %w", postgres.ErrAgentLeaseOperationMismatch), "operation_mismatch"},
 		{"activation open", postgres.ErrAgentLeaseActivationOpen, "activation_open"},
 		{"route moved", postgres.ErrAgentLeaseActivationRouteMoved, "route_moved"},
 		{"late report recorded", postgres.ErrAgentLeaseActivationLateReportRecorded, "late_report_recorded"},

@@ -94,7 +94,10 @@ var (
 // the server (that would need a source parse or a server import); keep it in
 // step with mapError by hand.
 const (
+	// ConflictIntegrity on activation-result means the operation is terminal
+	// or the ambiguity was durably recorded.
 	ConflictIntegrity            = "integrity_conflict"
+	ConflictOperationMismatch    = "operation_mismatch"
 	ConflictCandidateNotReady    = "candidate_not_ready"
 	ConflictNoRouteHead          = "no_route_head"
 	ConflictActivationOpen       = "activation_open"

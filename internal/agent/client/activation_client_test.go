@@ -17,7 +17,7 @@ import (
 var serverConflictCodes = []string{
 	ConflictIntegrity, ConflictCandidateNotReady, ConflictNoRouteHead, ConflictActivationOpen,
 	ConflictEnvironmentBlocked, ConflictLateReportRecorded, ConflictRouteMoved, ConflictOutcomeMismatch,
-	ConflictActivationUnresolved, ConflictCorruptState, ConflictConstraintViolation,
+	ConflictActivationUnresolved, ConflictCorruptState, ConflictConstraintViolation, ConflictOperationMismatch,
 }
 
 func TestMapStatusConflictCodes(t *testing.T) {

@@ -328,6 +328,10 @@ func (h Handler) mapError(w http.ResponseWriter, err error) {
 		h.writeError(w, http.StatusConflict, "stale_lease")
 	case errors.Is(err, postgres.ErrAgentLeaseIntegrityConflict):
 		h.writeError(w, http.StatusConflict, "integrity_conflict")
+	case errors.Is(err, postgres.ErrAgentLeaseOperationMismatch):
+		// Nothing was recorded, so unlike integrity_conflict this must not
+		// read as "terminal or recorded"; still non-retryable.
+		h.writeError(w, http.StatusConflict, "operation_mismatch")
 	case errors.Is(err, postgres.ErrAgentLeaseActivationCandidateNotReady):
 		// 409, not 503: this is a permanent state mismatch (the candidate
 		// release is terminal or already active), never a condition retrying

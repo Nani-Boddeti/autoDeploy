@@ -431,8 +431,8 @@ func TestReportActivationResultRefusals(t *testing.T) {
 		a := newActivatedFixture(t, 188, true)
 		other, _ := strconv.ParseInt(a.operationID, 10, 64)
 		err := a.repo.ReportActivationResult(ctx, a.serverID, a.cred, a.attemptID, 1, strconv.FormatInt(other+1000, 10), true, a.routeDigest, "")
-		if !errors.Is(err, ErrAgentLeaseIntegrityConflict) {
-			t.Fatalf("err=%v, want ErrAgentLeaseIntegrityConflict", err)
+		if !errors.Is(err, ErrAgentLeaseOperationMismatch) || errors.Is(err, ErrAgentLeaseIntegrityConflict) {
+			t.Fatalf("err=%v, want ErrAgentLeaseOperationMismatch only", err)
 		}
 		a.assertStillAuthorized(t, 1, a.predecessorID)
 	})

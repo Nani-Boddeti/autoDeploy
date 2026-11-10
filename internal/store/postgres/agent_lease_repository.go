@@ -42,6 +42,14 @@ var ErrAgentLeaseStale = errors.New("agent lease stale")
 // stale/integrity failure").
 var ErrAgentLeaseIntegrityConflict = errors.New("agent lease integrity conflict")
 
+// ErrAgentLeaseOperationMismatch reports an activation result whose operation
+// id does not match the activation operation for this attempt and fence;
+// nothing was recorded. Deliberately distinct from (and not wrapping)
+// ErrAgentLeaseIntegrityConflict: on the activation-result route that error
+// means "operation terminal or ambiguity durably recorded", which lets the
+// agent drop its pending report, and this case records nothing.
+var ErrAgentLeaseOperationMismatch = errors.New("agent lease activation operation mismatch")
+
 // ErrAgentLeaseInvalidInput reports a malformed request (bad outcome/
 // failure-class combination, oversized operation ID, etc.) rejected before
 // any row is read or locked.
@@ -2139,7 +2147,10 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		return fmt.Errorf("lock activation operation: %w", err)
 	}
 	if op.id != parsedOperationID {
-		return ErrAgentLeaseIntegrityConflict
+		// Nothing is written and the operation stays as it was: NOT
+		// ErrAgentLeaseIntegrityConflict, which on this route promises the
+		// outcome is terminal or the ambiguity recorded.
+		return ErrAgentLeaseOperationMismatch
 	}
 	if len(op.routeDigest) != 32 {
 		return fmt.Errorf("%w: activation operation %d has a malformed route digest", ErrAgentLeaseCorruptState, op.id)
@@ -2451,6 +2462,14 @@ const (
 	activationBlockNoopSucceeded
 	// activationBlockNoopOther: already blocked/closed by a concurrent
 	// writer, or the attempt no longer occupies the slot at this fence.
+	// INVARIANT: callers may answer this with a refusal (integrity_conflict,
+	// route_moved) that the agent treats as "durably recorded", although this
+	// path writes nothing. That holds only because an attempt with an
+	// unresolved activation is never closed or displaced from the slot (the
+	// expiry diversion blocks the operation instead), so a lost occupant
+	// implies the operation is already reconciliation_required or terminal.
+	// Do not add a way to lose the occupant while the operation is still
+	// switch_authorized without revisiting those callers.
 	activationBlockNoopOther
 	// activationBlockLateRecorded: the operation was already
 	// reconciliation_required and this report was recorded (or recognised as
