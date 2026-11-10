@@ -31,8 +31,10 @@ re-renders and refuses on mismatch; Activate replay key (attempt, fence, image_d
    authorized route_digest, image_digest, phase (`authorized` | `result_ready`), result (success digest |
    failure summary + observed evidence), created_at. Load/List/Save/Delete.
 4. **10d-4 persistent reporter.** Loads pending records at startup and retries each until a TERMINAL answer,
-   capped backoff (5s→60s). Terminal: 200, and every 409 code on this route -> delete record; on non-success set
-   local `ReconciliationRequired`. Retry: 503, transport, unknown status, 401 (slowly). Never calls `Complete`
+   capped backoff (5s→60s). Delete only when the server durably holds the report or a final decision (allow-list): 200,
+   `late_report_recorded`, `route_moved`, `integrity_conflict`. Every other 409 (incl. `stale_lease`, `corrupt_state`,
+   `constraint_violation`, unknown codes: server rolled back, nothing recorded) is kept and parked at MaxBackoff. Does NOT set the
+   local `ReconciliationRequired` (D-E). Retry: 503, transport, unknown status, 401 (slowly). Never calls `Complete`
    and never fails the job after any 409. Loud log once past authority expiry. Tests: restart (new store, same
    dir), outage then recovery, each terminal code deletes, retryable codes keep.
 5. **10d-5 executor activation + config.** After a passing gate: `Activate` (failures here classify transient)
@@ -64,6 +66,9 @@ an authorized op and the operator declares `not_activated` (host untouched). Onl
 - D-B: no agent-side `Reconcile` caller in 10d; resolution stays operator-only; agent sends evidence only.
 - D-C: add the local route-revision guard, persisted in agent state.
 - D-D: Traefik route dir / API URL / probe address as agent flags with safe defaults.
+- D-E (2026-11-10): reporter never sets the local `ReconciliationRequired` flag; nothing clears it today ("never
+  reset locally"), so it would wedge the environment on this agent forever. The server's slot block (Claim returns
+  nothing until resolved) is the single authority.
 - Not in 10d: admin `AssignRouteHostname` on a flagged head (gate-review item, recorded in todo H2 block).
 
 ## Verification (scaled to risk)
@@ -91,7 +96,15 @@ gates; the Hetzner end-to-end bar remains the proof.
   Single agent process per state dir (no cross-process exclusion). Missing route-revision file reads 0 (accepted:
   guard is defence in depth over server CAS).
 
+- 10d-4 persistent reporter. Review 1 FAILED: server answered integrity_conflict on an operation-id mismatch after
+  a rollback (nothing recorded) and the reporter deleted on it -> fixed server-side as 409 `operation_mismatch`
+  (kept by the reporter). Delete allow-list: 200, late_report_recorded, route_moved, integrity_conflict. Corrupt
+  record files no longer block good ones (state.ScanActivations; corrupt files untouched, logged hourly). Outage
+  stops a pass; deferred records not charged; round-robin by last try. Re-review PASS.
+
 ## Follow-ups
 - Fence `Store.path`: ValidOpaqueID allows 128 bytes and encodeName can expand x3, exceeding the 255-byte file
   name limit for long environment ids (route-revision store already refuses these). Pre-existing; fix before
   activationEnabled flips.
+- Local `ReconciliationRequired` set on stale renewal (run.go) is never cleared: that environment is refused by this
+  agent forever, even after an operator resolves. Pre-existing; design a clearing rule before activationEnabled flips.

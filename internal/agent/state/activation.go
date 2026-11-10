@@ -418,6 +418,44 @@ func (a ActivationStore) ListActivations() ([]PendingActivation, error) {
 	return out, nil
 }
 
+// ScanActivations is the per-file counterpart of ListActivations for the
+// reporter: one unreadable entry must not block delivery of the others. Valid
+// records are returned sorted by attempt id; every entry that would make
+// ListActivations fail (bad JSON, invalid record, name/content mismatch, stray
+// file, non-regular entry, non-canonical name) is returned by name in corrupt
+// and is never modified or deleted. Atomic temp files are skipped. err is only
+// for a directory-level failure.
+func (a ActivationStore) ScanActivations() (records []PendingActivation, corruptNames []string, err error) {
+	if a.dir == "" {
+		return nil, nil, errUninitialized
+	}
+	mu := lockDir(a.dir)
+	mu.Lock()
+	defer mu.Unlock()
+	entries, err := os.ReadDir(a.dir)
+	if err != nil {
+		return nil, nil, corrupt(err)
+	}
+	for _, e := range entries {
+		if isAtomicTemp(e.Name()) && e.Type().IsRegular() {
+			continue
+		}
+		id, ok := parseActivationFileName(e.Name())
+		if !ok || !e.Type().IsRegular() {
+			corruptNames = append(corruptNames, e.Name())
+			continue
+		}
+		p, existed, rerr := a.readFile(id)
+		if rerr != nil || !existed {
+			corruptNames = append(corruptNames, e.Name())
+			continue
+		}
+		records = append(records, p)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].AttemptID < records[j].AttemptID })
+	return records, corruptNames, nil
+}
+
 // DeleteActivation removes the record for attemptID. It is idempotent and
 // fsyncs the directory so the removal is durable (a resurrected record only
 // causes an idempotent re-report, but a durable delete avoids the churn).

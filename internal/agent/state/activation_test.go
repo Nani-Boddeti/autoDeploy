@@ -613,3 +613,71 @@ func TestRouteRevisionOverlongEnvironmentID(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestScanActivations(t *testing.T) {
+	root, a := newActs(t)
+	dir := filepath.Join(root, "activations")
+	for _, p := range []PendingActivation{failed(5), succeeded(2), authorized(9)} {
+		if err := a.SaveActivation(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	good, err := os.ReadFile(a.path(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{
+		"attempt-3.json":   []byte("{not json"),
+		"attempt-4.json":   []byte(strings.Replace(string(good), `"fence":3`, `"fence":0`, 1)),
+		"attempt-6.json":   []byte(strings.Replace(string(good), `"attempt_id":2`, `"attempt_id":7`, 1)),
+		"attempt-007.json": good,
+		"stray.txt":        []byte("x"),
+		".fence-123.tmp":   []byte("partial"),
+	}
+	for n, c := range files {
+		if err := os.WriteFile(filepath.Join(dir, n), c, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "attempt-8.json"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	recs, bad, err := a.ScanActivations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 3 || recs[0].AttemptID != 2 || recs[1].AttemptID != 5 || recs[2].AttemptID != 9 {
+		t.Fatalf("records: %+v", recs)
+	}
+	want := map[string]bool{"attempt-3.json": true, "attempt-4.json": true, "attempt-6.json": true, "attempt-007.json": true, "stray.txt": true, "attempt-8.json": true}
+	if len(bad) != len(want) {
+		t.Fatalf("corrupt: %v", bad)
+	}
+	for _, n := range bad {
+		if !want[n] {
+			t.Fatalf("unexpected corrupt %q", n)
+		}
+	}
+	for n, c := range files {
+		got, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil || string(got) != string(c) {
+			t.Fatalf("%s modified: %v", n, err)
+		}
+	}
+	if _, err := a.ListActivations(); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("ListActivations must stay strict: %v", err)
+	}
+}
+
+func TestScanActivationsDirFailure(t *testing.T) {
+	root, a := newActs(t)
+	if err := os.RemoveAll(filepath.Join(root, "activations")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := a.ScanActivations(); !errors.Is(err, ErrCorruptState) {
+		t.Fatalf("got %v", err)
+	}
+	if _, _, err := (ActivationStore{}).ScanActivations(); err == nil {
+		t.Fatal("zero value must error")
+	}
+}
