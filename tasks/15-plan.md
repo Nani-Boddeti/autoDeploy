@@ -142,3 +142,14 @@ executed" honestly. Rollback and retention are slice 11 (not planned here).
   invariants (hence deferral recommendation).
 - `web.go` is already 1832 lines; add new files rather than growing it.
 - UI built on an empty DB can look fine while untested against real data volumes/long-running states.
+
+## Progress
+- 15a `859acc8` shared layout + embedded pastel stylesheet at /static/app.css; CSP + `style-src 'self'` only;
+  templates moved to `internal/web/templates/` (faithful, reviewed). Nav: Overview/Servers/GitHub; Projects and
+  Deployments links to be added by 15c. Review PASS with notes (stale comment fixed). Web integration tests green.
+- 15b read model `OperationsReadRepository` (ListProjects cap 200 silent, ListDeployments keyset 25/100,
+  GetDeploymentDetail; one sentinel not-found; owner via agent_jobs.owner_id; live non-locking session re-check
+  = lockAdministratorSession predicate minus FOR UPDATE; no locks, proven). Review PASS with notes; fixed route-head
+  cross-owner leak (env ids not owner-bound). Phase is not persisted anywhere (detail shows status/job/attempt
+  states). Follow-up: index agent_jobs(owner_id, created_at DESC) before scale (seq scan per owner today).
+- 15c next: web must authenticate session before calling; add Projects/Deployments nav links.
