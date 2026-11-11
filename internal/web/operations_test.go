@@ -377,3 +377,194 @@ func TestOperationsPagesStayCSPClean(t *testing.T) {
 		}
 	}
 }
+
+// ---- POST /deployments/cancel (step 15d) ----
+
+type cancellerStub struct {
+	err    error
+	calls  int
+	gotJob int64
+	gotOwn string
+}
+
+func (s *cancellerStub) RequestCancellation(_ context.Context, p auth.Principal, jobID int64) error {
+	s.calls++
+	s.gotJob, s.gotOwn = jobID, p.OwnerID
+	return s.err
+}
+
+func cancelHandler(t *testing.T, jobState string) (*Handler, *operationsStub, *cancellerStub, auth.Principal) {
+	t.Helper()
+	h, stub, p := operationsHandler(t)
+	stub.detail = sampleDetail(jobState, false)
+	c := &cancellerStub{}
+	h.config.DeploymentCanceller = c
+	return h, stub, c, p
+}
+
+func cancelForm(t *testing.T, h *Handler, p auth.Principal) url.Values {
+	t.Helper()
+	return url.Values{"csrf": {serversCSRF(t, h, p)}, "deployment_id": {"dep-1"}, "confirm": {"cancel"}}
+}
+
+func cancelPost(h *Handler, p auth.Principal, target string, form url.Values, mutate func(*http.Request)) *httptest.ResponseRecorder {
+	r := serversRequest(http.MethodPost, target, form, p, h)
+	if mutate != nil {
+		mutate(r)
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	return rr
+}
+
+func TestCancelDisabledWithoutCancellerOrReader(t *testing.T) {
+	h, _, p := operationsHandler(t) // reader only
+	if rr := cancelPost(h, p, "/deployments/cancel", url.Values{"x": {"y"}}, nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("no canceller = %d", rr.Code)
+	}
+	h2, _, _ := serversHandler(t)
+	h2.config.DeploymentCanceller = &cancellerStub{}
+	if rr := cancelPost(h2, p, "/deployments/cancel", url.Values{"x": {"y"}}, nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("no reader = %d", rr.Code)
+	}
+}
+
+func TestCancelMethodSessionCSRFOriginQuery(t *testing.T) {
+	h, _, c, p := cancelHandler(t, "queued")
+	rr := opsGet(h, p, http.MethodGet, "/deployments/cancel")
+	if rr.Code != http.StatusMethodNotAllowed || rr.Header().Get("Allow") != "POST" {
+		t.Fatalf("GET = %d allow=%q", rr.Code, rr.Header().Get("Allow"))
+	}
+	form := cancelForm(t, h, p)
+
+	// No session cookie: redirect to /login.
+	rr = cancelPost(h, p, "/deployments/cancel", form, func(r *http.Request) { r.Header.Del("Cookie") })
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/login" {
+		t.Fatalf("no session = %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+	// Bad CSRF: redirect like revoke; missing CSRF field: 400.
+	bad := cancelForm(t, h, p)
+	bad.Set("csrf", "bogus")
+	if rr = cancelPost(h, p, "/deployments/cancel", bad, nil); rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/login" {
+		t.Fatalf("bad csrf = %d", rr.Code)
+	}
+	missing := cancelForm(t, h, p)
+	missing.Del("csrf")
+	if rr = cancelPost(h, p, "/deployments/cancel", missing, nil); rr.Code != http.StatusBadRequest {
+		t.Fatalf("missing csrf = %d", rr.Code)
+	}
+	// Bad origin / no provenance.
+	if rr = cancelPost(h, p, "/deployments/cancel", form, func(r *http.Request) { r.Header.Set("Origin", "https://evil.example.test") }); rr.Code != http.StatusBadRequest {
+		t.Fatalf("bad origin = %d", rr.Code)
+	}
+	// Missing/wrong confirm and extra fields (including a client job id).
+	noConfirm := cancelForm(t, h, p)
+	noConfirm.Del("confirm")
+	wrongConfirm := cancelForm(t, h, p)
+	wrongConfirm.Set("confirm", "yes")
+	extra := cancelForm(t, h, p)
+	extra.Set("job_id", "999")
+	for name, f := range map[string]url.Values{"no confirm": noConfirm, "wrong confirm": wrongConfirm, "client job_id": extra} {
+		if rr = cancelPost(h, p, "/deployments/cancel", f, nil); rr.Code != http.StatusBadRequest {
+			t.Fatalf("%s = %d", name, rr.Code)
+		}
+	}
+	// Query string: 404.
+	if rr = cancelPost(h, p, "/deployments/cancel?id=dep-1", form, nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("query string = %d", rr.Code)
+	}
+	if c.calls != 0 {
+		t.Fatalf("canceller called %d times on rejected requests", c.calls)
+	}
+}
+
+func TestCancelUnknownDeploymentNeverCallsCanceller(t *testing.T) {
+	for _, e := range []error{postgres.ErrOperationsNotFound, postgres.ErrOperationsInvalidInput} {
+		h, stub, c, p := cancelHandler(t, "queued")
+		stub.err = e
+		rr := cancelPost(h, p, "/deployments/cancel", cancelForm(t, h, p), nil)
+		if rr.Code != http.StatusNotFound || c.calls != 0 {
+			t.Fatalf("reader err %v = %d calls=%d", e, rr.Code, c.calls)
+		}
+	}
+}
+
+func TestCancelUsesServerSideJobIDAndRedirects(t *testing.T) {
+	h, stub, c, p := cancelHandler(t, "leased") // sampleDetail job id is 3
+	rr := cancelPost(h, p, "/deployments/cancel", cancelForm(t, h, p), nil)
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/deployments/detail?id=dep-1" {
+		t.Fatalf("success = %d %q", rr.Code, rr.Header().Get("Location"))
+	}
+	if c.calls != 1 || c.gotJob != 3 || c.gotOwn != "owner" || stub.gotID != "dep-1" {
+		t.Fatalf("calls=%d job=%d owner=%q looked up=%q", c.calls, c.gotJob, c.gotOwn, stub.gotID)
+	}
+}
+
+func TestCancelErrorMapping(t *testing.T) {
+	cases := []struct {
+		err  error
+		code int
+		body string
+	}{
+		{postgres.ErrAgentJobTerminal, http.StatusConflict, "this deployment has already finished and cannot be cancelled\n"},
+		{postgres.ErrAgentJobActivating, http.StatusConflict, "this deployment is activating and can no longer be cancelled\n"},
+		{postgres.ErrServerAuthorizationDenied, http.StatusBadRequest, "bad request\n"},
+		{fmt.Errorf("lock agent job for cancellation: %w", errors.New("secret detail")), http.StatusInternalServerError, "the deployment could not be cancelled; retry\n"},
+	}
+	for _, tc := range cases {
+		h, _, c, p := cancelHandler(t, "queued")
+		c.err = tc.err
+		rr := cancelPost(h, p, "/deployments/cancel", cancelForm(t, h, p), nil)
+		if rr.Code != tc.code || rr.Body.String() != tc.body {
+			t.Errorf("%v = %d %q", tc.err, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+func TestDetailCancelButtonVisibility(t *testing.T) {
+	const form = `action="/deployments/cancel"`
+	req := t0
+	cases := []struct {
+		name      string
+		state     string
+		requested bool
+		status    string
+		canceller bool
+		want      bool
+	}{
+		{"queued", "queued", false, "", true, true},
+		{"retry_wait", "retry_wait", false, "", true, true},
+		{"leased", "leased", false, "", true, true},
+		{"leased activating", "leased", false, "activating", true, false},
+		{"cancel already requested", "leased", true, "", true, false},
+		{"succeeded", "succeeded", false, "", true, false},
+		{"failed", "failed", false, "", true, false},
+		{"cancelled", "cancelled", true, "", true, false},
+		{"dead", "dead", false, "", true, false},
+		{"no canceller", "queued", false, "", false, false},
+	}
+	for _, tc := range cases {
+		h, stub, c, p := cancelHandler(t, tc.state)
+		if !tc.canceller {
+			h.config.DeploymentCanceller = nil
+		}
+		_ = c
+		if tc.requested {
+			stub.detail.Job.CancelRequestedAt = &req
+		}
+		if tc.status != "" {
+			stub.detail.Deployment.Status = tc.status
+		}
+		rr := opsGet(h, p, http.MethodGet, "/deployments/detail?id=dep-1")
+		body := rr.Body.String()
+		if rr.Code != http.StatusOK || strings.Contains(body, form) != tc.want {
+			t.Errorf("%s: code=%d form=%v want %v", tc.name, rr.Code, strings.Contains(body, form), tc.want)
+		}
+		if tc.want && !strings.Contains(body, `value="`+serversCSRF(t, h, p)+`"`) {
+			t.Errorf("%s: CSRF token missing", tc.name)
+		}
+		if strings.Contains(body, "cancellation requested") != tc.requested {
+			t.Errorf("%s: cancellation-requested note mismatch", tc.name)
+		}
+	}
+}

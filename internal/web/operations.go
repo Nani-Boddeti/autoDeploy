@@ -25,6 +25,13 @@ type OperationsReader interface {
 	GetDeploymentDetail(ctx context.Context, principal auth.Principal, deploymentID string) (postgres.DeploymentDetail, error)
 }
 
+// DeploymentCanceller is the narrow write surface behind POST
+// /deployments/cancel (step 15d). A nil DeploymentCanceller 404s the route and
+// hides the Cancel button. *postgres.AgentLeaseRepository satisfies it.
+type DeploymentCanceller interface {
+	RequestCancellation(ctx context.Context, principal auth.Principal, jobID int64) error
+}
+
 const (
 	// maxOperationsParamBytes bounds every query value accepted here.
 	maxOperationsParamBytes = 128
@@ -366,6 +373,21 @@ type deploymentDetailView struct {
 	Release      struct{ ID, State, Tone, Strategy, Commit, Digest, Created, Updated string }
 	Instances    []instanceRow
 	BackHref     string
+	// CanCancel renders the Cancel form; CSRF is set only then.
+	CanCancel         bool
+	CSRF              string
+	CancelRequestedAt string
+}
+
+// cancellableJobStates are the job states RequestCancellation accepts as a
+// new request: queued/retry_wait cancel immediately, leased cooperatively.
+// Terminal states are refused by the store and so never offered.
+var cancellableJobStates = map[string]bool{"queued": true, "retry_wait": true, "leased": true}
+
+// canOfferCancel reports whether the detail page should show the Cancel form.
+// A deployment already activating is refused by the store, so it is hidden.
+func canOfferCancel(d postgres.DeploymentDetail) bool {
+	return cancellableJobStates[d.Job.State] && d.Job.CancelRequestedAt == nil && d.Deployment.Status != "activating"
 }
 
 func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
@@ -398,6 +420,17 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		JobCreated: formatTimestamp(d.Job.CreatedAt), JobUpdated: formatTimestamp(d.Job.UpdatedAt),
 		BackHref: deploymentsHref(postgres.DeploymentFilter{ProjectID: d.Deployment.ProjectID}, ""),
 	}
+	if d.Job.CancelRequestedAt != nil {
+		view.CancelRequestedAt = formatTimestamp(*d.Job.CancelRequestedAt)
+	}
+	if h.config.DeploymentCanceller != nil && canOfferCancel(d) {
+		csrf, csrfErr := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+		if csrfErr != nil {
+			plain(w, http.StatusInternalServerError, "the page could not be loaded; retry\n")
+			return
+		}
+		view.CanCancel, view.CSRF = true, csrf
+	}
 	for _, e := range d.StatusEvents {
 		view.StatusEvents = append(view.StatusEvents, statusEventRow{At: formatTimestamp(e.OccurredAt), From: orDash(e.FromStatus), To: e.ToStatus, Revision: strconv.FormatInt(e.Revision, 10)})
 	}
@@ -426,4 +459,50 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		view.Instances = append(view.Instances, instanceRow{ID: strconv.FormatInt(in.ID, 10), Attempt: strconv.FormatInt(in.AttemptID, 10), Fence: strconv.FormatInt(in.Fence, 10), State: in.ObservedState, Tone: stateTone(in.ObservedState), Created: formatTimestamp(in.CreatedAt)})
 	}
 	renderOperations(w, deploymentDetailTemplate, view)
+}
+
+// deploymentCancel requests cancellation of a deployment's job. The job id is
+// resolved server-side through the owner-scoped detail read, never taken from
+// the client. Checks mirror serversRevoke: provenance, strict form, session,
+// CSRF, explicit confirm. Failures are fixed generic texts.
+func (h *Handler) deploymentCancel(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 3 || len(v["csrf"]) != 1 || len(v["deployment_id"]) != 1 || len(v["confirm"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	id := v.Get("deployment_id")
+	if v.Get("confirm") != "cancel" || !validOperationsID(id) {
+		badRequest(w)
+		return
+	}
+	d, err := h.config.OperationsReader.GetDeploymentDetail(r.Context(), p, id)
+	if err != nil {
+		if errors.Is(err, postgres.ErrOperationsInvalidInput) {
+			err = postgres.ErrOperationsNotFound
+		}
+		operationsFailure(w, r, err)
+		return
+	}
+	switch err = h.config.DeploymentCanceller.RequestCancellation(r.Context(), p, d.Job.ID); {
+	case err == nil:
+		redirect(w, detailHref(id))
+	case errors.Is(err, postgres.ErrAgentJobTerminal):
+		plain(w, http.StatusConflict, "this deployment has already finished and cannot be cancelled\n")
+	case errors.Is(err, postgres.ErrAgentJobActivating):
+		plain(w, http.StatusConflict, "this deployment is activating and can no longer be cancelled\n")
+	case errors.Is(err, postgres.ErrServerAuthorizationDenied):
+		badRequest(w)
+	default:
+		plain(w, http.StatusInternalServerError, "the deployment could not be cancelled; retry\n")
+	}
 }

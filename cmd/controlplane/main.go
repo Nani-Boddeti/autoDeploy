@@ -178,6 +178,7 @@ func run(ctx context.Context) error {
 	// here the way serverAdmin composes two repositories above.
 	webOptions.RuntimeConfigAdmin = postgres.NewEnvironmentRuntimeConfigRepository(pool)
 	webOptions.OperationsReader = postgres.NewOperationsReadRepository(pool)
+	webOptions.DeploymentCanceller = leaseRepository
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {
 		return err

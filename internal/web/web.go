@@ -101,6 +101,7 @@ type Config struct {
 	RuntimeConfigAdmin    RuntimeConfigAdmin
 	RouteHeadAdmin        RouteHeadAdmin
 	OperationsReader      OperationsReader
+	DeploymentCanceller   DeploymentCanceller
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -229,6 +230,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			h.deploymentDetail(w, r)
 		}
+	case "/deployments/cancel":
+		if h.config.OperationsReader == nil || h.config.DeploymentCanceller == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.deploymentCancel(w, r)
 	case "/servers/register":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)

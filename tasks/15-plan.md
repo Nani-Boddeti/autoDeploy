@@ -155,4 +155,8 @@ executed" honestly. Rollback and retention are slice 11 (not planned here).
 - 15c+15e pages /projects, /deployments (filters + base64url keyset cursor), /deployments/detail (meta refresh 5s
   while job not in succeeded/failed/cancelled/dead; static exec-disabled banner; live badge only when
   ReleaseIsActive). Review PASS with notes. Not visually checked in a browser yet.
-- 15d next: cancel button.
+- 15d POST /deployments/cancel over unchanged RequestCancellation; parity with /servers/revoke (provenance, strict
+  3-key form, session+CSRF); job id only from owner-scoped detail read; 409 terminal/activating; button only for
+  queued/retry_wait/leased, not requested, not activating. PG18 integration incl. 10 concurrent posts (one
+  transition) and cancel-vs-claim race, -race -count=20 green. Review PASS with notes.
+- 15g next: log channel plan + ADR amendment (no code before owner review).

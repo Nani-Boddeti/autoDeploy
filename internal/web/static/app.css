@@ -138,8 +138,10 @@ button {
   cursor: pointer;
 }
 button:hover { background: var(--btn-hover); }
-form[action$="/revoke"] button { background: var(--btn-danger); }
-form[action$="/revoke"] button:hover { background: var(--btn-danger-hover); }
+form[action$="/revoke"] button,
+form[action$="/cancel"] button { background: var(--btn-danger); }
+form[action$="/revoke"] button:hover,
+form[action$="/cancel"] button:hover { background: var(--btn-danger-hover); }
 
 table {
   width: 100%;
