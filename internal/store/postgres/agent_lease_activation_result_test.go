@@ -41,14 +41,14 @@ func newActivatedFixture(t *testing.T, seed byte, withPredecessor bool) activate
 	t.Helper()
 	f := newLeaseFixture(t, seed)
 	cred := f.withCredential(t, seed+50)
-	attemptID := f.leaseJob(t, 1, 90)
-	f.advanceDeploymentToHealthChecking(t)
 	f.insertRouteHead(t, "app.example.com")
 	predecessorID := ""
 	if withPredecessor {
 		predecessorID = "predecessor-" + releaseSuffix(t)
 		f.insertActiveReleaseAndPointRouteHead(t, predecessorID)
 	}
+	attemptID := f.leaseJob(t, 1, 90)
+	f.advanceDeploymentToHealthChecking(t)
 	candidateID := "candidate-" + releaseSuffix(t)
 	f.insertCandidateRelease(t, attemptID, candidateID)
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))

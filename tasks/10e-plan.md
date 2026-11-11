@@ -27,7 +27,8 @@ predecessor; a stop failure never undoes the activation. Retention/cleanup/rollb
 4. **10e-4 Drainer** (agent goroutine + startup resume): wait `armed_at + drain_seconds` (resume remaining time after
    restart); guards; stop; wait stopped; delete record. Failure -> keep record as `stop_failed` evidence + loud log;
    bounded retry for transient errors only.
-5. **10e-5 Docs**: ADR 0005 amendment + IMPLEMENTATION_STATUS.
+5. **10e-5 Docs**: ADR 0005 amendment + IMPLEMENTATION_STATUS + ADR 0004 note: Activate now does a plain non-locking
+   `release_operations` read (predecessor derivation) after the route head lock.
 
 ## Guards (must never happen)
 - Stop the new release: refuse if predecessor runtime instance/release == new; resolve by container name, then
@@ -53,3 +54,10 @@ Label/identity confusion (exact match + self-refusal); later activation racing t
 long agent outage (predecessor keeps running, record survives); failed stop invisible to control plane until slice
 11 (D-c); restart policy vs explicit stop and real Engine semantics unprovable on macOS; clock jumps (persist
 wall-clock armed_at, bound the wait by drain_seconds).
+
+## Progress
+- 10e-1 `3e83f79` Engine StopContainer (ID or AutoDeploy name only; grace 1-300s) + fail-closed WaitStopped.
+- 10e-2 activate response names the predecessor (release id + runtime instance = attempt id of its newest succeeded
+  activate op; plain read after the route head lock; replay derives from the stored op). Corrupt state refused
+  (no succeeded op; identity equal to candidate). Client requires both keys (absent = malformed; empty = none).
+  Review PASS with notes, applied. Integration on fresh PG18 green.

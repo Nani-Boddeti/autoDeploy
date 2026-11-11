@@ -66,6 +66,7 @@ func activateBody(mutate func(map[string]any)) string {
 	m := map[string]any{
 		"operation_id": "op_1", "route_revision": 7, "hostname": "app.example.com", "entrypoint_name": "websecure",
 		"cert_resolver_name": "le", "backend_runtime_instance_id": "rt_1", "route_digest": s,
+		"predecessor_release_id": "", "predecessor_runtime_instance_id": "",
 	}
 	if mutate != nil {
 		mutate(m)
@@ -136,6 +137,67 @@ func TestActivateMalformedResponses(t *testing.T) {
 			}
 			if n := atomic.LoadInt32(&calls); n != 1 {
 				t.Fatalf("requests=%d, want 1 (not retried)", n)
+			}
+		})
+	}
+}
+
+func TestActivatePredecessorParsing(t *testing.T) {
+	serve := func(t *testing.T, mutate func(map[string]any)) (ActivateResponse, error) {
+		t.Helper()
+		body := activateBody(mutate)
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
+		defer srv.Close()
+		return newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{})
+	}
+	t.Run("both empty", func(t *testing.T) {
+		resp, err := serve(t, func(m map[string]any) { m["predecessor_release_id"] = ""; m["predecessor_runtime_instance_id"] = "" })
+		if err != nil || resp.PredecessorReleaseID != "" || resp.PredecessorRuntimeInstanceID != "" {
+			t.Fatalf("resp=%+v err=%v", resp, err)
+		}
+	})
+	t.Run("both absent is malformed", func(t *testing.T) {
+		if _, err := serve(t, func(m map[string]any) {
+			delete(m, "predecessor_release_id")
+			delete(m, "predecessor_runtime_instance_id")
+		}); !errors.Is(err, ErrMalformedResponse) {
+			t.Fatalf("err=%v, want ErrMalformedResponse", err)
+		}
+	})
+	t.Run("one key absent is malformed", func(t *testing.T) {
+		if _, err := serve(t, func(m map[string]any) { m["predecessor_release_id"] = ""; delete(m, "predecessor_runtime_instance_id") }); !errors.Is(err, ErrMalformedResponse) {
+			t.Fatalf("err=%v, want ErrMalformedResponse", err)
+		}
+	})
+	t.Run("both set", func(t *testing.T) {
+		resp, err := serve(t, func(m map[string]any) {
+			m["predecessor_release_id"] = "rel_0"
+			m["predecessor_runtime_instance_id"] = "rt_0"
+		})
+		if err != nil || resp.PredecessorReleaseID != "rel_0" || resp.PredecessorRuntimeInstanceID != "rt_0" {
+			t.Fatalf("resp=%+v err=%v", resp, err)
+		}
+	})
+	bad := map[string]func(map[string]any){
+		"release only": func(m map[string]any) { m["predecessor_release_id"] = "rel_0" },
+		"runtime only": func(m map[string]any) { m["predecessor_runtime_instance_id"] = "rt_0" },
+		"invalid release id": func(m map[string]any) {
+			m["predecessor_release_id"] = "rel\u0000"
+			m["predecessor_runtime_instance_id"] = "rt_0"
+		},
+		"invalid runtime id": func(m map[string]any) {
+			m["predecessor_release_id"] = "rel_0"
+			m["predecessor_runtime_instance_id"] = "bad id/!"
+		},
+		"predecessor equals backend": func(m map[string]any) {
+			m["predecessor_release_id"] = "rel_0"
+			m["predecessor_runtime_instance_id"] = "rt_1"
+		},
+	}
+	for name, mutate := range bad {
+		t.Run(name, func(t *testing.T) {
+			if _, err := serve(t, mutate); !errors.Is(err, ErrMalformedResponse) {
+				t.Fatalf("err=%v, want ErrMalformedResponse", err)
 			}
 		})
 	}

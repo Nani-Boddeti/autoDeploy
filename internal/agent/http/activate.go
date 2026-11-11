@@ -46,6 +46,10 @@ type activateResponse struct {
 	CertResolverName         string `json:"cert_resolver_name"`
 	BackendRuntimeInstanceID string `json:"backend_runtime_instance_id"`
 	RouteDigest              string `json:"route_digest"`
+	// Both predecessor fields are always present; they are the empty string
+	// together when the route had no active release (first activation).
+	PredecessorReleaseID         string `json:"predecessor_release_id"`
+	PredecessorRuntimeInstanceID string `json:"predecessor_runtime_instance_id"`
 }
 
 // handleActivate serves POST /agent/v1/leases/activate (Step 10c tx1). A
@@ -79,12 +83,14 @@ func (h Handler) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.writeJSON(w, http.StatusOK, activateResponse{
-		OperationID:              result.OperationID,
-		RouteRevision:            result.RouteRevision,
-		Hostname:                 result.Hostname,
-		EntrypointName:           result.EntrypointName,
-		CertResolverName:         result.CertResolverName,
-		BackendRuntimeInstanceID: result.BackendRuntimeInstanceID,
-		RouteDigest:              result.RouteDigest,
+		OperationID:                  result.OperationID,
+		RouteRevision:                result.RouteRevision,
+		Hostname:                     result.Hostname,
+		EntrypointName:               result.EntrypointName,
+		CertResolverName:             result.CertResolverName,
+		BackendRuntimeInstanceID:     result.BackendRuntimeInstanceID,
+		RouteDigest:                  result.RouteDigest,
+		PredecessorReleaseID:         result.PredecessorReleaseID,
+		PredecessorRuntimeInstanceID: result.PredecessorRuntimeInstanceID,
 	})
 }

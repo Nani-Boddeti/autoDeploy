@@ -156,6 +156,38 @@ func TestHandleActivateRequestShapes(t *testing.T) {
 			got.BackendRuntimeInstanceID != "42" || got.RouteDigest == "" {
 			t.Fatalf("unexpected response: %+v", got)
 		}
+		// First activation: both predecessor fields present and empty.
+		if got.PredecessorReleaseID != "" || got.PredecessorRuntimeInstanceID != "" {
+			t.Fatalf("predecessor must be empty: %+v", got)
+		}
+		var raw map[string]any
+		decodeBody(t, do(Handler{Activator: fa}, newRequestTLS(newRequest(t, pathActivate, string(body), bearerPrefix+string(tok), "server_1"))), &raw)
+		if v, ok := raw["predecessor_release_id"]; !ok || v != "" {
+			t.Fatalf("predecessor_release_id must be present and empty, raw=%v", raw)
+		}
+		if v, ok := raw["predecessor_runtime_instance_id"]; !ok || v != "" {
+			t.Fatalf("predecessor_runtime_instance_id must be present and empty, raw=%v", raw)
+		}
+	})
+
+	t.Run("predecessor fields are forwarded", func(t *testing.T) {
+		fa := &fakeActivator{result: queue.ActivationResult{
+			OperationID: "op-2", RouteRevision: 3, Hostname: "app.example.com", EntrypointName: "websecure",
+			CertResolverName: "letsencrypt-production", BackendRuntimeInstanceID: "43",
+			RouteDigest:                  "sha256:" + hexDigest(digestFixture(4)),
+			PredecessorReleaseID:         "release-1",
+			PredecessorRuntimeInstanceID: "42",
+		}}
+		body, _ := json.Marshal(activateRequest{AttemptID: 43, Fence: 3, ImageDigest: hexDigest(digestFixture(3))})
+		w := do(Handler{Activator: fa}, newRequestTLS(newRequest(t, pathActivate, string(body), bearerPrefix+string(tok), "server_1")))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		var got activateResponse
+		decodeBody(t, w, &got)
+		if got.PredecessorReleaseID != "release-1" || got.PredecessorRuntimeInstanceID != "42" {
+			t.Fatalf("unexpected predecessor: %+v", got)
+		}
 	})
 }
 

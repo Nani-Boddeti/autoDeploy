@@ -10,8 +10,10 @@ import (
 
 	agentcheckout "autodeploy/internal/agent/checkout"
 	"autodeploy/internal/deployment"
+	"autodeploy/internal/github"
 	"autodeploy/internal/githubapp"
 	"autodeploy/internal/queue"
+	"autodeploy/internal/runtime/dockerid"
 	"autodeploy/internal/server"
 )
 
@@ -327,6 +329,13 @@ type ActivateResponse struct {
 	CertResolverName         string
 	BackendRuntimeInstanceID string
 	RouteDigest              [32]byte
+	// PredecessorReleaseID and PredecessorRuntimeInstanceID identify the
+	// release (and its container's runtime instance) the route served before
+	// this switch. Both empty means the server affirmatively reported no
+	// predecessor (first activation; the keys were present but empty), otherwise
+	// both are set. A response that omits the keys is malformed.
+	PredecessorReleaseID         string
+	PredecessorRuntimeInstanceID string
 }
 
 // Activate asks the control plane to authorize the traffic switch for
@@ -348,13 +357,15 @@ func (c *Client) Activate(ctx context.Context, attemptID, fence int64, imageDige
 		ImageDigest string `json:"image_digest"`
 	}{AttemptID: attemptID, Fence: fence, ImageDigest: hex.EncodeToString(imageDigest[:])}
 	var resp struct {
-		OperationID              string `json:"operation_id"`
-		RouteRevision            int64  `json:"route_revision"`
-		Hostname                 string `json:"hostname"`
-		EntrypointName           string `json:"entrypoint_name"`
-		CertResolverName         string `json:"cert_resolver_name"`
-		BackendRuntimeInstanceID string `json:"backend_runtime_instance_id"`
-		RouteDigest              string `json:"route_digest"`
+		OperationID                  string  `json:"operation_id"`
+		RouteRevision                int64   `json:"route_revision"`
+		Hostname                     string  `json:"hostname"`
+		EntrypointName               string  `json:"entrypoint_name"`
+		CertResolverName             string  `json:"cert_resolver_name"`
+		BackendRuntimeInstanceID     string  `json:"backend_runtime_instance_id"`
+		RouteDigest                  string  `json:"route_digest"`
+		PredecessorReleaseID         *string `json:"predecessor_release_id"`
+		PredecessorRuntimeInstanceID *string `json:"predecessor_runtime_instance_id"`
 	}
 	if err := c.post(ctx, pathActivate, req, &resp, true); err != nil {
 		return ActivateResponse{}, err
@@ -367,11 +378,32 @@ func (c *Client) Activate(ctx context.Context, attemptID, fence int64, imageDige
 	if !ok {
 		return ActivateResponse{}, fmt.Errorf("%w: activate response route digest", ErrMalformedResponse)
 	}
+	if resp.PredecessorReleaseID == nil || resp.PredecessorRuntimeInstanceID == nil {
+		return ActivateResponse{}, fmt.Errorf("%w: activate response missing predecessor fields", ErrMalformedResponse)
+	}
+	if !validPredecessor(*resp.PredecessorReleaseID, *resp.PredecessorRuntimeInstanceID, resp.BackendRuntimeInstanceID) {
+		return ActivateResponse{}, fmt.Errorf("%w: activate response predecessor identity", ErrMalformedResponse)
+	}
 	return ActivateResponse{
+		PredecessorReleaseID: *resp.PredecessorReleaseID, PredecessorRuntimeInstanceID: *resp.PredecessorRuntimeInstanceID,
 		OperationID: resp.OperationID, RouteRevision: resp.RouteRevision, Hostname: resp.Hostname,
 		EntrypointName: resp.EntrypointName, CertResolverName: resp.CertResolverName,
 		BackendRuntimeInstanceID: resp.BackendRuntimeInstanceID, RouteDigest: digest,
 	}, nil
+}
+
+// validPredecessor accepts both identities empty (first activation), or both
+// set with a valid opaque release id and a runtime instance id that forms a
+// valid container name and differs from the new backend's.
+func validPredecessor(releaseID, runtimeInstanceID, backendRuntimeInstanceID string) bool {
+	if releaseID == "" && runtimeInstanceID == "" {
+		return true
+	}
+	if releaseID == "" || runtimeInstanceID == "" || !github.ValidOpaqueID(releaseID) || runtimeInstanceID == backendRuntimeInstanceID {
+		return false
+	}
+	_, err := dockerid.ContainerName(runtimeInstanceID)
+	return err == nil
 }
 
 // parseRouteDigest accepts exactly "sha256:" + 64 lowercase hex.

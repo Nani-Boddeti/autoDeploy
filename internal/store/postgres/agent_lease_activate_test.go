@@ -64,8 +64,15 @@ func (f leaseFixture) insertRouteHead(t *testing.T, hostname string) {
 // insertActiveReleaseAndPointRouteHead creates a second deployment's release
 // row directly in 'active' state (releases has no INSERT-time state-machine
 // trigger -- only UPDATE is guarded) and repoints f's already-created route
-// head at it, so a later Activate call sees a genuine predecessor.
-func (f leaseFixture) insertActiveReleaseAndPointRouteHead(t *testing.T, releaseID string) {
+// head at it, so a later Activate call sees a genuine predecessor. Because
+// Activate derives the predecessor's runtime instance from the release's
+// succeeded activate operation, it also inserts the predecessor's own job,
+// closed attempt and succeeded activate operation (what a real finalize
+// leaves behind), and returns that attempt id (its runtime instance id is
+// dockerid.AttemptRuntimeInstanceID of it). It must run BEFORE leaseJob so the
+// predecessor's attempt id is lower than the candidate's (the resolution code
+// anchors on the latest attempt); it creates the slot itself at fence 1.
+func (f leaseFixture) insertActiveReleaseAndPointRouteHead(t *testing.T, releaseID string) int64 {
 	t.Helper()
 	ctx := context.Background()
 	deploymentID := "predecessor-" + releaseID
@@ -85,9 +92,48 @@ func (f leaseFixture) insertActiveReleaseAndPointRouteHead(t *testing.T, release
 		releaseID, deploymentID, f.envID); err != nil {
 		t.Fatal(err)
 	}
+	predecessorAttemptID := f.insertSucceededActivation(t, releaseID, deploymentID, "")
 	if _, err := f.pool.Exec(ctx, `UPDATE route_heads SET active_release_id=$2, route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`, f.envID, releaseID); err != nil {
 		t.Fatal(err)
 	}
+	return predecessorAttemptID
+}
+
+// insertSucceededActivation (forced SQL) gives releaseID a job, a closed
+// attempt and a SUCCEEDED activate operation, as a real finalize leaves
+// behind; tag keeps the job's idempotency key unique when a release gets more
+// than one. deploymentID must be unused by any other agent_jobs row. Returns
+// the attempt id. Creates the slot at fence 1 if needed, so it must run before
+// leaseJob.
+func (f leaseFixture) insertSucceededActivation(t *testing.T, releaseID, deploymentID, tag string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	f.insertSlot(t)
+	if _, err := f.pool.Exec(ctx, `UPDATE environment_slots SET fence=1 WHERE environment_id=$1`, f.envID); err != nil {
+		t.Fatal(err)
+	}
+	var predecessorJobID int64
+	if err := f.pool.QueryRow(ctx, `INSERT INTO agent_jobs(schema_version,job_kind,owner_id,project_id,environment_id,server_id,deployment_id,repository_id,full_ref,commit_sha,priority,available_at,idempotency_key,payload_digest,state,attempt_count)
+		VALUES (1,'deployment_execution',$1,'project',$2,$3,$4,201,'refs/heads/main','abcdefabcdefabcdefabcdefabcdefabcdefabcd',0,clock_timestamp(),$5,decode(repeat('00',32),'hex'),'succeeded',1) RETURNING id`,
+		f.ownerID, f.envID, f.serverID, deploymentID, "pred-key-"+releaseID+tag).Scan(&predecessorJobID); err != nil {
+		t.Fatal(err)
+	}
+	var predecessorAttemptID int64
+	if err := f.pool.QueryRow(ctx, `WITH t AS (SELECT clock_timestamp() + interval '90 seconds' AS deadline)
+		INSERT INTO agent_job_attempts(job_id, attempt_number, server_id, environment_id, fence, state, lease_expires_at, authority_expires_at)
+		SELECT $1, 1, $2, $3, (SELECT fence FROM environment_slots WHERE environment_id=$3), 'leased', t.deadline, t.deadline FROM t RETURNING id`,
+		predecessorJobID, f.serverID, f.envID).Scan(&predecessorAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE agent_job_attempts SET state='succeeded', result_operation_id='pred-result', result_digest=decode(repeat('00',32),'hex'), closed_at=clock_timestamp() WHERE id=$1`, predecessorAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `INSERT INTO release_operations(release_id, job_id, attempt_id, fence, kind, digest, state, created_at, closed_at, environment_id, expected_route_revision, route_digest)
+		SELECT $1, $2, $3, fence, 'activate', decode(repeat('11',32),'hex'), 'succeeded', clock_timestamp() - interval '1 second', clock_timestamp(), $4, 0, decode(repeat('33',32),'hex') FROM agent_job_attempts WHERE id=$3`,
+		releaseID, predecessorJobID, predecessorAttemptID, f.envID); err != nil {
+		t.Fatal(err)
+	}
+	return predecessorAttemptID
 }
 
 // insertCandidateRelease creates the one release row this fixture's own
@@ -173,11 +219,11 @@ func TestAgentLeaseActivateFirstDeploymentSwitchAuthorized(t *testing.T) {
 func TestAgentLeaseActivateWithPredecessorCapturesExpectedActiveRelease(t *testing.T) {
 	f := newLeaseFixture(t, 161)
 	cred := f.withCredential(t, 211)
-	attemptID := f.leaseJob(t, 1, 90)
-	f.advanceDeploymentToHealthChecking(t)
 	f.insertRouteHead(t, "app.example.com")
 	predecessorID := "predecessor-release-" + t.Name()
 	f.insertActiveReleaseAndPointRouteHead(t, predecessorID)
+	attemptID := f.leaseJob(t, 1, 90)
+	f.advanceDeploymentToHealthChecking(t)
 	releaseID := "release-" + t.Name()
 	f.insertCandidateRelease(t, attemptID, releaseID)
 

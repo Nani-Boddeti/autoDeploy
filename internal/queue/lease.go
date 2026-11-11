@@ -115,6 +115,11 @@ type ActivationResult struct {
 	CertResolverName         string
 	BackendRuntimeInstanceID string
 	RouteDigest              string
+	// PredecessorReleaseID and PredecessorRuntimeInstanceID name the release
+	// the route served when the switch was authorized and its backend runtime
+	// instance. Both empty on a first activation; never one without the other.
+	PredecessorReleaseID         string
+	PredecessorRuntimeInstanceID string
 }
 
 // FrozenSecretReference is one frozen secret this attempt is authorized to

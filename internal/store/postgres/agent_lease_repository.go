@@ -1293,12 +1293,13 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	// transaction left behind (including a freshly inserted operation row),
 	// never a state this transaction hasn't committed yet.
 	var existingOperationID int64
+	var existingReleaseID string
 	var existingDigest, existingRouteDigest []byte
 	var existingExpectedRouteRevision int64
 	var existingExpectedActiveReleaseID *string
 	var existingState string
-	err = tx.QueryRow(ctx, `SELECT id, digest, route_digest, expected_route_revision, expected_active_release_id, state FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND kind='activate'`, attemptID, fence).
-		Scan(&existingOperationID, &existingDigest, &existingRouteDigest, &existingExpectedRouteRevision, &existingExpectedActiveReleaseID, &existingState)
+	err = tx.QueryRow(ctx, `SELECT id, release_id, digest, route_digest, expected_route_revision, expected_active_release_id, state FROM release_operations WHERE attempt_id=$1 AND fence=$2 AND kind='activate'`, attemptID, fence).
+		Scan(&existingOperationID, &existingReleaseID, &existingDigest, &existingRouteDigest, &existingExpectedRouteRevision, &existingExpectedActiveReleaseID, &existingState)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return queue.ActivationResult{}, fmt.Errorf("check existing activation operation: %w", err)
 	}
@@ -1331,14 +1332,26 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		if err = tx.QueryRow(ctx, `SELECT hostname FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&hostname); err != nil {
 			return queue.ActivationResult{}, fmt.Errorf("lock route head for activate replay: %w", err)
 		}
+		// The predecessor is derived from the operation's own stored
+		// expected_active_release_id, never from the current route head, so a
+		// replay answers exactly what the original authorization did.
+		// existingReleaseID and existingExpectedActiveReleaseID are FK-validated
+		// release ids (release_operations.release_id / expected_active_release_id).
+		var predecessorReleaseID, predecessorRuntimeInstanceID string
+		predecessorReleaseID, predecessorRuntimeInstanceID, err = derivePredecessor(ctx, tx, existingExpectedActiveReleaseID, existingReleaseID, dockerid.AttemptRuntimeInstanceID(attemptID))
+		if err != nil {
+			return queue.ActivationResult{}, err
+		}
 		result := queue.ActivationResult{
-			OperationID:              strconv.FormatInt(existingOperationID, 10),
-			RouteRevision:            existingExpectedRouteRevision + 1,
-			Hostname:                 hostname,
-			EntrypointName:           traefik.DefaultEntrypointName,
-			CertResolverName:         traefik.DefaultCertResolverName,
-			BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
-			RouteDigest:              "sha256:" + hex.EncodeToString(existingRouteDigest),
+			PredecessorReleaseID:         predecessorReleaseID,
+			PredecessorRuntimeInstanceID: predecessorRuntimeInstanceID,
+			OperationID:                  strconv.FormatInt(existingOperationID, 10),
+			RouteRevision:                existingExpectedRouteRevision + 1,
+			Hostname:                     hostname,
+			EntrypointName:               traefik.DefaultEntrypointName,
+			CertResolverName:             traefik.DefaultCertResolverName,
+			BackendRuntimeInstanceID:     dockerid.AttemptRuntimeInstanceID(attemptID),
+			RouteDigest:                  "sha256:" + hex.EncodeToString(existingRouteDigest),
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate replay: %w", err)
@@ -1351,9 +1364,10 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	// see another attempt's stranded row; this one is environment-scoped. It
 	// is read here, at the release_operations position of the lock order
 	// (after the attempt row, before the deployment and route head), as a
-	// plain non-locking SELECT; no release_operations READ happens after the
-	// route head lock (the INSERT below is a write at ADR position 8). A plain
-	// read is sufficient because the environment_slots row locked above is
+	// plain non-locking SELECT. After the route head lock the only
+	// release_operations access is derivePredecessor's plain, non-locking
+	// SELECT (no row lock, so no lock-order position), plus the INSERT below,
+	// a write at ADR position 8. A plain read is sufficient because the environment_slots row locked above is
 	// held by every writer of this environment's activation operations, so the
 	// answer cannot change before this transaction ends.
 	//
@@ -1492,6 +1506,14 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		expectedActiveReleaseID = activeReleaseID
 	}
 
+	// Predecessor identity for the agent's later drain-and-stop (step 10e):
+	// a plain read, no lock, after every lock this function takes; the slot
+	// lock held above serializes every writer that could change it.
+	predecessorReleaseID, predecessorRuntimeInstanceID, err := derivePredecessor(ctx, tx, expectedActiveReleaseID, releaseID, dockerid.AttemptRuntimeInstanceID(attemptID))
+	if err != nil {
+		return queue.ActivationResult{}, err
+	}
+
 	var operationID int64
 	// A stranded unresolved activation in this environment (any attempt)
 	// collides here on the widened unique index; it is a deterministic,
@@ -1521,14 +1543,60 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	}
 
 	return queue.ActivationResult{
-		OperationID:              strconv.FormatInt(operationID, 10),
-		RouteRevision:            routeRevision + 1,
-		Hostname:                 hostname,
-		EntrypointName:           traefik.DefaultEntrypointName,
-		CertResolverName:         traefik.DefaultCertResolverName,
-		BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
-		RouteDigest:              routeDigestHex,
+		PredecessorReleaseID:         predecessorReleaseID,
+		PredecessorRuntimeInstanceID: predecessorRuntimeInstanceID,
+		OperationID:                  strconv.FormatInt(operationID, 10),
+		RouteRevision:                routeRevision + 1,
+		Hostname:                     hostname,
+		EntrypointName:               traefik.DefaultEntrypointName,
+		CertResolverName:             traefik.DefaultCertResolverName,
+		BackendRuntimeInstanceID:     dockerid.AttemptRuntimeInstanceID(attemptID),
+		RouteDigest:                  routeDigestHex,
 	}, nil
+}
+
+// derivePredecessor names the release the route currently serves (the
+// operation's expected_active_release_id; nil/empty on a first activation)
+// and the runtime instance its backend container runs as. route_heads and
+// the route document do not record a backend runtime instance, so the
+// instance is derived the only way the system ever creates one: the
+// runtime instance id of an attempt is dockerid.AttemptRuntimeInstanceID of
+// its attempt id, and a release becomes active only through a SUCCEEDED
+// activate operation (finalizeActivationSucceeded), so the most recent
+// succeeded activate operation of that release in this environment names the
+// attempt whose container the route points at. Both results are empty when
+// there is no predecessor.
+//
+// The query filters on release_id only: releases.environment_id is immutable
+// and release_operations.environment_id is trigger-validated equal to it, so
+// an environment filter would be redundant. ORDER BY id DESC keeps the newest
+// succeeded operation should a release ever be activated again (slice 11).
+//
+// It is a plain SELECT (no row lock, no new lock class). Corrupt state, never
+// authorized: a predecessor release with no succeeded activate operation, or
+// one that equals the candidate release or the candidate's runtime instance.
+func derivePredecessor(ctx context.Context, tx pgx.Tx, expectedActiveReleaseID *string, candidateReleaseID, candidateRuntimeInstanceID string) (releaseID, runtimeInstanceID string, err error) {
+	if expectedActiveReleaseID == nil || *expectedActiveReleaseID == "" {
+		return "", "", nil
+	}
+	releaseID = *expectedActiveReleaseID
+	if releaseID == candidateReleaseID {
+		return "", "", fmt.Errorf("%w: predecessor release %s equals the candidate release", ErrAgentLeaseCorruptState, releaseID)
+	}
+	var predecessorAttemptID int64
+	err = tx.QueryRow(ctx, `SELECT attempt_id FROM release_operations WHERE release_id=$1 AND kind='activate' AND state=$2 ORDER BY id DESC LIMIT 1`,
+		releaseID, activationStateSucceeded).Scan(&predecessorAttemptID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", fmt.Errorf("%w: active release %s has no succeeded activate operation", ErrAgentLeaseCorruptState, releaseID)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("derive predecessor runtime instance: %w", err)
+	}
+	runtimeInstanceID = dockerid.AttemptRuntimeInstanceID(predecessorAttemptID)
+	if runtimeInstanceID == candidateRuntimeInstanceID {
+		return "", "", fmt.Errorf("%w: predecessor runtime instance %s equals the candidate runtime instance", ErrAgentLeaseCorruptState, runtimeInstanceID)
+	}
+	return releaseID, runtimeInstanceID, nil
 }
 
 // ErrAgentLeaseActivationOpen reports a Complete call refused because a
