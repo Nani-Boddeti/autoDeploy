@@ -204,3 +204,7 @@ inside the 30 min window, network failure modes on a real link, actual secret-le
   batches, 30s budget; own session try-lock key 0x61676e745f6c7033 on a dedicated conn, conn destroyed if unlock
   fails); env `AUTODEPLOY_LOG_RETENTION_MAX_AGE` (336h, 1h..365d) / `AUTODEPLOY_LOG_RETENTION_KEEP_NEWEST` (20,
   1..10000). Review PASS with notes (pool of 1 would starve; no recover, matches repo).
+- 15g-5 `/deployments/logs?id=&after=` (operations prelude reuse; strict decimal `after`; grouped by attempt; closed-set
+  stream classes; markers styled via shared constants, drop prefix pinned to logship.DroppedMarkerPrefix by test;
+  3s refresh only non-terminal + last page, reloads current `after`; "From the start" link covers late lower ids)
+  + Logs link on detail. Review PASS with notes.

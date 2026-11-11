@@ -35,6 +35,10 @@ import (
 	"autodeploy/internal/crypto"
 )
 
+// DroppedMarkerPrefix starts the system-stream line emitted once per overflow
+// episode. The web log page matches it to style the marker.
+const DroppedMarkerPrefix = "[logs dropped: "
+
 // Stream names are the server's allowlist (migration 000022).
 type Stream string
 
@@ -377,7 +381,7 @@ func (a *Attempt) markerLocked(extra int) {
 	if a.droppedN == 0 {
 		return
 	}
-	body := fmt.Sprintf("[logs dropped: %d lines]", a.droppedN)
+	body := fmt.Sprintf(DroppedMarkerPrefix+"%d lines]", a.droppedN)
 	if a.used+len(body)+64+extra+64 > a.cfg.BufferBytes {
 		return
 	}

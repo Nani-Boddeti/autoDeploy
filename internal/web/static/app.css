@@ -192,3 +192,40 @@ dl.facts {
 dl.facts dt { color: var(--ink-soft); font-weight: 600; }
 dl.facts dd { margin: 0; overflow-wrap: anywhere; }
 .notice + .hint, .notice { margin-bottom: var(--space-md); }
+
+/* Deployment logs: one row per stored chunk, grouped by attempt. Stream classes come from a closed
+   server-side set (build / phase / health / activation / drain / system, else "other"); the stream name is
+   always printed, so color is never the only signal. */
+:root {
+  --tag-lav: oklch(0.93 0.05 300);
+  --tag-lav-line: oklch(0.8 0.08 300);
+  --tag-peach: oklch(0.94 0.05 55);
+  --tag-peach-line: oklch(0.82 0.08 55);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --tag-lav: oklch(0.36 0.06 300);
+    --tag-lav-line: oklch(0.5 0.08 300);
+    --tag-peach: oklch(0.36 0.06 55);
+    --tag-peach-line: oklch(0.5 0.08 55);
+  }
+}
+.attempt { margin-bottom: var(--space-lg); }
+.attempt h2 { margin-bottom: var(--space-sm); }
+ol.logs { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+ol.logs li { display: grid; grid-template-columns: 6.5rem 6rem 1fr; gap: var(--space-sm) var(--space-md); align-items: baseline; padding: var(--space-xs) var(--space-md); border-top: 1px solid var(--line); }
+ol.logs li:first-child { border-top: 0; }
+ol.logs time { color: var(--ink-soft); font: 0.85em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.stream { justify-self: start; padding: 0 var(--space-sm); border-radius: 999px; border: 1px solid var(--line); background: var(--surface-alt); font-size: 0.8em; font-weight: 600; }
+.stream.stream-build { background: var(--pill-busy); border-color: var(--pill-busy-line); }
+.stream.stream-phase { background: var(--tag-lav); border-color: var(--tag-lav-line); }
+.stream.stream-health { background: var(--pill-ok); border-color: var(--pill-ok-line); }
+.stream.stream-activation { background: var(--tag-peach); border-color: var(--tag-peach-line); }
+.stream.stream-drain { background: var(--notice); border-color: var(--notice-line); }
+ol.logs pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 0.88em/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+ol.logs li.marker { background: var(--notice); border-top: 1px dashed var(--notice-line); border-bottom: 1px dashed var(--notice-line); }
+ol.logs li.marker pre { font-style: italic; }
+.log-nav { display: flex; flex-wrap: wrap; gap: var(--space-md); margin: var(--space-md) 0; }
+@media (max-width: 40rem) {
+  ol.logs li { grid-template-columns: 1fr; gap: var(--space-xs); }
+}

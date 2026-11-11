@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"autodeploy/internal/store/postgres"
 )
 
 const wantCSP = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'"
@@ -64,6 +66,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 	h.config.RouteHeadAdmin = &routeHeadAdminStub{}
 	h.config.RuntimeConfigAdmin = &runtimeConfigAdminStub{}
 	h.config.OperationsReader = &operationsStub{detail: sampleDetail("leased", true)}
+	h.config.DeploymentLogReader = &logStub{page: postgres.DeploymentLogPage{Items: []postgres.DeploymentLogLine{line(1, 1, "build", "hi")}}}
 	pages := map[string]string{}
 	login := httptest.NewRecorder()
 	h.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "https://admin.example.test/login", nil))
@@ -71,7 +74,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		t.Fatalf("/login = %d", login.Code)
 	}
 	pages["/login"] = login.Body.String()
-	for _, target := range []string{"/", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1"} {
+	for _, target := range []string{"/", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, serversRequest(http.MethodGet, target, nil, p, h))
 		if rr.Code != http.StatusOK {

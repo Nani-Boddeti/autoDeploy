@@ -102,6 +102,7 @@ type Config struct {
 	RouteHeadAdmin        RouteHeadAdmin
 	OperationsReader      OperationsReader
 	DeploymentCanceller   DeploymentCanceller
+	DeploymentLogReader   DeploymentLogReader
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -154,7 +155,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveStylesheet(w, r)
 		return
 	}
-	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" {
+	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" {
 		http.NotFound(w, r)
 		return
 	}
@@ -230,6 +231,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			h.deploymentDetail(w, r)
 		}
+	case "/deployments/logs":
+		if h.config.DeploymentLogReader == nil {
+			http.NotFound(w, r)
+			return
+		}
+		h.deploymentLogs(w, r)
 	case "/deployments/cancel":
 		if h.config.OperationsReader == nil || h.config.DeploymentCanceller == nil {
 			http.NotFound(w, r)

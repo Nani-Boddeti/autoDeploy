@@ -179,6 +179,7 @@ func run(ctx context.Context) error {
 	webOptions.RuntimeConfigAdmin = postgres.NewEnvironmentRuntimeConfigRepository(pool)
 	webOptions.OperationsReader = postgres.NewOperationsReadRepository(pool)
 	webOptions.DeploymentCanceller = leaseRepository
+	webOptions.DeploymentLogReader = postgres.NewDeploymentLogRepository(pool)
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {
 		return err

@@ -373,6 +373,8 @@ type deploymentDetailView struct {
 	Release      struct{ ID, State, Tone, Strategy, Commit, Digest, Created, Updated string }
 	Instances    []instanceRow
 	BackHref     string
+	// LogsHref is set only when a DeploymentLogReader is configured.
+	LogsHref string
 	// CanCancel renders the Cancel form; CSRF is set only then.
 	CanCancel         bool
 	CSRF              string
@@ -419,6 +421,9 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		Active: d.ReleaseIsActive, JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
 		JobCreated: formatTimestamp(d.Job.CreatedAt), JobUpdated: formatTimestamp(d.Job.UpdatedAt),
 		BackHref: deploymentsHref(postgres.DeploymentFilter{ProjectID: d.Deployment.ProjectID}, ""),
+	}
+	if h.config.DeploymentLogReader != nil {
+		view.LogsHref = logsHref(id, 0)
 	}
 	if d.Job.CancelRequestedAt != nil {
 		view.CancelRequestedAt = formatTimestamp(*d.Job.CancelRequestedAt)
