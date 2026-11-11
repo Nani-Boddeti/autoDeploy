@@ -89,14 +89,16 @@ header.site nav a:hover { background: var(--surface-alt); }
 header.site nav a[aria-current="page"] { background: var(--surface); font-weight: 600; }
 
 main {
-  max-width: 72rem;
+  max-width: 80rem;
   margin: 0 auto;
   padding: var(--space-lg) var(--space-md) var(--space-xl);
+  overflow-x: auto;
 }
 h1 { margin: 0 0 var(--space-md); font-size: 1.6rem; line-height: 1.2; overflow-wrap: anywhere; }
 h2 { margin: var(--space-xl) 0 var(--space-sm); font-size: 1.2rem; line-height: 1.3; }
 h3 { margin: var(--space-lg) 0 var(--space-sm); font-size: 1rem; }
 p { max-width: 70ch; margin: 0 0 var(--space-md); }
+main > table { margin-bottom: var(--space-md); }
 
 .notice {
   max-width: 70ch;
@@ -149,12 +151,22 @@ table {
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  font-size: 0.9rem;
+  font-size: 0.875rem;
 }
-th, td { padding: var(--space-sm) var(--space-md); text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+th, td { padding: var(--space-sm) 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+/* Data cells stay on one line (ids, commits, timestamps never break mid-string); the table scrolls inside its own
+   box instead. Cells that hold forms or prose are allowed to wrap at spaces. */
+td { white-space: nowrap; overflow-wrap: normal; word-break: normal; }
+td:has(form), td:has(.hint) { white-space: normal; }
 th { background: var(--surface-alt); color: var(--ink-soft); font-weight: 600; white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
-td form { margin-bottom: var(--space-sm); }
+/* Inline action forms inside table cells: compact stacked controls so data columns keep their width. */
+td form { flex-direction: column; align-items: stretch; gap: var(--space-xs); width: 13rem; max-width: 100%; margin-bottom: var(--space-sm); }
+td form:last-child { margin-bottom: 0; }
+td form button { align-self: flex-start; }
+td form input:not([type="checkbox"]), td form select { width: 100%; min-width: 0; }
+/* Narrow viewports: the table scrolls inside its own box. Wider ones use a normal table; main scrolls
+   horizontally as a backstop so the page itself never does. */
 @media (max-width: 52rem) {
   table { display: block; overflow-x: auto; }
 }
@@ -213,7 +225,7 @@ dl.facts dd { margin: 0; overflow-wrap: anywhere; }
 .attempt { margin-bottom: var(--space-lg); }
 .attempt h2 { margin-bottom: var(--space-sm); }
 ol.logs { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
-ol.logs li { display: grid; grid-template-columns: 6.5rem 6rem 1fr; gap: var(--space-sm) var(--space-md); align-items: baseline; padding: var(--space-xs) var(--space-md); border-top: 1px solid var(--line); }
+ol.logs li { display: grid; grid-template-columns: 6.5rem 6rem minmax(0, 1fr); gap: var(--space-sm) var(--space-md); align-items: baseline; padding: var(--space-xs) var(--space-md); border-top: 1px solid var(--line); }
 ol.logs li:first-child { border-top: 0; }
 ol.logs time { color: var(--ink-soft); font: 0.85em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .stream { justify-self: start; padding: 0 var(--space-sm); border-radius: 999px; border: 1px solid var(--line); background: var(--surface-alt); font-size: 0.8em; font-weight: 600; }
@@ -222,10 +234,10 @@ ol.logs time { color: var(--ink-soft); font: 0.85em ui-monospace, SFMono-Regular
 .stream.stream-health { background: var(--pill-ok); border-color: var(--pill-ok-line); }
 .stream.stream-activation { background: var(--tag-peach); border-color: var(--tag-peach-line); }
 .stream.stream-drain { background: var(--notice); border-color: var(--notice-line); }
-ol.logs pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 0.88em/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+ol.logs pre { min-width: 0; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 0.88em/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 ol.logs li.marker { background: var(--notice); border-top: 1px dashed var(--notice-line); border-bottom: 1px dashed var(--notice-line); }
 ol.logs li.marker pre { font-style: italic; }
 .log-nav { display: flex; flex-wrap: wrap; gap: var(--space-md); margin: var(--space-md) 0; }
 @media (max-width: 40rem) {
-  ol.logs li { grid-template-columns: 1fr; gap: var(--space-xs); }
+  ol.logs li { grid-template-columns: minmax(0, 1fr); gap: var(--space-xs); }
 }
