@@ -1,6 +1,6 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-11. Branch: main at 639f4f8 (feat: add the deployment logs page) plus the step 15 docs commit. origin/main is at cff4d8f (slice 10 complete); step 15 commits (a5818f4..639f4f8 and the docs commit) are local until pushed. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry and rollback deferred). Migrations run through 000022. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-12. Branch: main at be34361 (fix: use a same-origin referrer policy so browser form posts pass provenance), pushed; origin/main = be34361. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false; nothing has run on a real host. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 

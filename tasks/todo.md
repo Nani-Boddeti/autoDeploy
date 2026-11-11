@@ -8,7 +8,7 @@
 - 2026-11-11: step 15 operations UI is partial (`859acc8`..`639f4f8`): projects, deployments list/detail, cancel and
   deploy-step logs (storage, upload, agent shipper, retention, page) are done; retry (after the real-host run),
   rollback button (slice 11), container runtime logs, drain log lines and a visual browser check are deferred.
-  Plans: [tasks/15-plan.md](15-plan.md), [tasks/15g-plan.md](15g-plan.md).
+  Plans: [tasks/15-plan.md](15-plan.md), [tasks/15g-plan.md](15g-plan.md). Pushed 2026-11-12 (origin/main be34361), including the referrer-policy login fix. Next session: owner picks slice 11, observability, packaging, or the real-host run.
 - Next: owner chooses between a real-host run (privileged Linux smoke + minimal packaging to deploy one push end to
   end) and further work (operations UI, observability, slice 11). Hard gates and per-step state:
   [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10"; decisions and follow-ups:
