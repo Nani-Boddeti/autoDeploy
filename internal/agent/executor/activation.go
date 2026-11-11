@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	agentclient "autodeploy/internal/agent/client"
+	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/agent/state"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/traefik"
@@ -196,12 +197,19 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		return e.outcome(lease, false, queue.FailureClassTransient)
 	}
 
+	// Structural step lines only (fixed formats, enum/numeric arguments; never
+	// error text). ctx carries the attempt's shipper (nil-safe when absent).
+	logs := logship.FromContext(ctx)
+	logs.Linef(logship.StreamActivation, "activation: requesting authorization")
+
 	resp, err := a.authorize(ctx, lease, imageDigest)
 	if err != nil {
 		if class, definite := classifyActivateRefusal(err); definite {
+			logs.Linef(logship.StreamActivation, "activation: refused by the control plane (%s)", class)
 			a.logger.Printf("agent activation refused by the control plane (attempt %d): %v", lease.AttemptID, err)
 			return e.outcome(lease, false, class)
 		}
+		logs.Linef(logship.StreamActivation, "activation: authorization state unknown; route untouched")
 		a.logger.Printf("agent activation ERROR attempt %d: authorization state UNKNOWN after %d tries; route untouched, sending no completion (the attempt will expire and an operator may need to declare not_activated): %v",
 			lease.AttemptID, a.activateAttempts, err)
 		return agentclient.Outcome{AuthorizationUnknown: true, OperationID: fmt.Sprintf("op-%d-%d", lease.AttemptID, lease.Fence)}
@@ -212,6 +220,7 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.timeout)
 	defer cancel()
 
+	logs.Linef(logship.StreamActivation, "activation: authorized (route revision %d)", resp.RouteRevision)
 	rec := state.PendingActivation{
 		AttemptID:     lease.AttemptID,
 		Fence:         lease.Fence,
@@ -239,10 +248,12 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 	observed, summary := a.switchRoute(dctx, lease, resp)
 	rec.Phase = state.PhaseResultReady
 	if summary == "" {
+		logs.Linef(logship.StreamActivation, "activation: route switched and verified")
 		rec.Succeeded = true
 		rec.ObservedRouteDigest = observed
 	} else {
 		rec.FailureSummary = summary
+		logs.Linef(logship.StreamActivation, "activation: route switch failed; see the activation result")
 		a.logger.Printf("agent activation ERROR attempt %d: %s", lease.AttemptID, summary)
 	}
 	if err := a.saveWithRetry(rec); err != nil {
@@ -279,6 +290,7 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 			}
 		}
 	}
+	logs.Linef(logship.StreamActivation, "activation: handed off for result reporting")
 	if a.cfg.Kicker != nil {
 		a.cfg.Kicker.Kick()
 	}

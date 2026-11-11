@@ -191,3 +191,12 @@ inside the 30 min window, network failure modes on a real link, actual secret-le
   control chars, PEM, Authorization header/JSON/quoted forms, Bearer, GitHub token shapes, srv/enr tokens; all-empty
   request -> 400) + client `AppendLogs` (single attempt; 403/404 permanent locally; shared mapStatus untouched;
   ctx cancel classifies retryable -> shipper must check ctx.Err() itself). Review PASS with notes, both fixed.
+- 15g-3 `internal/agent/logship` (per-Start strictly increasing epoch; seq per stream/epoch, stable across retries;
+  256 KiB queue incl. in-flight, drop-newest + one marker per episode; batches ≤32 chunks/~60 KiB encoded; 6 tries
+  capped backoff; 2s Close budget) + executor wiring (build tee, phase/health/activation lines). Redaction: controls
+  stripped -> crypto.RedactingWriter on raw stream -> assembly; armed by `secretMaterializer.onFetched` (no extra
+  materialize calls; call counts/classes identical, tested); no build-scoped bindings -> empty set (build holds no
+  secrets); fetch failure -> build output suppressed. Review 1 PASS with notes (eager fetch, post-redaction strip)
+  -> fixed -> re-review PASS. Gaps for 15g-6 docs: drain lines not shipped (drain record lacks fence); checkout
+  credential not reachable (checkout output not shipped); runtime-only secret in build output not masked (cannot
+  reach build); encoded forms residual; Execute may wait up to ~2.1s on a hung log server.

@@ -27,6 +27,7 @@ import (
 
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/agent/executor"
+	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/agent/state"
 	"autodeploy/internal/checkoutcontain"
 	"autodeploy/internal/checkoutquota"
@@ -469,7 +470,14 @@ func buildExecutor(ctx context.Context, c command, client *agentclient.Client, l
 	// executor.ControlPlane's three embedded interfaces (the checkout RPCs,
 	// MaterializeSecrets, ReportProgress) are all satisfied by
 	// *agentclient.Client structurally; no adapter type is needed.
+	// Log shipping rides the same client; it is only reachable when the
+	// executor is enabled, and a failure to ship never affects an attempt.
+	shipper, err := logship.NewFactory(logship.Config{Sender: client, Logger: logger})
+	if err != nil {
+		return nil, fmt.Errorf("configure log shipper: %w", err)
+	}
 	return executor.NewExecutor(ctx, executor.Config{
+		LogShipper:     shipper,
 		ControlPlane:   client,
 		Docker:         dockerClient,
 		CheckoutRunner: checkoutRunner,

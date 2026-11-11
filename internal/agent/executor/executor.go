@@ -24,6 +24,7 @@ import (
 
 	agentcheckout "autodeploy/internal/agent/checkout"
 	agentclient "autodeploy/internal/agent/client"
+	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/gitcheckout"
 	"autodeploy/internal/queue"
@@ -78,6 +79,11 @@ type Config struct {
 	// value discards build output.
 	BuildOutput io.Writer
 	Logger      *log.Logger
+	// LogShipper ships each attempt's redacted build output and structural
+	// deploy-step lines to the control plane (step 15g). Optional (nil: local
+	// logging only); it is additive -- BuildOutput keeps receiving the same
+	// bytes -- and shipping failures never affect an attempt.
+	LogShipper *logship.Factory
 	// Activation configures the post-health-gate traffic switch. It is
 	// REQUIRED: NewExecutor refuses a nil value, because an executor without
 	// activation would report success after the health gate and close the
@@ -98,6 +104,7 @@ type Executor struct {
 	network      string
 	buildOutput  io.Writer
 	logger       *log.Logger
+	logs         *logship.Factory  // nil: no log shipping.
 	activation   *activationRunner // nil: Execute fails closed.
 }
 
@@ -141,6 +148,7 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 		network:      cfg.Network,
 		buildOutput:  buildOutput,
 		logger:       logger,
+		logs:         cfg.LogShipper,
 	}, nil
 }
 
@@ -179,7 +187,16 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 
 	progress := newProgressReporter(e.controlPlane)
 	materializer := newSecretMaterializer(e.controlPlane, lease.AttemptID, lease.Fence)
-	tracker := &phaseTracker{}
+
+	// Log shipping is best effort and bounded: Close waits at most the flush
+	// budget and never reports an error. The shipper rides ctx so activation
+	// (which detaches from ctx cancellation, keeping its values) can write its
+	// own step lines.
+	logs := e.logs.Start(lease.AttemptID, lease.Fence)
+	defer logs.Close()
+	ctx = logship.WithAttempt(ctx, logs)
+	materializer.onFetched = logs.SetSecrets
+	tracker := &phaseTracker{logs: logs}
 
 	if err := tracker.advance(ctx, progress, lease.AttemptID, lease.Fence, deployment.StatusFetching); err != nil {
 		return e.outcome(lease, false, queue.FailureClassTransient)
@@ -187,8 +204,11 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 
 	checkoutResult, err := e.checkout.Checkout(ctx, lease.AttemptID, lease.Fence)
 	if err != nil {
-		return e.outcome(lease, false, classifyPhaseError(ctx, err))
+		class := classifyPhaseError(ctx, err)
+		logs.Linef(logship.StreamPhase, "checkout: failed (%s)", class)
+		return e.outcome(lease, false, class)
 	}
+	logs.Linef(logship.StreamPhase, "checkout: complete")
 	var closeOnce sync.Once
 	closeCheckout := func() {
 		closeOnce.Do(func() {
@@ -203,6 +223,15 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		return e.outcome(lease, false, queue.FailureClassTransient)
 	}
 
+	// Log redaction is armed from the existing lazy materialize (see
+	// materializer.onFetched): docker.Build fetches the full set before it
+	// produces any output when the lease has build-scoped bindings. With none,
+	// the build process receives no secret values, so build output is armed
+	// with an empty set here; a later runtime fetch still extends the set for
+	// structural lines. No extra materialize call is ever made for logging.
+	if len(docker.BuildScopedBindings(toScopedBindings(lease.SecretBindings))) == 0 {
+		logs.SetSecrets(nil)
+	}
 	buildResult, err := e.build(ctx, docker.BuildRequest{
 		ContextDir: checkoutResult.ContextDir,
 		Identity: docker.BuiltImageIdentity{
@@ -213,12 +242,15 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		},
 		SecretBindings: docker.BuildScopedBindings(toScopedBindings(lease.SecretBindings)),
 		Materializer:   materializer,
-		Stdout:         e.buildOutput,
-		Stderr:         e.buildOutput,
+		Stdout:         teeWriter{local: e.buildOutput, ship: logs.BuildWriter()},
+		Stderr:         teeWriter{local: e.buildOutput, ship: logs.BuildWriter()},
 	})
 	if err != nil {
-		return e.outcome(lease, false, docker.ClassifyFailure(err))
+		class := docker.ClassifyFailure(err)
+		logs.Linef(logship.StreamPhase, "build: failed (%s)", class)
+		return e.outcome(lease, false, class)
 	}
+	logs.Linef(logship.StreamPhase, "build: complete")
 	// The checkout is no longer needed once the image is built; release its
 	// quota allocation promptly rather than holding it through run+gate.
 	closeCheckout()
@@ -256,7 +288,9 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		Env:           env,
 	}, e.network)
 	if err != nil {
-		return e.outcome(lease, false, docker.ClassifyFailure(err))
+		class := docker.ClassifyFailure(err)
+		logs.Linef(logship.StreamPhase, "run: failed (%s)", class)
+		return e.outcome(lease, false, class)
 	}
 
 	if err := tracker.advance(ctx, progress, lease.AttemptID, lease.Fence, deployment.StatusHealthChecking); err != nil {
@@ -281,16 +315,34 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		Scheme: lease.ContainerScheme,
 	})
 	if err != nil {
-		return e.outcome(lease, false, docker.ClassifyFailure(err))
+		class := docker.ClassifyFailure(err)
+		logs.Linef(logship.StreamHealth, "health gate: error (%s)", class)
+		return e.outcome(lease, false, class)
 	}
 	if !gateResult.Success {
-		return e.outcome(lease, false, docker.ClassifyHealthGateResult(gateResult))
+		class := docker.ClassifyHealthGateResult(gateResult)
+		logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s class=%s)", gateResult.Reason, class)
+		return e.outcome(lease, false, class)
 	}
+	logs.Linef(logship.StreamHealth, "health gate: passed")
 
 	// Health gate passed: run the activation sequence. A completed sequence
 	// is never reported through Complete -- the activation-result report
 	// closes the attempt server-side.
 	return e.activate(ctx, lease, buildResult.ImageDigest)
+}
+
+// teeWriter copies build output to the existing local writer and, additively,
+// to the shipper. The shipper's writer never blocks or fails, so the local
+// writer's result stays authoritative and unchanged.
+type teeWriter struct {
+	local io.Writer
+	ship  io.Writer
+}
+
+func (t teeWriter) Write(p []byte) (int, error) {
+	_, _ = t.ship.Write(p)
+	return t.local.Write(p)
 }
 
 // containerEnv merges runtime-scoped materialized secrets with runtime-

@@ -40,6 +40,12 @@ type secretMaterializer struct {
 	attemptID int64
 	fence     int64
 
+	// onFetched, when set before the first fetch, receives the FULL
+	// materialized value set (all scopes) once, on success only. It is how
+	// log redaction is armed from the existing lazy fetch without adding any
+	// materialize call.
+	onFetched func(values [][]byte)
+
 	once sync.Once
 	all  []agentclient.MaterializedSecret
 	err  error
@@ -52,6 +58,13 @@ func newSecretMaterializer(client controlPlaneSecrets, attemptID, fence int64) *
 func (m *secretMaterializer) fetch(ctx context.Context) ([]agentclient.MaterializedSecret, error) {
 	m.once.Do(func() {
 		m.all, m.err = m.client.MaterializeSecrets(ctx, m.attemptID, m.fence)
+		if m.err == nil && m.onFetched != nil {
+			values := make([][]byte, 0, len(m.all))
+			for _, s := range m.all {
+				values = append(values, []byte(s.Value))
+			}
+			m.onFetched(values)
+		}
 	})
 	return m.all, m.err
 }

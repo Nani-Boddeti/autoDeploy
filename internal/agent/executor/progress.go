@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 
+	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/deployment"
 )
 
@@ -73,6 +74,7 @@ func (r *progressReporter) report(ctx context.Context, attemptID, fence int64, p
 type phaseTracker struct {
 	last    deployment.Status
 	reached bool
+	logs    *logship.Attempt // optional; nil-safe
 }
 
 // advance reports phase through r unless phase is the phase already
@@ -86,5 +88,6 @@ func (t *phaseTracker) advance(ctx context.Context, r *progressReporter, attempt
 	}
 	t.last = phase
 	t.reached = true
+	t.logs.Linef(logship.StreamPhase, "phase: %s", phase)
 	return nil
 }
