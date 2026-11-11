@@ -1702,7 +1702,7 @@ func (h *Handler) securityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Referrer-Policy", "same-origin")
 }
 func loginCookie(value string, now time.Time) *http.Cookie {
 	return &http.Cookie{Name: loginCookieName, Value: value, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: int(auth.LoginEnvelopeMaxAge.Seconds()), Expires: now.Add(auth.LoginEnvelopeMaxAge)}

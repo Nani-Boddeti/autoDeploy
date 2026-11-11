@@ -23,6 +23,20 @@ func TestContentSecurityPolicyIsExact(t *testing.T) {
 	}
 }
 
+// TestReferrerPolicyKeepsSameOriginOrigin pins same-origin: with no-referrer,
+// browsers send "Origin: null" on form POSTs and provenance rejects every
+// login and admin form with 400.
+func TestReferrerPolicyKeepsSameOriginOrigin(t *testing.T) {
+	h, _, _ := serversHandler(t)
+	for _, target := range []string{"/login", "/static/app.css", "/nope"} {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "https://admin.example.test"+target, nil))
+		if got := rr.Header().Get("Referrer-Policy"); got != "same-origin" {
+			t.Fatalf("%s Referrer-Policy = %q", target, got)
+		}
+	}
+}
+
 func TestStylesheetRoute(t *testing.T) {
 	h, _, _ := serversHandler(t)
 	get := func(method, target string) *httptest.ResponseRecorder {

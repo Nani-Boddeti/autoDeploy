@@ -168,7 +168,7 @@ callback. The setup flow uses two one-time server-side capabilities:
 The callback never binds a repository or installation and never mutates authorization directly.
 State and handoff capabilities expire within ten minutes, are stored only by domain-separated
 digest, are single-use under concurrency, and cannot cross users or owners. Callback and landing
-responses use `Cache-Control: no-store`, a no-referrer policy, no third-party resources, and logs
+responses use `Cache-Control: no-store`, a same-origin referrer policy (no-referrer made browsers send `Origin: null` on form POSTs, failing provenance; amended 2026-11-12), no third-party resources, and logs
 that exclude query strings.
 
 ## Durable login throttling
