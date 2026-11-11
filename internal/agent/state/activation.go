@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"autodeploy/internal/github"
+	"autodeploy/internal/runtime/dockerid"
 )
 
 // Pending activation records (tasks/10d-plan.md, 10d-3). A record is written
@@ -75,6 +76,62 @@ type PendingActivation struct {
 	FailureSummary      string   // result_ready && !Succeeded
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
+
+	// Drain obligation inputs (tasks/10e-plan.md, 10e-3). All immutable. Records
+	// written before 10e lack them and decode to zero values, meaning "no
+	// predecessor, nothing to drain".
+	ReleaseID                    string // the new release, from the lease
+	BackendRuntimeInstanceID     string // the new runtime instance, from the activate response
+	PredecessorReleaseID         string // both predecessor ids empty, or both set
+	PredecessorRuntimeInstanceID string
+	DrainSeconds                 int // from the lease; 1..maxDrainSeconds when a predecessor is set
+}
+
+// maxDrainSeconds mirrors the server's frozen drain_seconds bound (1-300).
+const maxDrainSeconds = 300
+
+// HasPredecessor reports whether the activation replaced a running release.
+func (p PendingActivation) HasPredecessor() bool { return p.PredecessorRuntimeInstanceID != "" }
+
+func validRuntimeInstanceID(s string) bool {
+	_, err := dockerid.ContainerName(s)
+	return err == nil
+}
+
+func (p PendingActivation) validateDrainFields() error {
+	bad := func(msg string) error { return fmt.Errorf("%w: %s", ErrInvalidActivation, msg) }
+	if p.PredecessorReleaseID == "" && p.PredecessorRuntimeInstanceID == "" {
+		// No predecessor: nothing will be drained, so the new-release fields
+		// stay as lenient as before 10e (an odd first-activation lease must
+		// not fail the authorized save).
+		return nil
+	}
+	if p.ReleaseID != "" && !github.ValidOpaqueID(p.ReleaseID) {
+		return bad("invalid release id")
+	}
+	if p.BackendRuntimeInstanceID != "" && !validRuntimeInstanceID(p.BackendRuntimeInstanceID) {
+		return bad("invalid backend runtime instance id")
+	}
+	if p.DrainSeconds < 0 || p.DrainSeconds > maxDrainSeconds {
+		return bad("drain seconds out of range")
+	}
+	switch {
+	case p.PredecessorReleaseID == "" || p.PredecessorRuntimeInstanceID == "":
+		return bad("predecessor release and runtime instance ids must be set together")
+	case !github.ValidOpaqueID(p.PredecessorReleaseID):
+		return bad("invalid predecessor release id")
+	case !validRuntimeInstanceID(p.PredecessorRuntimeInstanceID):
+		return bad("invalid predecessor runtime instance id")
+	case p.ReleaseID == "" || p.BackendRuntimeInstanceID == "":
+		return bad("a predecessor requires the new release and backend runtime instance ids")
+	case p.PredecessorRuntimeInstanceID == p.BackendRuntimeInstanceID:
+		return bad("predecessor runtime instance must differ from the backend runtime instance")
+	case p.PredecessorReleaseID == p.ReleaseID:
+		return bad("predecessor release must differ from the release")
+	case p.DrainSeconds < 1:
+		return bad("drain seconds must be 1..300 when a predecessor is set")
+	}
+	return nil
 }
 
 func (p PendingActivation) validate() error {
@@ -94,6 +151,9 @@ func (p PendingActivation) validate() error {
 		return bad("image digest required")
 	case p.RouteRevision <= 0:
 		return bad("route revision must be positive")
+	}
+	if err := p.validateDrainFields(); err != nil {
+		return err
 	}
 	switch p.Phase {
 	case PhaseAuthorized:
@@ -147,6 +207,13 @@ type activationWire struct {
 	FailureSummary      string    `json:"failure_summary"`
 	CreatedAt           time.Time `json:"created_at"`
 	UpdatedAt           time.Time `json:"updated_at"`
+
+	// Absent in records written before 10e: they decode to zero values.
+	ReleaseID                    string `json:"release_id"`
+	BackendRuntimeInstanceID     string `json:"backend_runtime_instance_id"`
+	PredecessorReleaseID         string `json:"predecessor_release_id"`
+	PredecessorRuntimeInstanceID string `json:"predecessor_runtime_instance_id"`
+	DrainSeconds                 int    `json:"drain_seconds"`
 }
 
 func hexDigest(d [32]byte) string { return hex.EncodeToString(d[:]) }
@@ -173,6 +240,10 @@ func (p PendingActivation) marshal() ([]byte, error) {
 		ObservedRouteDigest: hexDigest(p.ObservedRouteDigest),
 		FailureSummary:      p.FailureSummary,
 		CreatedAt:           p.CreatedAt, UpdatedAt: p.UpdatedAt,
+		ReleaseID: p.ReleaseID, BackendRuntimeInstanceID: p.BackendRuntimeInstanceID,
+		PredecessorReleaseID:         p.PredecessorReleaseID,
+		PredecessorRuntimeInstanceID: p.PredecessorRuntimeInstanceID,
+		DrainSeconds:                 p.DrainSeconds,
 	})
 }
 
@@ -208,6 +279,10 @@ func unmarshalActivation(contents []byte) (PendingActivation, error) {
 		Succeeded: w.Succeeded, ObservedRouteDigest: observed,
 		FailureSummary: w.FailureSummary,
 		CreatedAt:      w.CreatedAt.UTC(), UpdatedAt: w.UpdatedAt.UTC(),
+		ReleaseID: w.ReleaseID, BackendRuntimeInstanceID: w.BackendRuntimeInstanceID,
+		PredecessorReleaseID:         w.PredecessorReleaseID,
+		PredecessorRuntimeInstanceID: w.PredecessorRuntimeInstanceID,
+		DrainSeconds:                 w.DrainSeconds,
 	}
 	if err := p.validate(); err != nil {
 		return PendingActivation{}, err
@@ -339,7 +414,11 @@ func (a ActivationStore) SaveActivation(p PendingActivation) error {
 	if existed {
 		if prev.Fence != p.Fence || prev.EnvironmentID != p.EnvironmentID ||
 			prev.OperationID != p.OperationID || prev.RouteDigest != p.RouteDigest ||
-			prev.ImageDigest != p.ImageDigest || prev.RouteRevision != p.RouteRevision {
+			prev.ImageDigest != p.ImageDigest || prev.RouteRevision != p.RouteRevision ||
+			prev.ReleaseID != p.ReleaseID || prev.BackendRuntimeInstanceID != p.BackendRuntimeInstanceID ||
+			prev.PredecessorReleaseID != p.PredecessorReleaseID ||
+			prev.PredecessorRuntimeInstanceID != p.PredecessorRuntimeInstanceID ||
+			prev.DrainSeconds != p.DrainSeconds {
 			return ErrActivationImmutable
 		}
 		if prev.Phase == PhaseResultReady && p.Phase == PhaseAuthorized {

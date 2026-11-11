@@ -5,6 +5,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"autodeploy/internal/agent/state"
@@ -151,5 +152,25 @@ func TestRecoverActivationsAgainstRealStore(t *testing.T) {
 	got, ok, err := acts.LoadActivation(9)
 	if err != nil || !ok || got.Phase != state.PhaseResultReady || got.Succeeded || !strings.Contains(got.FailureSummary, "on-disk route digest: absent") {
 		t.Fatalf("got=%+v ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestRecoverActivationsWithDrainFieldsConvertsToFailureAndArmsNothing(t *testing.T) {
+	rec := authorizedRec(7, "env_a")
+	rec.ReleaseID, rec.BackendRuntimeInstanceID = "rel_new", "7"
+	rec.PredecessorReleaseID, rec.PredecessorRuntimeInstanceID = "rel_old", "6"
+	rec.DrainSeconds = 30
+	f := &recoveryFake{records: []state.PendingActivation{rec}}
+	read := func(string, string) (string, bool, error) { return "", false, nil }
+	if n := recoverActivations(f, "/routes", read, log.New(&strings.Builder{}, "", 0)); n != 1 {
+		t.Fatalf("converted=%d", n)
+	}
+	got := f.saved[0]
+	if got.Phase != state.PhaseResultReady || got.Succeeded || got.PredecessorRuntimeInstanceID != "6" || got.DrainSeconds != 30 {
+		t.Fatalf("record = %+v", got)
+	}
+	// Recovery has no drain-store access, and a failure result never owes a drain.
+	if _, owed := state.DrainFromActivation(got, time.Now()); owed {
+		t.Fatal("recovered failure owes a drain")
 	}
 }

@@ -33,6 +33,12 @@ type activationRecordStore interface {
 	DeleteActivation(attemptID int64) error
 }
 
+// drainArmer records the obligation to stop a predecessor release
+// (tasks/10e-plan.md, 10e-3). state.DrainStore satisfies it.
+type drainArmer interface {
+	ArmDrain(d state.PendingDrain) error
+}
+
 // ActivationReporter delivers every result_ready pending activation to the
 // control plane and keeps retrying until the server gives a TERMINAL answer,
 // across outages and agent restarts (records reload from disk). A record is
@@ -61,6 +67,14 @@ type ActivationReporter struct {
 	Client activationReportClient
 	Store  activationRecordStore
 	Logger *log.Logger
+	// Drains arms the predecessor drain (10e-3). On a 200 answer to a SUCCESS
+	// report of a record with a predecessor the drain is saved BEFORE the
+	// activation record is deleted; if arming fails the record is kept and the
+	// report re-sent next pass (the server answers an identical replay 200
+	// again, and arming an existing identical drain is a no-op that preserves
+	// ArmedAt). No 409 -- even a delete-list one -- ever arms: those do not mean
+	// the server acknowledged a verified success. A nil Drains never arms.
+	Drains drainArmer
 
 	// MinBackoff/MaxBackoff bound the per-record retry delay (defaults 5s/60s).
 	MinBackoff, MaxBackoff time.Duration
@@ -78,6 +92,9 @@ type ActivationReporter struct {
 	// (default 1h); corruptSeen is touched only by the Run goroutine.
 	corruptLogEvery time.Duration
 	corruptSeen     map[string]time.Time
+	// armErrSeen rate-limits the "cannot arm" ERROR per attempt id (a stuck
+	// drain file keeps the activation record forever); Run goroutine only.
+	armErrSeen map[int64]time.Time
 
 	kickOnce sync.Once
 	kick     chan struct{}
@@ -348,6 +365,13 @@ func (r *ActivationReporter) report(ctx context.Context, p state.PendingActivati
 		outage = callTimedOut || errors.Is(err, ErrServiceUnavailable) || errors.Is(err, ErrTransportFailure)
 	}
 
+	if terminal && err == nil {
+		if !r.armDrain(p) {
+			// Keep the activation record: the obligation is not durable yet.
+			r.retryBackoff(tr)
+			return false
+		}
+	}
 	if terminal {
 		if derr := r.Store.DeleteActivation(p.AttemptID); derr != nil {
 			r.logger().Printf("activation reporter: attempt %d: report answered but record delete failed; will retry: %v", p.AttemptID, derr)
@@ -366,6 +390,34 @@ func (r *ActivationReporter) report(ctx context.Context, p state.PendingActivati
 	}
 	r.warnStale(p, tr)
 	return outage
+}
+
+// armDrain persists the drain obligation of an acknowledged (200) success
+// with a predecessor. It reports whether the caller may delete the activation
+// record: true when nothing is owed, the drain store is absent (logged once) or
+// the drain is durable.
+func (r *ActivationReporter) armDrain(p state.PendingActivation) bool {
+	d, owed := state.DrainFromActivation(p, r.clock())
+	if !owed {
+		return true
+	}
+	if r.Drains == nil {
+		r.logger().Printf("activation reporter: ERROR attempt %d: a predecessor drain is owed but no drain store is configured; the predecessor will not be stopped", p.AttemptID)
+		return true
+	}
+	if err := r.Drains.ArmDrain(d); err != nil {
+		if r.armErrSeen == nil {
+			r.armErrSeen = map[int64]time.Time{}
+		}
+		now := r.clock()
+		if last, ok := r.armErrSeen[p.AttemptID]; !ok || now.Sub(last) >= durOr(r.corruptLogEvery, time.Hour) {
+			r.armErrSeen[p.AttemptID] = now
+			r.logger().Printf("activation reporter: ERROR attempt %d: report acknowledged but the predecessor drain could not be armed; keeping the activation record, retrying (further occurrences logged hourly): %v", p.AttemptID, err)
+		}
+		return false
+	}
+	delete(r.armErrSeen, p.AttemptID)
+	return true
 }
 
 func (r *ActivationReporter) warnStale(p state.PendingActivation, tr *reportTrack) {

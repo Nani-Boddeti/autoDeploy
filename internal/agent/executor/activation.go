@@ -91,6 +91,13 @@ type RouteRevisionStore interface {
 	RecordRouteRevision(environmentID string, rev int64) error
 }
 
+// DrainArmer records the obligation to stop the predecessor release after a
+// server-acknowledged success (10e-3). state.DrainStore satisfies it. Optional
+// in ActivationConfig: nil never arms (logged when a drain was owed).
+type DrainArmer interface {
+	ArmDrain(d state.PendingDrain) error
+}
+
 // Kicker wakes the activation reporter. *agentclient.ActivationReporter
 // satisfies it. A nil Kicker is allowed.
 type Kicker interface{ Kick() }
@@ -104,6 +111,8 @@ type ActivationConfig struct {
 	Revisions RouteRevisionStore
 	// Kicker is optional.
 	Kicker Kicker
+	// Drains is optional; see DrainArmer.
+	Drains DrainArmer
 
 	// RouteDir is the Traefik file-provider directory.
 	RouteDir string
@@ -211,6 +220,12 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		ImageDigest:   imageDigest,
 		RouteRevision: resp.RouteRevision,
 		Phase:         state.PhaseAuthorized,
+
+		ReleaseID:                    lease.ReleaseID,
+		BackendRuntimeInstanceID:     resp.BackendRuntimeInstanceID,
+		PredecessorReleaseID:         resp.PredecessorReleaseID,
+		PredecessorRuntimeInstanceID: resp.PredecessorRuntimeInstanceID,
+		DrainSeconds:                 lease.DrainSeconds,
 	}
 	if err := a.cfg.Store.SaveActivation(rec); err != nil {
 		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the authorized record, route untouched: %v", lease.AttemptID, err)
@@ -237,7 +252,18 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		// startup recovery converts it into a result_ready failure with
 		// on-disk evidence for the reporter.
 		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the result record after retries: %v", lease.AttemptID, err)
-		if a.reportDirect(dctx, rec, resultFromRecord(rec)) {
+		// A 200 acknowledgement of a success with a predecessor must first
+		// make the drain durable. If that fails the authorized record stays:
+		// startup recovery then converts it into a failure report (the server
+		// answers that re-send terminally) and the drain is LOST. Accepted
+		// and logged: a stop obligation never outranks the report, and the
+		// predecessor keeps running until an operator stops it.
+		terminal, acked := a.reportDirect(dctx, rec, resultFromRecord(rec))
+		mayDelete := terminal
+		if terminal && acked && !a.armDrainWithRetry(rec) {
+			mayDelete = false
+		}
+		if mayDelete {
 			// The server holds the report or a final decision: drop the
 			// leftover `authorized` record so recovery cannot later re-report
 			// it as a failure. If the delete fails, recovery converts it to a
@@ -356,8 +382,9 @@ func classifyActivateRefusal(err error) (queue.FailureClass, bool) {
 // result_ready record could be persisted: bounded retries on its own
 // detached deadline (ctx's cancellation and expiry are ignored), stopping at
 // any answer the reporter would treat as terminal. It reports whether such a
-// terminal answer was received.
-func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingActivation, result agentclient.ActivationResult) bool {
+// terminal answer was received (terminal) and whether it was a 200
+// acknowledgement (acked; a terminal 409 is not one).
+func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingActivation, result agentclient.ActivationResult) (terminal, acked bool) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), directReportTimeout)
 	defer cancel()
 	backoff := a.reportBackoff
@@ -376,11 +403,46 @@ func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingAc
 			backoff = min(backoff*2, maxReportBackoff)
 		}
 		if err = a.cfg.Client.ReportActivationResult(rctx, rec.AttemptID, rec.Fence, rec.OperationID, result); agentclient.ReportAnswerIsTerminal(err) {
-			return true
+			return true, err == nil
 		}
 	}
 	a.logger.Printf("agent activation ERROR attempt %d: direct report did not land (last: %v); the authorized record stays on disk for startup recovery to convert", rec.AttemptID, err)
+	return false, false
+}
+
+// armDrainWithRetry retries armDrain a few times with short backoff, since a
+// failed arm (fsync, ENOSPC) is often transient.
+func (a *activationRunner) armDrainWithRetry(rec state.PendingActivation) bool {
+	backoff := a.saveBackoff
+	for i := 0; i < defaultSaveAttempts; i++ {
+		if i > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+		if a.armDrain(rec) {
+			return true
+		}
+	}
 	return false
+}
+
+// armDrain persists the predecessor drain of an acknowledged success. It
+// reports whether the caller may delete the authorized record. A missing drain
+// store logs every lost drain at ERROR (making Drains required is 10e-4).
+func (a *activationRunner) armDrain(rec state.PendingActivation) bool {
+	d, owed := state.DrainFromActivation(rec, time.Now())
+	if !owed {
+		return true
+	}
+	if a.cfg.Drains == nil {
+		a.logger.Printf("agent activation ERROR attempt %d: a predecessor drain is owed but no drain store is configured; the predecessor will not be stopped", rec.AttemptID)
+		return true
+	}
+	if err := a.cfg.Drains.ArmDrain(d); err != nil {
+		a.logger.Printf("agent activation ERROR attempt %d: report acknowledged but the predecessor drain could not be armed; keeping the authorized record: %v", rec.AttemptID, err)
+		return false
+	}
+	return true
 }
 
 // switchRoute runs re-render, revision guard, write, verify and probe. It

@@ -27,7 +27,11 @@ predecessor; a stop failure never undoes the activation. Retention/cleanup/rollb
 4. **10e-4 Drainer** (agent goroutine + startup resume): wait `armed_at + drain_seconds` (resume remaining time after
    restart); guards; stop; wait stopped; delete record. Failure -> keep record as `stop_failed` evidence + loud log;
    bounded retry for transient errors only.
-5. **10e-5 Docs**: ADR 0005 amendment + IMPLEMENTATION_STATUS + ADR 0004 note: Activate now does a plain non-locking
+   10e-4 must also: make the drain store REQUIRED in production wiring (reporter + ActivationConfig; fail agent
+   startup if nil); decide on a tombstone so a late re-arm after a completed drain cannot stop the predecessor
+   twice (304 + route-digest guard make it harmless, but record the decision).
+5. **10e-5 Docs**: ADR 0005 amendment + IMPLEMENTATION_STATUS + note that a 10d binary cannot read 10e-written activation records (strict decode; drain them
+   before any downgrade) + ADR 0004 note: Activate now does a plain non-locking
    `release_operations` read (predecessor derivation) after the route head lock.
 
 ## Guards (must never happen)
@@ -61,3 +65,7 @@ wall-clock armed_at, bound the wait by drain_seconds).
   activate op; plain read after the route head lock; replay derives from the stored op). Corrupt state refused
   (no succeeded op; identity equal to candidate). Client requires both keys (absent = malformed; empty = none).
   Review PASS with notes, applied. Integration on fresh PG18 green.
+- 10e-3 durable drain record: armed (ArmDrain: create-or-no-op, never rewinds drainer progress, ArmedAt preserved)
+  only on HTTP 200 to a success report with a predecessor, before the activation record is deleted; reporter and
+  executor direct-report fallback (bounded retry). PendingActivation carries release/backend/predecessor/drain
+  fields (old-shape files still load). Review PASS with notes, applied.
