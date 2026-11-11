@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"html/template"
 	"io"
 	"net"
 	"net/http"
@@ -147,6 +146,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.securityHeaders(w)
 	if r.URL == nil || r.URL.RawPath != "" || r.URL.ForceQuery {
 		http.NotFound(w, r)
+		return
+	}
+	if r.URL.Path == "/static/app.css" {
+		serveStylesheet(w, r)
 		return
 	}
 	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" {
@@ -1660,7 +1663,7 @@ func (h *Handler) newID() (string, error) {
 }
 func (h *Handler) securityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
@@ -1697,10 +1700,6 @@ func methodNotAllowed(w http.ResponseWriter, methods ...string) {
 	w.Header().Set("Allow", strings.Join(methods, ", "))
 	plain(w, http.StatusMethodNotAllowed, "method not allowed\n")
 }
-
-var loginTemplate = template.Must(template.New("login").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy sign in</title></head><body><main><h1>AutoDeploy</h1><form method="post" action="/login"><label>Username <input name="username" autocomplete="username" required></label><label>Password <input name="password" type="password" autocomplete="current-password" required></label><input type="hidden" name="csrf" value="{{.}}"><button type="submit">Sign in</button></form></main></body></html>`))
-var landingTemplate = template.Must(template.New("landing").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy</title></head><body><main><h1>AutoDeploy</h1><p>Control plane ready. Projects, environments, and deployments will appear here.</p><p><a href="/servers">Servers</a></p><form method="post" action="/github/installations/reconcile"><label>GitHub installation ID <input name="installation_id" inputmode="numeric" required></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Refresh GitHub repositories</button></form><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Sign out</button></form></main></body></html>`))
-var githubCompleteTemplate = template.Must(template.New("github-complete").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Confirm GitHub App</title></head><body><main><h1>Confirm GitHub App installation</h1><form method="post" action="/github/setup/complete"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Confirm</button></form></main></body></html>`))
 
 func renderLogin(w http.ResponseWriter, csrf string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1775,7 +1774,6 @@ func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expire
 // 000012). Rotation is deferred to a follow-up agent-initiated rotation
 // protocol; this slice ships register, reissue-before-enrollment, and
 // revoke only.
-var serversTemplate = template.Must(template.New("servers").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AutoDeploy servers</title></head><body><main><h1>Servers</h1><form method="post" action="/servers/register"><label>Name <input name="name" required maxlength="128"></label><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Register server</button></form><table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Created</th><th>Last heartbeat</th><th>Active credential</th><th>Enrollment</th><th>Actions</th></tr></thead><tbody>{{range .Servers}}<tr><td>{{.ID}}</td><td>{{.Name}}</td><td>{{.Status}}</td><td>{{.CreatedAt}}</td><td>{{.LastHeartbeatAt}}</td><td>{{.ActiveCredentialVersion}}</td><td>{{.Enrollment}}</td><td><form method="post" action="/servers/enrollment"><input type="hidden" name="server_id" value="{{.ID}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Reissue enrollment token</button></form><form method="post" action="/servers/revoke"><input type="hidden" name="server_id" value="{{.ID}}"><label>Reason <input name="reason" required maxlength="512"></label><label><input type="checkbox" name="confirm" value="revoke" required> Confirm revoke</label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Revoke</button></form></td></tr>{{end}}</tbody></table><h2>Reconciling environments</h2><table><thead><tr><th>Environment</th><th>Attempt</th><th>Job</th><th>Server</th><th>Since</th><th>Activation</th><th>Actions</th></tr></thead><tbody>{{range .ReconcilingEnvironments}}<tr><td>{{.EnvironmentID}}</td><td>{{.AttemptID}}</td><td>{{.JobID}}</td><td>{{.ServerID}}</td><td>{{.Since}}</td><td>{{.Activation}}</td><td><form method="post" action="/environments/resolve"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><label>Outcome <select name="outcome" required autocomplete="off"><option value="">Choose outcome</option><option value="activated">activated: the route switched</option><option value="not_activated">not_activated: the route did not switch</option><option value="no_activation">no_activation: no activation caused this block</option></select></label><label>Reason <input name="reason" required autocomplete="off" maxlength="{{$.ResolveReasonMax}}"></label><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Resolve</button></form></td></tr>{{end}}</tbody></table><h2>Runtime configuration</h2><form method="get" action="/environments/config"><label>Environment ID <input name="environment_id" required maxlength="128"></label><button type="submit">View / edit configuration</button></form><p><a href="/">Back</a></p></main></body></html>`))
 
 // runtimeConfigView and bindingRow are pre-formatted the same way
 // serverRow/reconcilingRow are: every field is already rendered to text
@@ -1800,10 +1798,9 @@ type runtimeConfigView struct {
 
 // environmentConfigTemplate renders one environment's runtime configuration
 // form (create or CAS-update, depending on whether Exists is true) and its
-// variable bindings with add/remove forms. Plain HTML, no JavaScript, no
-// design system (deferred to the operations UI milestone) -- matches
-// serversTemplate's own conventions exactly.
-var environmentConfigTemplate = template.Must(template.New("environment-config").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment runtime configuration</title></head><body><main><h1>Runtime configuration: {{.EnvironmentID}}</h1>{{if .ConfigError}}<p><strong>{{.ConfigError}}</strong></p>{{end}}{{if not .Exists}}<p>No configuration exists yet for this environment. Fill in the form below to create one.</p>{{end}}<form method="post" action="/environments/config"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Container port <input name="container_port" required maxlength="5" value="{{.Port}}"></label><label>Container scheme <select name="container_scheme"><option value="http" {{if eq .Scheme "http"}}selected{{end}}>http</option><option value="https" {{if eq .Scheme "https"}}selected{{end}}>https</option></select></label><label>Release strategy <select name="release_strategy"><option value="blue_green" {{if eq .Strategy "blue_green"}}selected{{end}}>blue_green</option><option value="stop_then_start" {{if eq .Strategy "stop_then_start"}}selected{{end}}>stop_then_start</option></select></label><label>Drain seconds <input name="drain_seconds" required maxlength="3" value="{{.Drain}}"></label><label>CPU millis <input name="cpu_millis" required maxlength="6" value="{{.CPU}}"></label><label>Memory bytes <input name="memory_bytes" required maxlength="12" value="{{.Memory}}"></label><label>Restart policy <select name="restart_policy"><option value="unless-stopped" {{if eq .Restart "unless-stopped"}}selected{{end}}>unless-stopped</option><option value="on-failure" {{if eq .Restart "on-failure"}}selected{{end}}>on-failure</option></select></label><label>Health gate path <input name="health_gate_path" required maxlength="2048" value="{{.HealthGatePath}}"></label><label>Health gate host <input name="health_gate_host" required maxlength="269" value="{{.HealthGateHost}}"></label><button type="submit">{{if .Exists}}Save configuration{{else}}Create configuration{{end}}</button></form><h2>Variable bindings</h2>{{if .BindingError}}<p><strong>{{.BindingError}}</strong></p>{{end}}<table><thead><tr><th>Variable</th><th>Kind</th><th>Scope</th><th>Value / identity</th><th>Created</th><th>Actions</th></tr></thead><tbody>{{range .Bindings}}<tr><td>{{.VariableName}}</td><td>{{.Kind}}</td><td>{{.Scope}}</td><td>{{.Identity}}</td><td>{{.CreatedAt}}</td><td><form method="post" action="/environments/bindings/remove"><input type="hidden" name="environment_id" value="{{$.EnvironmentID}}"><input type="hidden" name="variable_name" value="{{.VariableName}}"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit">Remove</button></form></td></tr>{{end}}</tbody></table><h3>Add binding</h3><form method="post" action="/environments/bindings/add"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><label>Variable name <input name="variable_name" required maxlength="128" value="{{.BindVariable}}"></label><label>Kind <select name="binding_kind"><option value="secret" {{if eq .BindKind "secret"}}selected{{end}}>secret</option><option value="literal_nonsecret" {{if eq .BindKind "literal_nonsecret"}}selected{{end}}>literal_nonsecret</option></select></label><label>Delivery scope <select name="delivery_scope"><option value="runtime" {{if eq .BindScope "runtime"}}selected{{end}}>runtime</option><option value="build" {{if eq .BindScope "build"}}selected{{end}}>build</option></select></label><label>Secret head ID (kind=secret only) <input name="secret_head_id" maxlength="128" value="{{.BindSecretHeadID}}"></label><label>Literal value (kind=literal_nonsecret only) <input name="literal_value" maxlength="4096" value="{{.BindLiteralValue}}"></label><button type="submit">Add binding</button></form><p><a href="/servers">Back to servers</a></p></main></body></html>`))
+// variable bindings with add/remove forms (templates/environment-config.html).
+// No JavaScript and no inline styles; styling comes only from the shared
+// layout's same-origin stylesheet (templates.go).
 
 type routeHeadView struct {
 	CSRF, EnvironmentID    string
@@ -1825,8 +1822,6 @@ type routeHeadView struct {
 // hostname and acknowledges authority to use it") -- it is never
 // pre-checked and carries no stored value, only a one-time attestation the
 // server requires on every submission.
-var routeHeadTemplate = template.Must(template.New("environment-route").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Environment route</title></head><body><main><h1>Route: {{.EnvironmentID}}</h1>{{if .RouteError}}<p><strong>{{.RouteError}}</strong></p>{{end}}{{if not .Exists}}<p>No route exists yet for this environment. Assign a hostname below to create one.</p>{{else}}<p>Active release: {{if .ActiveReleaseID}}{{.ActiveReleaseID}}{{else}}none{{end}}{{if .ReconciliationRequired}} (reconciliation required){{end}}</p><p>Updated: {{.UpdatedAt}}</p>{{end}}<form method="post" action="/environments/route"><input type="hidden" name="environment_id" value="{{.EnvironmentID}}"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="expected_revision" value="{{.Revision}}"><label>Hostname <input name="hostname" required maxlength="253" value="{{.Hostname}}"></label><label><input type="checkbox" name="acknowledge_authority" value="on" required> I have authority to use this hostname</label><button type="submit">{{if .Exists}}Change hostname{{else}}Assign hostname{{end}}</button></form><p><a href="/environments/config?environment_id={{.EnvironmentID}}">Runtime configuration</a></p></main></body></html>`))
 
 // enrollmentTokenTemplate is rendered exactly once per register/reissue
 // response: the raw enrollment token appears here and nowhere else.
-var enrollmentTokenTemplate = template.Must(template.New("server-enrollment-token").Parse(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Server enrollment token</title></head><body><main><h1>Enrollment token issued</h1><p>This token is shown once and cannot be retrieved again. Copy it now.</p><p>Server ID: {{.ServerID}}</p><p>Token: {{.Token}}</p><p>Expires: {{.ExpiresAt}}</p><p>On the target host, run the agent enrollment command with this server ID and this token before it expires. If it expires or is lost, reissue a new one from the servers page.</p><p><a href="/servers">Back to servers</a></p></main></body></html>`))

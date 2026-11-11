@@ -1,0 +1,1 @@
+{{template "head" "Confirm GitHub App"}}{{template "nav" "github"}}<main><h1>Confirm GitHub App installation</h1><form method="post" action="/github/setup/complete"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Confirm</button></form></main>{{template "foot"}}
