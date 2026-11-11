@@ -109,7 +109,7 @@ a real host (`executorEnabled`/`activationEnabled` stay false). UI has no JS (CS
 
 ### Endpoint `POST /agent/v1/leases/logs`
 - Auth: `h.identity` as progress. Body: `{attempt_id, fence, writer_epoch, chunks:[{stream,seq,body}]}`; dedicated
-  cap 32 KiB (`MaxLogBodyBytes`), <= 32 chunks, strict decode (unknown fields rejected like other handlers), stream
+  cap 64 KiB (`MaxLogBodyBytes`), <= 32 chunks, strict decode (unknown fields rejected like other handlers), stream
   allowlist, body 1..4096 bytes valid UTF-8, seq > 0.
 - Store `AppendLogChunks`: lock active credential (existing helper) -> `SELECT` attempt (server_id must equal caller,
   fence must equal, state leased OR closed_at > now()-30 min) -> insert with `ON CONFLICT (attempt_id,stream,
@@ -187,3 +187,7 @@ inside the 30 min window, network failure modes on a real link, actual secret-le
   - 15g-5: chunk-id keyset can miss a lower id committed late by an overlapping previous attempt's post-close
     window -> render from after=0 once the job is terminal (or document).
   - 15g-6: docs must state no FK (plan Design text still shows REFERENCES).
+- 15g-2 `POST /agent/v1/leases/logs` (auth = progress route; route-only 64 KiB body cap; ≤32 chunks; L5 sanitizer:
+  control chars, PEM, Authorization header/JSON/quoted forms, Bearer, GitHub token shapes, srv/enr tokens; all-empty
+  request -> 400) + client `AppendLogs` (single attempt; 403/404 permanent locally; shared mapStatus untouched;
+  ctx cancel classifies retryable -> shipper must check ctx.Err() itself). Review PASS with notes, both fixed.

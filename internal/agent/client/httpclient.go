@@ -35,6 +35,7 @@ const (
 	pathActivationRes = "/agent/v1/leases/activation-result"
 	pathMaterialize   = "/agent/v1/leases/materialize-secrets"
 	pathProgress      = "/agent/v1/leases/progress"
+	pathLogs          = "/agent/v1/leases/logs"
 	pathCheckoutBegin = "/agent/v1/checkout/begin"
 	pathCheckoutStart = "/agent/v1/checkout/start"
 	pathCheckoutClose = "/agent/v1/checkout/close"

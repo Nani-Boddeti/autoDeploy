@@ -186,6 +186,7 @@ func newTestHandler(pool *pgxpool.Pool) Handler {
 		Canceller:        leases,
 		Reconciler:       leases,
 		ProgressReporter: leases,
+		LogAppender:      postgres.NewDeploymentLogRepository(pool),
 	}
 }
 

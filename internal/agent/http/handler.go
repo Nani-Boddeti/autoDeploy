@@ -40,6 +40,7 @@ const (
 	pathReconcile        = "/agent/v1/environments/reconcile"
 	pathMaterialize      = "/agent/v1/leases/materialize-secrets"
 	pathProgress         = "/agent/v1/leases/progress"
+	pathLogs             = "/agent/v1/leases/logs"
 	pathCheckoutBegin    = "/agent/v1/checkout/begin"
 	pathCheckoutStart    = "/agent/v1/checkout/start"
 	pathCheckoutClose    = "/agent/v1/checkout/close"
@@ -135,6 +136,7 @@ type Handler struct {
 	MaterializationAuthorizer MaterializationAuthorizer
 	SecretMaterializerFactory SecretMaterializerFactory
 	ProgressReporter          ProgressReporter
+	LogAppender               LogAppender
 	CheckoutAuthorizer        CheckoutAuthorizer
 	CheckoutStore             CheckoutReservationStore
 	CheckoutActivator         CheckoutActivator
@@ -205,6 +207,8 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleMaterializeSecrets(w, r)
 	case pathProgress:
 		h.handleProgress(w, r)
+	case pathLogs:
+		h.handleLogs(w, r)
 	case pathCheckoutBegin:
 		h.handleCheckoutBegin(w, r)
 	case pathCheckoutStart:

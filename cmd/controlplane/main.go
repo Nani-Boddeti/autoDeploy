@@ -204,6 +204,7 @@ func run(ctx context.Context) error {
 			// secrets" (agenthttp.handleMaterializeSecrets fails closed).
 			handler.MaterializationAuthorizer = leaseRepository
 			handler.ProgressReporter = leaseRepository
+			handler.LogAppender = postgres.NewDeploymentLogRepository(pool)
 			if activationEnabled {
 				handler.Activator = leaseRepository
 				handler.ActivationReporter = leaseRepository
