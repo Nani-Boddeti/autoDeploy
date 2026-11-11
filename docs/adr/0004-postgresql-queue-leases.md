@@ -767,6 +767,29 @@ Step 10e-2 added one `release_operations` read to `Activate`; checked against
   (the operation is terminal or the ambiguity is durably recorded), which is what lets the agent's reporter
   drop its pending report on it.
 
+### Deployment log upload endpoint (step 15g)
+
+Checked against `internal/store/postgres` (`DeploymentLogRepository`, `LogPurgeScheduler`), the agent log
+handler and migration 000022. Decisions are in `tasks/15g-plan.md`. Nothing here has run on a real host.
+
+- **`POST /agent/v1/leases/logs` takes no slot, job, deployment or attempt lock.** Auth is the same as
+  progress (`h.identity`). The body cap is 64 KiB, applied to this route only. The store locks nothing beyond the
+  shared server/credential `FOR SHARE` (`lockActiveServerCredential`), then reads the attempt and requires
+  the caller's server id and the attempt fence to match. It accepts while the attempt is leased or closed less
+  than 30 minutes ago; the post-close window covers activation (drain lines are not shipped). The only write
+  is the chunk insert plus a totals-row upsert per attempt, which serializes same-attempt cap checks. The slot
+  fence is deliberately not compared: after close the slot may belong to a newer attempt, and the attempt's
+  own fence is the authority. No position is added to the lock order above.
+- **No foreign key from the log tables to `agent_job_attempts`.** A FK insert takes `FOR KEY SHARE` on the
+  attempt row, which conflicts with the lease path's `FOR UPDATE`; attempts are undeletable by trigger, so the FK
+  would add contention and no integrity. Chunks are append-only (UPDATE rejected; DELETE only under the purge
+  GUC `autodeploy.log_purge`, an accident guard, not a security boundary).
+- **Purge is single-flight on its own advisory key.** `LogPurgeScheduler` takes a session try-lock with key
+  `0x61676e745f6c7033` on a dedicated connection (destroyed if the unlock fails), distinct from the sweeper's
+  key, and is triggered asynchronously after each sweeper tick so it never delays lease expiry.
+- **Web cancel reuses `RequestCancellation` unchanged** (step 15d). The job id comes only from the
+  owner-scoped read of the deployment detail, never from the form.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

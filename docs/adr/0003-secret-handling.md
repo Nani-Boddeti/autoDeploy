@@ -464,6 +464,22 @@ Costs:
 - Backup restore succeeds with the separate KEK set and fails safely without it.
 - Deletion tests cover live references, tombstones, WAL/backup retention, and upstream revocation.
 
+## Amendments (2026-11-11)
+
+Step 15g shipped redacted deploy-step logs from the agent to the control plane (`internal/agent/logship`,
+executor wiring, agent log endpoint sanitizer). Decisions are in `tasks/15g-plan.md`.
+
+- **Agent-side exact-value redaction is the primary control.** Order: control characters stripped ->
+  `crypto.RedactingWriter` over the full materialized secret set -> line assembly -> shipper. It is armed only from
+  the existing lazy secret fetch (`secretMaterializer.onFetched`); no extra materialize calls are made. The build
+  stream uses an empty set when the attempt has no build-scoped bindings (the build holds no secrets). A fetch
+  failure suppresses build output rather than shipping it unredacted.
+- **The server pattern sanitizer is defence in depth**: control characters, PEM blocks, Authorization
+  header/JSON/quoted forms, Bearer values, GitHub token shapes and `srv.`/`enr.` tokens are masked before insert.
+- **Residuals.** Encoded or derived forms of a secret are not caught. A runtime-only secret appearing in build
+  output is not masked (it cannot reach the build). The checkout credential is not reachable by the shipper
+  because checkout output is not shipped. A PEM block split across chunks is only partly caught server-side.
+
 ## References
 
 - [Go crypto/cipher package](https://pkg.go.dev/crypto/cipher)

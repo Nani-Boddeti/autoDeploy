@@ -5,6 +5,10 @@
 - 2026-11-11: slice 10 is code-complete through 10e (`59e116d`..`36b0548`, plus the 10e-5 docs commit; origin/main is at
   `a33a8f7`, the 10e commits are local until pushed). 8/18 implementation-sequence outcomes complete; nothing has
   executed on a real host (`executorEnabled` and `activationEnabled` both false).
+- 2026-11-11: step 15 operations UI is partial (`859acc8`..`639f4f8`): projects, deployments list/detail, cancel and
+  deploy-step logs (storage, upload, agent shipper, retention, page) are done; retry (after the real-host run),
+  rollback button (slice 11), container runtime logs, drain log lines and a visual browser check are deferred.
+  Plans: [tasks/15-plan.md](15-plan.md), [tasks/15g-plan.md](15g-plan.md).
 - Next: owner chooses between a real-host run (privileged Linux smoke + minimal packaging to deploy one push end to
   end) and further work (operations UI, observability, slice 11). Hard gates and per-step state:
   [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10"; decisions and follow-ups:

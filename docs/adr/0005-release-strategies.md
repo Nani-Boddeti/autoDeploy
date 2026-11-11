@@ -584,6 +584,17 @@ on-disk digest equals the authorized one.
 - **Still slice 11.** Stop-then-start, retention and cleanup, rollback, and a server-side record of stop
   failures.
 
+### Deployment log retention (step 15g)
+
+- **Caps and retention.** Per attempt: 256 KiB and 4000 rows, then one truncation marker and no further rows.
+  Chunks are purged when their attempt closed more than 14 days ago, but the newest 20 attempts per
+  environment are always kept (both predicates must allow deletion).
+- **Configuration.** `AUTODEPLOY_LOG_RETENTION_MAX_AGE` (default 336h, 1h..365d) and
+  `AUTODEPLOY_LOG_RETENTION_KEEP_NEWEST` (default 20, 1..10000).
+- **Schedule.** Purge runs at most every 10 minutes, in batches of 500 rows, at most 40 batches, within a 30 s
+  budget, under its own advisory key (see ADR 0004). Container runtime logs and drain log lines are not part of
+  this channel.
+
 ## References
 
 - [Traefik file provider](https://doc.traefik.io/traefik/providers/file/)

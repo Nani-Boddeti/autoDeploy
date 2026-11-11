@@ -1,12 +1,12 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-11. Branch: main at 36b0548 (feat: drain and stop the predecessor release after an acknowledged switch). origin/main is at a33a8f7 (through 10d-5b); the five 10e commits (1423393..36b0548) and the 10e-5 docs commit are local until pushed. Slices 9a, 9b and slice 10 through step 10e are committed; slice 10 is code-complete. Migrations run through 000021. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-11. Branch: main at 639f4f8 (feat: add the deployment logs page) plus the step 15 docs commit. origin/main is at cff4d8f (slice 10 complete); step 15 commits (a5818f4..639f4f8 and the docs commit) are local until pushed. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry and rollback deferred). Migrations run through 000022. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
 AutoDeploy replaces Coolify for the owner's private GitHub Dockerfile applications on Hetzner. V1 has one administrator and one initial server but retains owner/project/environment/server scope. The approved stack is Go, PostgreSQL, Docker/BuildKit, and Traefik; routes require HTTPS and environments select health-gated blue/green by default or explicit stop-then-start.
 
-Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is code-complete through 10e: the control plane's fenced activation protocol, Traefik route rendering, the full reconciliation path for an ambiguous traffic switch, the agent's activation sequence (Activate, durable record, route write, Traefik verify, HTTPS probe, persistent result reporter, startup recovery) and the predecessor drain-and-stop are all committed. It has never run on a real host: `cmd/controlplane` keeps `activationEnabled = false` and `cmd/agent` keeps `executorEnabled = false`, so no activation can be authorized and no executor is registered. No outcome tick moves, which is why the count stays 8/18. Remaining: operations UI, observability, packaging, slice 11 (stop-then-start, retention/cleanup, rollback, server-side stop-failure record) and end-to-end validation on a real host. The weighted-effort figure above was last estimated after slice 9b and has not been re-estimated (10c-2b through 10e have not changed it).
+Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is code-complete through 10e: the control plane's fenced activation protocol, Traefik route rendering, the full reconciliation path for an ambiguous traffic switch, the agent's activation sequence (Activate, durable record, route write, Traefik verify, HTTPS probe, persistent result reporter, startup recovery) and the predecessor drain-and-stop are all committed. It has never run on a real host: `cmd/controlplane` keeps `activationEnabled = false` and `cmd/agent` keeps `executorEnabled = false`, so no activation can be authorized and no executor is registered. No outcome tick moves, which is why the count stays 8/18. Remaining: operations UI retry/rollback (list, detail, cancel and logs are done; see "From step 15"), observability, packaging, slice 11 (stop-then-start, retention/cleanup, rollback, server-side stop-failure record) and end-to-end validation on a real host. The weighted-effort figure above was last estimated after slice 9b and has not been re-estimated (10c-2b through 10e have not changed it).
 
 Completed outcomes:
 
@@ -260,6 +260,20 @@ From slice 10 (full list with reasoning in tasks/todo.md step blocks):
 - A failure report after a declared `not_activated` agrees with it but is still answered `integrity_conflict`.
 - The concurrency verification stage (21 activation race tests at `-race -count=20`) takes ~11 minutes and
   needs `-timeout 60m`.
+
+From step 15 (operations UI and deployment logs; plans in tasks/15-plan.md and tasks/15g-plan.md):
+
+- Done (859acc8..639f4f8, migration 000022): projects list, deployments list and detail, cancel (over unchanged
+  `RequestCancellation`), and deploy-step logs: append-only storage with caps, agent upload endpoint, agent
+  shipper with exact-value redaction, retention purge, and the `/deployments/logs` page.
+- Deferred: retry (after the real-host run), rollback button (slice 11), container runtime logs, drain log lines
+  (the drain record lacks the fence), and a visual browser check of the pages (not yet done).
+- Web UI: the CSP gained only `style-src 'self'` (a same-origin embedded stylesheet at `/static/app.css`); no
+  scripts anywhere; live pages poll with meta-refresh (5s detail, 3s logs tail).
+- Add index `agent_jobs(owner_id, created_at DESC)` before scale; the owner-scoped read model seq-scans per owner today.
+- A connection pool of size 1 would starve the log purge scheduler and the sweeper.
+- `Execute` may wait up to about 2.1s on a hung log server (shipper `Close` budget).
+- Gates unchanged: `executorEnabled` and `activationEnabled` are still false and nothing has run on a real host.
 
 ## Resume order and commands
 
