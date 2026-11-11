@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -46,6 +47,26 @@ func TestStopContainerNotFound(t *testing.T) {
 	err := c.StopContainer(context.Background(), stopTestID, time.Second)
 	if !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("err = %v, want ErrContainerNotFound", err)
+	}
+}
+
+func TestInspectContainer404IsNotFoundAndStillAnEngineError(t *testing.T) {
+	c := stopClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"No such container"}`, http.StatusNotFound)
+	}))
+	_, err := c.InspectContainer(context.Background(), stopTestID)
+	var ee *EngineError
+	if !errors.Is(err, ErrContainerNotFound) || !errors.As(err, &ee) || ee.Status != http.StatusNotFound || ee.Class != ErrClassConfiguration {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestClientHasNoRemoveOrKillMethod(t *testing.T) {
+	typ := reflect.TypeOf(&Client{})
+	for i := 0; i < typ.NumMethod(); i++ {
+		if n := typ.Method(i).Name; strings.HasPrefix(n, "Remove") || strings.HasPrefix(n, "Kill") {
+			t.Fatalf("client has forbidden method %s", n)
+		}
 	}
 }
 

@@ -63,6 +63,12 @@ type ActivationDelivery interface {
 	Kick()
 }
 
+// DrainRunner is the predecessor drainer the Agent starts. The executor
+// package's Drainer satisfies it.
+type DrainRunner interface {
+	Run(ctx context.Context) error
+}
+
 // Agent runs the heartbeat loop, and -- only when Executor is non-nil -- the
 // claim/renew/complete lease loop, for one enrolled server identity.
 type Agent struct {
@@ -80,6 +86,9 @@ type Agent struct {
 	// reporter starts and before any Claim, so no executor can own a record it
 	// inspects. The Reporter is kicked right after it.
 	Recover func()
+	// Drainer, when non-nil, is started as a goroutine by Run after Recover and
+	// alongside the reporter, stopped by ctx; Run waits for it to return.
+	Drainer DrainRunner
 
 	// RenewInterval overrides the ADR 0004 30s renewal cadence; zero/negative
 	// uses renewInterval. Production leaves this unset -- it exists so
@@ -120,6 +129,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		}()
 		defer func() { <-done }()
 		a.Reporter.Kick()
+	}
+	if a.Drainer != nil {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := a.Drainer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				a.logger().Printf("agent predecessor drainer stopped: %v", err)
+			}
+		}()
+		defer func() { <-done }()
 	}
 	ticker := time.NewTicker(defaultHeartbeatInterval)
 	defer ticker.Stop()

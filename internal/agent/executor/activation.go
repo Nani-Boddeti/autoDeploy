@@ -92,8 +92,9 @@ type RouteRevisionStore interface {
 }
 
 // DrainArmer records the obligation to stop the predecessor release after a
-// server-acknowledged success (10e-3). state.DrainStore satisfies it. Optional
-// in ActivationConfig: nil never arms (logged when a drain was owed).
+// server-acknowledged success (10e-3). state.DrainStore satisfies it. REQUIRED
+// in ActivationConfig (newActivationRunner rejects nil): without it a
+// predecessor would silently never be stopped.
 type DrainArmer interface {
 	ArmDrain(d state.PendingDrain) error
 }
@@ -111,7 +112,7 @@ type ActivationConfig struct {
 	Revisions RouteRevisionStore
 	// Kicker is optional.
 	Kicker Kicker
-	// Drains is optional; see DrainArmer.
+	// Drains is required; see DrainArmer.
 	Drains DrainArmer
 
 	// RouteDir is the Traefik file-provider directory.
@@ -152,7 +153,7 @@ type activationRunner struct {
 }
 
 func newActivationRunner(cfg ActivationConfig, logger *log.Logger) (*activationRunner, error) {
-	if cfg.Client == nil || cfg.Observer == nil || cfg.Store == nil || cfg.Revisions == nil ||
+	if cfg.Client == nil || cfg.Observer == nil || cfg.Store == nil || cfg.Revisions == nil || cfg.Drains == nil ||
 		cfg.RouteDir == "" || cfg.ProbeAddress == "" || cfg.ProbeTimeout <= 0 {
 		return nil, errors.New("agent executor: incomplete activation configuration")
 	}
@@ -427,8 +428,9 @@ func (a *activationRunner) armDrainWithRetry(rec state.PendingActivation) bool {
 }
 
 // armDrain persists the predecessor drain of an acknowledged success. It
-// reports whether the caller may delete the authorized record. A missing drain
-// store logs every lost drain at ERROR (making Drains required is 10e-4).
+// reports whether the caller may delete the authorized record. newActivationRunner rejects a
+// missing drain store, so the nil branch is a defensive guard that logs every
+// lost drain at ERROR.
 func (a *activationRunner) armDrain(rec state.PendingActivation) bool {
 	d, owed := state.DrainFromActivation(rec, time.Now())
 	if !owed {

@@ -28,15 +28,19 @@ predecessor; a stop failure never undoes the activation. Retention/cleanup/rollb
    restart); guards; stop; wait stopped; delete record. Failure -> keep record as `stop_failed` evidence + loud log;
    bounded retry for transient errors only.
    10e-4 must also: make the drain store REQUIRED in production wiring (reporter + ActivationConfig; fail agent
-   startup if nil); decide on a tombstone so a late re-arm after a completed drain cannot stop the predecessor
-   twice (304 + route-digest guard make it harmless, but record the decision).
-5. **10e-5 Docs**: ADR 0005 amendment + IMPLEMENTATION_STATUS + note that a 10d binary cannot read 10e-written activation records (strict decode; drain them
+   startup if nil); no tombstone (decided 2026-11-11): a late re-arm after a completed drain only re-stops an
+   already-stopped container (304 = success) and the route guard still applies.
+5. **10e-5 Docs**: ADR 0005 amendment + IMPLEMENTATION_STATUS + note: the drainer runs only while the executor is enabled (leftover drains wait); the route guard is checked
+   before stop, so a route change during the stop window is not re-checked (no second activation exists until slice 11)
+   + note that a 10d binary cannot read 10e-written activation records (strict decode; drain them
    before any downgrade) + ADR 0004 note: Activate now does a plain non-locking
    `release_operations` read (predecessor derivation) after the route head lock.
 
 ## Guards (must never happen)
 - Stop the new release: refuse if predecessor runtime instance/release == new; resolve by container name, then
-  require exact labels (managed, runtime kind, owner, environment, server, release id, runtime instance id); exactly
+  require exact labels (managed, runtime kind, environment, release id, runtime instance id — owner/server NOT
+  checked: deviation recorded 2026-11-11, the runtime instance id is the globally unique attempt id and owner/server
+  are not in the drain record); stop by the inspected container ID; exactly
   one match; never an empty selector.
 - Stop without a verified switch: arm only from a 200-acknowledged success with a non-zero observed digest.
 - Stop what the route still serves: before stopping, on-disk route digest must equal the recorded observed digest;
@@ -69,3 +73,7 @@ wall-clock armed_at, bound the wait by drain_seconds).
   only on HTTP 200 to a success report with a predecessor, before the activation record is deleted; reporter and
   executor direct-report fallback (bounded retry). PendingActivation carries release/backend/predecessor/drain
   fields (old-shape files still load). Review PASS with notes, applied.
+- 10e-4 drainer + wiring. Review 1 FAILED: Docker inspect 404 was never ErrContainerNotFound (fakes masked it),
+  so a gone predecessor became permanent stop_failed -> engine now wraps it (still *EngineError 404). Also fixed:
+  backward clock step (monotonic first-seen bound), Drainer.Validate at startup, *docker.Client has no Remove/Kill
+  (reflection test). Re-review PASS. Drain store required; drainer started after Recover; --drain-stop-grace 30s.

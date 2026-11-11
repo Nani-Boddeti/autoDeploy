@@ -109,6 +109,17 @@ type reportTrack struct {
 	lastTry     time.Time // zero: never tried; due records go oldest-try first
 }
 
+// Validate checks the production requirements: a client, a record store and a
+// drain store. Without Drains a predecessor would silently never be stopped, so
+// cmd/agent must call this; a nil Drains stays allowed on a struct literal only
+// for tests that exercise reporting alone.
+func (r *ActivationReporter) Validate() error {
+	if r.Client == nil || r.Store == nil || r.Drains == nil {
+		return errors.New("activation reporter: client, activation store and drain store are required")
+	}
+	return nil
+}
+
 func (r *ActivationReporter) logger() *log.Logger {
 	if r.Logger == nil {
 		return log.Default()

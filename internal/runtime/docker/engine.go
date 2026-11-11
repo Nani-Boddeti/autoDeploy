@@ -457,6 +457,13 @@ type ContainerInspect struct {
 func (c *Client) InspectContainer(ctx context.Context, id string) (ContainerInspect, error) {
 	var out ContainerInspect
 	if err := c.getJSON(ctx, "container-inspect", "/containers/"+url.PathEscape(id)+"/json", &out); err != nil {
+		// A 404 stays an *EngineError (Class, Status unchanged, so existing
+		// callers behave as before) whose cause also matches
+		// ErrContainerNotFound.
+		var ee *EngineError
+		if errors.As(err, &ee) && ee.Status == http.StatusNotFound && !errors.Is(ee.Err, ErrContainerNotFound) {
+			ee.Err = fmt.Errorf("%w: %v", ErrContainerNotFound, ee.Err)
+		}
 		return ContainerInspect{}, err
 	}
 	if out.ID == "" {

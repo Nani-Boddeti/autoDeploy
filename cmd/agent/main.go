@@ -79,6 +79,8 @@ const (
 	defaultTraefikHTTPSAddr       = "127.0.0.1:443"
 	defaultActivationProbePath    = "/"
 	defaultActivationProbeTimeout = 3 * time.Minute
+	defaultDrainStopGrace         = 30 * time.Second
+	maxDrainStopGrace             = 300 * time.Second
 )
 
 func main() {
@@ -131,6 +133,7 @@ type command struct {
 	activationProbePath    string
 	activationProbeTimeout time.Duration // > 0
 	activationTimeout      time.Duration // 0 = derived default
+	drainStopGrace         time.Duration // whole seconds, 1..300s (Step 10e-4)
 }
 
 func parseArgs(args []string) (command, error) {
@@ -223,6 +226,15 @@ func parseArgs(args []string) (command, error) {
 				return command{}, fmt.Errorf("invalid --activation-timeout: %w", err)
 			}
 			c.activationTimeout = d
+		case "--drain-stop-grace":
+			if c.action != "run" {
+				return command{}, errors.New("--drain-stop-grace is only valid for run")
+			}
+			d, err := time.ParseDuration(value)
+			if err != nil {
+				return command{}, fmt.Errorf("invalid --drain-stop-grace: %w", err)
+			}
+			c.drainStopGrace = d
 		default:
 			return command{}, fmt.Errorf("unknown flag %q", flag)
 		}
@@ -245,6 +257,9 @@ func parseArgs(args []string) (command, error) {
 		}
 		if c.activationProbeTimeout == 0 {
 			c.activationProbeTimeout = defaultActivationProbeTimeout
+		}
+		if c.drainStopGrace == 0 {
+			c.drainStopGrace = defaultDrainStopGrace
 		}
 	}
 	return c, nil
@@ -275,6 +290,9 @@ func validateActivationFlags(c command) error {
 	if c.activationTimeout < 0 {
 		return errors.New("--activation-timeout must not be negative")
 	}
+	if c.drainStopGrace < time.Second || c.drainStopGrace > maxDrainStopGrace || c.drainStopGrace%time.Second != 0 {
+		return errors.New("--drain-stop-grace must be whole seconds within 1s..300s")
+	}
 	return nil
 }
 
@@ -283,7 +301,12 @@ type activationParts struct {
 	config   executor.ActivationConfig
 	reporter *agentclient.ActivationReporter
 	recover  func()
+	drainer  *executor.Drainer
 }
+
+// newDrainDocker builds the drainer's Engine client; a variable so tests can
+// run on platforms where the docker runtime is unsupported.
+var newDrainDocker = func(socket string) (executor.DrainDocker, error) { return docker.NewClient(socket) }
 
 // buildActivation validates the activation flags and assembles the durable
 // stores, Traefik observer, reporter, recovery hook and a complete
@@ -304,13 +327,32 @@ func buildActivation(c command, client *agentclient.Client, stateStore state.Sto
 	if err != nil {
 		return activationParts{}, fmt.Errorf("configure traefik observer: %w", err)
 	}
-	reporter := &agentclient.ActivationReporter{Client: client, Store: activations, Logger: logger}
+	drains, err := stateStore.Drains()
+	if err != nil {
+		return activationParts{}, fmt.Errorf("open pending drain state: %w", err)
+	}
+	dockerClient, err := newDrainDocker(c.dockerSocket)
+	if err != nil {
+		return activationParts{}, fmt.Errorf("configure docker engine client: %w", err)
+	}
+	reporter := &agentclient.ActivationReporter{Client: client, Store: activations, Drains: drains, Logger: logger}
+	if err := reporter.Validate(); err != nil {
+		return activationParts{}, err
+	}
+	drainer := &executor.Drainer{
+		Store: drains, Docker: dockerClient, RouteDir: c.traefikRouteDir,
+		Logger: logger, StopGrace: c.drainStopGrace,
+	}
+	if err := drainer.Validate(); err != nil {
+		return activationParts{}, fmt.Errorf("configure predecessor drainer: %w", err)
+	}
 	return activationParts{
 		config: executor.ActivationConfig{
 			Client:       client,
 			Observer:     observer,
 			Store:        activations,
 			Revisions:    revisions,
+			Drains:       drains,
 			Kicker:       reporter,
 			RouteDir:     c.traefikRouteDir,
 			ProbeAddress: c.traefikHTTPSAddr,
@@ -319,6 +361,7 @@ func buildActivation(c command, client *agentclient.Client, stateStore state.Sto
 			Timeout:      c.activationTimeout,
 		},
 		reporter: reporter,
+		drainer:  drainer,
 		recover: func() {
 			executor.RecoverActivations(activations, c.traefikRouteDir, logger)
 		},
@@ -379,6 +422,7 @@ func runAgent(c command, stderr io.Writer) error {
 		agent.Executor = exec
 		agent.Reporter = parts.reporter
 		agent.Recover = parts.recover
+		agent.Drainer = parts.drainer
 	}
 
 	stopped := make(chan os.Signal, 1)

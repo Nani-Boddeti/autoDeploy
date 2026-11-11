@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"autodeploy/internal/agent/executor"
 	"autodeploy/internal/agent/state"
 )
 
@@ -93,7 +94,7 @@ func TestParseArgsActivationDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.traefikRouteDir != "" || c.traefikAPIURL != "http://127.0.0.1:8080" || c.traefikHTTPSAddr != "127.0.0.1:443" ||
-		c.activationProbePath != "/" || c.activationProbeTimeout != 3*time.Minute || c.activationTimeout != 0 {
+		c.activationProbePath != "/" || c.activationProbeTimeout != 3*time.Minute || c.activationTimeout != 0 || c.drainStopGrace != 30*time.Second {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -102,12 +103,12 @@ func TestParseArgsActivationFlags(t *testing.T) {
 	c, err := parseArgs(runArgs(
 		"--traefik-route-dir", "/etc/traefik/dynamic", "--traefik-api-url", "http://localhost:9090",
 		"--traefik-https-addr", "[::1]:8443", "--activation-probe-path", "/healthz",
-		"--activation-probe-timeout", "90s", "--activation-timeout", "10m"))
+		"--activation-probe-timeout", "90s", "--activation-timeout", "10m", "--drain-stop-grace", "45s"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.traefikRouteDir != "/etc/traefik/dynamic" || c.traefikAPIURL != "http://localhost:9090" || c.traefikHTTPSAddr != "[::1]:8443" ||
-		c.activationProbePath != "/healthz" || c.activationProbeTimeout != 90*time.Second || c.activationTimeout != 10*time.Minute {
+		c.activationProbePath != "/healthz" || c.activationProbeTimeout != 90*time.Second || c.activationTimeout != 10*time.Minute || c.drainStopGrace != 45*time.Second {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -116,6 +117,8 @@ func TestParseArgsRejectsBadActivationFlagSyntax(t *testing.T) {
 	for _, args := range [][]string{
 		runArgs("--activation-probe-timeout", "soon"),
 		runArgs("--activation-timeout", "10"),
+		runArgs("--drain-stop-grace", "30"),
+		{"enroll", "--base-url", "https://cp.example", "--server-id", "s", "--state-dir", "/var/lib/agent", "--drain-stop-grace", "30s"},
 		{"enroll", "--base-url", "https://cp.example", "--server-id", "s", "--state-dir", "/var/lib/agent", "--traefik-route-dir", "/x"},
 	} {
 		if _, err := parseArgs(args); err == nil {
@@ -159,6 +162,10 @@ func TestValidateActivationFlagsRejectsInvalidValues(t *testing.T) {
 		"probe timeout zero":       func(c *command) { c.activationProbeTimeout = 0 },
 		"probe timeout negative":   func(c *command) { c.activationProbeTimeout = -time.Second },
 		"activation timeout minus": func(c *command) { c.activationTimeout = -time.Second },
+		"drain grace zero":         func(c *command) { c.drainStopGrace = 0 },
+		"drain grace negative":     func(c *command) { c.drainStopGrace = -time.Second },
+		"drain grace fractional":   func(c *command) { c.drainStopGrace = 1500 * time.Millisecond },
+		"drain grace too long":     func(c *command) { c.drainStopGrace = 301 * time.Second },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -185,7 +192,12 @@ func TestBuildActivationRequiresRouteDir(t *testing.T) {
 	}
 }
 
+type stubDrainDocker struct{ executor.DrainDocker }
+
 func TestBuildActivationAssemblesCompleteConfig(t *testing.T) {
+	orig := newDrainDocker
+	newDrainDocker = func(string) (executor.DrainDocker, error) { return stubDrainDocker{}, nil }
+	defer func() { newDrainDocker = orig }()
 	c := validActivationCommand(t)
 	c.activationTimeout = 20 * time.Minute
 	st, err := state.New(t.TempDir())
@@ -199,8 +211,37 @@ func TestBuildActivationAssemblesCompleteConfig(t *testing.T) {
 	cfg := parts.config
 	if cfg.Store == nil || cfg.Revisions == nil || cfg.Observer == nil || cfg.Kicker == nil || cfg.RouteDir != c.traefikRouteDir ||
 		cfg.ProbeAddress != c.traefikHTTPSAddr || cfg.ProbePath != "/" || cfg.ProbeTimeout != 3*time.Minute || cfg.Timeout != 20*time.Minute ||
-		parts.reporter == nil || parts.recover == nil {
+		cfg.Drains == nil || parts.reporter == nil || parts.reporter.Drains == nil || parts.recover == nil ||
+		parts.drainer == nil || parts.drainer.StopGrace != 30*time.Second || parts.drainer.RouteDir != c.traefikRouteDir ||
+		parts.drainer.Store == nil || parts.drainer.Docker == nil {
 		t.Fatalf("incomplete wiring: %+v", parts)
 	}
 	parts.recover() // empty store: must be a harmless no-op
+}
+
+func TestValidateActivationFlagsAcceptsGraceBounds(t *testing.T) {
+	for _, g := range []time.Duration{time.Second, 300 * time.Second} {
+		c := validActivationCommand(t)
+		c.drainStopGrace = g
+		if err := validateActivationFlags(c); err != nil {
+			t.Fatalf("grace %s: %v", g, err)
+		}
+	}
+}
+
+func TestBuildActivationRejectsMisconfiguredDrainer(t *testing.T) {
+	orig := newDrainDocker
+	newDrainDocker = func(string) (executor.DrainDocker, error) { return stubDrainDocker{}, nil }
+	defer func() { newDrainDocker = orig }()
+	c := validActivationCommand(t)
+	// Bypasses flag validation to prove the drainer's own Validate gates startup.
+	c.drainStopGrace = 30 * time.Second
+	st, err := state.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDrainDocker = func(string) (executor.DrainDocker, error) { return nil, nil }
+	if _, err := buildActivation(c, nil, st, log.New(io.Discard, "", 0)); err == nil || !strings.Contains(err.Error(), "drainer") {
+		t.Fatalf("err = %v, want a drainer configuration error", err)
+	}
 }

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -97,6 +98,7 @@ func TestSaveDrainValidation(t *testing.T) {
 		"attempts neg":     mut(func(p *PendingDrain) { p.Attempts = -1 }),
 		"unknown phase":    mut(func(p *PendingDrain) { p.Phase = "x" }),
 		"pending+summary":  mut(func(p *PendingDrain) { p.FailureSummary = "x" }),
+		"pending+retry":    mut(func(p *PendingDrain) { p.Retryable = true }),
 		"failed no summ":   mut(func(p *PendingDrain) { p.Phase = DrainStopFailed }),
 		"failed long":      mut(func(p *PendingDrain) { p.Phase, p.FailureSummary = DrainStopFailed, strings.Repeat("a", 2049) }),
 		"failed bad utf8":  mut(func(p *PendingDrain) { p.Phase, p.FailureSummary = DrainStopFailed, "a\xffb" }),
@@ -439,5 +441,51 @@ func TestDrainFromActivation(t *testing.T) {
 		if _, owed := DrainFromActivation(p, armed); owed {
 			t.Fatalf("%s: drain owed", name)
 		}
+	}
+}
+
+func TestDrainRetryableRoundTripsAndIsAMutableField(t *testing.T) {
+	_, d := newDrains(t)
+	p := drainRec(1)
+	p.Phase, p.FailureSummary, p.Attempts, p.Retryable = DrainStopFailed, "boom", 1, true
+	if err := d.SaveDrain(p); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := d.LoadDrain(1)
+	if !got.Retryable {
+		t.Fatal("Retryable lost")
+	}
+	p.Retryable = false // same phase/summary/attempts: must still be written
+	if err := d.SaveDrain(p); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = d.LoadDrain(1)
+	if got.Retryable {
+		t.Fatal("Retryable change was treated as a no-op")
+	}
+}
+
+func TestDrainFileWithoutRetryableStillLoads(t *testing.T) {
+	root, d := newDrains(t)
+	if err := d.SaveDrain(drainRec(1)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "drains", "attempt-1.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "retryable")
+	old, _ := json.Marshal(m)
+	if err := os.WriteFile(path, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := d.LoadDrain(1)
+	if err != nil || !ok || got.Retryable || got.Phase != DrainPending {
+		t.Fatalf("old-shape file: %+v ok=%v err=%v", got, ok, err)
 	}
 }

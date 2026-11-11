@@ -147,3 +147,21 @@ func TestDirectReportArmRetriesTransientFailure(t *testing.T) {
 		t.Fatalf("armed=%d deleted=%v arm calls=%d", len(arm.armed), f.deleted, len(arm.deletedSeen))
 	}
 }
+
+// noopArmer satisfies the required DrainArmer for tests that do not exercise
+// arming.
+type noopArmer struct{}
+
+func (noopArmer) ArmDrain(state.PendingDrain) error { return nil }
+
+func TestNewActivationRunnerRequiresDrains(t *testing.T) {
+	f := newActFake(testLease())
+	cfg := f.runner().cfg
+	if _, err := newActivationRunner(cfg, testLogger()); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Drains = nil
+	if _, err := newActivationRunner(cfg, testLogger()); err == nil {
+		t.Fatal("nil Drains accepted")
+	}
+}

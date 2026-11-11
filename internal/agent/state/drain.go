@@ -64,7 +64,11 @@ type PendingDrain struct {
 	Phase                                              DrainPhase
 	FailureSummary                                     string // stop_failed only
 	Attempts                                           int    // stop attempts so far (the drainer increments)
-	CreatedAt, UpdatedAt                               time.Time
+	// Retryable is meaningful only in stop_failed (false in pending): the
+	// drainer may try again. Permanent failures (guard refusals, configuration
+	// errors, exhausted attempts) are kept as non-retryable evidence.
+	Retryable            bool
+	CreatedAt, UpdatedAt time.Time
 }
 
 // DrainFromActivation derives the drain obligation of a successful result_ready
@@ -119,6 +123,9 @@ func (d PendingDrain) validate() error {
 		if d.FailureSummary != "" {
 			return bad("pending drain must not carry a failure summary")
 		}
+		if d.Retryable {
+			return bad("pending drain must not be marked retryable")
+		}
 	case DrainStopFailed:
 		if d.FailureSummary == "" || len(d.FailureSummary) > maxDrainSummaryLn {
 			return bad("failure summary must be 1..2048 bytes")
@@ -146,6 +153,7 @@ type drainWire struct {
 	Phase                        string    `json:"phase"`
 	FailureSummary               string    `json:"failure_summary"`
 	Attempts                     int       `json:"attempts"`
+	Retryable                    bool      `json:"retryable"`
 	CreatedAt                    time.Time `json:"created_at"`
 	UpdatedAt                    time.Time `json:"updated_at"`
 }
@@ -159,7 +167,7 @@ func (d PendingDrain) marshal() ([]byte, error) {
 		DrainSeconds:                 d.DrainSeconds, ArmedAt: d.ArmedAt,
 		ObservedRouteDigest: hexDigest(d.ObservedRouteDigest),
 		Phase:               string(d.Phase), FailureSummary: d.FailureSummary,
-		Attempts: d.Attempts, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+		Attempts: d.Attempts, Retryable: d.Retryable, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
 	})
 }
 
@@ -179,7 +187,7 @@ func unmarshalDrain(contents []byte) (PendingDrain, error) {
 		PredecessorRuntimeInstanceID: w.PredecessorRuntimeInstanceID,
 		DrainSeconds:                 w.DrainSeconds, ArmedAt: w.ArmedAt.UTC(),
 		ObservedRouteDigest: observed, Phase: DrainPhase(w.Phase),
-		FailureSummary: w.FailureSummary, Attempts: w.Attempts,
+		FailureSummary: w.FailureSummary, Attempts: w.Attempts, Retryable: w.Retryable,
 		CreatedAt: w.CreatedAt.UTC(), UpdatedAt: w.UpdatedAt.UTC(),
 	}
 	if err := d.validate(); err != nil {
@@ -311,7 +319,7 @@ func (d DrainStore) save(p PendingDrain, arm bool) error {
 		}
 		p.ArmedAt = prev.ArmedAt
 		p.CreatedAt = prev.CreatedAt
-		if p.Phase == prev.Phase && p.FailureSummary == prev.FailureSummary && p.Attempts == prev.Attempts {
+		if p.Phase == prev.Phase && p.FailureSummary == prev.FailureSummary && p.Attempts == prev.Attempts && p.Retryable == prev.Retryable {
 			return nil
 		}
 	} else {

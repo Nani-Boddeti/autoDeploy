@@ -639,7 +639,7 @@ func TestNewExecutorSucceedsWhenBothProbesPass(t *testing.T) {
 func testActivationConfig() *ActivationConfig {
 	f := newActFake(testLease())
 	return &ActivationConfig{
-		Client: f, Observer: f, Store: f, Revisions: f,
+		Client: f, Observer: f, Store: f, Revisions: f, Drains: noopArmer{},
 		RouteDir: "/route-dir", ProbeAddress: "127.0.0.1:443", ProbePath: "/", ProbeTimeout: time.Second,
 	}
 }

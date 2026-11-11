@@ -162,7 +162,7 @@ func (f *actFake) Kick() { f.kicks++ }
 func (f *actFake) runner() *activationRunner {
 	a := &activationRunner{
 		cfg: ActivationConfig{
-			Client: f, Observer: f, Store: f, Revisions: f, Kicker: f,
+			Client: f, Observer: f, Store: f, Revisions: f, Kicker: f, Drains: noopArmer{},
 			RouteDir: "/route-dir", ProbeAddress: "127.0.0.1:443", ProbePath: "/", ProbeTimeout: time.Second,
 		},
 		write: func(_ string, r traefik.EnvironmentRoute) (traefik.WriteResult, error) {
