@@ -697,3 +697,83 @@ WHERE a.job_id=$1 AND c.id>$2 ORDER BY c.id LIMIT 201`, f.jobID, int64(0))
 		t.Fatalf("newest-per-environment lookup does not use agent_job_attempts_environment_id_idx when seq scans are disabled")
 	}
 }
+
+// TestLogPurgeSchedulerThroughSweeperWiring drives the real sweeper tick loop
+// (real pool, advisory locks, repository) and proves old attempts are purged
+// while the newest 20 per environment, young attempts and the live attempt
+// survive; a second scheduler proves the single-runner try-lock.
+func TestLogPurgeSchedulerThroughSweeperWiring(t *testing.T) {
+	f := newLogFixture(t, 181)
+	ctx := context.Background()
+	if _, err := f.append(ctx, 1, lines("build", 1, 3, "live")...); err != nil {
+		t.Fatal(err)
+	}
+	purgeable, protected := f.seedRetentionSet(t, 3)
+
+	// Single runner: while another session holds the purge lock, a run skips.
+	holder, err := f.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got bool
+	if err = holder.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, deploymentLogPurgeAdvisoryLockKey).Scan(&got); err != nil || !got {
+		t.Fatalf("holder lock = %v, %v", got, err)
+	}
+	sched, err := NewLogPurgeScheduler(f.pool, f.logs, LogPurgeOptions{Retention: DefaultLogRetention, Every: time.Millisecond, BatchSize: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched.Trigger(ctx)
+	sched.Wait(10 * time.Second)
+	if chunks, _ := f.liveAttempts(t); chunks[purgeable[0]] == 0 {
+		t.Fatal("purge ran while another session held the lock")
+	}
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_unlock($1)`, deploymentLogPurgeAdvisoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	holder.Release()
+
+	// Real sweeper wiring: ticks run lease duties, then the purge drains in
+	// 4-row batches until nothing purgeable remains.
+	sweeper := NewAgentLeaseSweeper(f.pool, NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))).WithTick(10 * time.Millisecond).WithLogPurge(sched)
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); sweeper.Run(runCtx) }()
+	deadline := time.After(20 * time.Second)
+	for {
+		chunks, _ := f.liveAttempts(t)
+		remaining := 0
+		for _, id := range purgeable {
+			remaining += chunks[id]
+		}
+		if remaining == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("purgeable chunks remaining = %d", remaining)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+	chunks, totals := f.liveAttempts(t)
+	for _, id := range purgeable {
+		if _, ok := totals[id]; ok {
+			t.Fatalf("purged attempt %d kept totals", id)
+		}
+	}
+	for _, id := range protected {
+		if chunks[id] != 3 || totals[id] != 3 {
+			t.Fatalf("protected attempt %d chunks=%d totals=%d", id, chunks[id], totals[id])
+		}
+	}
+	if chunks[f.attemptID] != 3 {
+		t.Fatalf("live attempt chunks = %d", chunks[f.attemptID])
+	}
+	var held bool
+	if err = f.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND granted AND objid=$1)`, int32(deploymentLogPurgeAdvisoryLockKey&0xffffffff)).Scan(&held); err != nil || held {
+		t.Fatalf("purge advisory lock leaked: held=%v err=%v", held, err)
+	}
+}

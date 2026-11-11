@@ -200,3 +200,7 @@ inside the 30 min window, network failure modes on a real link, actual secret-le
   -> fixed -> re-review PASS. Gaps for 15g-6 docs: drain lines not shipped (drain record lacks fence); checkout
   credential not reachable (checkout output not shipped); runtime-only secret in build output not masked (cannot
   reach build); encoded forms residual; Execute may wait up to ~2.1s on a hung log server.
+- 15g-4 `LogPurgeScheduler` triggered async after each sweeper tick (non-blocking; ≤ every 10 min; 500 × ≤40
+  batches, 30s budget; own session try-lock key 0x61676e745f6c7033 on a dedicated conn, conn destroyed if unlock
+  fails); env `AUTODEPLOY_LOG_RETENTION_MAX_AGE` (336h, 1h..365d) / `AUTODEPLOY_LOG_RETENTION_KEEP_NEWEST` (20,
+  1..10000). Review PASS with notes (pool of 1 would starve; no recover, matches repo).

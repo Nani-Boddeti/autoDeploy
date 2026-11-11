@@ -263,3 +263,28 @@ func tempDir(t *testing.T) string {
 	t.Cleanup(func() { _ = os.RemoveAll(path) })
 	return path
 }
+
+func TestAgentConfigLogRetention(t *testing.T) {
+	got, err := config.AgentConfigFromEnvironment()
+	if err != nil || got.LogRetentionMaxAge != 14*24*time.Hour || got.LogRetentionKeepNewest != 20 {
+		t.Fatalf("defaults %#v err %v", got, err)
+	}
+	t.Setenv(config.LogRetentionMaxAgeEnv, "48h")
+	t.Setenv(config.LogRetentionKeepNewestEnv, "5")
+	if got, err = config.AgentConfigFromEnvironment(); err != nil || got.LogRetentionMaxAge != 48*time.Hour || got.LogRetentionKeepNewest != 5 {
+		t.Fatalf("custom %#v err %v", got, err)
+	}
+	for _, age := range []string{"bogus", "0s", "30m", "59m", "8761h"} {
+		t.Setenv(config.LogRetentionMaxAgeEnv, age)
+		if _, err = config.AgentConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+			t.Fatalf("age %q err %v", age, err)
+		}
+	}
+	t.Setenv(config.LogRetentionMaxAgeEnv, "")
+	for _, keep := range []string{"0", "-1", "x", "10001"} {
+		t.Setenv(config.LogRetentionKeepNewestEnv, keep)
+		if _, err = config.AgentConfigFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) {
+			t.Fatalf("keep %q err %v", keep, err)
+		}
+	}
+}

@@ -225,7 +225,14 @@ func run(ctx context.Context) error {
 			agentHandler = handler
 		}
 		sweepLogger, _ := controlplaneLogger(os.Stderr, nil)
-		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { sweepLogger.Print("agent lease sweep failed") })
+		logPurger, purgeErr := postgres.NewLogPurgeScheduler(pool, postgres.NewDeploymentLogRepository(pool), postgres.LogPurgeOptions{
+			Retention: postgres.LogRetention{MaxAge: agentConfig.LogRetentionMaxAge, KeepNewestPerEnv: agentConfig.LogRetentionKeepNewest},
+			OnError:   func() { sweepLogger.Print("deployment log purge failed") },
+		})
+		if purgeErr != nil {
+			return purgeErr
+		}
+		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { sweepLogger.Print("agent lease sweep failed") }).WithLogPurge(logPurger)
 	}
 	handler, err := web.New(repository, webOptions)
 	if err != nil {

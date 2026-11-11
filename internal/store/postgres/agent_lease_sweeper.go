@@ -26,6 +26,8 @@ type AgentLeaseSweeper struct {
 	tick    time.Duration
 	batch   int
 	onError func()
+	purge   *LogPurgeScheduler
+	sweepFn func(context.Context) (int, error) // tests only; nil = SweepOnce
 }
 
 // NewAgentLeaseSweeper constructs a sweeper with the ADR 0004 V1 defaults:
@@ -61,6 +63,14 @@ func (s *AgentLeaseSweeper) WithErrorHandler(onError func()) *AgentLeaseSweeper 
 	return s
 }
 
+// WithLogPurge attaches the deployment-log retention scheduler. It is
+// triggered after each tick's lease duties, never blocks the tick, and its
+// failures never fail a sweep (it reports through its own OnError).
+func (s *AgentLeaseSweeper) WithLogPurge(p *LogPurgeScheduler) *AgentLeaseSweeper {
+	s.purge = p
+	return s
+}
+
 // Run polls until ctx is cancelled. It never returns an error; a failed tick
 // is reported to the error handler, if any, and retried on the next tick.
 func (s *AgentLeaseSweeper) Run(ctx context.Context) {
@@ -69,11 +79,18 @@ func (s *AgentLeaseSweeper) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			s.purge.Wait(5 * time.Second)
 			return
 		case <-ticker.C:
-			if _, err := s.SweepOnce(ctx); err != nil && ctx.Err() == nil && s.onError != nil {
+			sweep := s.SweepOnce
+			if s.sweepFn != nil {
+				sweep = s.sweepFn
+			}
+			if _, err := sweep(ctx); err != nil && ctx.Err() == nil && s.onError != nil {
 				s.onError()
 			}
+			// After the lease/activation duties, regardless of their outcome.
+			s.purge.Trigger(ctx)
 		}
 	}
 }

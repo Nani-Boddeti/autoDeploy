@@ -47,6 +47,8 @@ const (
 	GitHubWebhookRetainedSecretFilesEnv = "AUTODEPLOY_GITHUB_WEBHOOK_RETAINED_SECRET_FILES"
 	AgentEnabledEnv                     = "AUTODEPLOY_AGENT_ENABLED"
 	AgentSweepIntervalEnv               = "AUTODEPLOY_AGENT_SWEEP_INTERVAL"
+	LogRetentionMaxAgeEnv               = "AUTODEPLOY_LOG_RETENTION_MAX_AGE"
+	LogRetentionKeepNewestEnv           = "AUTODEPLOY_LOG_RETENTION_KEEP_NEWEST"
 )
 
 // defaultAgentSweepInterval matches ADR 0004's V1 sweeper default (Step 4).
@@ -55,6 +57,17 @@ const defaultAgentSweepInterval = 15 * time.Second
 const (
 	minAgentSweepInterval = 5 * time.Second
 	maxAgentSweepInterval = 5 * time.Minute
+)
+
+// Deployment log retention (15g L4): owner defaults 14 days / newest 20 attempts
+// per environment. The minimum age must stay above the 30-minute post-close
+// append window (the store scheduler re-validates).
+const (
+	defaultLogRetentionMaxAge     = 14 * 24 * time.Hour
+	minLogRetentionMaxAge         = time.Hour
+	maxLogRetentionMaxAge         = 365 * 24 * time.Hour
+	defaultLogRetentionKeepNewest = 20
+	maxLogRetentionKeepNewest     = 10000
 )
 
 var ErrInvalidEnvironment = errors.New("invalid database configuration")
@@ -178,8 +191,10 @@ func safeGitHubText(s string, max int) bool {
 // package; only whether the routes/sweeper run, and how often the sweeper
 // ticks, is configured here.
 type AgentConfig struct {
-	Enabled       bool
-	SweepInterval time.Duration
+	Enabled                bool
+	SweepInterval          time.Duration
+	LogRetentionMaxAge     time.Duration
+	LogRetentionKeepNewest int
 }
 
 // AgentConfigFromEnvironment mirrors GitHubAppConfigFromEnvironment's
@@ -202,7 +217,23 @@ func AgentConfigFromEnvironment() (AgentConfig, error) {
 		}
 		interval = parsed
 	}
-	return AgentConfig{Enabled: enabled, SweepInterval: interval}, nil
+	maxAge := defaultLogRetentionMaxAge
+	if raw := os.Getenv(LogRetentionMaxAgeEnv); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed < minLogRetentionMaxAge || parsed > maxLogRetentionMaxAge {
+			return AgentConfig{}, ErrInvalidEnvironment
+		}
+		maxAge = parsed
+	}
+	keepNewest := defaultLogRetentionKeepNewest
+	if raw := os.Getenv(LogRetentionKeepNewestEnv); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxLogRetentionKeepNewest {
+			return AgentConfig{}, ErrInvalidEnvironment
+		}
+		keepNewest = parsed
+	}
+	return AgentConfig{Enabled: enabled, SweepInterval: interval, LogRetentionMaxAge: maxAge, LogRetentionKeepNewest: keepNewest}, nil
 }
 
 // DatabaseURLFromEnvironment reads a database URL only from the configured credential file.
