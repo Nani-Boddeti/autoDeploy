@@ -1,12 +1,12 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-10. Branch: main at 6c06bfd (fix: mount the postgres 18 volume at /var/lib/postgresql), **pushed to origin/main**; nothing is unpushed. Slices 9a, 9b and slice 10 through step 10c-2b I (10c-2b complete) are committed. Migrations run through 000021. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-11. Branch: main at 36b0548 (feat: drain and stop the predecessor release after an acknowledged switch). origin/main is at a33a8f7 (through 10d-5b); the five 10e commits (1423393..36b0548) and the 10e-5 docs commit are local until pushed. Slices 9a, 9b and slice 10 through step 10e are committed; slice 10 is code-complete. Migrations run through 000021. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
 AutoDeploy replaces Coolify for the owner's private GitHub Dockerfile applications on Hetzner. V1 has one administrator and one initial server but retains owner/project/environment/server scope. The approved stack is Go, PostgreSQL, Docker/BuildKit, and Traefik; routes require HTTPS and environments select health-gated blue/green by default or explicit stop-then-start.
 
-Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is in progress: the control plane's fenced activation protocol, Traefik route rendering, and the full reconciliation path for an ambiguous traffic switch are committed, but `cmd/controlplane` keeps `activationEnabled = false`, so no activation can be authorized. The agent side of activation (10d), drain/stop (10e), operations UI, observability, packaging, and end-to-end validation remain. The weighted-effort figure above was last estimated after slice 9b and has not been re-estimated.
+Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is code-complete through 10e: the control plane's fenced activation protocol, Traefik route rendering, the full reconciliation path for an ambiguous traffic switch, the agent's activation sequence (Activate, durable record, route write, Traefik verify, HTTPS probe, persistent result reporter, startup recovery) and the predecessor drain-and-stop are all committed. It has never run on a real host: `cmd/controlplane` keeps `activationEnabled = false` and `cmd/agent` keeps `executorEnabled = false`, so no activation can be authorized and no executor is registered. No outcome tick moves, which is why the count stays 8/18. Remaining: operations UI, observability, packaging, slice 11 (stop-then-start, retention/cleanup, rollback, server-side stop-failure record) and end-to-end validation on a real host. The weighted-effort figure above was last estimated after slice 9b and has not been re-estimated (10c-2b through 10e have not changed it).
 
 Completed outcomes:
 
@@ -176,22 +176,44 @@ Committed:
 | 10c-2b H1 | Agent reconcile endpoint requires `outcome`; terminal 409 `outcome_mismatch` / `activation_unresolved` | 231b4ad |
 | 10c-2b H2 | Operator resolve form declares an outcome via `ResolveActivation` | c030d02 |
 | 10c-2b H3 | Superseded `Reconcile` / `MarkReconciled` removed after porting unique assertions | 1e92f75..e7b55a5 |
-| 10c-2b I | ADR 0004 amendment: sweeper diversion, `release_operations` lock position, resolution paths | (this commit) |
+| 10c-2b I | ADR 0004 amendment: sweeper diversion, `release_operations` lock position, resolution paths | e6a16bc |
+| 10d-1 | Agent client: typed 409 conflict codes (`ConflictError`, `ConflictCode`), `Activate`, `ReportActivationResult` | 59e116d |
+| 10d-2 | HTTPS data-plane probe for a switched route (`runtime/traefik/probe.go`) | cfec942 |
+| 10d-3 | Durable pending-activation records and the local route-revision guard (`agent/state`) | 2e2de1b |
+| 10d-4 | Persistent activation-result reporter (delete only on a terminal answer); server answers an operation-id mismatch with 409 `operation_mismatch` | d99970a, 736e3ad |
+| 10d-5a | Executor activation sequence after a passing health gate | c1d4357 |
+| 10d-5b | Startup recovery of stranded `authorized` records, reporter started in `Agent.Run`, activation flags | a33a8f7 |
+| 10e-1 | Engine `StopContainer` and fail-closed `WaitStopped`; plan 10e | 1423393, 3e83f79 |
+| 10e-2 | Activate response names the predecessor release and runtime instance | df7d228 |
+| 10e-3 | Durable drain record, armed only on a 200-acknowledged success report | e52ab4f |
+| 10e-4 | Drainer: guarded stop of the predecessor after `drain_seconds`, resumed across restarts | 36b0548 |
+| 10e-5 | ADR 0005 and ADR 0004 amendments, this status refresh | (this commit) |
 
-Remaining in slice 10:
+Slice 10 code-complete; not yet run on a real host.
 
-- **10d**: agent-side activation — render/verify the route document, switch, report; a **persistent** retry
-  for the result report (the client retries only ~3s today); the agent deciding which outcome to declare.
-- **10e**: drain and stop the previous release.
-
-Hard gates before `activationEnabled` may flip (detail in tasks/todo.md):
+Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agent) may flip (detail in tasks/todo.md, tasks/10d-plan.md and tasks/10e-plan.md "Follow-ups"):
 
 1. The privileged Linux checkout smoke (owner only; macOS cannot substitute).
-2. 10d's persistent result-report retry.
+2. ~~10d's persistent result-report retry~~ done in 10d-4 (`d99970a`); still unproven against a real control-plane outage.
 3. Traefik API authentication (ADR 0005 says authenticated; the 10b client is unauthenticated loopback),
    and Traefik's JSON shapes and reload timing observed against a real Traefik.
 4. Both resolution paths (operator `ResolveActivation`, agent `ReconcileActivation`) can resolve an activation;
    that is safe only while no activate operations exist, i.e. while the gate is false. Re-check before flipping.
+5. Fence `Store.path`: `ValidOpaqueID` allows 128 bytes and `encodeName` can expand x3, exceeding the 255-byte
+   file-name limit for long environment ids (the route-revision store already refuses these). Fix before flipping.
+6. The agent-local `ReconciliationRequired` flag set on a stale renewal is never cleared, so this agent refuses
+   that environment forever even after an operator resolves it. Design a clearing rule before flipping.
+7. Activation recovery runs only at agent startup: a double failure (result save and direct report both fail)
+   leaves an `authorized` record unreported until restart. Consider a between-leases recovery pass.
+8. `validateActivationFlags` does not check `--activation-timeout` against probe + verify + 30s (`NewExecutor`
+   does, after the Docker probe) or route-dir writability. Both fail closed.
+9. The recovery failure summary truncates from the tail; a reason-capped builder would be sturdier (low).
+10. A drain whose arming fails after a direct activation report is lost (the authorized record stays and startup
+    recovery turns it into a failure report): the predecessor keeps running until an operator stops it.
+11. Drains and stop failures are agent-local evidence only; there is no server record or UI until slice 11.
+12. The drainer, reporter and startup recovery run only while the executor is enabled; a 10d binary cannot read
+    activation records written by 10e (strict decode), so drain records and pending activations before any
+    downgrade.
 
 ## Known follow-ups
 
@@ -229,12 +251,12 @@ From slice 9a:
 
 From slice 10 (full list with reasoning in tasks/todo.md step blocks):
 
-- 10b enforces no route-revision monotonicity: `Write` overwrites whenever the on-disk digest differs. Any
-  ownership/monotonicity guard must live in the control plane's CAS or be added to 10b (relevant to 10d).
+- 10b enforces no route-revision monotonicity: `Write` overwrites whenever the on-disk digest differs. 10d added
+  a local route-revision guard in the agent (`RouteRevisionStore`, defence in depth over the control plane's CAS).
 - `AssignRouteHostname` can move a not-yet-active route head while an activation is blocked; `activated` is
   then refused `route_moved` and only `not_activated` remains.
-- The agent client collapses every non-`stale_lease` 409 into `ErrIntegrityConflict`, so the agent cannot yet
-  tell `late_report_recorded`, `outcome_mismatch` or `activation_unresolved` apart (10d).
+- Resolved in 10d-1: the agent client now exposes the 409 code (`ConflictCode`) and the reporter and executor
+  branch on it.
 - A failure report after a declared `not_activated` agrees with it but is still answered `integrity_conflict`.
 - The concurrency verification stage (21 activation race tests at `-race -count=20`) takes ~11 minutes and
   needs `-timeout 60m`.

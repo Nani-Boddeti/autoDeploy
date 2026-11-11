@@ -497,6 +497,93 @@ Costs:
 - Drain tests document long-lived connection interruption after the 30-second default.
 - Labels, route files, health diagnostics, access logs, API, audit, and metrics contain no secrets.
 
+## Amendments (2026-11-11)
+
+Steps 10d (agent activation) and 10e (predecessor drain) implemented the blue/green procedure above. Each
+statement was checked against `internal/agent/executor` (`activation.go`, `recovery.go`, `drain.go`),
+`internal/agent/client/reporter.go`, `internal/runtime/traefik/probe.go` and
+`internal/store/postgres/agent_lease_repository.go` (`derivePredecessor`). Decisions are recorded in
+`tasks/10d-plan.md` and `tasks/10e-plan.md`. Nothing here has run on a real host.
+
+### Agent activation sequence (10d)
+
+After a passing health gate the executor (`activate`) runs, in order:
+
+1. **Activate** (`authorize`). A 409 is a definite refusal: nothing was authorized, and the failure is
+   classified (`classifyActivateRefusal`: `candidate_not_ready` transient, `no_route_head`
+   permanent_configuration, every other code corrupt_state). Any other error (transport, 503, undecodable
+   body) leaves the authorization state UNKNOWN, because the control plane may have committed it and the answer
+   been lost. The call is replayed (the server replays on attempt, fence and image digest); a 409 after an
+   earlier unknown try is still unknown, since it may be a consequence of the agent's own authorization. When
+   the state stays unknown the agent writes no route and sends no `Complete`; the sweeper blocks the operation
+   and an operator declares the outcome.
+2. **Durable `authorized` record** (`state.PendingActivation`) BEFORE any route write. If it cannot be saved the
+   route is untouched and a failure is reported directly.
+3. **`switchRoute`**: re-render from the response and lease and refuse on any entrypoint, cert-resolver or
+   digest mismatch with the authorized route digest; local route-revision guard (refuse a revision below the
+   stored one, record the new one before writing); write; Traefik API verify (`Observer.Verify`, polled while
+   the reload is pending); HTTPS data-plane probe (`traefik.ProbeDataPlane`: literal loopback dial, SNI =
+   hostname, full chain and hostname verification, Host header, bounded poll for first-deploy ACME); re-read
+   the on-disk digest and compare.
+4. **Durable `result_ready` record** (success with the on-disk digest, or a failure summary of at most 2048
+   bytes carrying the step, reason and on-disk versus authorized digests), then the persistent reporter is
+   kicked. The outcome handed back to the lease loop never causes `Complete` or a cancel acknowledgement.
+
+Everything after step 1 runs under a context detached from lease cancellation, so post-authorization work
+survives cancellation and a stale renewal. A failure is never rolled back: no route restore and no
+`Complete(failed)`, which is this ADR's own blind-resolution rule. The agent never declares a reconciliation
+outcome itself (owner decision D-B in `tasks/10d-plan.md`); the server blocks the operation and an operator
+resolves it. The reporter never sets the agent-local `ReconciliationRequired` flag either (D-E).
+
+### Persistent reporter and startup recovery (10d)
+
+`ActivationReporter` delivers every `result_ready` record and retries (capped backoff 5s to 60s) across outages
+and restarts. It deletes a record only on an allow-list of answers meaning the server holds the report or a
+final decision: HTTP 200, `late_report_recorded`, `route_moved`, `integrity_conflict`. Every other 409
+(`stale_lease`, `corrupt_state`, `constraint_violation`, unknown codes, and `operation_mismatch`) can follow a
+server rollback that recorded nothing, so the record is kept and retried at the maximum backoff.
+`RecoverActivations` runs once at agent startup, before any claim: every stranded `authorized` record becomes a
+`result_ready` FAILURE carrying the on-disk digest (or `absent` / `unreadable`) as evidence, even when the
+on-disk digest equals the authorized one.
+
+### Predecessor drain (10e)
+
+- **Arming.** A drain is armed only on HTTP 200 to a SUCCESS report of an activation that has a predecessor
+  (`ActivationReporter` and the executor's direct-report fallback, via `state.DrainStore.ArmDrain`, saved before
+  the activation record is deleted). No 409, even an allow-list one, ever arms it. The drain is an agent-local
+  durable obligation OUTSIDE any lease (owner decision D-a): the success report's finalize closes the attempt,
+  slot and job, so no lease exists afterwards.
+- **Predecessor identity** comes from the control plane in the activate response (D-b):
+  `predecessor_release_id` and `predecessor_runtime_instance_id`, empty on a first activation. The server
+  derives them (`derivePredecessor`) from the release the route serves (`expected_active_release_id`) and the
+  newest succeeded activate operation of that release, whose attempt id names the runtime instance. A
+  predecessor with no succeeded activate operation, or one equal to the candidate release or runtime instance,
+  is corrupt state and is refused.
+- **Stop, never remove.** After the frozen `drain_seconds` (the wait resumes after a restart from the persisted
+  `armed_at` and is bounded on the monotonic clock against wall-clock steps) the `Drainer` stops the container.
+  The drain interface and the engine client have no remove or kill call. Guards, each failing closed (the
+  predecessor keeps running and the record stays as evidence): identity sanity (target never equals the new
+  release or runtime instance); the on-disk route digest must equal the digest the switch left; the container
+  resolved by its deterministic name must be the single container matching the exact identity labels (managed,
+  runtime kind, environment, release, runtime instance id) and must not carry the new release or instance;
+  the stop targets the inspected container ID, not the name. Owner and server labels are deliberately NOT
+  checked: the runtime instance id is the globally unique attempt id and neither label is in the drain record.
+  The stop grace is whole seconds within 1..300 (`--drain-stop-grace`, default 30s; never 0, which would be an
+  immediate SIGKILL). A container already stopped or gone discharges the obligation and the record is deleted.
+- **Failures** are agent-local evidence only (D-c): the record becomes `stop_failed` with a bounded summary and
+  a loud log; transient engine errors retry a bounded number of times, others are permanent. There is no
+  control-plane record of a stop failure until slice 11. No tombstone is kept after a completed drain: a late
+  re-arm only re-stops an already-stopped container (Engine 304 counts as success) and the route guard still
+  applies.
+- **Limits to remember.** The drainer (and the reporter and startup recovery) are wired only while the executor
+  is enabled, so leftover drains wait while it is disabled. The route guard is checked before the stop, not
+  during it; a route change inside the stop window is not re-checked (no second activation exists until slice
+  11). If arming fails after a direct report the drain is lost and logged; the predecessor keeps running until
+  an operator stops it. A 10d binary cannot read activation records written by 10e (strict JSON decode rejects
+  the new fields): drain pending activations and drains before any downgrade.
+- **Still slice 11.** Stop-then-start, retention and cleanup, rollback, and a server-side record of stop
+  failures.
+
 ## References
 
 - [Traefik file provider](https://doc.traefik.io/traefik/providers/file/)

@@ -743,6 +743,30 @@ checked against `internal/store/postgres/agent_lease_repository.go` and `activat
     is refused on both paths, since clearing the flag would leave a leased attempt invisible to the
     sweeper (owner-approved).
 
+## Amendments (2026-11-11)
+
+Step 10e-2 added one `release_operations` read to `Activate`; checked against
+`internal/store/postgres/agent_lease_repository.go` (`Activate`, `derivePredecessor`) and
+`activation_resolution.go`.
+
+- **`Activate` reads `release_operations` to name the predecessor, with no new lock class.**
+  `derivePredecessor` runs a plain, non-locking `SELECT attempt_id FROM release_operations WHERE
+  release_id=$1 AND kind='activate' AND state='succeeded' ORDER BY id DESC LIMIT 1`. It runs after the
+  route-head lock, on both the fresh path (the release the route serves, `expected_active_release_id`) and the
+  replay path (the operation's own stored `expected_active_release_id`, so a replay answers exactly what the
+  original authorization did). It takes no row lock, so it has no position in the lock order above. The read is
+  stable because the `environment_slots` lock `Activate` already holds is held by every writer of a succeeded
+  activate operation: `ReportActivationResult` (tx2), operator `ResolveActivation` and agent
+  `ReconcileActivation` (the last two through `resolveDeclared`, `finalizeActivationSucceeded`). This is the
+  forward constraint of the 2026-09-22 amendment applied to one more reader; any future writer of a succeeded
+  activate operation must keep taking the slot lock first.
+- **Activation-result answers an operation-id mismatch with 409 `operation_mismatch`.**
+  `ReportActivationResult` returns `ErrAgentLeaseOperationMismatch` when the reported operation id differs
+  from the activation operation locked for that attempt and fence; nothing is recorded. It is deliberately not
+  `ErrAgentLeaseIntegrityConflict`, so on this route `integrity_conflict` always means a final decision exists
+  (the operation is terminal or the ambiguity is durably recorded), which is what lets the agent's reporter
+  drop its pending report on it.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

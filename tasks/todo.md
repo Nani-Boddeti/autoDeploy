@@ -2,12 +2,13 @@
 
 ## Status
 
-- 2026-10-27: `origin/main` is at `ad8fc3c` (through H2). H3 phase 1 committed locally, unpushed. Slices 9a, 9b and slice 10 through
-  10c-2b step H2 are committed. 8/18 implementation-sequence outcomes complete; nothing has executed
-  on a real host (`executorEnabled` and `activationEnabled` both false).
-- Next: finish 10c-2b H3 (phase 1 done, owner decision pending — see H3 block), I (docs),
-  then 10d (agent activation) and 10e (drain/stop). Current state per step:
-  [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10".
+- 2026-11-11: slice 10 is code-complete through 10e (`59e116d`..`36b0548`, plus the 10e-5 docs commit; origin/main is at
+  `a33a8f7`, the 10e commits are local until pushed). 8/18 implementation-sequence outcomes complete; nothing has
+  executed on a real host (`executorEnabled` and `activationEnabled` both false).
+- Next: owner chooses between a real-host run (privileged Linux smoke + minimal packaging to deploy one push end to
+  end) and further work (operations UI, observability, slice 11). Hard gates and per-step state:
+  [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md), "Current slice: 10"; decisions and follow-ups:
+  [tasks/10d-plan.md](10d-plan.md), [tasks/10e-plan.md](10e-plan.md).
 
 ## Product Goal
 

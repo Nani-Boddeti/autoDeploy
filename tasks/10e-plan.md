@@ -77,3 +77,4 @@ wall-clock armed_at, bound the wait by drain_seconds).
   so a gone predecessor became permanent stop_failed -> engine now wraps it (still *EngineError 404). Also fixed:
   backward clock step (monotonic first-seen bound), Drainer.Validate at startup, *docker.Client has no Remove/Kill
   (reflection test). Re-review PASS. Drain store required; drainer started after Recover; --drain-stop-grace 30s.
+- 10e-5 docs: ADR 0005 + ADR 0004 amendments (2026-11-11), IMPLEMENTATION_STATUS, todo status. **SLICE 10 CODE-COMPLETE** (gates still false; nothing run on a real host).
