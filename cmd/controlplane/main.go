@@ -177,6 +177,7 @@ func run(ctx context.Context) error {
 	// method set directly (Slice 9a Step 3d), so no adapter type is needed
 	// here the way serverAdmin composes two repositories above.
 	webOptions.RuntimeConfigAdmin = postgres.NewEnvironmentRuntimeConfigRepository(pool)
+	webOptions.OperationsReader = postgres.NewOperationsReadRepository(pool)
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {
 		return err

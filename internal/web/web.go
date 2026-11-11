@@ -100,6 +100,7 @@ type Config struct {
 	ServerAdmin           ServerAdmin
 	RuntimeConfigAdmin    RuntimeConfigAdmin
 	RouteHeadAdmin        RouteHeadAdmin
+	OperationsReader      OperationsReader
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -152,7 +153,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveStylesheet(w, r)
 		return
 	}
-	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" {
+	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" {
 		http.NotFound(w, r)
 		return
 	}
@@ -211,6 +212,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.serversList(w, r)
+	case "/projects", "/deployments", "/deployments/detail":
+		if h.config.OperationsReader == nil {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.URL.Path {
+		case "/projects":
+			if r.URL.RawQuery != "" {
+				http.NotFound(w, r)
+				return
+			}
+			h.projectsList(w, r)
+		case "/deployments":
+			h.deploymentsList(w, r)
+		default:
+			h.deploymentDetail(w, r)
+		}
 	case "/servers/register":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)

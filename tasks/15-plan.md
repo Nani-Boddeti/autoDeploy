@@ -152,4 +152,7 @@ executed" honestly. Rollback and retention are slice 11 (not planned here).
   = lockAdministratorSession predicate minus FOR UPDATE; no locks, proven). Review PASS with notes; fixed route-head
   cross-owner leak (env ids not owner-bound). Phase is not persisted anywhere (detail shows status/job/attempt
   states). Follow-up: index agent_jobs(owner_id, created_at DESC) before scale (seq scan per owner today).
-- 15c next: web must authenticate session before calling; add Projects/Deployments nav links.
+- 15c+15e pages /projects, /deployments (filters + base64url keyset cursor), /deployments/detail (meta refresh 5s
+  while job not in succeeded/failed/cancelled/dead; static exec-disabled banner; live badge only when
+  ReleaseIsActive). Review PASS with notes. Not visually checked in a browser yet.
+- 15d next: cancel button.

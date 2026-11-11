@@ -63,6 +63,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 	h, _, p := serversHandler(t)
 	h.config.RouteHeadAdmin = &routeHeadAdminStub{}
 	h.config.RuntimeConfigAdmin = &runtimeConfigAdminStub{}
+	h.config.OperationsReader = &operationsStub{detail: sampleDetail("leased", true)}
 	pages := map[string]string{}
 	login := httptest.NewRecorder()
 	h.ServeHTTP(login, httptest.NewRequest(http.MethodGet, "https://admin.example.test/login", nil))
@@ -70,7 +71,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		t.Fatalf("/login = %d", login.Code)
 	}
 	pages["/login"] = login.Body.String()
-	for _, target := range []string{"/", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a"} {
+	for _, target := range []string{"/", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, serversRequest(http.MethodGet, target, nil, p, h))
 		if rr.Code != http.StatusOK {

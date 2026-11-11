@@ -1,0 +1,429 @@
+package web
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"html/template"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"autodeploy/internal/auth"
+	"autodeploy/internal/store/postgres"
+)
+
+// OperationsReader is the narrow read-only surface behind /projects,
+// /deployments and /deployments/detail (step 15c). A nil OperationsReader
+// 404s all three routes. *postgres.OperationsReadRepository satisfies it.
+type OperationsReader interface {
+	ListProjects(ctx context.Context, principal auth.Principal) ([]postgres.ProjectSummary, error)
+	ListDeployments(ctx context.Context, principal auth.Principal, filter postgres.DeploymentFilter, page postgres.DeploymentPage) (postgres.DeploymentList, error)
+	GetDeploymentDetail(ctx context.Context, principal auth.Principal, deploymentID string) (postgres.DeploymentDetail, error)
+}
+
+const (
+	// maxOperationsParamBytes bounds every query value accepted here.
+	maxOperationsParamBytes = 128
+	// maxCursorBytes bounds the encoded cursor (RFC3339Nano + "|" + id, base64).
+	maxCursorBytes = 512
+	// detailRefreshSeconds is the meta-refresh period for non-terminal jobs.
+	detailRefreshSeconds = 5
+)
+
+var (
+	projectsTemplate         = parsePage("projects")
+	deploymentsTemplate      = parsePage("deployments")
+	deploymentDetailTemplate = parsePage("deployment-detail")
+)
+
+// terminalJobStates mirrors agent_jobs_state_check (migration 000013): the
+// states with no outgoing transition. Every other state (queued, leased,
+// retry_wait) can still change, so the detail page keeps refreshing.
+var terminalJobStates = map[string]bool{"succeeded": true, "failed": true, "cancelled": true, "dead": true}
+
+// stateTone maps a closed state enum to a CSS tone class. Unknown values map
+// to "neutral" so no database text ever reaches a class attribute.
+func stateTone(state string) string {
+	switch state {
+	case "healthy", "succeeded", "ready", "active", "running":
+		return "ok"
+	case "failed", "dead":
+		return "bad"
+	case "queued", "assigned", "fetching", "building", "starting", "health_checking", "activating", "leased", "retry_wait", "candidate", "started":
+		return "busy"
+	default:
+		return "neutral"
+	}
+}
+
+// encodeDeploymentCursor renders the opaque keyset cursor:
+// base64url(RFC3339Nano UTC created_at + "|" + deployment id), no padding.
+func encodeDeploymentCursor(c postgres.DeploymentCursor) string {
+	raw := c.CreatedAt.UTC().Format(time.RFC3339Nano) + "|" + c.DeploymentID
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// decodeDeploymentCursor strictly decodes a cursor: canonical base64url, a UTC
+// RFC3339Nano timestamp that re-formats identically, and a bounded id with no
+// control characters. Anything else is rejected.
+func decodeDeploymentCursor(s string) (postgres.DeploymentCursor, bool) {
+	if s == "" || len(s) > maxCursorBytes {
+		return postgres.DeploymentCursor{}, false
+	}
+	raw, err := base64.RawURLEncoding.Strict().DecodeString(s)
+	if err != nil {
+		return postgres.DeploymentCursor{}, false
+	}
+	ts, id, found := strings.Cut(string(raw), "|")
+	if !found || !validOperationsID(id) {
+		return postgres.DeploymentCursor{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil || t.UTC().Format(time.RFC3339Nano) != ts {
+		return postgres.DeploymentCursor{}, false
+	}
+	return postgres.DeploymentCursor{CreatedAt: t, DeploymentID: id}, true
+}
+
+func validOperationsID(s string) bool {
+	if s == "" || len(s) > maxOperationsParamBytes {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x21 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// singleParam returns the only value of key; ok is false for repeats.
+func singleParam(q url.Values, key string) (string, bool) {
+	v := q[key]
+	switch len(v) {
+	case 0:
+		return "", true
+	case 1:
+		return v[0], true
+	}
+	return "", false
+}
+
+func onlyParams(q url.Values, allowed ...string) bool {
+next:
+	for k := range q {
+		for _, a := range allowed {
+			if k == a {
+				continue next
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// operationsPrelude applies the shared route rules: method allowlist, then the
+// session. It returns false after writing the response.
+func (h *Handler) operationsPrelude(w http.ResponseWriter, r *http.Request) (auth.Principal, bool) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowed(w, http.MethodGet, http.MethodHead)
+		return auth.Principal{}, false
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok {
+		redirect(w, "/login")
+		return auth.Principal{}, false
+	}
+	return p, true
+}
+
+// operationsFailure maps a repository error. A denied principal (session
+// revoked between validation and the read) is treated like no session.
+func operationsFailure(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, postgres.ErrServerAuthorizationDenied):
+		redirect(w, "/login")
+	case errors.Is(err, postgres.ErrOperationsNotFound):
+		http.NotFound(w, r)
+	case errors.Is(err, postgres.ErrOperationsInvalidInput):
+		badRequest(w)
+	default:
+		plain(w, http.StatusInternalServerError, "the page could not be loaded; retry\n")
+	}
+}
+
+func renderOperations(w http.ResponseWriter, t *template.Template, view any) {
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, view); err != nil {
+		plain(w, http.StatusInternalServerError, "the page could not be rendered\n")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(buf.Bytes())
+}
+
+func detailHref(deploymentID string) string {
+	return "/deployments/detail?" + url.Values{"id": {deploymentID}}.Encode()
+}
+
+func deploymentsHref(filter postgres.DeploymentFilter, after string) string {
+	v := url.Values{}
+	if filter.ProjectID != "" {
+		v.Set("project_id", filter.ProjectID)
+	}
+	if filter.EnvironmentID != "" {
+		v.Set("environment_id", filter.EnvironmentID)
+	}
+	if after != "" {
+		v.Set("after", after)
+	}
+	if len(v) == 0 {
+		return "/deployments"
+	}
+	return "/deployments?" + v.Encode()
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func shortDigest(hex string) string {
+	if len(hex) > 12 {
+		return hex[:12]
+	}
+	return hex
+}
+
+// ---- /projects ----
+
+type projectRow struct {
+	ProjectID       string
+	ProjectHref     string
+	Repository      string
+	DeployRef       string
+	BindingState    string
+	Environments    string
+	HasLatest       bool
+	LatestStatus    string
+	LatestTone      string
+	LatestCommit    string
+	LatestTime      string
+	LatestDetailURL string
+}
+
+type projectsView struct{ Projects []projectRow }
+
+func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.operationsPrelude(w, r)
+	if !ok {
+		return
+	}
+	projects, err := h.config.OperationsReader.ListProjects(r.Context(), p)
+	if err != nil {
+		operationsFailure(w, r, err)
+		return
+	}
+	view := projectsView{}
+	for _, pr := range projects {
+		row := projectRow{
+			ProjectID:    pr.ProjectID,
+			ProjectHref:  deploymentsHref(postgres.DeploymentFilter{ProjectID: pr.ProjectID}, ""),
+			Repository:   orDash(pr.RepositoryFullName),
+			DeployRef:    orDash(pr.RepositoryDefaultRef),
+			BindingState: "no binding",
+			Environments: orDash(strings.Join(pr.EnvironmentIDs, ", ")),
+		}
+		if pr.HasBinding {
+			row.BindingState = "inactive"
+			if pr.BindingActive {
+				row.BindingState = "active"
+			}
+		}
+		if d := pr.LatestDeployment; d != nil {
+			row.HasLatest = true
+			row.LatestStatus = d.Status
+			row.LatestTone = stateTone(d.Status)
+			row.LatestCommit = d.ShortCommit()
+			row.LatestTime = formatTimestamp(d.CreatedAt)
+			row.LatestDetailURL = detailHref(d.DeploymentID)
+		}
+		view.Projects = append(view.Projects, row)
+	}
+	renderOperations(w, projectsTemplate, view)
+}
+
+// ---- /deployments ----
+
+type deploymentRow struct {
+	ID              string
+	DetailHref      string
+	ProjectID       string
+	EnvironmentID   string
+	ServerID        string
+	Commit          string
+	Status          string
+	StatusTone      string
+	JobState        string
+	JobTone         string
+	CancelRequested bool
+	CreatedAt       string
+	UpdatedAt       string
+}
+
+type deploymentsView struct {
+	Deployments   []deploymentRow
+	ProjectID     string
+	EnvironmentID string
+	HasOlder      bool
+	OlderHref     string
+	ClearHref     string
+	HasFilter     bool
+}
+
+func newDeploymentRow(d postgres.DeploymentSummary) deploymentRow {
+	return deploymentRow{
+		ID: d.DeploymentID, DetailHref: detailHref(d.DeploymentID),
+		ProjectID: d.ProjectID, EnvironmentID: d.EnvironmentID, ServerID: d.ServerID,
+		Commit: d.ShortCommit(), Status: d.Status, StatusTone: stateTone(d.Status),
+		JobState: d.JobState, JobTone: stateTone(d.JobState), CancelRequested: d.CancelRequested,
+		CreatedAt: formatTimestamp(d.CreatedAt), UpdatedAt: formatTimestamp(d.UpdatedAt),
+	}
+}
+
+func (h *Handler) deploymentsList(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.operationsPrelude(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	if !onlyParams(q, "project_id", "environment_id", "after") {
+		http.NotFound(w, r)
+		return
+	}
+	projectID, ok1 := singleParam(q, "project_id")
+	environmentID, ok2 := singleParam(q, "environment_id")
+	after, ok3 := singleParam(q, "after")
+	if !ok1 || !ok2 || !ok3 || len(projectID) > maxOperationsParamBytes || len(environmentID) > maxOperationsParamBytes {
+		badRequest(w)
+		return
+	}
+	filter := postgres.DeploymentFilter{ProjectID: projectID, EnvironmentID: environmentID}
+	page := postgres.DeploymentPage{}
+	if _, present := q["after"]; present {
+		cursor, valid := decodeDeploymentCursor(after)
+		if !valid {
+			badRequest(w)
+			return
+		}
+		page.After = &cursor
+	}
+	list, err := h.config.OperationsReader.ListDeployments(r.Context(), p, filter, page)
+	if err != nil {
+		operationsFailure(w, r, err)
+		return
+	}
+	view := deploymentsView{ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
+	for _, d := range list.Items {
+		view.Deployments = append(view.Deployments, newDeploymentRow(d))
+	}
+	if list.Next != nil {
+		view.HasOlder = true
+		view.OlderHref = deploymentsHref(filter, encodeDeploymentCursor(*list.Next))
+	}
+	renderOperations(w, deploymentsTemplate, view)
+}
+
+// ---- /deployments/detail ----
+
+type statusEventRow struct{ At, From, To, Revision string }
+type jobEventRow struct{ At, Sequence, Type, Attempt string }
+type attemptRow struct {
+	Number, State, Tone, FailureClass, Fence, Strategy, Created, Closed string
+}
+type instanceRow struct{ ID, Attempt, Fence, State, Tone, Created string }
+
+type deploymentDetailView struct {
+	Title        string
+	Refresh      bool
+	RefreshEvery string
+	Summary      deploymentRow
+	Active       bool
+	JobID        string
+	JobAttempts  string
+	JobCreated   string
+	JobUpdated   string
+	StatusEvents []statusEventRow
+	JobEvents    []jobEventRow
+	Attempts     []attemptRow
+	HasRelease   bool
+	Release      struct{ ID, State, Tone, Strategy, Commit, Digest, Created, Updated string }
+	Instances    []instanceRow
+	BackHref     string
+}
+
+func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
+	p, ok := h.operationsPrelude(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	if !onlyParams(q, "id") {
+		http.NotFound(w, r)
+		return
+	}
+	id, single := singleParam(q, "id")
+	if !single || !validOperationsID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	d, err := h.config.OperationsReader.GetDeploymentDetail(r.Context(), p, id)
+	if err != nil {
+		if errors.Is(err, postgres.ErrOperationsInvalidInput) {
+			err = postgres.ErrOperationsNotFound // never distinguish malformed from absent
+		}
+		operationsFailure(w, r, err)
+		return
+	}
+	view := deploymentDetailView{
+		Title: "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
+		Refresh: !terminalJobStates[d.Job.State], RefreshEvery: strconv.Itoa(detailRefreshSeconds),
+		Active: d.ReleaseIsActive, JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
+		JobCreated: formatTimestamp(d.Job.CreatedAt), JobUpdated: formatTimestamp(d.Job.UpdatedAt),
+		BackHref: deploymentsHref(postgres.DeploymentFilter{ProjectID: d.Deployment.ProjectID}, ""),
+	}
+	for _, e := range d.StatusEvents {
+		view.StatusEvents = append(view.StatusEvents, statusEventRow{At: formatTimestamp(e.OccurredAt), From: orDash(e.FromStatus), To: e.ToStatus, Revision: strconv.FormatInt(e.Revision, 10)})
+	}
+	for _, e := range d.JobEvents {
+		attempt := "-"
+		if e.AttemptID != nil {
+			attempt = strconv.FormatInt(*e.AttemptID, 10)
+		}
+		view.JobEvents = append(view.JobEvents, jobEventRow{At: formatTimestamp(e.OccurredAt), Sequence: strconv.Itoa(e.Sequence), Type: e.EventType, Attempt: attempt})
+	}
+	for _, a := range d.Attempts {
+		closed := "open"
+		if a.ClosedAt != nil {
+			closed = formatTimestamp(*a.ClosedAt)
+		}
+		view.Attempts = append(view.Attempts, attemptRow{Number: strconv.Itoa(a.AttemptNumber), State: a.State, Tone: stateTone(a.State), FailureClass: orDash(a.FailureClass), Fence: strconv.FormatInt(a.Fence, 10), Strategy: orDash(a.ReleaseStrategy), Created: formatTimestamp(a.CreatedAt), Closed: closed})
+	}
+	if rel := d.Release; rel != nil {
+		view.HasRelease = true
+		view.Release.ID, view.Release.State, view.Release.Tone = rel.ID, rel.State, stateTone(rel.State)
+		view.Release.Strategy, view.Release.Commit = orDash(rel.Strategy), rel.CommitSHA
+		view.Release.Digest = orDash(shortDigest(rel.ImageDigest))
+		view.Release.Created, view.Release.Updated = formatTimestamp(rel.CreatedAt), formatTimestamp(rel.UpdatedAt)
+	}
+	for _, in := range d.RuntimeInstances {
+		view.Instances = append(view.Instances, instanceRow{ID: strconv.FormatInt(in.ID, 10), Attempt: strconv.FormatInt(in.AttemptID, 10), Fence: strconv.FormatInt(in.Fence, 10), State: in.ObservedState, Tone: stateTone(in.ObservedState), Created: formatTimestamp(in.CreatedAt)})
+	}
+	renderOperations(w, deploymentDetailTemplate, view)
+}
