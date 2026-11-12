@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"syscall"
 )
 
 const (
@@ -429,7 +430,10 @@ func trustedSpawnSocket(path string, gid uint32) bool {
 	if e != nil || i.Mode()&os.ModeSocket == 0 || i.Mode().Perm() != 0o620 {
 		return false
 	}
-	st, ok := i.Sys().(*unix.Stat_t)
+	st, ok := i.Sys().(*syscall.Stat_t)
 	return ok && st.Uid == 0 && st.Gid == gid
 }
-func rootOwnedSpawn(i os.FileInfo) bool { st, ok := i.Sys().(*unix.Stat_t); return ok && st.Uid == 0 }
+func rootOwnedSpawn(i os.FileInfo) bool {
+	st, ok := i.Sys().(*syscall.Stat_t)
+	return ok && st.Uid == 0
+}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+	"syscall"
 )
 
 const clientDeadline = 5 * time.Second
@@ -190,7 +191,7 @@ func trustedSocket(path string, agentGID uint32) bool {
 	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0o620 {
 		return false
 	}
-	st, ok := info.Sys().(*unix.Stat_t)
+	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && st.Uid == 0 && st.Gid == agentGID
 }
 

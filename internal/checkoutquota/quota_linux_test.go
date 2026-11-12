@@ -213,10 +213,10 @@ func TestTerminalLedgerRecordAndBoundedPruning(t *testing.T) {
 }
 
 func TestStaleSocketModeAllowedOnlyIntermediateOrFinal(t *testing.T) {
-	if !staleSocketModeAllowed(&unix.Stat_t{Gid: 0, Mode: 0o600}, 42) || !staleSocketModeAllowed(&unix.Stat_t{Gid: 0, Mode: 0o620}, 42) || !staleSocketModeAllowed(&unix.Stat_t{Gid: 42, Mode: 0o620}, 42) {
+	if !staleSocketModeAllowed(0, 0o600, 42) || !staleSocketModeAllowed(0, 0o620, 42) || !staleSocketModeAllowed(42, 0o620, 42) {
 		t.Fatal("safe startup modes rejected")
 	}
-	if staleSocketModeAllowed(&unix.Stat_t{Gid: 42, Mode: 0o600}, 42) || staleSocketModeAllowed(&unix.Stat_t{Gid: 9, Mode: 0o620}, 42) || staleSocketModeAllowed(&unix.Stat_t{Gid: 0, Mode: 0o640}, 42) {
+	if staleSocketModeAllowed(42, 0o600, 42) || staleSocketModeAllowed(9, 0o620, 42) || staleSocketModeAllowed(0, 0o640, 42) {
 		t.Fatal("mixed ownership/mode accepted")
 	}
 }

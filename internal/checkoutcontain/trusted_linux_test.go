@@ -38,7 +38,8 @@ func TestELFValidationRejectsScriptsAndAcceptsMinimalELFHeader(t *testing.T) {
 	if err := f.Truncate(0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.Write([]byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0}); err != nil {
+	// Truncate keeps the file offset, so write at 0 explicitly.
+	if _, err := f.WriteAt([]byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0}, 0); err != nil {
 		t.Fatal(err)
 	}
 	if !isELF(int(f.Fd())) {

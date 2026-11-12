@@ -21,6 +21,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"syscall"
 )
 
 const (
@@ -225,8 +226,8 @@ func recoverStaleSocket(path string, gid uint32) error {
 	if err != nil || info.Mode()&os.ModeSocket == 0 {
 		return ErrDenied
 	}
-	old, ok := info.Sys().(*unix.Stat_t)
-	if !ok || old.Uid != 0 || !staleSocketModeAllowed(old, gid) {
+	old, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || old.Uid != 0 || !staleSocketModeAllowed(old.Gid, old.Mode, gid) {
 		return ErrDenied
 	}
 	// A successful connect proves a listener is live. Refuse to disrupt it.
@@ -249,7 +250,7 @@ func recoverStaleSocket(path string, gid uint32) error {
 	}
 	defer unix.Close(pfd)
 	var st unix.Stat_t
-	if unix.Fstatat(pfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Uid != 0 || st.Mode&unix.S_IFMT != unix.S_IFSOCK || !staleSocketModeAllowed(&st, gid) {
+	if unix.Fstatat(pfd, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Uid != 0 || st.Mode&unix.S_IFMT != unix.S_IFSOCK || !staleSocketModeAllowed(st.Gid, st.Mode, gid) {
 		return ErrDenied
 	}
 	if st.Dev != old.Dev || st.Ino != old.Ino {
@@ -264,8 +265,8 @@ func recoverStaleSocket(path string, gid uint32) error {
 // The root:root 0600 form exists only between bind and chown; root:agent 0620
 // is the final listener. Both are recoverable only after listener and inode
 // stability checks above.
-func staleSocketModeAllowed(st *unix.Stat_t, gid uint32) bool {
-	return (st.Gid == 0 && (st.Mode&0o777 == 0o600 || st.Mode&0o777 == 0o620)) || (st.Gid == gid && st.Mode&0o777 == 0o620)
+func staleSocketModeAllowed(ownerGID, mode, gid uint32) bool {
+	return (ownerGID == 0 && (mode&0o777 == 0o600 || mode&0o777 == 0o620)) || (ownerGID == gid && mode&0o777 == 0o620)
 }
 func (s *Service) serveConn(fd int) {
 	defer unix.Close(fd)
@@ -509,7 +510,7 @@ func New(c Config) (*Service, error) {
 	return s, nil
 }
 func rootOwned(i os.FileInfo) bool {
-	st, ok := i.Sys().(*unix.Stat_t)
+	st, ok := i.Sys().(*syscall.Stat_t)
 	return ok && st.Uid == 0 && st.Gid == 0
 }
 func trustedPath(p string) error {
