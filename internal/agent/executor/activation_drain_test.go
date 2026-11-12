@@ -165,3 +165,41 @@ func TestNewActivationRunnerRequiresDrains(t *testing.T) {
 		t.Fatal("nil Drains accepted")
 	}
 }
+
+func TestDirectReportArmFailureResavesResultReadyRecord(t *testing.T) {
+	f, arm, e, lease := predFake()
+	arm.err = errors.New("disk full")
+	f.saveErrOn = map[int]error{2: errors.New("busy"), 3: errors.New("busy"), 4: errors.New("busy")}
+	var logs strings.Builder
+	e.activation.logger = log.New(&logs, "", 0)
+	out := e.activate(context.Background(), lease, testImageDigest)
+	if !out.HandedOff || len(f.deleted) != 0 || len(f.reports) != 1 {
+		t.Fatalf("outcome=%+v deleted=%v reports=%d", out, f.deleted, len(f.reports))
+	}
+	rec := f.last(t)
+	if rec.Phase != state.PhaseResultReady || !rec.Succeeded || rec.FailureSummary != "" || rec.ObservedRouteDigest != f.resp.RouteDigest ||
+		rec.PredecessorReleaseID != "rel_old" || rec.PredecessorRuntimeInstanceID != "41" || rec.DrainSeconds != 45 {
+		t.Fatalf("record = %+v", rec)
+	}
+	if !strings.Contains(logs.String(), "ERROR attempt 42: the report was acknowledged but the predecessor drain could not be armed; the result record was saved") {
+		t.Fatalf("no loud log: %s", logs.String())
+	}
+}
+
+func TestDirectReportArmFailureAndResaveFailureLogsLostDrain(t *testing.T) {
+	f, arm, e, lease := predFake()
+	arm.err = errors.New("disk full")
+	f.saveErrFrom = 2
+	var logs strings.Builder
+	e.activation.logger = log.New(&logs, "", 0)
+	out := e.activate(context.Background(), lease, testImageDigest)
+	if !out.HandedOff || len(f.deleted) != 0 {
+		t.Fatalf("outcome=%+v deleted=%v", out, f.deleted)
+	}
+	if f.last(t).Phase != state.PhaseAuthorized {
+		t.Fatal("authorized record must remain")
+	}
+	if !strings.Contains(logs.String(), "ERROR attempt 42: drain obligation LOST") || !strings.Contains(logs.String(), "rel_old") {
+		t.Fatalf("lost drain not logged: %s", logs.String())
+	}
+}

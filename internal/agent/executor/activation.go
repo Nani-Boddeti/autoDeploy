@@ -279,15 +279,25 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		// a result_ready failure with on-disk evidence for the reporter.
 		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the result record after retries: %v", lease.AttemptID, err)
 		// A 200 acknowledgement of a success with a predecessor must first
-		// make the drain durable. If that fails the authorized record stays:
-		// recovery then converts it into a failure report (the server
-		// answers that re-send terminally) and the drain is LOST. Accepted
-		// and logged: a stop obligation never outranks the report, and the
+		// make the drain durable. If arming fails, the real result is saved
+		// once more (below): a result_ready success record hands the drain
+		// to the reporter, which re-reports it (the server answers an
+		// identical replay 200) and arms the drain through its own durable
+		// retry. Only if that save fails too does the authorized record
+		// stay: recovery then converts it into a failure report (the server
+		// answers that re-send terminally) and the drain is LOST; the
 		// predecessor keeps running until an operator stops it.
 		terminal, acked := a.reportDirect(dctx, rec, resultFromRecord(rec))
 		mayDelete := terminal
 		if terminal && acked && !a.armDrainWithRetry(rec) {
 			mayDelete = false
+			if serr := a.saveWithRetry(rec); serr != nil {
+				a.logger.Printf("agent activation ERROR attempt %d: drain obligation LOST: the report was acknowledged but neither the drain nor the result record could be persisted; predecessor release %s must be stopped by an operator: %v",
+					lease.AttemptID, rec.PredecessorReleaseID, serr)
+			} else {
+				a.logger.Printf("agent activation ERROR attempt %d: the report was acknowledged but the predecessor drain could not be armed; the result record was saved so the reporter re-reports it and arms the drain (predecessor release %s)",
+					lease.AttemptID, rec.PredecessorReleaseID)
+			}
 		}
 		if mayDelete {
 			// The server holds the report or a final decision: drop the
@@ -454,9 +464,10 @@ func (a *activationRunner) armDrainWithRetry(rec state.PendingActivation) bool {
 }
 
 // armDrain persists the predecessor drain of an acknowledged success. It
-// reports whether the caller may delete the authorized record. newActivationRunner rejects a
-// missing drain store, so the nil branch is a defensive guard that logs every
-// lost drain at ERROR.
+// reports whether the caller may delete the activation record; on false the
+// caller keeps it (the executor re-saves the result for the reporter).
+// newActivationRunner rejects a missing drain store, so the nil branch is a
+// defensive guard that logs every lost drain at ERROR.
 func (a *activationRunner) armDrain(rec state.PendingActivation) bool {
 	d, owed := state.DrainFromActivation(rec, time.Now())
 	if !owed {
@@ -467,7 +478,7 @@ func (a *activationRunner) armDrain(rec state.PendingActivation) bool {
 		return true
 	}
 	if err := a.cfg.Drains.ArmDrain(d); err != nil {
-		a.logger.Printf("agent activation ERROR attempt %d: report acknowledged but the predecessor drain could not be armed; keeping the authorized record: %v", rec.AttemptID, err)
+		a.logger.Printf("agent activation ERROR attempt %d: report acknowledged but the predecessor drain could not be armed; the activation record is kept: %v", rec.AttemptID, err)
 		return false
 	}
 	return true
