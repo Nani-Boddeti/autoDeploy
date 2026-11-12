@@ -1,0 +1,15 @@
+# Traefik dynamic configuration: TLS from the private CA (private-ca.sh).
+# Installed (root:root 0644) by install-app.sh into the agent's route directory.
+# The certificate covers *.<domain> and <domain>; Traefik matches it by SNI. It is
+# also the default certificate, served when no SNI matches. Because route files name
+# an ACME resolver that is not configured (see traefik.yml), nothing ever asks an
+# ACME server for these hostnames.
+tls:
+  certificates:
+    - certFile: /etc/traefik/tls/server.crt
+      keyFile: /etc/traefik/tls/server.key
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/tls/server.crt
+        keyFile: /etc/traefik/tls/server.key

@@ -1,0 +1,73 @@
+# Traefik v3 reverse proxy for AutoDeploy, as a container supervised by systemd
+# (step 18a-2). Official image pinned by digest (index digest of tag v3.7.18).
+#
+# WHY NOT HOST NETWORKING (departs from tasks/18-plan.md): the renderer points every
+# route at the application container by Docker DNS name
+# (internal/runtime/traefik/names.go backendServerURL: "http://<container-name>:<port>").
+# Only containers on a user-defined Docker network resolve those names, so Traefik
+# joins the environment network (autodeploy-env, created by install-app.sh) at a FIXED
+# address outside the network's --ip-range (apps are allocated only from that range, so
+# nothing else can hold this address); the control plane trusts forwarded headers from
+# exactly this /32 and ufw admits only it to the gateway. Ports are published on the host:
+#   80/443  -> TRAEFIK_BIND (default 127.0.0.1; set 0.0.0.0 at install time to serve the LAN.
+#              Note Docker-published ports bypass ufw)
+#   8080    -> 127.0.0.1 only: the basic-auth protected management API the agent observes
+#              (--traefik-api-url http://127.0.0.1:8080)
+#
+# Mounts, all read-only:
+#   traefik.yml            static config (deploy/host/traefik/traefik.yml)
+#   dynamic/               the agent's route directory (root:autodeploy-agent 1770);
+#                          Traefik reads it through --group-add <agent gid>
+#   tls/                   server certificate + key from private-ca.sh (NOT the CA key)
+#   secrets/api-users      bcrypt htpasswd for the management API (root 0600)
+[Unit]
+Description=AutoDeploy Traefik (container)
+Requires=docker.service
+After=docker.service
+AssertPathExists=/etc/autodeploy/traefik/traefik.yml
+AssertPathExists=/etc/autodeploy/tls/server.crt
+AssertPathExists=/etc/autodeploy/tls/server.key
+AssertPathExists=/etc/autodeploy/traefik-secrets/api-users
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/autodeploy/host.env
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+Environment=DOCKER_CONFIG=/nonexistent
+ExecStartPre=-/usr/bin/docker rm -f autodeploy-traefik
+# NET_BIND_SERVICE for :80/:443 inside the container; nothing else. Root in the
+# container has no DAC override, so file access is by ownership/group: the route
+# directory is group autodeploy-agent (gid from host.env), the key is root-owned.
+ExecStart=/usr/bin/docker run --rm --name autodeploy-traefik \
+  --network ${AUTODEPLOY_ENV_NETWORK} --ip ${AUTODEPLOY_ENV_TRAEFIK_IP} \
+  --read-only --cap-drop=ALL --cap-add=NET_BIND_SERVICE --security-opt=no-new-privileges \
+  --pids-limit=256 --memory=512m \
+  --group-add ${AUTODEPLOY_AGENT_GID} \
+  -p ${AUTODEPLOY_TRAEFIK_BIND}:80:80 -p ${AUTODEPLOY_TRAEFIK_BIND}:443:443 -p 127.0.0.1:8080:8080 \
+  -v /etc/autodeploy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro \
+  -v /var/lib/autodeploy/traefik/dynamic:/etc/traefik/dynamic:ro \
+  -v /etc/autodeploy/tls:/etc/traefik/tls:ro \
+  -v /etc/autodeploy/traefik-secrets:/etc/traefik/secrets:ro \
+  traefik:v3.7.18@sha256:9c437ac4f09ce6f4980a8544902d3475fdf70a1a7c578729581d2535dfa7d635
+ExecStop=/usr/bin/docker stop --time=30 autodeploy-traefik
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=5
+SuccessExitStatus=130 137 143
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

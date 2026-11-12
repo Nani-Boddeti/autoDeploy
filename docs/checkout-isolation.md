@@ -97,6 +97,13 @@ PIDs, I/O, CPU quota/period, duration, output, and block device major/minor.
 The service rejects incomplete bounds. The Git executable is opened from the
 trusted root-owned directory at startup; do not point it at an arbitrary PATH.
 
+Widening the spawn service's `RestrictAddressFamilies` beyond `AF_UNIX` (for an
+HTTPS fetch by the Git child, which inherits the unit's restrictions) must be
+paired with `IPAddressDeny=` for `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, and `fc00::/7`, plus
+`IPAddressAllow=` for the resolver and fetch destinations; otherwise the child can
+reach host-local services.
+
 ## Service ordering and hardening
 
 Run both helpers as root-owned systemd services, not from the agent process.

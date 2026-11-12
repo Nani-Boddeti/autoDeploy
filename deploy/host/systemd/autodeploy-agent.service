@@ -1,0 +1,103 @@
+# AutoDeploy deployment agent (cmd/agent), step 18a-2.
+#
+# Identity: autodeploy-agent (uid/gid 800, created by install-checkout.sh; its primary
+# group is the checkout-helper socket group) plus membership of the `docker` group
+# (install-app.sh). docker-group membership is ROOT-EQUIVALENT on this host: whoever
+# can talk to /var/run/docker.sock can start a privileged container. That is inherent
+# to an agent that drives dockerd, so the hardening below protects the agent from
+# accidents and from the network, not the host from a compromised agent.
+#
+# Ordering (docs/checkout-isolation.md "Service ordering and hardening"): starts only
+# after both root helper sockets exist (their units gate readiness on socket metadata),
+# after dockerd and Traefik. Requires= makes an explicit stop/restart of a helper stop/
+# restart the agent; PartOf= is the same restart propagation stated explicitly. BindsTo=
+# is deliberately not used: it would also stop the agent when a helper crashes and
+# Restart=on-failure revives only the helper, leaving the agent down. A crashed helper
+# is handled by the agent instead: every checkout call reconnects and re-verifies the
+# socket metadata (internal/checkoutquota/client_linux.go trustedSocket), failing closed
+# while the helper is away.
+#
+# Not started by install-app.sh: it is enabled, but ConditionPathExists below keeps it
+# down until the agent has been enrolled (credential file written by `agent enroll`).
+[Unit]
+Description=AutoDeploy deployment agent
+Requires=autodeploy-checkout-quota.service autodeploy-checkout-exec.service docker.service
+PartOf=autodeploy-checkout-quota.service autodeploy-checkout-exec.service
+After=autodeploy-checkout-quota.service autodeploy-checkout-exec.service docker.service autodeploy-traefik.service autodeploy-controlplane.service
+Wants=autodeploy-traefik.service
+ConditionPathExists=/var/lib/autodeploy/agent/credential
+
+[Service]
+Type=simple
+User=autodeploy-agent
+Group=autodeploy-agent
+# host.env / agent.env / checkout.env are generated, non-secret. agent-local.env is the
+# owner's (server id), created empty-valued by install-app.sh and never overwritten.
+EnvironmentFile=/etc/autodeploy/host.env
+EnvironmentFile=/etc/autodeploy/agent.env
+EnvironmentFile=/etc/autodeploy/checkout.env
+EnvironmentFile=/etc/autodeploy/agent-local.env
+# The agent shells out to `docker buildx build` (internal/runtime/docker/build.go) with
+# a minimal allowlisted environment: PATH, HOME, DOCKER_* only. /usr/bin first so the
+# Engine CLI is used, not /usr/local/bin/docker (Docker Desktop's CLI on this host).
+Environment=PATH=/usr/bin:/bin
+Environment=HOME=/var/lib/autodeploy/agent/home
+Environment=DOCKER_CONFIG=/var/lib/autodeploy/agent/home/.docker
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+ExecStart=/usr/local/lib/autodeploy/app/agent run \
+  --base-url ${AUTODEPLOY_AGENT_BASE_URL} \
+  --server-id ${AUTODEPLOY_AGENT_SERVER_ID} \
+  --state-dir ${AUTODEPLOY_AGENT_STATE_DIR} \
+  --docker-socket /var/run/docker.sock \
+  --checkout-quota-socket ${AUTODEPLOY_CHECKOUT_QUOTA_SOCKET} \
+  --checkout-spawn-socket ${AUTODEPLOY_CHECKOUT_SPAWN_SOCKET} \
+  --checkout-agent-gid ${AUTODEPLOY_CHECKOUT_AGENT_GID} \
+  --environment-network ${AUTODEPLOY_ENV_NETWORK} \
+  --traefik-route-dir ${AUTODEPLOY_AGENT_ROUTE_DIR} \
+  --traefik-api-url http://127.0.0.1:8080 \
+  --traefik-api-credentials-file ${AUTODEPLOY_AGENT_TRAEFIK_CREDENTIALS_FILE} \
+  --traefik-https-addr 127.0.0.1:443 \
+  --activation-probe-timeout ${AUTODEPLOY_AGENT_PROBE_TIMEOUT} \
+  --drain-stop-grace ${AUTODEPLOY_AGENT_DRAIN_STOP_GRACE}
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# The agent drains on SIGTERM; leave room for the longest drain grace (<= 300 s).
+TimeoutStopSec=330
+
+# ---- hardening ---------------------------------------------------------------
+# Needs: docker.sock (group docker), the helper sockets (group of the agent), TCP to
+# the control plane and Traefik, exec of /usr/bin/docker + buildx.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+# ProtectSystem=full (not strict): strict would also remount the checkout XFS volume
+# read-only for the agent; whether the build path ever writes a checkout workspace
+# through a descriptor is unverified, so the first real run uses the less intrusive mode.
+# Revisit with strict + ReadWritePaths after 18e.
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RemoveIPC=yes
+# MemoryDenyWriteExecute is not set: the docker/buildx CLIs it spawns inherit it and
+# their Go runtimes are fine, but it is unverified against buildx on this host.
+
+[Install]
+WantedBy=multi-user.target

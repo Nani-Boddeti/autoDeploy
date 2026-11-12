@@ -1,0 +1,28 @@
+# Pins the checkout image to /dev/loop200 (fixed device number 7:200) so the quota
+# ledger's device binding survives reboots. Started before, and required by,
+# srv-autodeploy-checkout.mount; stopped only after that mount is gone (Requires=
+# propagates the stop, After= orders it), then detaches the device.
+# Idempotent attach: no-op if /dev/loop200 already backs the image; fails loudly if
+# it backs anything else or the image is attached elsewhere (see checkout-loop).
+# `losetup /dev/loopN FILE` creates a missing node through /dev/loop-control
+# (util-linux >= 2.39 on the target; the control device exists on the acer host).
+[Unit]
+Description=AutoDeploy checkout loop device (/dev/loop200 -> checkout.xfs)
+DefaultDependencies=no
+After=local-fs-pre.target
+Before=srv-autodeploy-checkout.mount umount.target
+Conflicts=umount.target
+RequiresMountsFor=/var/lib/autodeploy
+AssertPathExists=/var/lib/autodeploy/checkout.xfs
+AssertFileIsExecutable=/usr/local/lib/autodeploy/checkout-loop
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/modprobe loop
+ExecStart=/usr/local/lib/autodeploy/checkout-loop attach /dev/loop200 /var/lib/autodeploy/checkout.xfs
+ExecStop=/usr/local/lib/autodeploy/checkout-loop detach /dev/loop200 /var/lib/autodeploy/checkout.xfs
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Run the one-shot control-plane tools (migrate, admin) as the control-plane user with
+# the non-secret configuration from /etc/autodeploy/controlplane.env. Secrets stay in
+# their 0600 files; the tools read them themselves (internal/credential), so nothing
+# secret passes through this script, argv or the environment.
+#
+# Usage (as root):  autodeploy-run migrate
+#                   autodeploy-run admin bootstrap --username administrator
+#                   autodeploy-run admin reset-password --username administrator
+# `admin` needs an interactive terminal (cmd/admin refuses otherwise).
+set -euo pipefail
+
+readonly APP_DIR=/usr/local/lib/autodeploy/app
+readonly ENV_FILE=/etc/autodeploy/controlplane.env
+readonly RUN_USER=autodeploy-controlplane
+
+die() { printf 'autodeploy-run: error: %s\n' "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "must run as root"
+tool="${1:-}"
+case "$tool" in
+  migrate | admin) shift ;;
+  *) die "usage: autodeploy-run migrate | admin <args...>" ;;
+esac
+[[ -r $ENV_FILE ]] || die "$ENV_FILE not found (run install-app.sh)"
+
+vars=()
+while IFS= read -r line; do
+  [[ "$line" =~ ^AUTODEPLOY_[A-Z0-9_]+=.*$ ]] && vars+=("$line")
+done <"$ENV_FILE"
+
+exec runuser -u "$RUN_USER" -- env -i "PATH=/usr/bin:/bin" "TERM=${TERM:-dumb}" "${vars[@]}" "$APP_DIR/$tool" "$@"

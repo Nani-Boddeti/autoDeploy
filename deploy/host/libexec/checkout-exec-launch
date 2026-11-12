@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Launcher for autodeploy-checkout-exec.service (installed to
+# /usr/local/lib/autodeploy/checkout-exec-launch, root-owned).
+#
+# systemd (Delegate=, DelegateSubgroup=supervisor) already put this process in
+# <unit cgroup>/supervisor and left the unit cgroup itself empty. That is what
+# the kernel's no-internal-process rule needs before controllers can be enabled
+# in the unit cgroup's subtree. This script then only:
+#   1. enables cpu io memory pids in the unit cgroup's subtree_control,
+#   2. creates the empty "leaves" cgroup that checkout-exec uses as its
+#      --cgroup-root and enables the same controllers there (checkout-exec
+#      refuses a root where they are not enabled, or that holds processes),
+#   3. resolves the block device of the checkout XFS volume (io.max needs
+#      MAJOR:MINOR) and execs checkout-exec with the configured bounds.
+# Configuration comes from /etc/autodeploy/checkout.env via the unit's
+# EnvironmentFile; nothing secret is involved.
+set -euo pipefail
+
+: "${AUTODEPLOY_CHECKOUT_ROOT:?}" "${AUTODEPLOY_CHECKOUT_SPAWN_SOCKET:?}" "${AUTODEPLOY_CHECKOUT_BIN_ROOT:?}"
+: "${AUTODEPLOY_CHECKOUT_AGENT_UID:?}" "${AUTODEPLOY_CHECKOUT_AGENT_GID:?}"
+: "${AUTODEPLOY_CHECKOUT_UID:?}" "${AUTODEPLOY_CHECKOUT_GID:?}"
+: "${AUTODEPLOY_CHECKOUT_MEMORY_MAX:?}" "${AUTODEPLOY_CHECKOUT_PIDS_MAX:?}" "${AUTODEPLOY_CHECKOUT_IO_MAX:?}"
+: "${AUTODEPLOY_CHECKOUT_CPU_QUOTA:?}" "${AUTODEPLOY_CHECKOUT_CPU_PERIOD:?}"
+: "${AUTODEPLOY_CHECKOUT_MAX_DURATION:?}" "${AUTODEPLOY_CHECKOUT_MAX_OUTPUT:?}"
+
+die() { printf 'checkout-exec-launch: %s\n' "$*" >&2; exit 1; }
+
+IFS=: read -r _ _ self_cgroup </proc/self/cgroup
+[[ "$self_cgroup" == */supervisor ]] || die "not running in the delegated 'supervisor' subgroup (DelegateSubgroup= missing?)"
+unit_cgroup="/sys/fs/cgroup${self_cgroup%/supervisor}"
+[[ -d "$unit_cgroup" ]] || die "unit cgroup $unit_cgroup not found"
+
+want="cpu io memory pids"
+read -r available <"$unit_cgroup/cgroup.controllers"
+for c in $want; do
+  [[ " $available " == *" $c "* ]] || die "controller $c not delegated to $unit_cgroup"
+done
+
+enable_controllers() {
+  local c
+  for c in $want; do
+    printf '+%s\n' "$c" >"$1/cgroup.subtree_control" || die "cannot enable $c in $1"
+  done
+}
+enable_controllers "$unit_cgroup"
+[[ -d "$unit_cgroup/leaves" ]] || mkdir -m 0755 "$unit_cgroup/leaves"
+enable_controllers "$unit_cgroup/leaves"
+
+dev="$(findmnt -n -o MAJ:MIN --target "$AUTODEPLOY_CHECKOUT_ROOT" | tr -d ' ')"
+[[ "$dev" =~ ^[0-9]+:[0-9]+$ ]] || die "cannot determine block device of $AUTODEPLOY_CHECKOUT_ROOT"
+
+exec "$AUTODEPLOY_CHECKOUT_BIN_ROOT/checkout-exec" \
+  --socket "$AUTODEPLOY_CHECKOUT_SPAWN_SOCKET" \
+  --bin-root "$AUTODEPLOY_CHECKOUT_BIN_ROOT" \
+  --git-name git \
+  --cgroup-root "$unit_cgroup/leaves" \
+  --agent-uid "$AUTODEPLOY_CHECKOUT_AGENT_UID" \
+  --agent-gid "$AUTODEPLOY_CHECKOUT_AGENT_GID" \
+  --checkout-uid "$AUTODEPLOY_CHECKOUT_UID" \
+  --checkout-gid "$AUTODEPLOY_CHECKOUT_GID" \
+  --memory-max "$AUTODEPLOY_CHECKOUT_MEMORY_MAX" \
+  --pids-max "$AUTODEPLOY_CHECKOUT_PIDS_MAX" \
+  --io-max "$AUTODEPLOY_CHECKOUT_IO_MAX" \
+  --cpu-quota "$AUTODEPLOY_CHECKOUT_CPU_QUOTA" \
+  --cpu-period "$AUTODEPLOY_CHECKOUT_CPU_PERIOD" \
+  --device-major "${dev%:*}" \
+  --device-minor "${dev#*:}" \
+  --max-duration "$AUTODEPLOY_CHECKOUT_MAX_DURATION" \
+  --max-output "$AUTODEPLOY_CHECKOUT_MAX_OUTPUT"

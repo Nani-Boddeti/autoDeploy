@@ -1,0 +1,66 @@
+# PostgreSQL 18 for the AutoDeploy control plane, as a container supervised by
+# systemd (step 18a-2). Official image pinned by digest (index digest of the
+# multi-arch tag, resolved with `docker buildx imagetools inspect postgres:18.6`).
+#
+# Network: published only on 127.0.0.1:5432 of the host, and deliberately NOT
+# attached to the application environment network, so deployed apps cannot reach it.
+# Data: named volume autodeploy-postgres-data mounted at /var/lib/postgresql (the
+# PostgreSQL 18 image keeps its versioned PGDATA below that path, see
+# deploy/docker-compose.yml).
+# Secret: the superuser password is read by the image's entrypoint from
+# POSTGRES_PASSWORD_FILE; the file (root:root 0600, created by create-credentials.sh)
+# is bind-mounted read-only. Nothing secret appears on the command line or in the
+# environment. It only seeds the role on the FIRST start of an empty volume; rotating
+# it later is an ALTER ROLE, not a file change.
+[Unit]
+Description=AutoDeploy PostgreSQL 18 (container)
+Requires=docker.service
+After=docker.service
+AssertPathExists=/etc/autodeploy/secrets/postgres-password
+
+[Service]
+Type=simple
+Environment=DOCKER_HOST=unix:///var/run/docker.sock
+# No docker client config for this unit (root's home is hidden by ProtectHome).
+Environment=DOCKER_CONFIG=/nonexistent
+ExecStartPre=-/usr/bin/docker rm -f autodeploy-postgres
+# Capabilities: the entrypoint starts as root, chowns the data directory and drops
+# to the postgres user with gosu. Exactly the set below; everything else dropped.
+ExecStart=/usr/bin/docker run --rm --name autodeploy-postgres \
+  --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=SETGID --cap-add=SETUID \
+  --security-opt=no-new-privileges --pids-limit=512 --memory=2g --shm-size=256m \
+  -e POSTGRES_DB=autodeploy -e POSTGRES_USER=autodeploy \
+  -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password \
+  -v /etc/autodeploy/secrets/postgres-password:/run/secrets/postgres-password:ro \
+  -v autodeploy-postgres-data:/var/lib/postgresql \
+  -p 127.0.0.1:5432:5432 \
+  postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
+# Ready only when the FINAL server accepts TCP connections. During first-time
+# initialisation the entrypoint runs a temporary server on the unix socket only, so
+# -h 127.0.0.1 cannot succeed early.
+ExecStartPost=/usr/bin/bash -c 'for _ in $(seq 1 120); do /usr/bin/docker exec autodeploy-postgres pg_isready -q -h 127.0.0.1 -U autodeploy -d autodeploy && exit 0; sleep 1; done; exit 1'
+ExecStop=/usr/bin/docker stop --time=60 autodeploy-postgres
+TimeoutStartSec=150
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+# docker run returns the container's exit status; a signalled stop is not a failure.
+SuccessExitStatus=130 137 143
+
+# The unit only runs the docker CLI against /var/run/docker.sock.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,111 @@
+# Root spawn helper (cmd/checkout-exec): runs the trusted git as the checkout
+# identity inside a per-call cgroup-v2 leaf. Started through
+# checkout-exec-launch, which enables the delegated controllers and computes the
+# XFS device number before exec'ing checkout-exec with all bounds (the binary
+# rejects incomplete bounds). Configuration: /etc/autodeploy/checkout.env.
+[Unit]
+Description=AutoDeploy checkout spawn helper (root, cgroup v2 delegation)
+# Needs: delegated cgroup (this unit's own Delegate=), the trusted bin directory
+# and launcher, the checkout volume (io.max device lookup).
+RequiresMountsFor=/srv/autodeploy/checkout /usr/local/lib/autodeploy/bin /var/lib/autodeploy/checkout-exec
+After=srv-autodeploy-checkout.mount
+AssertPathIsDirectory=/usr/local/lib/autodeploy/bin
+AssertFileIsExecutable=/usr/local/lib/autodeploy/bin/checkout-exec
+AssertFileIsExecutable=/usr/local/lib/autodeploy/bin/git
+AssertFileIsExecutable=/usr/local/lib/autodeploy/checkout-exec-launch
+
+[Service]
+Type=simple
+User=root
+Slice=system.slice
+EnvironmentFile=/etc/autodeploy/checkout.env
+
+# cgroup delegation, systemd-native: systemd enables the four controllers for
+# this unit's cgroup and (DelegateSubgroup, systemd >= 254) puts the main
+# process in a "supervisor" child, leaving the unit cgroup process-free so its
+# subtree_control can be set. Resulting layout, cgroup-root = .../leaves:
+#   /sys/fs/cgroup/system.slice/autodeploy-checkout-exec.service/{supervisor,leaves/checkout-*}
+Delegate=cpu io memory pids
+DelegateSubgroup=supervisor
+
+ExecStartPre=/usr/bin/rm -f -- ${AUTODEPLOY_CHECKOUT_SPAWN_SOCKET}
+ExecStart=/usr/local/lib/autodeploy/checkout-exec-launch
+ExecStartPost=/usr/local/lib/autodeploy/checkout-wait-socket ${AUTODEPLOY_CHECKOUT_SPAWN_SOCKET} ${AUTODEPLOY_CHECKOUT_AGENT_GID}
+# KillMode=control-group (default) also kills every checkout leaf on stop.
+TimeoutStartSec=30
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+# ---- hardening ---------------------------------------------------------------
+# Capabilities, each justified (cmd/checkout-exec/main_linux.go):
+#   CAP_SETUID/SETGID  child credential switch to the checkout uid/gid with an
+#                      empty supplementary group list (:413, setgroups(0))
+#   CAP_CHOWN          Chown(socket, 0, agent gid) (:175)
+#   CAP_KILL           exec.CommandContext's timeout/cancel does kill(2) on a
+#                      process owned by the checkout uid (:409); without it the
+#                      SIGKILL fails with EPERM and a timeout would wait for the
+#                      child instead of ending it. cgroup.kill needs no capability.
+# No CAP_DAC_OVERRIDE/SYS_ADMIN: cgroup files and directories are root-owned, so
+# owner permissions suffice; mounts are not performed. NOTE: dropping
+# CAP_DAC_OVERRIDE does NOT confine where root can write: uid 0 still writes any
+# root-owned file through the owner permission bits. Write confinement here is
+# only the read-only paths below plus the git child running as the checkout uid.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
+AmbientCapabilities=
+NoNewPrivileges=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# The seccomp filter and these restrictions are inherited by the git child.
+# AF_UNIX only follows docs/checkout-isolation.md, but means git cannot reach the
+# network from here: an https fetch (GitFetchExact) will fail until this is
+# widened to AF_UNIX AF_INET AF_INET6 (deliberate decision pending, see report).
+# WHEN WIDENING: pair it with IPAddressDeny= for 127.0.0.0/8 ::1/128 10.0.0.0/8
+# 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 (the git child would
+# otherwise reach PostgreSQL, the Traefik API on 127.0.0.1:8080, the control plane
+# on the bridge gateway and the Docker bridge), and IPAddressAllow= for the DNS
+# resolver(s) and the fetch destinations. Never widen without this pairing.
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+ReadOnlyPaths=/etc -/boot
+# Deliberately NOT set, with the reason:
+#  ProtectSystem=/ReadWritePaths=/ReadOnlyPaths= on /, /usr or /var: each makes
+#    systemd bind-mount along the paths checkout-exec opens with openat2
+#    RESOLVE_NO_XDEV: the trusted bin dir /usr/local/lib/autodeploy/bin
+#    (internal/checkoutcontain/trusted_linux.go:44, resolved from / segment by
+#    segment, via cmd/checkout-exec/main_linux.go:95) and the socket parent
+#    /var/lib/autodeploy/checkout-exec (cmd/checkout-exec/main_linux.go:216, also
+#    from /). Crossing any mount point returns EXDEV, so the helper would refuse to
+#    start. For the same reason the socket lives under /var/lib (root filesystem),
+#    not /run (a tmpfs mount; EXDEV verified on the target host). The cgroup root
+#    is opened WITHOUT NO_XDEV (cgroup_linux.go:63) and the workspace/leaf opens
+#    are descriptor-relative (trusted_linux.go:64,:82; cgroup_linux.go:135,:219,:310).
+#  ProtectKernelTunables/ProtectControlGroups: make /sys (cgroupfs) read-only;
+#    the helper must write its delegated subtree.
+#  PrivateNetwork: not needed given AF_UNIX-only, and would block future fetches.
+#
+# Set instead, on paths the helper never traverses with RESOLVE_NO_XDEV:
+#   ReadOnlyPaths=/etc -/boot   (neither is on any path above)
+#   /home and /root are already inaccessible through ProtectHome=yes, so no
+#   InaccessiblePaths= is added. NOT set: /usr and /var (on the paths above).
+#   UNVERIFIED: confirm on the real host in 18c that the helper still starts and
+#   that a checkout fetch works with /etc read-only (git reads /etc/gitconfig,
+#   /etc/passwd, nsswitch.conf).
+
+[Install]
+WantedBy=multi-user.target

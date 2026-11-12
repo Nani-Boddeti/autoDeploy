@@ -1,0 +1,104 @@
+# Root quota helper (cmd/checkout-quota-service). Serves the descriptor-based
+# quota protocol on a SOCK_SEQPACKET socket that only the agent group may
+# connect to. Arguments, in order, follow docs/checkout-isolation.md:
+#   <checkout-root> <quota-socket> <state-file> <agent-uid> <agent-gid>
+#   <checkout-uid> <checkout-gid> <max-bytes> <max-inodes>
+# Values come from /etc/autodeploy/checkout.env (non-secret, written by
+# install-checkout.sh). The ledger itself is created once by the installer with
+# --initialize; this unit refuses to run without it (never auto-initializes).
+[Unit]
+Description=AutoDeploy checkout quota helper (root, XFS project quotas)
+# Ordered after the XFS mount (RequiresMountsFor adds Requires= and After=) and
+# the root-owned state directory + ledger.
+RequiresMountsFor=/srv/autodeploy/checkout /var/lib/autodeploy/checkout-quota
+After=srv-autodeploy-checkout.mount
+AssertPathIsDirectory=/var/lib/autodeploy/checkout-quota
+AssertPathExists=/var/lib/autodeploy/checkout-quota/ledger.json
+AssertFileIsExecutable=/usr/local/lib/autodeploy/bin/checkout-quota-service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/autodeploy/checkout.env
+ExecStart=/usr/local/lib/autodeploy/bin/checkout-quota-service \
+  ${AUTODEPLOY_CHECKOUT_ROOT} ${AUTODEPLOY_CHECKOUT_QUOTA_SOCKET} ${AUTODEPLOY_CHECKOUT_STATE_FILE} \
+  ${AUTODEPLOY_CHECKOUT_AGENT_UID} ${AUTODEPLOY_CHECKOUT_AGENT_GID} \
+  ${AUTODEPLOY_CHECKOUT_UID} ${AUTODEPLOY_CHECKOUT_GID} \
+  ${AUTODEPLOY_CHECKOUT_QUOTA_BYTES} ${AUTODEPLOY_CHECKOUT_QUOTA_INODES}
+# Started only counts as ready once the socket carries root:<agent gid> 0620.
+ExecStartPost=/usr/local/lib/autodeploy/checkout-wait-socket ${AUTODEPLOY_CHECKOUT_QUOTA_SOCKET} ${AUTODEPLOY_CHECKOUT_AGENT_GID}
+TimeoutStartSec=30
+Restart=on-failure
+RestartSec=2
+
+# Socket parent: /run/autodeploy-checkout-quota, root:root 0711 (traverse-only
+# for others; the socket itself is the only thing the agent group may open).
+# Removed on stop, so a stale socket cannot survive a restart.
+RuntimeDirectory=autodeploy-checkout-quota
+RuntimeDirectoryMode=0711
+UMask=0077
+
+# ---- hardening ---------------------------------------------------------------
+# Capabilities, each justified by helper code (internal/checkoutquota/quota_linux.go):
+#   CAP_CHOWN         Fchown(workspace, checkout uid/gid) on grant, Fchown(0,0) on
+#                     revoke (:665,:714), Chown(socket, 0, agent gid) (:183)
+#   CAP_DAC_OVERRIDE  cleanup walks/unlinks a revoked (root:root 0000) workspace
+#                     tree whose entries belong to the checkout user
+#                     (removeWorkspaceContents :902)
+#   CAP_SYS_ADMIN     quotactl_fd Q_XSETQLIM / Q_XGETQUOTA on a project ID, which
+#                     the kernel allows only with CAP_SYS_ADMIN (:1004-1047)
+#   CAP_FOWNER        (a) Fchmod(workspace, 0700) right after the Fchown to the checkout
+#                     uid (:665-669): chmod needs the file owner or CAP_FOWNER, and
+#                     the owner is no longer root at that point; (b) the same
+#                     cleanup's unlinkat of entries in sticky directories owned by the
+#                     checkout user (:936,:949): the sticky-bit check is bypassed only
+#                     by CAP_FOWNER (CAP_DAC_OVERRIDE does not cover it);
+#                     (c) FS_IOC_FSSETXATTR project-ID set/clear on inodes the checkout
+#                     identity owns (setProject :987; the kernel requires ownership or
+#                     CAP_FOWNER). Verify (c) on the host in 18c; (a)/(b) follow from
+#                     the code.
+# These are bounding-set only (the service runs as root, so they are effective at
+# exec); AmbientCapabilities stays empty because ambient caps matter for non-root.
+# If the smoke test shows EPERM from a further operation, add that capability here
+# with the call site, do not widen anything else.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SYS_ADMIN
+AmbientCapabilities=
+NoNewPrivileges=yes
+# Generic service allowlist (includes chown, setuid-family, openat2, flock, fsync,
+# renameat and AF_UNIX socket calls) plus the one syscall family it lacks: quotactl_fd
+# (:1039). Plain quotactl is named too since both sit in @privileged.
+SystemCallFilter=@system-service
+SystemCallFilter=quotactl quotactl_fd
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# Minimal writable paths: only the XFS volume (workspaces) and the ledger directory.
+# ReadWritePaths/ProtectSystem bind-mount these paths, which is safe here: the quota
+# service opens the checkout root, ledger directory and socket parent with plain
+# open(2) (internal/checkoutquota/quota_linux.go:457,:475,:246), never with
+# RESOLVE_NO_XDEV, and a bind of the XFS root keeps the same st_dev/fsid the ledger
+# binds. Its only RESOLVE_NO_XDEV open (:940) is workspace-relative, below the bind.
+# The /run RuntimeDirectory is likewise only opened without that flag (:246).
+ProtectSystem=strict
+ReadWritePaths=/srv/autodeploy/checkout /var/lib/autodeploy/checkout-quota
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,64 @@
+# Traefik static configuration for the AutoDeploy host (step 18a-2).
+# Installed by install-app.sh to /etc/autodeploy/traefik/traefik.yml and mounted
+# read-only into the container by autodeploy-traefik.service. Non-secret.
+#
+# Addresses below are INSIDE the container (it runs on the AutoDeploy environment
+# network, not host networking: see autodeploy-traefik.service). The host-side
+# bindings are set by the unit's -p options; the management API is published only
+# on 127.0.0.1:8080 of the host.
+#
+# Names that the application code fixes (internal/runtime/traefik/defaults.go):
+#   DefaultEntrypointName   = "websecure"
+#   DefaultCertResolverName = "letsencrypt-production"
+# The renderer emits both into every route file (entryPoints: [websecure],
+# tls.certResolver: letsencrypt-production) and the observer requires the loaded
+# router to report exactly them. The entrypoint is defined here. The resolver is
+# deliberately NOT defined: see the "TLS" note at the bottom.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+  # Drop request headers whose names alias a header Traefik manages (X_Forwarded_For
+  # vs X-Forwarded-For): the control plane trusts forwarded headers from this proxy.
+  aliasHeadersStrategy: delete
+
+log:
+  level: INFO
+accessLog: {}
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+  # Management API entrypoint. Reached only through the host-side loopback port
+  # publication (127.0.0.1:8080). The router that serves it (with basicAuth) lives in
+  # the file-provider directory: autodeploy-api.yml.
+  traefik:
+    address: ":8080"
+
+api:
+  # Dashboard off; insecure off (insecure would expose the API without auth).
+  dashboard: false
+  insecure: false
+
+providers:
+  file:
+    # The agent's route directory (agent-owned, written atomically by
+    # internal/runtime/traefik). It also holds the root-owned, installer-managed
+    # files autodeploy-api.yml, autodeploy-controlplane.yml and autodeploy-tls.yml.
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# TLS: no certificatesResolvers section. Certificates come from the file provider
+# (autodeploy-tls.yml: wildcard certificate signed by the private CA, also set as
+# the default certificate). A router's tls.certResolver that names an undefined
+# resolver is accepted by Traefik; it only matters to ACME, which is not
+# configured. Verified against the pinned image (see deploy/host/README notes /
+# report). Real ACME (DNS-01) later means adding certificatesResolvers.
+# letsencrypt-production here, with no other change to application code.

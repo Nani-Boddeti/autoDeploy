@@ -1,0 +1,27 @@
+# Dedicated XFS volume for checkouts: a sparse loop image, mounted with project
+# quotas (docs/checkout-isolation.md "XFS project quotas"). The unit name must
+# equal the escaped mount path. Created and enabled by install-checkout.sh,
+# which formats the image first (mkfs.xfs only when it holds no filesystem).
+#
+# The loop device is PINNED to /dev/loop200 by autodeploy-checkout-loop.service
+# instead of Options=loop: the quota ledger binds the device number (st_dev),
+# and a dynamically allocated /dev/loopN can change across reboots.
+#
+# nosuid,nodev: nothing in a checkout needs set-id binaries or device nodes.
+# noexec is intentionally not set: not verified against BuildKit's use of the
+# workspace; revisit during step 18e.
+[Unit]
+Description=AutoDeploy checkout XFS volume (loop image, project quotas)
+Requires=autodeploy-checkout-loop.service
+After=autodeploy-checkout-loop.service
+RequiresMountsFor=/var/lib/autodeploy
+AssertPathExists=/var/lib/autodeploy/checkout.xfs
+
+[Mount]
+What=/dev/loop200
+Where=/srv/autodeploy/checkout
+Type=xfs
+Options=prjquota,nosuid,nodev
+
+[Install]
+WantedBy=multi-user.target

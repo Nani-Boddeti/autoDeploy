@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Attach/detach helper for autodeploy-checkout-loop.service (installed to
+# /usr/local/lib/autodeploy/checkout-loop, root-owned).
+#   checkout-loop attach /dev/loopN IMAGE
+#   checkout-loop detach /dev/loopN IMAGE
+# attach is idempotent: nothing to do if DEV already backs IMAGE; an error if DEV
+# backs another file or IMAGE is attached to a different device. detach only
+# touches DEV when it backs IMAGE and is not mounted.
+set -euo pipefail
+
+die() { printf 'checkout-loop: %s\n' "$*" >&2; exit 1; }
+
+(($# == 3)) || die "usage: checkout-loop attach|detach /dev/loopN IMAGE"
+mode="$1" dev="$2" image="$3"
+[[ "$dev" =~ ^/dev/loop[0-9]+$ ]] || die "invalid loop device: $dev"
+[[ -f "$image" && ! -L "$image" ]] || die "$image is not a regular file"
+
+# Every loop device currently bound to IMAGE (matched by device+inode, not by name).
+bound_to_image() { losetup --noheadings --output NAME --associated "$image" 2>/dev/null || true; }
+# Is DEV bound to anything at all?
+dev_in_use() { losetup --list --noheadings --output NAME | grep -qxF "$dev"; }
+
+case "$mode" in
+  attach)
+    others="$(bound_to_image | grep -vxF "$dev" || true)"
+    [[ -z "$others" ]] || die "$image is already attached to $(tr '\n' ' ' <<<"$others")instead of $dev; detach it first"
+    if bound_to_image | grep -qxF "$dev"; then
+      exit 0
+    fi
+    if dev_in_use; then
+      die "$dev is already in use by another file ($(losetup --noheadings --output BACK-FILE "$dev")); refusing to take it over"
+    fi
+    losetup "$dev" "$image"
+    [[ -b "$dev" ]] || die "$dev did not appear after losetup"
+    bound_to_image | grep -qxF "$dev" || die "$dev is not bound to $image after losetup"
+    ;;
+  detach)
+    bound_to_image | grep -qxF "$dev" || exit 0
+    if findmnt --noheadings --source "$dev" >/dev/null 2>&1; then
+      die "$dev is still mounted; refusing to detach"
+    fi
+    losetup --detach "$dev"
+    ;;
+  *) die "unknown mode: $mode" ;;
+esac

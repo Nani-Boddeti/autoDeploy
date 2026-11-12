@@ -1,0 +1,72 @@
+# AutoDeploy control plane (cmd/controlplane), step 18a-2.
+#
+# Identity: autodeploy-controlplane, uid/gid 802 (install-app.sh). No shell, no home,
+# no supplementary groups, no capabilities.
+# Listening: AUTODEPLOY_LISTEN_ADDRESS is the Docker bridge gateway of the environment
+# network (default 172.29.0.1:8081), because Traefik runs in a container on that
+# network and cannot reach host loopback. The control plane itself speaks plain HTTP;
+# TLS terminates in Traefik (autodeploy-controlplane.yml route).
+# Forwarded headers are trusted from Traefik's fixed address only
+# (AUTODEPLOY_TRUSTED_PROXY_CIDRS=<AUTODEPLOY_ENV_TRAEFIK_IP>/32); app containers on the
+# same network are allocated from a disjoint --ip-range, and ufw admits only Traefik's
+# address to this port. With ufw inactive any container can still reach the port.
+#
+# Configuration (cmd/controlplane -> internal/config) is environment only, all
+# NON-secret: paths to credential files and public settings, from controlplane.env.
+# Secrets are files read by the binary itself with internal/credential:
+#   database-url, username-throttle-key-1, csrf-key-1
+# in /etc/autodeploy/controlplane/ (root:autodeploy-controlplane 0750; files owned by
+# the service user, mode 0600). LoadCredential= is NOT used: it delivers files as
+# 0400 (and, for a non-root User=, by ACL while the file stays root-owned), whereas
+# internal/credential/stat_linux.go safeCredentialStat requires the file to be owned
+# by the process UID (or AUTODEPLOY_CREDENTIAL_OWNER_UID) with no group/world bits,
+# and open_linux.go refuses a symlink anywhere in the path.
+[Unit]
+Description=AutoDeploy control plane
+Requires=autodeploy-postgres.service docker.service
+After=autodeploy-postgres.service docker.service network.target
+AssertPathExists=/etc/autodeploy/controlplane/database-url
+AssertPathExists=/etc/autodeploy/controlplane/username-throttle-key-1
+AssertPathExists=/etc/autodeploy/controlplane/csrf-key-1
+
+[Service]
+Type=simple
+User=autodeploy-controlplane
+Group=autodeploy-controlplane
+EnvironmentFile=/etc/autodeploy/controlplane.env
+ExecStart=/usr/local/lib/autodeploy/app/controlplane
+# Exits when PostgreSQL or the bridge address is not up yet; retry quickly.
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+# ---- hardening ---------------------------------------------------------------
+# Writes nothing to disk. TCP only (PostgreSQL on loopback, GitHub API later).
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target
