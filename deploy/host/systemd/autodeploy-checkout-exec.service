@@ -79,7 +79,13 @@ ProtectHostname=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID is deliberately OFF: systemd cannot inspect openat2's mode (it is in
+# struct open_how), so with RestrictSUIDSGID=yes it blocks openat2 entirely with ENOSYS to
+# force an openat fallback. The helper uses openat2(RESOLVE_NO_XDEV|RESOLVE_BENEATH) as its
+# path-safety check and has no fallback by design (observed on the acer, systemd 255:
+# openat2 -> ENOSYS, exit 126). Setuid creation stays harmless: NoNewPrivileges=yes and
+# the checkout volume is mounted nosuid.
+RestrictSUIDSGID=no
 RestrictNamespaces=yes
 RemoveIPC=yes
 ReadOnlyPaths=/etc -/boot
