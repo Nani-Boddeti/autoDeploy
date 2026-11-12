@@ -30,8 +30,8 @@ import (
 //
 // An `authorized` record left behind (a crash, or the result save and the
 // direct report both failing) is converted into a result_ready failure with
-// on-disk evidence by RecoverActivations (recovery.go) at agent startup. The reporter intentionally
-// ignores `authorized` records because the executor may still own them.
+// on-disk evidence by RecoverActivations (recovery.go) at agent startup or after
+// the lease returns. The reporter intentionally ignores `authorized` records because the executor may still own them.
 //
 // After authorization nothing is ever rolled back or rewritten (D4 / ADR 0005:
 // blind resolution is forbidden); a failure is reported as evidence and the
@@ -275,12 +275,12 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		// ignores `authorized` records (the executor may still own them), so
 		// it has nothing to send. Report the REAL result directly, bounded.
 		// If that also fails, the `authorized` record stays on disk and
-		// startup recovery converts it into a result_ready failure with
-		// on-disk evidence for the reporter.
+		// recovery (after this lease returns, or at startup) converts it into
+		// a result_ready failure with on-disk evidence for the reporter.
 		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the result record after retries: %v", lease.AttemptID, err)
 		// A 200 acknowledgement of a success with a predecessor must first
 		// make the drain durable. If that fails the authorized record stays:
-		// startup recovery then converts it into a failure report (the server
+		// recovery then converts it into a failure report (the server
 		// answers that re-send terminally) and the drain is LOST. Accepted
 		// and logged: a stop obligation never outranks the report, and the
 		// predecessor keeps running until an operator stops it.
@@ -300,7 +300,7 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 			// reconciliation_required operation -> late_report_recorded
 			// (store/postgres ReportActivationResult; traced in 10d-4 review).
 			if derr := a.cfg.Store.DeleteActivation(rec.AttemptID); derr != nil {
-				a.logger.Printf("agent activation ERROR attempt %d: cannot delete the authorized record after a terminal direct report; startup recovery will re-report it and the server will answer terminally: %v", lease.AttemptID, derr)
+				a.logger.Printf("agent activation ERROR attempt %d: cannot delete the authorized record after a terminal direct report; recovery will re-report it and the server will answer terminally: %v", lease.AttemptID, derr)
 			}
 		}
 	}
@@ -433,7 +433,7 @@ func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingAc
 			return true, err == nil
 		}
 	}
-	a.logger.Printf("agent activation ERROR attempt %d: direct report did not land (last: %v); the authorized record stays on disk for startup recovery to convert", rec.AttemptID, err)
+	a.logger.Printf("agent activation ERROR attempt %d: direct report did not land (last: %v); the authorized record stays on disk for recovery to convert", rec.AttemptID, err)
 	return false, false
 }
 

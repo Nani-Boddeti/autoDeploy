@@ -7,7 +7,7 @@ import (
 	"autodeploy/internal/runtime/traefik"
 )
 
-// RecoveryStore is the slice of state.ActivationStore startup recovery uses.
+// RecoveryStore is the slice of state.ActivationStore recovery uses.
 // state.ActivationStore satisfies it.
 type RecoveryStore interface {
 	ScanActivations() (records []state.PendingActivation, corrupt []string, err error)
@@ -15,9 +15,11 @@ type RecoveryStore interface {
 }
 
 // RecoverActivations converts every `authorized` pending activation into a
-// result_ready FAILURE so the reporter can deliver it. It must run before the
-// agent claims any lease: only then is no executor guaranteed not to own an
-// `authorized` record. An `authorized` record at startup means a crash (or a
+// result_ready FAILURE so the reporter can deliver it. It must run only
+// while no executor is running: at startup before the first claim, and after
+// each lease returns (the agent runs leases one at a time and waits for the
+// executor on every exit path). Only then is it guaranteed that no executor
+// owns an `authorized` record. A stranded `authorized` record means a crash (or a
 // failed result save plus a failed direct report) happened after authorization,
 // so the route may or may not have been switched and no result was recorded.
 //
@@ -41,7 +43,7 @@ func recoverActivations(store RecoveryStore, routeDir string, readDigest func(di
 	}
 	records, _, err := store.ScanActivations()
 	if err != nil {
-		logger.Printf("agent activation recovery ERROR: cannot scan pending activations; stranded authorized records are NOT recovered this start: %v", err)
+		logger.Printf("agent activation recovery ERROR: cannot scan pending activations; stranded authorized records are NOT recovered this pass: %v", err)
 		return 0
 	}
 	converted := 0
@@ -59,7 +61,7 @@ func recoverActivations(store RecoveryStore, routeDir string, readDigest func(di
 		}
 		rec.Phase = state.PhaseResultReady
 		rec.Succeeded = false
-		rec.FailureSummary = buildFailureSummary("startup-recovery", "agent restarted mid-activation", onDisk, routeDigestString(rec.RouteDigest))
+		rec.FailureSummary = buildFailureSummary("recovery", "activation result was neither saved nor reported (agent restart or failed result save)", onDisk, routeDigestString(rec.RouteDigest))
 		if serr := store.SaveActivation(rec); serr != nil {
 			logger.Printf("agent activation recovery ERROR attempt %d: cannot convert the authorized record, left untouched (operator action may be required): %v", rec.AttemptID, serr)
 			continue

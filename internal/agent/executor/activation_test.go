@@ -587,7 +587,7 @@ func TestActivateSaveAndDirectReportBothFailLeavesAuthorizedAndLogs(t *testing.T
 	if f.last(t).Phase != state.PhaseAuthorized {
 		t.Fatal("authorized record must remain")
 	}
-	if !strings.Contains(buf.String(), "stays on disk for startup recovery") {
+	if !strings.Contains(buf.String(), "stays on disk for recovery to convert") {
 		t.Fatalf("no loud log: %q", buf.String())
 	}
 }
@@ -853,8 +853,8 @@ func TestFailureSummaryKeepsEvidenceWhenFixedFieldsAreLong(t *testing.T) {
 }
 
 func TestFailureSummaryShortReasonUnchanged(t *testing.T) {
-	got := buildFailureSummary("startup-recovery", "agent restarted mid-activation", "absent", "sha256:"+ones(64))
-	want := "activation failed at startup-recovery: agent restarted mid-activation; on-disk route digest: absent; authorized route digest: sha256:" + ones(64) + "; route not rolled back"
+	got := buildFailureSummary("recovery", "activation result was neither saved nor reported (agent restart or failed result save)", "absent", "sha256:"+ones(64))
+	want := "activation failed at recovery: activation result was neither saved nor reported (agent restart or failed result save); on-disk route digest: absent; authorized route digest: sha256:" + ones(64) + "; route not rolled back"
 	if got != want {
 		t.Fatalf("got %q", got)
 	}

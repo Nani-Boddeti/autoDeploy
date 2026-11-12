@@ -82,9 +82,10 @@ type Agent struct {
 	// Reporter, when non-nil, is started as a goroutine by Run (before any
 	// claim) and stopped by ctx; Run waits for it to return.
 	Reporter ActivationDelivery
-	// Recover, when non-nil, runs once at the start of Run, before the
-	// reporter starts and before any Claim, so no executor can own a record it
-	// inspects. The Reporter is kicked right after it.
+	// Recover, when non-nil, runs at the start of Run (before the reporter
+	// starts and before any Claim) and again after every lease returns, i.e.
+	// only while no executor is running, so no executor can own a record it
+	// inspects. The Reporter is kicked right after each run.
 	Recover func()
 	// Drainer, when non-nil, is started as a goroutine by Run after Recover and
 	// alongside the reporter, stopped by ctx; Run waits for it to return.
@@ -201,6 +202,23 @@ func (a *Agent) claimAndRun(ctx context.Context) {
 	}
 	for _, lease := range leases {
 		a.runLease(ctx, lease)
+		a.recoverStranded()
+	}
+}
+
+// recoverStranded re-runs activation recovery right after a lease returned.
+// runLease waits for its executor goroutine on every exit path and leases run
+// one at a time, so here no executor owns an `authorized` record: any that
+// remain (the executor's result save and direct report both failed) are
+// stranded and safe to convert. Without this they would wait for an agent
+// restart. The reporter is kicked so a converted record is reported promptly.
+func (a *Agent) recoverStranded() {
+	if a.Recover == nil {
+		return
+	}
+	a.Recover()
+	if a.Reporter != nil {
+		a.Reporter.Kick()
 	}
 }
 

@@ -66,7 +66,7 @@ func TestRecoverActivationsConvertsAuthorizedToFailure(t *testing.T) {
 			if got.Phase != state.PhaseResultReady || got.Succeeded || got.ObservedRouteDigest != ([32]byte{}) {
 				t.Fatalf("record = %+v, want a result_ready FAILURE even when digests are equal", got)
 			}
-			for _, want := range []string{tc.wantIn, "authorized route digest: " + authorized, "agent restarted mid-activation", "route not rolled back"} {
+			for _, want := range []string{tc.wantIn, "authorized route digest: " + authorized, "activation result was neither saved nor reported", "route not rolled back"} {
 				if !strings.Contains(got.FailureSummary, want) {
 					t.Fatalf("summary %q lacks %q", got.FailureSummary, want)
 				}
