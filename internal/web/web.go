@@ -1412,6 +1412,8 @@ func (h *Handler) environmentRoutePost(w http.ResponseWriter, r *http.Request) {
 			submitted.RouteError = "this hostname is already assigned to another environment"
 		case errors.Is(opErr, postgres.ErrRouteHeadHostnameImmutable):
 			submitted.RouteError = "this route has an active release; the hostname cannot change until it is deactivated"
+		case errors.Is(opErr, postgres.ErrRouteHeadReconciliationRequired):
+			submitted.RouteError = "this route has an unresolved activation; resolve it on the environment's reconciliation page before changing the hostname"
 		default:
 			submitted.RouteError = "route rejected: invalid values, or you are not authorized to configure this environment"
 		}

@@ -1189,3 +1189,52 @@ func TestResolveActivationReplayIsAnchoredToLatestAttempt(t *testing.T) {
 		}
 	})
 }
+
+// Step 16h: a hostname change is refused while the route head is flagged by an
+// unresolved activation (first deployment, no active release), because the
+// revision bump would make a later "activated" declaration impossible. The
+// flag comes from the real ambiguous success report; it is cleared by the
+// real ResolveActivation.
+func TestAssignRouteHostnameRefusedWhileReconciliationRequired(t *testing.T) {
+	a := newActivatedFixture(t, 90, false)
+	blockCauses[1].block(t, a) // ambig
+	ctx := context.Background()
+	routes := NewRouteHeadRepository(a.pool)
+	revision, active, flagged := a.routeHead(t)
+	if !flagged || active != nil {
+		t.Fatalf("setup: flagged=%v active=%v, want flagged first-deployment head", flagged, active)
+	}
+	failureAudits := func() int {
+		var n int
+		if err := a.pool.QueryRow(ctx, `SELECT count(*) FROM route_head_audit_events WHERE environment_id=$1 AND action='hostname_assigned' AND result='failure'`, a.envID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	auditsBefore := failureAudits()
+	if _, err := routes.AssignRouteHostname(ctx, a.principal, a.envID, "changed.example.com", int64ptr(revision)); !errors.Is(err, ErrRouteHeadReconciliationRequired) {
+		t.Fatalf("hostname change while flagged = %v, want ErrRouteHeadReconciliationRequired", err)
+	}
+	// Precedence: a stale revision is still reported as reconciliation-required.
+	if _, err := routes.AssignRouteHostname(ctx, a.principal, a.envID, "changed.example.com", int64ptr(revision+5)); !errors.Is(err, ErrRouteHeadReconciliationRequired) {
+		t.Fatalf("stale revision while flagged = %v, want ErrRouteHeadReconciliationRequired", err)
+	}
+	if got := failureAudits(); got != auditsBefore+2 {
+		t.Fatalf("failure audit rows = %d, want %d", got, auditsBefore+2)
+	}
+	if rev, _, stillFlagged := a.routeHead(t); rev != revision || !stillFlagged {
+		t.Fatalf("head after refusal revision=%d flagged=%v, want %d flagged", rev, stillFlagged, revision)
+	}
+
+	if err := a.resolve(ActivationOutcomeNotActivated); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	rev, _, flagged := a.routeHead(t)
+	if flagged {
+		t.Fatal("resolution did not clear the head flag")
+	}
+	got, err := routes.AssignRouteHostname(ctx, a.principal, a.envID, "changed.example.com", int64ptr(rev))
+	if err != nil || got.RouteRevision != rev+1 || got.Hostname != "changed.example.com" {
+		t.Fatalf("hostname change after resolution = %+v err=%v", got, err)
+	}
+}

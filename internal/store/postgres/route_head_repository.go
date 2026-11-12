@@ -82,6 +82,15 @@ var ErrRouteHeadHostnameTaken = errors.New("hostname is already assigned to anot
 // silently desynchronizing the database from what Traefik is still serving.
 var ErrRouteHeadHostnameImmutable = errors.New("route head hostname cannot change while a release is active")
 
+// ErrRouteHeadReconciliationRequired reports that the caller tried to change
+// the hostname of a route head that is flagged reconciliation_required: an
+// ambiguous activation is unresolved, so the host may or may not have
+// switched. Bumping route_revision now would make the operator's later
+// "activated" declaration impossible (resolution checks the expected
+// revision) and force "not_activated" even if the host really switched; the
+// operator must resolve the activation first.
+var ErrRouteHeadReconciliationRequired = errors.New("route head has an unresolved activation; resolve it before changing the hostname")
+
 // RouteHead is the read view of one environment_id's route_heads row.
 type RouteHead struct {
 	EnvironmentID          string
@@ -247,8 +256,8 @@ func (r *RouteHeadRepository) createRouteHead(ctx context.Context, tx pgx.Tx, ac
 }
 
 // updateRouteHeadHostname locks the target row first (SELECT ... FOR
-// UPDATE), then decides not-found / immutable (active_release_id set) /
-// stale-revision entirely from that locked snapshot, before ever issuing
+// UPDATE), then decides not-found / reconciliation-required / immutable
+// (active_release_id set) / stale-revision entirely from that locked snapshot, before ever issuing
 // the mutating UPDATE. This is deliberate: an earlier version issued the
 // CAS predicate (revision + active_release_id IS NULL) directly in the
 // UPDATE's WHERE clause and, on zero rows affected, ran a second *unlocked*
@@ -264,6 +273,15 @@ func (r *RouteHeadRepository) createRouteHead(ctx context.Context, tx pgx.Tx, ac
 // validate_route_head_update trigger's own hostname-immutability check
 // remains as defense in depth against any future direct-SQL path that
 // bypasses this method, unchanged.
+//
+// Precedence (all from the locked snapshot): not-found, then
+// reconciliation-required, then immutable, then stale revision.
+// Reconciliation-required outranks the others because it names the one
+// actionable step (resolve the activation) and is independent of the
+// caller's revision: a stale caller would otherwise be told to retry with a
+// fresh revision that will also be refused. It outranks immutable because a
+// flagged head that also has an active release should send the operator to
+// resolution first, after which immutability is reported if it still applies.
 func (r *RouteHeadRepository) updateRouteHeadHostname(ctx context.Context, tx pgx.Tx, actor AuditActor, ownerID, environmentID, hostname string, expectedRevision int64) (RouteHead, error) {
 	var head RouteHead
 	head.EnvironmentID = environmentID
@@ -287,6 +305,15 @@ func (r *RouteHeadRepository) updateRouteHeadHostname(ctx context.Context, tx pg
 	}
 	if activeReleaseID != nil {
 		current.ActiveReleaseID = *activeReleaseID
+	}
+	if current.ReconciliationRequired {
+		if auditErr := insertRouteHeadAuditEvent(ctx, tx, actor, ownerID, environmentID, "hostname_assigned", &hostname, nil, "failure", ""); auditErr != nil {
+			return RouteHead{}, auditErr
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return RouteHead{}, fmt.Errorf("commit assign route head hostname (reconciliation required): %w", commitErr)
+		}
+		return RouteHead{}, ErrRouteHeadReconciliationRequired
 	}
 	if current.ActiveReleaseID != "" {
 		if auditErr := insertRouteHeadAuditEvent(ctx, tx, actor, ownerID, environmentID, "hostname_assigned", &hostname, nil, "failure", ""); auditErr != nil {

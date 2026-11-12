@@ -5,6 +5,7 @@ package postgres_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -254,9 +255,11 @@ func TestResolveFormEndToEndReplay(t *testing.T) {
 	}
 }
 
-// RouteMoved is reachable through production calls: with no active release the
-// head's hostname may still be reassigned while the environment is blocked
-// (RouteHeadRepository.AssignRouteHostname), which moves route_revision.
+// RouteMoved: since step 16h AssignRouteHostname refuses a hostname change
+// while the head is flagged, so the move is forced in SQL (a revision bump with
+// the flag untouched, the shape any future writer of a flagged head would
+// leave); the refusal itself is covered by
+// TestAssignRouteHostnameRefusedWhileReconciliationRequired.
 func TestResolveFormEndToEndRouteMoved(t *testing.T) {
 	env := postgres.NewActivationBlockForTest(t, 200, false)
 	h := newResolveHarness(t, env)
@@ -266,8 +269,11 @@ func TestResolveFormEndToEndRouteMoved(t *testing.T) {
 		t.Fatalf("GetRouteHead found=%v err=%v", found, err)
 	}
 	rev := head.RouteRevision
-	if _, err = heads.AssignRouteHostname(context.Background(), env.Principal, env.EnvironmentID, "moved.example.com", &rev); err != nil {
-		t.Fatalf("AssignRouteHostname on the blocked head: %v", err)
+	if _, err = heads.AssignRouteHostname(context.Background(), env.Principal, env.EnvironmentID, "moved.example.com", &rev); !errors.Is(err, postgres.ErrRouteHeadReconciliationRequired) {
+		t.Fatalf("AssignRouteHostname on the blocked head: %v, want ErrRouteHeadReconciliationRequired", err)
+	}
+	if _, err = env.Pool.Exec(context.Background(), `UPDATE route_heads SET hostname='moved.example.com', route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`, env.EnvironmentID); err != nil {
+		t.Fatalf("force the route move: %v", err)
 	}
 	events, audits := h.count(eventsQuery), h.count(auditQuery)
 	rr := h.resolve("activated")

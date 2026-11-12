@@ -329,3 +329,28 @@ func TestEnvironmentRouteHostnameImmutableSurfacesDistinctMessage(t *testing.T) 
 		t.Fatalf("body missing hostname-immutable message: %s", rr.Body.String())
 	}
 }
+
+// TestEnvironmentRouteReconciliationRequiredSurfacesDistinctMessage proves a
+// hostname change refused for an unresolved activation points the operator at
+// the reconciliation page.
+func TestEnvironmentRouteReconciliationRequiredSurfacesDistinctMessage(t *testing.T) {
+	h, admin, p := routeHeadHandler(t)
+	csrf := serversCSRF(t, h, p)
+	admin.assignErr = postgres.ErrRouteHeadReconciliationRequired
+	admin.getFound = true
+	admin.getHead = postgres.RouteHead{EnvironmentID: "env-a", Hostname: "old.example.com", RouteRevision: 1, ReconciliationRequired: true}
+
+	form := validRouteForm("env-a", csrf, "1")
+	r := httptest.NewRequest(http.MethodPost, "https://admin.example.test/environments/route", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("Origin", "https://admin.example.test")
+	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "v1.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reconciliation required = %d", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "unresolved activation") {
+		t.Fatalf("body missing reconciliation-required message: %s", rr.Body.String())
+	}
+}
