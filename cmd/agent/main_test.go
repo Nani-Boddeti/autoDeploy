@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -294,5 +298,139 @@ func TestBuildActivationRejectsMisconfiguredDrainer(t *testing.T) {
 	newDrainDocker = func(string) (executor.DrainDocker, error) { return nil, nil }
 	if _, err := buildActivation(c, nil, st, log.New(io.Discard, "", 0)); err == nil || !strings.Contains(err.Error(), "drainer") {
 		t.Fatalf("err = %v, want a drainer configuration error", err)
+	}
+}
+
+const testTraefikPassword = "Sup3r-S3cret-pw"
+
+func writeCredFile(t *testing.T, contents string, mode os.FileMode) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "traefik-creds")
+	if err := os.WriteFile(p, []byte(contents), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, mode); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestTraefikCredentialsFlagParsedForRunOnly(t *testing.T) {
+	c, err := parseArgs(runArgs("--traefik-api-credentials-file", "/x/creds"))
+	if err != nil || c.traefikAPICredentialsFile != "/x/creds" {
+		t.Fatalf("run: %v %q", err, c.traefikAPICredentialsFile)
+	}
+	if _, err := parseArgs([]string{"enroll", "--base-url", "https://x", "--server-id", "s", "--state-dir", "/s", "--traefik-api-credentials-file", "/x"}); err == nil {
+		t.Fatal("flag must be rejected outside run")
+	}
+}
+
+func TestTraefikObserverWithoutCredentialsFileIsUnauthenticated(t *testing.T) {
+	c := validActivationCommand(t)
+	if c.traefikAPICredentialsFile != "" {
+		t.Fatal("default must be empty")
+	}
+	if err := validateActivationFlags(c); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newTraefikObserver(c); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTraefikCredentialsFileAccepted(t *testing.T) {
+	for _, body := range []string{"agent:" + testTraefikPassword, "agent:" + testTraefikPassword + "\n", "agent:" + testTraefikPassword + "\r\n", "agent:pa:ss"} {
+		c := validActivationCommand(t)
+		c.traefikAPICredentialsFile = writeCredFile(t, body, 0o600)
+		if err := validateActivationFlags(c); err != nil {
+			t.Fatalf("%q: %v", body, err)
+		}
+		o, err := newTraefikObserver(c)
+		if err != nil || o == nil {
+			t.Fatalf("%q: %v", body, err)
+		}
+		if strings.Contains(fmt.Sprintf("%v %+v %#v", o, o, o), testTraefikPassword) {
+			t.Fatal("observer formatting leaks password")
+		}
+	}
+}
+
+func TestTraefikCredentialsSentToObserverEndpoint(t *testing.T) {
+	var gotUser, gotPass string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUser, gotPass, _ = r.BasicAuth()
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	c := validActivationCommand(t)
+	c.traefikAPIURL = srv.URL
+	c.traefikAPICredentialsFile = writeCredFile(t, "agent:"+testTraefikPassword+"\n", 0o600)
+	o, err := newTraefikObserver(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ObserveRouter(context.Background(), "r"); err != nil {
+		t.Fatal(err)
+	}
+	if gotUser != "agent" || gotPass != testTraefikPassword {
+		t.Fatalf("credential not applied: %q", gotUser)
+	}
+}
+
+func TestTraefikCredentialsFileRejected(t *testing.T) {
+	cases := map[string]string{
+		"no colon":     "agent" + testTraefikPassword,
+		"empty user":   ":" + testTraefikPassword,
+		"empty pass":   "agent:",
+		"two lines":    "agent:" + testTraefikPassword + "\nsecond:line\n",
+		"nul":          "agent:" + testTraefikPassword + "\x00",
+		"tab":          "agent:" + testTraefikPassword + "\t",
+		"bare cr":      "agent:" + testTraefikPassword + "\rx",
+		"empty file":   "",
+		"only newline": "\n",
+	}
+	for name, body := range cases {
+		c := validActivationCommand(t)
+		c.traefikAPICredentialsFile = writeCredFile(t, body, 0o600)
+		for label, err := range map[string]error{
+			"validate": validateActivationFlags(c),
+			"observer": func() error { _, err := newTraefikObserver(c); return err }(),
+		} {
+			if err == nil {
+				t.Fatalf("%s/%s: expected rejection", name, label)
+			}
+			if strings.Contains(err.Error(), testTraefikPassword) {
+				t.Fatalf("%s/%s: error leaks password: %v", name, label, err)
+			}
+		}
+	}
+}
+
+func TestTraefikCredentialsFileRejectsUntrustedFile(t *testing.T) {
+	body := "agent:" + testTraefikPassword + "\n"
+	good := writeCredFile(t, body, 0o600)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]string{
+		"mode 0644": writeCredFile(t, body, 0o644),
+		"mode 0400": writeCredFile(t, body, 0o400),
+		"symlink":   link,
+		"missing":   filepath.Join(t.TempDir(), "absent"),
+		"directory": t.TempDir(),
+		"relative":  "creds",
+		"oversized": writeCredFile(t, "agent:"+strings.Repeat("x", 5000), 0o600),
+	}
+	for name, p := range paths {
+		c := validActivationCommand(t)
+		c.traefikAPICredentialsFile = p
+		err := validateActivationFlags(c)
+		if err == nil {
+			t.Fatalf("%s: expected rejection", name)
+		}
+		if strings.Contains(err.Error(), testTraefikPassword) {
+			t.Fatalf("%s: error leaks password: %v", name, err)
+		}
 	}
 }

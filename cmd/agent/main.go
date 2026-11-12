@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -128,13 +129,17 @@ type command struct {
 	// Activation (Step 10d-5b). Like the fields above they are parsed for
 	// "run" regardless of executorEnabled but validated and used only when it
 	// is true (see validateActivationFlags).
-	traefikRouteDir        string // required when the executor is enabled; no default
-	traefikAPIURL          string // loopback only
-	traefikHTTPSAddr       string // literal loopback host:port
-	activationProbePath    string
-	activationProbeTimeout time.Duration // > 0
-	activationTimeout      time.Duration // 0 = derived default
-	drainStopGrace         time.Duration // whole seconds, 1..300s (Step 10e-4)
+	traefikRouteDir string // required when the executor is enabled; no default
+	traefikAPIURL   string // loopback only
+	// traefikAPICredentialsFile is an optional absolute path to a 0600 file
+	// holding "username:password" for a basic-auth-protected Traefik API.
+	// Never accepted via argv or env.
+	traefikAPICredentialsFile string
+	traefikHTTPSAddr          string // literal loopback host:port
+	activationProbePath       string
+	activationProbeTimeout    time.Duration // > 0
+	activationTimeout         time.Duration // 0 = derived default
+	drainStopGrace            time.Duration // whole seconds, 1..300s (Step 10e-4)
 }
 
 func parseArgs(args []string) (command, error) {
@@ -199,6 +204,11 @@ func parseArgs(args []string) (command, error) {
 				return command{}, errors.New("--traefik-api-url is only valid for run")
 			}
 			c.traefikAPIURL = value
+		case "--traefik-api-credentials-file":
+			if c.action != "run" {
+				return command{}, errors.New("--traefik-api-credentials-file is only valid for run")
+			}
+			c.traefikAPICredentialsFile = value
 		case "--traefik-https-addr":
 			if c.action != "run" {
 				return command{}, errors.New("--traefik-https-addr is only valid for run")
@@ -288,8 +298,8 @@ func validateActivationFlags(c command) error {
 	if closeErr != nil || removeErr != nil {
 		return errors.New("--traefik-route-dir must be writable by the agent")
 	}
-	if _, err := traefik.NewObserver(c.traefikAPIURL); err != nil {
-		return fmt.Errorf("invalid --traefik-api-url: %w", err)
+	if _, err := newTraefikObserver(c); err != nil {
+		return err
 	}
 	if err := traefik.ValidateProbeAddress(c.traefikHTTPSAddr); err != nil {
 		return fmt.Errorf("invalid --traefik-https-addr: %w", err)
@@ -326,6 +336,56 @@ type activationParts struct {
 // run on platforms where the docker runtime is unsupported.
 var newDrainDocker = func(socket string) (executor.DrainDocker, error) { return docker.NewClient(socket) }
 
+// newTraefikObserver builds the Traefik observer for c, applying the optional
+// basic-auth credential. validateActivationFlags and buildActivation both use
+// it so they can never disagree. Errors never include credential contents.
+func newTraefikObserver(c command) (*traefik.Observer, error) {
+	var opts []traefik.ObserverOption
+	if c.traefikAPICredentialsFile != "" {
+		user, pass, err := readTraefikAPICredentials(c.traefikAPICredentialsFile)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, traefik.WithBasicAuth(user, pass))
+	}
+	o, err := traefik.NewObserver(c.traefikAPIURL, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --traefik-api-url or traefik credentials: %w", err)
+	}
+	return o, nil
+}
+
+// readTraefikAPICredentials reads "username:password" (one line, optional
+// single trailing LF or CRLF) from a protected file (owner-only 0600, no
+// symlink, size-capped). Every failure is opaque about the contents.
+func readTraefikAPICredentials(path string) (string, string, error) {
+	if !filepath.IsAbs(path) {
+		return "", "", errors.New("--traefik-api-credentials-file must be an absolute path")
+	}
+	raw, err := agentclient.ReadProtectedFile(path)
+	if err != nil {
+		return "", "", errors.New("--traefik-api-credentials-file is not a readable owner-only (0600) regular file")
+	}
+	line := string(raw)
+	if strings.HasSuffix(line, "\r\n") {
+		line = strings.TrimSuffix(line, "\r\n")
+	} else {
+		line = strings.TrimSuffix(line, "\n")
+	}
+	user, pass, ok := strings.Cut(line, ":")
+	if !ok || user == "" || pass == "" {
+		return "", "", errTraefikCredentialFormat
+	}
+	for _, r := range line {
+		if r < 0x20 || r == 0x7f {
+			return "", "", errTraefikCredentialFormat
+		}
+	}
+	return user, pass, nil
+}
+
+var errTraefikCredentialFormat = errors.New("--traefik-api-credentials-file must contain exactly one line of the form username:password")
+
 // buildActivation validates the activation flags and assembles the durable
 // stores, Traefik observer, reporter, recovery hook and a complete
 // executor.ActivationConfig. Only reached when executorEnabled is true.
@@ -341,7 +401,7 @@ func buildActivation(c command, client *agentclient.Client, stateStore state.Sto
 	if err != nil {
 		return activationParts{}, fmt.Errorf("open route revision state: %w", err)
 	}
-	observer, err := traefik.NewObserver(c.traefikAPIURL)
+	observer, err := newTraefikObserver(c)
 	if err != nil {
 		return activationParts{}, fmt.Errorf("configure traefik observer: %w", err)
 	}

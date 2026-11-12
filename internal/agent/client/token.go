@@ -25,7 +25,7 @@ const maxEnrollmentTokenStdinBytes = 256
 func ReadEnrollmentToken(path string, stdin io.Reader) (server.EnrollmentToken, error) {
 	var raw string
 	if path != "" {
-		contents, err := readProtectedFile(path)
+		contents, err := ReadProtectedFile(path)
 		if err != nil {
 			return "", fmt.Errorf("read enrollment token file: %w", err)
 		}

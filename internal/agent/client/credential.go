@@ -107,7 +107,7 @@ func removeUnusedCredential(stateDir string) {
 // corrupt/truncated token -- fails closed rather than run with a credential
 // of uncertain provenance.
 func LoadCredential(stateDir string) (server.CredentialToken, error) {
-	contents, err := readProtectedFile(credentialPath(stateDir))
+	contents, err := ReadProtectedFile(credentialPath(stateDir))
 	if err != nil {
 		return "", err
 	}

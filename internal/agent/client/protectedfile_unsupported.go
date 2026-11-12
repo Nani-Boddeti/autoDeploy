@@ -9,4 +9,5 @@ import "errors"
 // closed rather than skip the ownership/mode checks.
 var ErrProtectedFileRejected = errors.New("protected file rejected")
 
-func readProtectedFile(string) ([]byte, error) { return nil, ErrProtectedFileRejected }
+// ReadProtectedFile always fails closed on this platform.
+func ReadProtectedFile(string) ([]byte, error) { return nil, ErrProtectedFileRejected }

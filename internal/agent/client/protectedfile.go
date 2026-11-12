@@ -18,18 +18,20 @@ const maxProtectedFileBytes = 4096
 // It deliberately never reveals which check failed.
 var ErrProtectedFileRejected = errors.New("protected file rejected")
 
-// readProtectedFile opens path with O_NOFOLLOW so a symlink at the final
-// path component is always rejected, then requires a regular file owned by
-// the current effective user with mode exactly 0600 before reading its
-// bounded contents. This is the same discipline tasks/todo.md Step 6c
-// requires of the credential file. It deliberately does not walk and
-// validate parent directories the way internal/credential does for
-// control-plane secrets mounted by an external orchestrator: the agent
-// state directory is created and owned by this same process (state.New /
-// writeCredentialAtomic use 0700), so that additional hardening protects
-// against a threat this package does not have.
-func readProtectedFile(path string) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+// ReadProtectedFile (exported for the agent's other owner-only secret files,
+// e.g. the Traefik API credential) opens path with O_NOFOLLOW so a symlink at
+// the final path component is always rejected, then requires a regular file
+// owned by the current effective user with mode exactly 0600 before reading
+// its bounded contents. This is the same discipline tasks/todo.md Step 6c
+// requires of the credential file. O_NONBLOCK keeps a FIFO at path from
+// blocking open(2) before the regular-file check rejects it. Parent
+// directories are not walked the way internal/credential does for
+// orchestrator-mounted secrets: that is sufficient for files in the agent's
+// own 0700 state directory; for an operator-chosen path (the Traefik API
+// credentials file) the owner and exact-0600 checks on the opened descriptor
+// are the protection.
+func ReadProtectedFile(path string) ([]byte, error) {
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, ErrProtectedFileRejected
 	}

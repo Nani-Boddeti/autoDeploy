@@ -133,6 +133,67 @@ var (
 type Observer struct {
 	baseURL string
 	client  *http.Client
+	// auth is the optional HTTP basic-auth credential for a Traefik API
+	// protected by a basicAuth middleware (ADR 0005: "private,
+	// authenticated management surface"). Nil means unauthenticated, the
+	// historical behaviour. It is a pointer to a type that redacts itself
+	// under every fmt verb, so printing an Observer can never leak it.
+	auth *basicAuth
+}
+
+// Format keeps every fmt verb away from the unexported fields: fmt prints
+// nested unexported pointer fields raw (it cannot call their methods), which
+// would expose the credential held in auth.
+func (o Observer) Format(f fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(f, "traefik.Observer{baseURL: %s, auth: %t}", o.baseURL, o.auth != nil)
+}
+
+// ErrBaseURLUserinfo means the base URL embeds user:pass@. The credential
+// must only ever arrive through WithBasicAuth (read from a protected file),
+// never through a URL that would sit in argv or process listings.
+var ErrBaseURLUserinfo = errors.New("traefik: observation api base url must not carry userinfo")
+
+// ErrInvalidBasicAuth means the credential passed to WithBasicAuth is not a
+// usable basic-auth pair. It never echoes the credential.
+var ErrInvalidBasicAuth = errors.New("traefik: invalid basic-auth credential")
+
+// basicAuth holds the credential; every fmt verb prints a fixed placeholder.
+// Value receivers, so a copied value (not only a pointer) stays redacted.
+type basicAuth struct {
+	username string
+	password string
+}
+
+func (basicAuth) String() string   { return "<redacted>" }
+func (basicAuth) GoString() string { return "<redacted>" }
+func (basicAuth) Format(f fmt.State, _ rune) {
+	_, _ = f.Write([]byte("<redacted>"))
+}
+
+// ObserverOption customises NewObserver.
+type ObserverOption func(*Observer) error
+
+// WithBasicAuth makes the observer send HTTP basic auth on every request.
+// The header can only reach loopback: NewObserver rejects non-loopback base
+// URLs, and the client follows no redirects and uses no environment proxy.
+func WithBasicAuth(username, password string) ObserverOption {
+	return func(o *Observer) error {
+		if username == "" || password == "" || strings.ContainsRune(username, ':') ||
+			hasControlChar(username) || hasControlChar(password) {
+			return ErrInvalidBasicAuth
+		}
+		o.auth = &basicAuth{username: username, password: password}
+		return nil
+	}
+}
+
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // NewObserver constructs an Observer against baseURL (e.g.
@@ -143,8 +204,8 @@ type Observer struct {
 // doc comment and ADR 0005's "private, authenticated management surfaces"
 // require, applied once here rather than left to each call site to
 // remember.
-func NewObserver(baseURL string) (*Observer, error) {
-	return newObserver(baseURL, defaultObservationTimeout)
+func NewObserver(baseURL string, opts ...ObserverOption) (*Observer, error) {
+	return newObserver(baseURL, defaultObservationTimeout, opts...)
 }
 
 // newObserver is NewObserver's implementation, parameterized by timeout so
@@ -152,10 +213,19 @@ func NewObserver(baseURL string) (*Observer, error) {
 // millisecond-scale deadline instead of defaultObservationTimeout's real 5
 // seconds. There is no exported way to construct an Observer with a
 // different timeout -- production code only ever calls NewObserver.
-func newObserver(baseURL string, timeout time.Duration) (*Observer, error) {
+func newObserver(baseURL string, timeout time.Duration, opts ...ObserverOption) (*Observer, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
+		// url.Error embeds the raw URL, which may carry a password; keep
+		// only the underlying cause.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
 		return nil, fmt.Errorf("%w: %v", ErrNonLoopbackBaseURL, err)
+	}
+	if u.User != nil {
+		return nil, ErrBaseURLUserinfo
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("%w: unsupported scheme %q", ErrNonLoopbackBaseURL, u.Scheme)
@@ -183,7 +253,13 @@ func newObserver(baseURL string, timeout time.Duration) (*Observer, error) {
 			return errRedirectRefused
 		},
 	}
-	return &Observer{baseURL: strings.TrimRight(baseURL, "/"), client: client}, nil
+	o := &Observer{baseURL: strings.TrimRight(baseURL, "/"), client: client}
+	for _, opt := range opts {
+		if err := opt(o); err != nil {
+			return nil, err
+		}
+	}
+	return o, nil
 }
 
 // errRedirectRefused is returned from CheckRedirect to make net/http
@@ -264,6 +340,9 @@ func (o *Observer) get(ctx context.Context, op, path string) (int, []byte, error
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL+path, nil)
 	if err != nil {
 		return 0, nil, &ObservationError{Class: ErrClassConfiguration, Op: op, Err: err}
+	}
+	if o.auth != nil {
+		req.SetBasicAuth(o.auth.username, o.auth.password)
 	}
 	resp, err := o.client.Do(req)
 	if err != nil {
