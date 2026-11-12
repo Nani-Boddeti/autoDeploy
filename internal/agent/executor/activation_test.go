@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -52,8 +54,13 @@ type actFake struct {
 
 	verifyErr error
 	verifyN   int
-	probeErr  error
-	probeN    int
+
+	preflightErr error
+	preflightN   int
+	// activateNAtPreflight records activateN when Preflight ran (ordering).
+	activateNAtPreflight int
+	probeErr             error
+	probeN               int
 
 	writes    []traefik.EnvironmentRoute
 	writeErr  error
@@ -156,6 +163,11 @@ func (f *actFake) RecordRouteRevision(_ string, rev int64) error {
 func (f *actFake) Verify(context.Context, traefik.EnvironmentRoute) (traefik.VerifyResult, error) {
 	f.verifyN++
 	return traefik.VerifyResult{}, f.verifyErr
+}
+func (f *actFake) Preflight(context.Context) error {
+	f.preflightN++
+	f.activateNAtPreflight = f.activateN
+	return f.preflightErr
 }
 func (f *actFake) Kick() { f.kicks++ }
 
@@ -901,3 +913,63 @@ func TestActivateWithRealStoresAndRouteDir(t *testing.T) {
 }
 
 func zeroBuild() (r docker.BuildResult) { return r }
+
+// realPreflightError returns the error a real traefik.Observer produces for a
+// Traefik API answering status, so the class mapping under test is the real one.
+func realPreflightError(t *testing.T, status int) error {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+	obs, err := traefik.NewObserver(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = obs.Preflight(context.Background())
+	if err == nil {
+		t.Fatalf("status %d: Preflight unexpectedly succeeded", status)
+	}
+	return err
+}
+
+func TestActivatePreflightFailureIsPreAuthorizationRefusal(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		want   queue.FailureClass
+	}{
+		{"unauthorized", http.StatusUnauthorized, queue.FailureClassPermanentConfiguration},
+		{"forbidden", http.StatusForbidden, queue.FailureClassPermanentConfiguration},
+		{"api_disabled", http.StatusNotFound, queue.FailureClassPermanentConfiguration},
+		{"server_error", http.StatusInternalServerError, queue.FailureClassTransient},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lease := testLease()
+			f := newActFake(lease)
+			f.preflightErr = realPreflightError(t, tc.status)
+			out := f.executor().activate(context.Background(), lease, testImageDigest)
+			if out.Succeeded || out.HandedOff || out.AuthorizationUnknown || out.FailureClass != tc.want {
+				t.Fatalf("outcome = %+v, want failed %s (Complete path)", out, tc.want)
+			}
+			if f.preflightN != 1 || f.activateN != 0 {
+				t.Fatalf("preflightN=%d activateN=%d, Activate must never be called", f.preflightN, f.activateN)
+			}
+			assertUntouched(t, f)
+			assertNoWrite(t, f)
+		})
+	}
+}
+
+func TestActivatePreflightRunsBeforeAuthorizeAndSuccessProceeds(t *testing.T) {
+	lease := testLease()
+	f := newActFake(lease)
+	out := f.executor().activate(context.Background(), lease, testImageDigest)
+	if f.preflightN != 1 || f.activateN != 1 || f.activateNAtPreflight != 0 {
+		t.Fatalf("preflightN=%d activateN=%d activateNAtPreflight=%d", f.preflightN, f.activateN, f.activateNAtPreflight)
+	}
+	if !out.HandedOff && !out.Succeeded {
+		t.Fatalf("outcome = %+v, want the sequence to proceed", out)
+	}
+}

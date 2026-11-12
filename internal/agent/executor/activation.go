@@ -75,6 +75,9 @@ type ActivationClient interface {
 // RouteObserver checks Traefik's API for the written route.
 // *traefik.Observer satisfies it.
 type RouteObserver interface {
+	// Preflight proves the observer's credential and URL work before anything
+	// is authorized (traefik.(*Observer).Preflight).
+	Preflight(ctx context.Context) error
 	Verify(ctx context.Context, r traefik.EnvironmentRoute) (traefik.VerifyResult, error)
 }
 
@@ -214,6 +217,21 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 	// Structural step lines only (fixed formats, enum/numeric arguments; never
 	// error text). ctx carries the attempt's shipper (nil-safe when absent).
 	logs := logship.FromContext(ctx)
+
+	// Prove the Traefik API is reachable with a working credential BEFORE
+	// authorizing. A misconfigured credential or URL would otherwise surface
+	// only after the route switch, as a reconciliation block on a route that
+	// was already written. Nothing is authorized yet, so the lease ctx (not a
+	// detached one) is right; the observer's per-request timeout bounds it.
+	if perr := a.cfg.Observer.Preflight(ctx); perr != nil {
+		class := traefik.ClassifyObservation(perr)
+		if !class.Valid() {
+			class = queue.FailureClassTransient
+		}
+		logs.Linef(logship.StreamActivation, "activation: traefik api check failed (%s)", class)
+		a.logger.Printf("agent activation attempt %d: traefik api check failed before authorization (%s); route untouched: %v", lease.AttemptID, class, perr)
+		return e.outcome(lease, false, class)
+	}
 	logs.Linef(logship.StreamActivation, "activation: requesting authorization")
 
 	resp, err := a.authorize(ctx, lease, imageDigest)
