@@ -213,9 +213,16 @@ func (a *Agent) runLease(ctx context.Context, lease Lease) {
 		a.logger().Print("agent fence state unreadable; refusing to act on environment")
 		return
 	}
-	if existed && (stored.ReconciliationRequired || lease.Fence <= stored.HighestAcceptedFence) {
+	if existed && lease.Fence <= stored.HighestAcceptedFence {
 		a.logger().Print("agent rejecting lease: environment reconciling or fence not advancing")
 		return
+	}
+	if existed && stored.ReconciliationRequired {
+		// A stale renewal always leaves the server slot flagged, and Claim
+		// hands out nothing for a flagged slot, so a strictly higher fence
+		// proves an operator resolved it. The Save below writes a Fence with
+		// the flag false, clearing it atomically with the fence advance.
+		a.logger().Print("agent cleared local reconciliation flag: server issued a higher fence")
 	}
 	if err := a.State.Save(state.Fence{EnvironmentID: lease.EnvironmentID, HighestAcceptedFence: lease.Fence}); err != nil {
 		a.logger().Print("agent failed to persist fence state; refusing to act")
@@ -287,7 +294,8 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 }
 
 // markReconciliationRequired flips the durable flag for environmentID
-// without changing its stored fence (Decision 5: "never reset locally").
+// without changing its stored fence. Only a later lease with a strictly higher
+// fence clears it (see runLease).
 func (a *Agent) markReconciliationRequired(environmentID string) {
 	stored, _, err := a.State.Load(environmentID)
 	if err != nil {

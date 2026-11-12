@@ -288,6 +288,103 @@ func TestLowerFenceRejectedClientSide(t *testing.T) {
 	}
 }
 
+func TestHigherFenceClearsLocalReconciliationFlag(t *testing.T) {
+	fake := &fakeControlPlane{leaseToOffer: fixtureLease(t, "env_f", 5), renewStatus: func(int) int { return http.StatusConflict }}
+	srv := httptest.NewTLSServer(fake.mux())
+	defer srv.Close()
+	executor := newFakeExecutor()
+	agent := newTestAgent(t, srv, executor, nil)
+
+	// Stale renewal persists the flag.
+	done := make(chan struct{})
+	go func() { agent.claimAndRun(context.Background()); close(done) }()
+	<-executor.started
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		executor.done <- Outcome{}
+	}()
+	<-done
+	if fence, _, err := agent.State.Load("env_f"); err != nil || !fence.ReconciliationRequired {
+		t.Fatalf("flag must be persisted: %+v %v", fence, err)
+	}
+
+	// The fake executor closes ctxDone once, so later phases get a fresh one.
+	executor = newFakeExecutor()
+	agent.Executor = executor
+	// Later phases must not re-flag through a stale renewal racing the executor.
+	fake.mu.Lock()
+	fake.renewStatus = nil
+	fake.mu.Unlock()
+
+	// Same fence: refused. The executor is pre-released so a regression
+	// fails the assertion instead of hanging.
+	executor.done <- Outcome{HandedOff: true}
+	agent.runLease(context.Background(), Lease{AttemptID: 2, Fence: 5, EnvironmentID: "env_f"})
+	select {
+	case <-executor.started:
+		t.Fatal("executor must not run for a lease whose fence does not advance")
+	default:
+	}
+	if fence, _, err := agent.State.Load("env_f"); err != nil || !fence.ReconciliationRequired || fence.HighestAcceptedFence != 5 {
+		t.Fatalf("same-fence refusal must leave flag and fence untouched: %+v %v", fence, err)
+	}
+	executor = newFakeExecutor()
+	agent.Executor = executor
+
+	// Higher fence: runs, and the flag is cleared with the fence advance.
+	executor.done <- Outcome{HandedOff: true}
+	agent.runLease(context.Background(), Lease{AttemptID: 3, Fence: 6, EnvironmentID: "env_f"})
+	select {
+	case <-executor.started:
+	default:
+		t.Fatal("executor must run for a lease with a higher fence")
+	}
+	fence, _, err := agent.State.Load("env_f")
+	if err != nil || fence.ReconciliationRequired || fence.HighestAcceptedFence != 6 {
+		t.Fatalf("flag must be cleared and fence advanced: %+v %v", fence, err)
+	}
+}
+
+func TestHigherFenceWithSaveFailureStaysRefusedAndFlagged(t *testing.T) {
+	srv := httptest.NewTLSServer((&fakeControlPlane{}).mux())
+	defer srv.Close()
+	executor := newFakeExecutor()
+	agent := newTestAgent(t, srv, executor, nil)
+	dir := t.TempDir()
+	store, err := state.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.State = store
+	if err := store.Save(state.Fence{EnvironmentID: "env_f", HighestAcceptedFence: 5, ReconciliationRequired: true}); err != nil {
+		t.Fatal(err)
+	}
+	// A read-only state directory makes the atomic write fail.
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+	if os.WriteFile(filepath.Join(dir, "probe"), nil, 0600) == nil {
+		t.Skip("state directory stays writable (running as root)")
+	}
+
+	executor.done <- Outcome{HandedOff: true}
+	agent.runLease(context.Background(), Lease{AttemptID: 3, Fence: 6, EnvironmentID: "env_f"})
+
+	select {
+	case <-executor.started:
+		t.Fatal("executor must not run when the cleared state cannot be persisted")
+	default:
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fence, _, err := agent.State.Load("env_f")
+	if err != nil || !fence.ReconciliationRequired || fence.HighestAcceptedFence != 5 {
+		t.Fatalf("flag and fence must be unchanged on disk: %+v %v", fence, err)
+	}
+}
+
 func TestFailClosedOnCorruptFenceState(t *testing.T) {
 	dir := t.TempDir()
 	store, err := state.New(dir)

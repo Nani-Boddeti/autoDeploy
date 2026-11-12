@@ -68,6 +68,43 @@ func TestAgentLeaseListReconcilingEnvironmentsOwnerScoped(t *testing.T) {
 	}
 }
 
+// TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves is the
+// server-side half of the agent's local-flag clearing rule: after a real
+// ordinary expiry close the slot is flagged and Claim hands out nothing, and
+// only after the operator resolution does Claim issue a lease with a strictly
+// higher fence. A lease with an advancing fence therefore proves the block was
+// resolved.
+func TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves(t *testing.T) {
+	f := newLeaseFixture(t, 253)
+	d := f.withCredential(t, 250)
+	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
+	ctx := context.Background()
+	f.leaseJob(t, 1, 1)
+	time.Sleep(1100 * time.Millisecond)
+	if _, err := repo.ExpireBatch(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	closedFence, _, _, flagged := f.slotRow(t)
+	if !flagged {
+		t.Fatal("ordinary expiry close must flag the slot")
+	}
+	// A claimable job on the same environment: only the slot flag may block it.
+	next := f.insertJob(t, f.serverID, f.envID, "next-after-flag", 0)
+	if leases, err := repo.Claim(ctx, f.serverID, d, 5); err != nil || len(leases) != 0 {
+		t.Fatalf("claim while flagged: leases=%+v err=%v, want none", leases, err)
+	}
+	if err := repo.ResolveActivation(ctx, f.principal, f.envID, ActivationOutcomeNoActivation, "operator break-glass: verified clean"); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := repo.Claim(ctx, f.serverID, d, 5)
+	if err != nil || len(leases) != 1 || leases[0].JobID != next {
+		t.Fatalf("claim after resolution: leases=%+v err=%v, want one", leases, err)
+	}
+	if leases[0].Fence <= closedFence {
+		t.Fatalf("fence=%d, want strictly above the closed attempt's advanced fence %d", leases[0].Fence, closedFence)
+	}
+}
+
 func TestAgentLeaseListReconcilingEnvironmentsInvalidPrincipalDenied(t *testing.T) {
 	f := newLeaseFixture(t, 252)
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))

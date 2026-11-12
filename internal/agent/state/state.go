@@ -28,9 +28,10 @@ import (
 var ErrCorruptState = errors.New("corrupt agent fence state")
 
 // Fence is one environment's durable local fence state.
-// HighestAcceptedFence must never decrease; ReconciliationRequired blocks
-// claiming that environment until the control-plane reconcile call clears
-// it.
+// HighestAcceptedFence must never decrease. ReconciliationRequired is set
+// after a stale renewal; it is cleared only when the server issues a lease
+// with a strictly higher fence, which proves the server-side block was
+// resolved (the agent client saves the new fence with the flag false).
 type Fence struct {
 	EnvironmentID          string `json:"environment_id"`
 	HighestAcceptedFence   int64  `json:"highest_accepted_fence"`
@@ -185,7 +186,8 @@ func (s Store) Load(environmentID string) (fence Fence, existed bool, err error)
 //
 // Save performs no monotonicity check of its own; callers
 // (internal/agent/client) must already have compared against Load's result
-// before calling Save, per Decision 5's "never reset locally".
+// before calling Save. Saving a Fence with ReconciliationRequired=false
+// clears the flag.
 func (s Store) Save(fence Fence) error {
 	if !fence.valid() {
 		return errors.New("invalid fence state")
