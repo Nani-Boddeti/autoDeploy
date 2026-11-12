@@ -153,6 +153,20 @@ type activationRunner struct {
 	logger           *log.Logger
 }
 
+// ValidateActivationTimeout rejects an explicit overall activation deadline
+// that leaves less than 30s beyond the probe and verify budgets. A verify
+// timeout <= 0 means the default. It is exported so cmd/agent can reject the
+// flag at startup with the same rule NewExecutor enforces.
+func ValidateActivationTimeout(activation, probe, verify time.Duration) error {
+	if verify <= 0 {
+		verify = defaultVerifyTimeout
+	}
+	if activation < probe+verify+minTimeoutMargin {
+		return errors.New("agent executor: activation timeout must be at least probe timeout + verify timeout + 30s")
+	}
+	return nil
+}
+
 func newActivationRunner(cfg ActivationConfig, logger *log.Logger) (*activationRunner, error) {
 	if cfg.Client == nil || cfg.Observer == nil || cfg.Store == nil || cfg.Revisions == nil || cfg.Drains == nil ||
 		cfg.RouteDir == "" || cfg.ProbeAddress == "" || cfg.ProbeTimeout <= 0 {
@@ -165,8 +179,8 @@ func newActivationRunner(cfg ActivationConfig, logger *log.Logger) (*activationR
 	timeout := cfg.Timeout
 	if timeout <= 0 {
 		timeout = cfg.ProbeTimeout + verifyTimeout + activationSlack
-	} else if timeout < cfg.ProbeTimeout+verifyTimeout+minTimeoutMargin {
-		return nil, errors.New("agent executor: activation timeout must be at least probe timeout + verify timeout + 30s")
+	} else if err := ValidateActivationTimeout(timeout, cfg.ProbeTimeout, verifyTimeout); err != nil {
+		return nil, err
 	}
 	return &activationRunner{
 		cfg:              cfg,
@@ -572,9 +586,14 @@ func (a *activationRunner) failureSummary(step, reason, authorized, environmentI
 	return buildFailureSummary(step, reason, onDisk, authorized)
 }
 
+// buildFailureSummary keeps the step and digest evidence intact and gives the
+// free-text reason whatever room is left (at most maxReasonBytes), so a long
+// reason can never push the digests past the 2048 byte bound.
 func buildFailureSummary(step, reason, onDisk, authorized string) string {
-	return boundSummary(fmt.Sprintf("activation failed at %s: %s; on-disk route digest: %s; authorized route digest: %s; route not rolled back",
-		step, truncateUTF8(reason, maxReasonBytes), onDisk, authorized))
+	const format = "activation failed at %s: %s; on-disk route digest: %s; authorized route digest: %s; route not rolled back"
+	fixed := len(fmt.Sprintf(format, step, "", onDisk, authorized))
+	budget := min(maxReasonBytes, max(maxFailureSummaryBytes-fixed, 0))
+	return boundSummary(fmt.Sprintf(format, step, truncateUTF8(reason, budget), onDisk, authorized))
 }
 
 func boundSummary(s string) string { return truncateUTF8(s, maxFailureSummaryBytes) }

@@ -276,6 +276,18 @@ func validateActivationFlags(c command) error {
 	if fi, err := os.Stat(c.traefikRouteDir); err != nil || !fi.IsDir() {
 		return errors.New("--traefik-route-dir must be an existing directory")
 	}
+	// Writability is checked now because an unwritable route dir otherwise
+	// only surfaces as a failed activation after authorization.
+	probe, err := os.CreateTemp(c.traefikRouteDir, ".autodeploy-writable-*")
+	if err != nil {
+		return errors.New("--traefik-route-dir must be writable by the agent")
+	}
+	name := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(name)
+	if closeErr != nil || removeErr != nil {
+		return errors.New("--traefik-route-dir must be writable by the agent")
+	}
 	if _, err := traefik.NewObserver(c.traefikAPIURL); err != nil {
 		return fmt.Errorf("invalid --traefik-api-url: %w", err)
 	}
@@ -290,6 +302,11 @@ func validateActivationFlags(c command) error {
 	}
 	if c.activationTimeout < 0 {
 		return errors.New("--activation-timeout must not be negative")
+	}
+	if c.activationTimeout != 0 {
+		if err := executor.ValidateActivationTimeout(c.activationTimeout, c.activationProbeTimeout, 0); err != nil {
+			return fmt.Errorf("invalid --activation-timeout: %w", err)
+		}
 	}
 	if c.drainStopGrace < time.Second || c.drainStopGrace > maxDrainStopGrace || c.drainStopGrace%time.Second != 0 {
 		return errors.New("--drain-stop-grace must be whole seconds within 1s..300s")

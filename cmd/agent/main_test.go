@@ -178,6 +178,57 @@ func TestValidateActivationFlagsRejectsInvalidValues(t *testing.T) {
 	}
 }
 
+func TestValidateActivationFlagsTimeoutBudget(t *testing.T) {
+	probe := validActivationCommand(t).activationProbeTimeout
+	// The verify budget is fixed at its 30s default, so the minimum is
+	// probe + 30s verify + 30s margin.
+	minimum := probe + 60*time.Second
+	for name, tc := range map[string]struct {
+		timeout time.Duration
+		wantErr bool
+	}{
+		"zero means derived": {0, false},
+		"too small":          {time.Second, true},
+		"one below minimum":  {minimum - time.Nanosecond, true},
+		"exactly minimum":    {minimum, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := validActivationCommand(t)
+			c.activationTimeout = tc.timeout
+			if err := validateActivationFlags(c); (err != nil) != tc.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateActivationFlagsRejectsReadOnlyRouteDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	c := validActivationCommand(t)
+	c.traefikRouteDir = dir
+	if err := validateActivationFlags(c); err == nil || !strings.Contains(err.Error(), "--traefik-route-dir") {
+		t.Fatalf("read-only route dir accepted or unnamed: %v", err)
+	}
+}
+
+func TestValidateActivationFlagsLeavesNoProbeFile(t *testing.T) {
+	c := validActivationCommand(t)
+	if err := validateActivationFlags(c); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(c.traefikRouteDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("route dir not clean: %v %v", entries, err)
+	}
+}
+
 func TestBuildActivationRequiresRouteDir(t *testing.T) {
 	c, err := parseArgs(runArgs())
 	if err != nil {

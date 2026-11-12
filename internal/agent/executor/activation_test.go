@@ -838,6 +838,28 @@ func TestSummaryHelperBoundsOnRuneBoundary(t *testing.T) {
 	}
 }
 
+func TestFailureSummaryKeepsEvidenceWhenFixedFieldsAreLong(t *testing.T) {
+	step := strings.Repeat("s", 1500)
+	reason := strings.Repeat("é", 3000)
+	s := buildFailureSummary(step, reason, "sha256:"+zeros(64), "sha256:"+ones(64))
+	if len(s) > 2048 || !utf8.ValidString(s) {
+		t.Fatalf("len=%d valid=%v", len(s), utf8.ValidString(s))
+	}
+	for _, want := range []string{"on-disk route digest: sha256:" + zeros(64), "authorized route digest: sha256:" + ones(64), "route not rolled back"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("evidence %q lost", want)
+		}
+	}
+}
+
+func TestFailureSummaryShortReasonUnchanged(t *testing.T) {
+	got := buildFailureSummary("startup-recovery", "agent restarted mid-activation", "absent", "sha256:"+ones(64))
+	want := "activation failed at startup-recovery: agent restarted mid-activation; on-disk route digest: absent; authorized route digest: sha256:" + ones(64) + "; route not rolled back"
+	if got != want {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestActivateWithRealStoresAndRouteDir(t *testing.T) {
 	lease := testLease()
 	f := newActFake(lease)
