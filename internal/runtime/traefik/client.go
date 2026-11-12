@@ -42,13 +42,16 @@ type ErrorClass uint8
 
 const (
 	ErrClassUnknown ErrorClass = iota
-	// ErrClassTransient covers dial/timeout/connection failures and a
-	// non-2xx, non-404 HTTP status: retrying later, once Traefik has
-	// finished reloading, may succeed.
+	// ErrClassTransient covers dial/timeout/connection failures and an HTTP
+	// status that retrying may fix: 5xx, and for router/service observation
+	// any non-2xx status other than 404/401/403 (Preflight narrows 4xx to
+	// 408/425/429): retrying later, once Traefik has finished reloading, may
+	// succeed.
 	ErrClassTransient
-	// ErrClassConfiguration covers a rejected request shape this client
-	// itself refuses to send (currently only a non-loopback base URL,
-	// caught at construction time -- see NewObserver).
+	// ErrClassConfiguration covers agent-side misconfiguration that retrying
+	// cannot fix: a request this client refuses to send (non-loopback base
+	// URL, caught in NewObserver), credentials Traefik rejects (401/403), and
+	// for Preflight any other 4xx (API not at the configured URL).
 	ErrClassConfiguration
 	// ErrClassMalformed covers a response that answered but not in the
 	// shape this client expects: an oversized body, an unexpected
@@ -74,7 +77,7 @@ func (c ErrorClass) String() string {
 
 // ObservationError is the error type every transport-layer failure in this
 // file is returned as. Op names the specific call that failed
-// ("observe-router", "observe-service"); Err carries the underlying cause.
+// ("observe-router", "observe-service", "preflight"); Err carries the underlying cause.
 type ObservationError struct {
 	Class ErrorClass
 	Op    string
@@ -363,6 +366,47 @@ func (o *Observer) get(ctx context.Context, op, path string) (int, []byte, error
 	return resp.StatusCode, body, nil
 }
 
+var (
+	errCredentialsRejected = errors.New("traefik api rejected the agent's credentials")
+	errAPINotFound         = errors.New("traefik api not found at the configured url")
+	errPreflightNotObject  = errors.New("traefik api version response is not a JSON object")
+)
+
+// Preflight performs one GET /api/version through get (loopback-only, basic
+// auth when configured, no redirects, per-request timeout) to prove the
+// configured API URL and credentials work before any route is written.
+// Mapping: 200 with a JSON object body -> nil; 200 otherwise -> Malformed;
+// 401/403 -> Configuration (credentials rejected); 408/425/429 -> Transient
+// (load shedding); any other 4xx -> Configuration (API not found at the
+// configured URL); 5xx and any other
+// non-2xx status -> Transient. Transport failures keep get's classification
+// (dial/timeout transient, refused redirect or oversized body malformed).
+// Messages are fixed strings and never carry the credential.
+func (o *Observer) Preflight(ctx context.Context) error {
+	const op = "preflight"
+	status, body, err := o.get(ctx, op, "/api/version")
+	if err != nil {
+		return err
+	}
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return &ObservationError{Class: ErrClassConfiguration, Op: op, Err: errCredentialsRejected}
+	case status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests:
+		// Load-shedding answers (a rateLimit/inFlightReq middleware or a slow
+		// read), not misconfiguration: retry rather than fail the job.
+		return &ObservationError{Class: ErrClassTransient, Op: op, Err: fmt.Errorf("unexpected status %d", status)}
+	case status >= 400 && status < 500:
+		return &ObservationError{Class: ErrClassConfiguration, Op: op, Err: errAPINotFound}
+	case status != http.StatusOK:
+		return &ObservationError{Class: ErrClassTransient, Op: op, Err: fmt.Errorf("unexpected status %d", status)}
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return &ObservationError{Class: ErrClassMalformed, Op: op, Err: errPreflightNotObject}
+	}
+	return nil
+}
+
 func isRedirectRefusal(err error) bool {
 	var urlErr *url.Error
 	return errors.As(err, &urlErr) && errors.Is(urlErr.Err, errRedirectRefused)
@@ -376,6 +420,9 @@ func (o *Observer) ObserveRouter(ctx context.Context, routerName string) (Router
 	}
 	if status == http.StatusNotFound {
 		return RouterObservation{Loaded: false}, nil
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return RouterObservation{}, &ObservationError{Class: ErrClassConfiguration, Op: "observe-router", Err: errCredentialsRejected}
 	}
 	if status < 200 || status >= 300 {
 		return RouterObservation{}, &ObservationError{Class: ErrClassTransient, Op: "observe-router", Err: fmt.Errorf("unexpected status %d", status)}
@@ -404,6 +451,9 @@ func (o *Observer) ObserveService(ctx context.Context, svcName string) (ServiceO
 	}
 	if status == http.StatusNotFound {
 		return ServiceObservation{Loaded: false}, nil
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return ServiceObservation{}, &ObservationError{Class: ErrClassConfiguration, Op: "observe-service", Err: errCredentialsRejected}
 	}
 	if status < 200 || status >= 300 {
 		return ServiceObservation{}, &ObservationError{Class: ErrClassTransient, Op: "observe-service", Err: fmt.Errorf("unexpected status %d", status)}

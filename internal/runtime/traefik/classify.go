@@ -102,7 +102,7 @@ func ClassifyWrite(err error) queue.FailureClass {
 //     would keep re-attempting fresh activations against a host that is
 //     already serving something unexpected.
 //   - *ObservationError{Class: ErrClassTransient} (dial/connect/timeout/
-//     unexpected non-2xx-non-404 status): transient.
+//     unexpected non-2xx-non-404-non-401/403 status): transient.
 //   - *ObservationError{Class: ErrClassMalformed} (oversized body, refused
 //     redirect, undecodable JSON): corrupt_state -- a loopback-only,
 //     single-purpose management API answering outside its documented shape
