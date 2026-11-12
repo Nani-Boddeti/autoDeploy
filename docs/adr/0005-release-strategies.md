@@ -622,10 +622,14 @@ reporter, recovery and Traefik observer code. Nothing here has run on a real hos
   only to the loopback base URL; redirects and proxies are refused; base URLs with userinfo are now rejected; the
   credential is redacted in all formatting. An absent flag keeps the unauthenticated loopback behaviour. This
   closes the code half of "authenticated management surface"; real Traefik behaviour is unverified.
-- **Known gap (open).** A wrong or missing Traefik credential returns 401, which the observer classifies as
-  transient, and Verify runs only after the route switch. A credential misconfiguration therefore turns every
-  activation into a post-authorization failure (reconciliation block). Candidate fix: a pre-authorization Traefik
-  API check; owner decision pending.
+- **Pre-authorization Traefik API check (step 17, 2026-11-12; replaces the earlier "known gap").** Before
+  requesting authorization the executor calls `Observer.Preflight` (one GET `/api/version` through the same
+  loopback-only, authenticated client). 401/403 (credentials rejected) and other 4xx (API not at the configured
+  URL) fail the attempt as `permanent_configuration`; 408/425/429, 5xx, dial errors and timeouts fail it as
+  `transient`; a non-object 200 or a refused redirect as `corrupt_state`. All of these happen before
+  authorization, so no route is written and no reconciliation is needed. After the switch, router/service
+  observation now classifies 401/403 as configuration, so Verify fails immediately instead of polling for the
+  verify timeout (still reconciliation-required: the route was written). Unverified against a real Traefik.
 
 ## References
 

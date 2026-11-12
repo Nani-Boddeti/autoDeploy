@@ -215,9 +215,10 @@ Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agen
 12. The drainer, reporter and startup recovery run only while the executor is enabled; a 10d binary cannot read
     activation records written by 10e (strict decode), so drain records and pending activations before any
     downgrade.
-13. A wrong or missing Traefik credential returns 401, which the observer treats as transient, and Verify runs
-    only after the route switch, so a credential misconfiguration surfaces only as a post-authorization failure
-    (reconciliation block). Decide a pre-authorization Traefik API check (owner decision pending).
+13. ~~A wrong or missing Traefik credential surfaces only after the route switch~~ done in step 17: the executor
+    runs `Observer.Preflight` (GET `/api/version`) before `authorize`; 401/403/other 4xx ->
+    `permanent_configuration`, 408/425/429/5xx/dial/timeout -> transient, all with no traffic change. Verify now
+    fails fast on 401/403 after the switch. Real Traefik `/api/version` behaviour unverified until the host run.
 14. The `validate_route_head_update` trigger does not enforce the 16h hostname refusal on a flagged route head
     (application-level only); add it as defence in depth.
 15. ~~Admin `AssignRouteHostname` on a flagged route head~~ closed by 16h (typed `ErrRouteHeadReconciliationRequired`).
