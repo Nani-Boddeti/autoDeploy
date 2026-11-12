@@ -91,7 +91,19 @@ func (s Store) path(environmentID string) (string, error) {
 	if !github.ValidOpaqueID(environmentID) {
 		return "", errors.New("invalid environment id")
 	}
-	return filepath.Join(s.dir, encodeName(environmentID)+".json"), nil
+	name, ok := fileNameFor(environmentID, ".json")
+	if !ok {
+		return "", errors.New("environment id too long to store")
+	}
+	return filepath.Join(s.dir, name), nil
+}
+
+// fileNameFor returns encodeName(id)+suffix, or false when that exceeds
+// maxFileNameBytes: ValidOpaqueID allows 128 bytes and each may encode to 3,
+// so a long id would otherwise fail later with an OS-level ENAMETOOLONG.
+func fileNameFor(id, suffix string) (string, bool) {
+	name := encodeName(id) + suffix
+	return name, len(name) <= maxFileNameBytes
 }
 
 // encodeName percent-encodes every byte outside a small safe allow-list so

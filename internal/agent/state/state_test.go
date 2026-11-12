@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -281,3 +282,38 @@ func fenceFilePath(t *testing.T, dir, environmentID string) string {
 // validOpaqueForTest mirrors github.ValidOpaqueID's bound without importing
 // it just for this one fixture guard.
 func validOpaqueForTest(s string) bool { return len(s) > 0 && len(s) <= 128 }
+
+func TestFenceOverlongEnvironmentIDRefused(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("/", 128) // valid opaque id; each byte encodes to 3
+	if err := store.Save(Fence{EnvironmentID: long, HighestAcceptedFence: 1}); err == nil || !strings.Contains(err.Error(), "environment id too long") {
+		t.Fatalf("Save err=%v, want too-long refusal", err)
+	}
+	if _, _, err := store.Load(long); err == nil || !strings.Contains(err.Error(), "environment id too long") {
+		t.Fatalf("Load err=%v, want too-long refusal", err)
+	}
+	over := strings.Repeat("/", 83) + "ab" // 256 bytes encoded: one past the limit
+	if err := store.Save(Fence{EnvironmentID: over, HighestAcceptedFence: 1}); err == nil || !strings.Contains(err.Error(), "environment id too long") {
+		t.Fatalf("Save at limit+1 err=%v, want too-long refusal", err)
+	}
+	// A refused Save must leave neither a fence file nor an index entry.
+	entries, err := os.ReadDir(store.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("refused saves left %d entries in the state dir", len(entries))
+	}
+	// Boundary: an encoded name of exactly maxFileNameBytes still stores.
+	edge := strings.Repeat("/", 83) + "a" // 83*3 + 1 + len(".json") = 255
+	if err := store.Save(Fence{EnvironmentID: edge, HighestAcceptedFence: 2}); err != nil {
+		t.Fatalf("Save at limit: %v", err)
+	}
+	got, existed, err := store.Load(edge)
+	if err != nil || !existed || got.HighestAcceptedFence != 2 {
+		t.Fatalf("Load at limit: %+v existed=%v err=%v", got, existed, err)
+	}
+}

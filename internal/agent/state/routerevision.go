@@ -59,9 +59,8 @@ func (r RouteRevisionStore) path(environmentID string) (string, error) {
 	if !github.ValidOpaqueID(environmentID) {
 		return "", fmt.Errorf("%w: invalid environment id", ErrInvalidRouteRevision)
 	}
-	// ValidOpaqueID allows 128 bytes, each of which may encode to 3 bytes.
-	name := encodeName(environmentID) + routeRevisionFileSuffix
-	if len(name) > maxFileNameBytes {
+	name, ok := fileNameFor(environmentID, routeRevisionFileSuffix)
+	if !ok {
 		return "", fmt.Errorf("%w: environment id too long to store", ErrInvalidRouteRevision)
 	}
 	return filepath.Join(r.dir, name), nil
