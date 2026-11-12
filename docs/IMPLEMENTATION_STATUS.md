@@ -1,6 +1,6 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-12. Branch: main at be34361 (fix: use a same-origin referrer policy so browser form posts pass provenance), pushed; origin/main = be34361. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false; nothing has run on a real host. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-12. Branch: main at 2edaa98 (feat: optional basic-auth credential file for the agent's Traefik API observer); local commits 34b86e8 (plan), fd9b8a1 (16a), 754fa3b (16d), 1a12929 (16b), d17fb19 (16c), bc0f072 (16e), 2edaa98 (16f) are unpushed beyond origin/main = 315a0bc; step 16h is uncommitted at the time of writing. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false; nothing has run on a real host. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
@@ -195,25 +195,32 @@ Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agen
 
 1. The privileged Linux checkout smoke (owner only; macOS cannot substitute).
 2. ~~10d's persistent result-report retry~~ done in 10d-4 (`d99970a`); still unproven against a real control-plane outage.
-3. Traefik API authentication (ADR 0005 says authenticated; the 10b client is unauthenticated loopback),
-   and Traefik's JSON shapes and reload timing observed against a real Traefik.
+3. Traefik API authentication: code half done in 16f (`2edaa98`, optional credentials file, basic auth to loopback
+   only); still open: Traefik's JSON shapes, reload timing and the authenticated API observed against a real Traefik.
 4. Both resolution paths (operator `ResolveActivation`, agent `ReconcileActivation`) can resolve an activation;
    that is safe only while no activate operations exist, i.e. while the gate is false. Re-check before flipping.
-5. Fence `Store.path`: `ValidOpaqueID` allows 128 bytes and `encodeName` can expand x3, exceeding the 255-byte
-   file-name limit for long environment ids (the route-revision store already refuses these). Fix before flipping.
-6. The agent-local `ReconciliationRequired` flag set on a stale renewal is never cleared, so this agent refuses
-   that environment forever even after an operator resolves it. Design a clearing rule before flipping.
-7. Activation recovery runs only at agent startup: a double failure (result save and direct report both fail)
-   leaves an `authorized` record unreported until restart. Consider a between-leases recovery pass.
-8. `validateActivationFlags` does not check `--activation-timeout` against probe + verify + 30s (`NewExecutor`
-   does, after the Docker probe) or route-dir writability. Both fail closed.
-9. The recovery failure summary truncates from the tail; a reason-capped builder would be sturdier (low).
-10. A drain whose arming fails after a direct activation report is lost (the authorized record stays and startup
-    recovery turns it into a failure report): the predecessor keeps running until an operator stops it.
+5. ~~Fence `Store.path`: `ValidOpaqueID` allows 128 bytes and `encodeName` can expand x3, exceeding the 255-byte
+   file-name limit for long environment ids~~ done in 16a (`fd9b8a1`): the fence store refuses them.
+6. ~~The agent-local `ReconciliationRequired` flag set on a stale renewal is never cleared~~ done in 16b
+   (`1a12929`): a later lease with fence > `HighestAcceptedFence` clears it atomically with the fence advance (ADR 0004
+   amendment 2026-11-12).
+7. ~~Activation recovery runs only at agent startup~~ done in 16c (`d17fb19`): recovery also runs after every lease.
+8. ~~`validateActivationFlags` does not check `--activation-timeout` against probe + verify + 30s or route-dir
+   writability~~ done in 16d (`754fa3b`).
+9. ~~The recovery failure summary truncates from the tail~~ done in 16d (`754fa3b`): digests kept, only the reason is
+   truncated.
+10. ~~A drain whose arming fails after a direct activation report is lost~~ done in 16e (`bc0f072`): the executor
+    re-saves the result as result_ready success so the reporter arms the drain; lost only if that re-save also fails.
 11. Drains and stop failures are agent-local evidence only; there is no server record or UI until slice 11.
 12. The drainer, reporter and startup recovery run only while the executor is enabled; a 10d binary cannot read
     activation records written by 10e (strict decode), so drain records and pending activations before any
     downgrade.
+13. A wrong or missing Traefik credential returns 401, which the observer treats as transient, and Verify runs
+    only after the route switch, so a credential misconfiguration surfaces only as a post-authorization failure
+    (reconciliation block). Decide a pre-authorization Traefik API check (owner decision pending).
+14. The `validate_route_head_update` trigger does not enforce the 16h hostname refusal on a flagged route head
+    (application-level only); add it as defence in depth.
+15. ~~Admin `AssignRouteHostname` on a flagged route head~~ closed by 16h (typed `ErrRouteHeadReconciliationRequired`).
 
 ## Known follow-ups
 
@@ -253,8 +260,9 @@ From slice 10 (full list with reasoning in tasks/todo.md step blocks):
 
 - 10b enforces no route-revision monotonicity: `Write` overwrites whenever the on-disk digest differs. 10d added
   a local route-revision guard in the agent (`RouteRevisionStore`, defence in depth over the control plane's CAS).
-- `AssignRouteHostname` can move a not-yet-active route head while an activation is blocked; `activated` is
-  then refused `route_moved` and only `not_activated` remains.
+- ~~`AssignRouteHostname` can move a not-yet-active route head while an activation is blocked; `activated` is
+  then refused `route_moved` and only `not_activated` remains.~~ closed by 16h: a hostname change is refused while
+  the head is `reconciliation_required`.
 - Resolved in 10d-1: the agent client now exposes the 409 code (`ConflictCode`) and the reporter and executor
   branch on it.
 - A failure report after a declared `not_activated` agrees with it but is still answered `integrity_conflict`.
@@ -274,6 +282,18 @@ From step 15 (operations UI and deployment logs; plans in tasks/15-plan.md and t
 - A connection pool of size 1 would starve the log purge scheduler and the sweeper.
 - `Execute` may wait up to about 2.1s on a hung log server (shipper `Close` budget).
 - Gates unchanged: `executorEnabled` and `activationEnabled` are still false and nothing has run on a real host.
+
+From step 16 (hardening before any gate flips; plan in tasks/16-plan.md; commits local, unpushed):
+
+- 16a (`fd9b8a1`): fence store refuses environment ids whose encoded file name exceeds 255 bytes.
+- 16b (`1a12929`): agent-local `ReconciliationRequired` clears on a later lease with a higher fence, atomically.
+- 16c (`d17fb19`): stranded activation records recovered after every lease, not only at startup.
+- 16d (`754fa3b`): startup validation of `--activation-timeout` and route-dir writability; digests kept in capped
+  failure summaries.
+- 16e (`bc0f072`): acknowledged success handed to the reporter when drain arming fails after a direct report.
+- 16f (`2edaa98`): optional basic-auth credentials file for the Traefik API observer (loopback only).
+- 16h (uncommitted): `AssignRouteHostname` refuses a hostname change on a flagged route head.
+- Gates unchanged: `executorEnabled` and `activationEnabled` are still false, nothing has run on a real host, 8/18.
 
 ## Resume order and commands
 

@@ -97,3 +97,50 @@ missing/world-readable/empty; hostname assignment racing resolution (route head 
   (`.autodeploy-writable-*`, no Traefik-loadable extension, removed). `buildFailureSummary` budgets the reason
   after fixed fields (no parallel helper). 5 mutations proved. Orchestrator review: PASS (agent-only, fails closed).
   Combined tree: gofmt, both vets, `go test -race ./...`, Linux builds, diff --check green.
+  Committed: plan `34b86e8`, 16a `fd9b8a1`, 16d `754fa3b`.
+- 16b: runLease drops the flag refusal; the existing atomic Save clears it with the fence advance; log after Save.
+  Orchestrator audit of every slot-flag clearer: resolution paths (activation_resolution.go plain x2, :440) and
+  own completion (agent_lease_repository.go:1876) all require `current_attempt_id = attempt` or are resolutions;
+  ordinary close NULLs current_attempt_id, so none clears an ordinary-close flag. New integration test
+  `TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves` (real ExpireBatch close -> Claim none ->
+  ResolveActivation -> higher fence); mutation-proved. Unit tests mutation-proved x4. Review PASS with 4 low notes,
+  all applied (renew reset between phases, same-fence on-disk check, log after Save, comment). Fresh PG18
+  integration green (4 pkgs) on the pre-note tree; notes touched only agent code/tests. Committed `1a12929`.
+- 16c: `recoverStranded` after every runLease (Recover + Reporter.Kick); startup recovery unchanged. Safety verified:
+  executor package has no goroutines; runLease waits on all exit paths; reporter never writes `authorized`;
+  SaveActivation refuses authorized-over-result_ready. Recovery summary reworded (was "agent restarted
+  mid-activation", false for a mid-run pass; nothing parses it). 4 client tests (fake Recover: import cycle
+  executor->agentclient); real store covered by TestRecoverActivationsAgainstRealStore. Review PASS with notes
+  (stale "startup recovery" comments/logs) — applied. Agent race x10, vets, Linux builds green. Committed `d17fb19`.
+- 16e DESIGN CHANGE (2026-11-12): the reporter path already arms durably (keeps record on arm failure, 200 replay
+  on re-send); the gap is only the direct-report path, entered because the result save already failed. Instead of
+  a new `reported_success` phase (another write to a disk that just refused one), on acked direct report + arm
+  failure retry `saveWithRetry(rec)` as result_ready success so the reporter owns it; if that fails too, log the
+  lost drain loudly. No new phase, no record-format change.
+- 16e done: preconditions proved (succeeded-op replay = 200 before occupant checks; reporter arms before delete,
+  keeps on arm failure; authorized->result_ready allowed). Review PASS with low notes, applied (log/doc wording,
+  FailureSummary assertion). Residual "operator declares not_activated on a succeeded op" impossible: resolution
+  locks only `unresolvedActivationSQL` ops (activation_resolution.go:266). Agent race x3, vet, builds green.
+  Committed `bc0f072`.
+- 16f (uncommitted, security review running): functional option `traefik.WithBasicAuth` on NewObserver;
+  `ReadProtectedFile` exported and reused; userinfo base URLs now rejected (were accepted); Observer.Format +
+  redacting type; url.Error raw URL stripped. FOLLOW-UP (gate list): a wrong credential -> 401, classified
+  transient, and Verify runs only AFTER the route switch -> every activation ends in a reconciliation block.
+  Candidate fix: a pre-authorization Traefik API check (e.g. GET version) so auth misconfig is a transient
+  pre-authorization failure; and/or classify 401/403 as non-transient. Owner to decide.
+  Security review PASS with notes; applied: basicAuth value-receiver redaction (copies stay redacted),
+  O_NONBLOCK in ReadProtectedFile (a FIFO blocked open(2) forever; new test, mutation-proved), doc comment
+  for operator-chosen paths. Other notes accepted: flag validated only when executorEnabled (like all
+  activation flags); /etc/hosts can redirect "localhost" (default is literal 127.0.0.1). Committed `2edaa98`
+  (commit agent first added a Co-Authored-By line, amended away; verified).
+- 16h: `ErrRouteHeadReconciliationRequired` from the locked snapshot in updateRouteHeadHostname (column already
+  selected; no new lock), failure audit + commit mirroring the immutable branch; precedence not-found >
+  reconciliation-required > immutable > stale. Web message mapped; only caller is the web handler.
+  `TestResolveFormEndToEndRouteMoved` rewritten: it renamed a flagged head to reach route_moved, now refused; it
+  asserts the refusal and forces the move via SQL (route_moved stays a defensive branch). Mutations x2 proved.
+  Fresh PG18 integration (4 pkgs) green. Trigger defence-in-depth deferred (needs migration; gate item 14).
+  Implementer's race run counted PASS lines only -> orchestrator re-ran with exit status: fresh PG18,
+  `-race -count=20 -p 1` over GenuinelyRaces|Races|ConcurrentCalls|ConcurrentAssign|TestAssignRouteHostnameRefused
+  in store/postgres, agent/http, web: exit 0, 0 `--- FAIL` (store/postgres 219s).
+- 16g: ADR 0004 + ADR 0005 "Amendments (2026-11-12)", IMPLEMENTATION_STATUS gate list (5-10 struck, 3 code
+  half done, new 13 Traefik 401, 14 trigger, 15 hostname closed) + "From step 16" block. Spot-checked.

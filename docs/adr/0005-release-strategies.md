@@ -595,6 +595,38 @@ on-disk digest equals the authorized one.
   budget, under its own advisory key (see ADR 0004). Container runtime logs and drain log lines are not part of
   this channel.
 
+## Amendments (2026-11-12)
+
+Step 16 (local commits fd9b8a1..2edaa98, plan 34b86e8, 16h pending commit); checked against the agent executor,
+reporter, recovery and Traefik observer code. Nothing here has run on a real host.
+
+### Recovery and drain hand-off (16c, 16d, 16e)
+
+- **Recovery cadence (16c).** Stranded `authorized` activation records are converted to result_ready failure
+  reports at startup and after every lease returns. No executor runs at that point: leases are serial and
+  `runLease` waits for the executor on every exit path. The failure summary now reads "activation result was
+  neither saved nor reported (agent restart or failed result save)" at step "recovery". The summary builder
+  keeps digests intact and truncates only the reason (16d).
+- **Drain hand-off (16e).** On the direct-report path (entered because the result save failed), if the report is
+  acknowledged 200 but arming the predecessor drain fails, the executor re-saves the real result as result_ready
+  success so the reporter owns it. The reporter re-reports (the server answers an identical success replay 200
+  before any occupant check) and arms the drain through its durable retry. Only if that save also fails is the
+  drain lost, logged loudly ("drain obligation LOST ... must be stopped by an operator").
+- **Startup flag validation (16d).** `--activation-timeout` must be at least probe + verify + 30s when non-zero
+  (one shared rule, `executor.ValidateActivationTimeout`); `--traefik-route-dir` must be writable.
+
+### Traefik API authentication (16f)
+
+- Optional `--traefik-api-credentials-file`: one `username:password` line in an owner-only (0600) regular file,
+  read with `O_NOFOLLOW|O_NONBLOCK` under a size cap; never via argv or env. The observer sends HTTP basic auth
+  only to the loopback base URL; redirects and proxies are refused; base URLs with userinfo are now rejected; the
+  credential is redacted in all formatting. An absent flag keeps the unauthenticated loopback behaviour. This
+  closes the code half of "authenticated management surface"; real Traefik behaviour is unverified.
+- **Known gap (open).** A wrong or missing Traefik credential returns 401, which the observer classifies as
+  transient, and Verify runs only after the route switch. A credential misconfiguration therefore turns every
+  activation into a post-authorization failure (reconciliation block). Candidate fix: a pre-authorization Traefik
+  API check; owner decision pending.
+
 ## References
 
 - [Traefik file provider](https://doc.traefik.io/traefik/providers/file/)

@@ -790,6 +790,31 @@ handler and migration 000022. Decisions are in `tasks/15g-plan.md`. Nothing here
 - **Web cancel reuses `RequestCancellation` unchanged** (step 15d). The job id comes only from the
   owner-scoped read of the deployment detail, never from the form.
 
+## Amendments (2026-11-12)
+
+Step 16 (local commits 34b86e8 plan, fd9b8a1 16a, 1a12929 16b, 754fa3b 16d, 16h pending commit); checked
+against the agent fence store, the agent-local activation state and `route_head_repository.go`. Nothing here has
+run on a real host.
+
+- **The agent-local `ReconciliationRequired` flag now clears (16b); the fence counter still never resets.** This
+  replaces the earlier wording that the local flag is never cleared. The flag is set on a stale renewal. A later
+  lease for that environment with fence > `HighestAcceptedFence` clears it, atomically with the fence advance
+  (one atomic `Save`). A non-advancing fence still refuses. Justification: the only server-side fence advances
+  are `Claim` and `closeAttemptOrdinary`, and the latter always flags the slot; `Claim` hands out nothing for a
+  flagged slot; the slot flag is cleared only by operator/agent resolution or by the attempt's own completion
+  (predicated on `current_attempt_id` = that attempt, which an ordinary close sets NULL). So a higher fence
+  proves the server-side block was resolved. The counter itself is still never reset from local assumptions (see
+  "Environment execution slots and fencing"). Pinned by the integration test
+  `TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves`.
+- **Fence state file names (16a).** An environment id whose encoded file name exceeds 255 bytes is refused by the
+  fence store (same rule as the route-revision store, via a shared helper).
+- **`AssignRouteHostname` refuses a hostname change on a flagged route head (16h).** While
+  `route_heads.reconciliation_required`, it returns the typed `ErrRouteHeadReconciliationRequired` and writes a
+  failure audit row. The decision uses the same locked snapshot as the other checks; precedence is not-found >
+  reconciliation-required > immutable > stale revision. No new lock; the lock order above is unchanged. Reason:
+  bumping the revision would make an `activated` declaration impossible. The `validate_route_head_update` trigger
+  does not yet enforce this; recorded as a defence-in-depth follow-up.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)
