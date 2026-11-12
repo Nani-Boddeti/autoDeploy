@@ -96,7 +96,7 @@ func validCgroupRoot(fd int) bool {
 		return false
 	}
 	for _, name := range []string{"cgroup.kill", "cgroup.events", "cgroup.procs"} {
-		controlFD, err := openControl(fd, name, unix.O_RDONLY)
+		controlFD, err := openControl(fd, name, presenceOpenFlags(name))
 		if err != nil {
 			return false
 		}
@@ -107,6 +107,17 @@ func validCgroupRoot(fd int) bool {
 	// an ambiguous hierarchy.
 	procs, err := readControl(fd, "cgroup.procs")
 	return err == nil && strings.TrimSpace(procs) == ""
+}
+
+// presenceOpenFlags is the open mode used only to prove a control file exists.
+// cgroup.kill is write-only (0200): opening it read-only needs CAP_DAC_OVERRIDE,
+// which the spawn helper deliberately lacks (observed on the acer: EACCES, exit
+// 126). Opening it O_WRONLY without writing kills nothing.
+func presenceOpenFlags(name string) int {
+	if name == "cgroup.kill" {
+		return unix.O_WRONLY
+	}
+	return unix.O_RDONLY
 }
 
 func hasControllers(v string) bool {
@@ -187,7 +198,7 @@ func validCgroupLeaf(fd int) bool {
 		return false
 	}
 	for _, name := range []string{"memory.max", "cpu.max", "pids.max", "io.max", "cgroup.kill", "cgroup.events"} {
-		if fd, err := openControl(fd, name, unix.O_RDONLY); err != nil {
+		if fd, err := openControl(fd, name, presenceOpenFlags(name)); err != nil {
 			return false
 		} else {
 			_ = unix.Close(fd)
