@@ -102,3 +102,17 @@ summarized in this file. Repo checks unchanged (gates false, `go test ./...` gre
   after RESOLVE_NO_XDEV inventory). Re-review skipped for speed (owner asked); 18c on the acer is the proof.
   Unverified items listed in the fix report: /etc read-only for exec, loop200 node creation, CAP_FOWNER use,
   ufw row format, --ip outside --ip-range on the acer engine.
+- 18c/18d DONE 2026-11-13: host prep + checkout install on the acer; PRIVILEGED SMOKE PASSED
+  (`TestPrivilegedHelperIsolation` PASS, report /var/tmp/autodeploy-diag/20261113-122332). Defects found only by
+  running on real Linux, each fixed + committed: (1) `FileInfo.Sys().(*unix.Stat_t)` never matches (os returns
+  *syscall.Stat_t) -> every ownership check failed (dff5d9a); (2) test wrote after Truncate at stale offset;
+  (3) systemd RestrictSUIDSGID returns ENOSYS for openat2 (a96d5ab); (4) cgroup.kill (0200) probed O_RDONLY without
+  CAP_DAC_OVERRIDE (3c319e4); (5) child-invocation argc check never matched; (6) RestrictNamespaces returns ENOSYS
+  for clone3 (CLONE_INTO_CGROUP) -> RestrictNamespaces=no + child seccomp namespace filter; (7) kernel io.max
+  output (riops/wiops=max) rejected (2a69a67); (8) smoke parsed subtree_control with trailing "\n" (9340784);
+  (9) CAP_SETUID lost across launcher exec under NoNewPrivileges -> AmbientCapabilities (0dc62fe);
+  (10) workspace FD from quota's mount-namespace copy unreachable -> git getcwd ENOENT -> re-open by name in own
+  namespace, verify dev+ino (c8ff690); (11) XFS Q_XGETQUOTA ENOENT = zero usage, treated as dirty in 4 places
+  (92ab769); (12) re-open needs O_PATH (no read perm without DAC_OVERRIDE) (f3ac066). Workflow: one-shot
+  deploy/host/diagnose.sh per owner sudo run (owner declined passwordless sudo).
+- Next: 18e app side (Postgres, Traefik, control plane, agent; needs owner GitHub App for checkout routes).
