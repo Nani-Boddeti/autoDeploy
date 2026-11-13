@@ -1,12 +1,12 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-12. Branch: main at 2edaa98 (feat: optional basic-auth credential file for the agent's Traefik API observer); local commits 34b86e8 (plan), fd9b8a1 (16a), 754fa3b (16d), 1a12929 (16b), d17fb19 (16c), bc0f072 (16e), 2edaa98 (16f) are unpushed beyond origin/main = 315a0bc; step 16h is uncommitted at the time of writing. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false; nothing has run on a real host. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-13. Branch: main at d0fee76, pushed (origin/main = d0fee76). Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false in committed code. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
 AutoDeploy replaces Coolify for the owner's private GitHub Dockerfile applications on Hetzner. V1 has one administrator and one initial server but retains owner/project/environment/server scope. The approved stack is Go, PostgreSQL, Docker/BuildKit, and Traefik; routes require HTTPS and environments select health-gated blue/green by default or explicit stop-then-start.
 
-Progress is still **8/18 implementation-sequence outcomes (approximately 44%)**, with roughly **50–55% weighted effort** complete. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. **Nothing has executed yet**: no image has been built, no container started, no deployment run end to end. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is code-complete through 10e: the control plane's fenced activation protocol, Traefik route rendering, the full reconciliation path for an ambiguous traffic switch, the agent's activation sequence (Activate, durable record, route write, Traefik verify, HTTPS probe, persistent result reporter, startup recovery) and the predecessor drain-and-stop are all committed. It has never run on a real host: `cmd/controlplane` keeps `activationEnabled = false` and `cmd/agent` keeps `executorEnabled = false`, so no activation can be authorized and no executor is registered. No outcome tick moves, which is why the count stays 8/18. Remaining: operations UI retry/rollback (list, detail, cancel and logs are done; see "From step 15"), observability, packaging, slice 11 (stop-then-start, retention/cleanup, rollback, server-side stop-failure record) and end-to-end validation on a real host. The weighted-effort figure above was last estimated after slice 9b and has not been re-estimated (10c-2b through 10e have not changed it).
+Progress is **10/18 implementation-sequence outcomes (approximately 56%)**, with weighted effort **roughly 65–70%**. Slice 9a moved no outcome on that list and is not meant to: it is the control-plane foundation host execution needs — frozen execution configuration, frozen secret versions, fenced materialization, phase progress, and a checkout credential seam. This is an execution roadmap, not a maturity claim. On 2026-11-13 the first real end-to-end deployment ran on the owner's Ubuntu host (the "acer"): quota-limited checkout with an HTTPS fetch from GitHub, a BuildKit build, a container start, an HTTP health gate, control-plane-authorized activation, a Traefik route switch verified by the observer and an HTTPS probe, and the result report; https://demo.autodeploy.test answered 200 through a private CA. The host runs a locally built binary with both gates flipped (deploy/host/build-acer-binaries.sh); the committed constants executorEnabled and activationEnabled remain false. Slice 9b is now code-complete — the agent can check out, build, run, and health-gate — but `cmd/agent` deliberately keeps `executorEnabled = false`, so no executor is registered, it heartbeats `executor_available=false`, and it claims nothing. Slice 10 (health-gate configuration + blue/green activation) is code-complete through 10e: the control plane's fenced activation protocol, Traefik route rendering, the full reconciliation path for an ambiguous traffic switch, the agent's activation sequence (Activate, durable record, route write, Traefik verify, HTTPS probe, persistent result reporter, startup recovery) and the predecessor drain-and-stop are all committed. Remaining: operations UI retry/rollback (list, detail, cancel and logs are done; see "From step 15"), observability, packaging, slice 11 (stop-then-start, retention/cleanup, rollback, server-side stop-failure record) and real-host validation (see "From step 18 (real host) and step 19").
 
 Completed outcomes:
 
@@ -26,7 +26,7 @@ session, container run by immutable digest with no published ports on one enviro
 default health gate, and an executor in `cmd/agent` assembling all of it. No release activation or Traefik
 routing is in scope, and a successful gate deliberately leaves the deployment at `health_checking`.
 
-**It has never run.** Every test in 9b exercises a fake: a fake Engine API over a real unix socket, a fake
+**It ran for real on 2026-11-13** (first end-to-end deploy on the acer; see "From step 18"). Before that, every test in 9b exercised a fake: a fake Engine API over a real unix socket, a fake
 `docker` binary on PATH, an `httptest` server for the probe. No real dockerd, no real BuildKit, no real
 checkout. `executor_available` stays false until the remaining prerequisite is met (both tracked in
 [tasks/todo.md](../tasks/todo.md)):
@@ -40,6 +40,21 @@ checkout. `executor_available` stays false until the remaining prerequisite is m
 
 Flipping `cmd/agent`'s `executorEnabled` constant is what starts real deployments; a test fails the build
 if it is flipped without being updated deliberately.
+
+## From step 18 (real host) and step 19
+
+- Outcomes newly proven on real hardware: isolated exact-commit checkout (privileged smoke passed; real HTTPS fetch), runtime container creation (network, CPU, memory, restart policy, labels).
+- Partially proven:
+  - build: BuildKit build proven; secret mounts and cleanup not exercised.
+  - health policies: HTTP proven; TCP/container not run.
+  - Traefik: route generation and atomic switch proven; automatic HTTPS via ACME not (private CA used).
+  - blue/green: first deploy only; a switch from a predecessor and its drain not yet run.
+  - UI: end to end works; retry, rollback and nav links to route/config missing.
+  - packaging: Ubuntu host kit in deploy/host works on the acer; Hetzner target not done.
+  - validation: first end-to-end deploy passed.
+- Step 19: admin manual Deploy action (POST /deployments/manual), so deploys need no inbound webhook.
+- Defects found only on the real host (all fixed) are listed in tasks/18-plan.md Progress.
+- Gates: still false in committed code; flipping them needs at least the blue/green switch/drain and recovery validated on a real host.
 
 ## Architecture and trust boundaries
 
@@ -189,11 +204,11 @@ Committed:
 | 10e-4 | Drainer: guarded stop of the predecessor after `drain_seconds`, resumed across restarts | 36b0548 |
 | 10e-5 | ADR 0005 and ADR 0004 amendments, this status refresh | (this commit) |
 
-Slice 10 code-complete; not yet run on a real host.
+Slice 10 code-complete; first activation (no predecessor) ran on the acer on 2026-11-13. A switch from a predecessor and its drain have not run yet.
 
 Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agent) may flip (detail in tasks/todo.md, tasks/10d-plan.md and tasks/10e-plan.md "Follow-ups"):
 
-1. The privileged Linux checkout smoke (owner only; macOS cannot substitute).
+1. ~~The privileged Linux checkout smoke (owner only; macOS cannot substitute)~~ passed on the acer 2026-11-13.
 2. ~~10d's persistent result-report retry~~ done in 10d-4 (`d99970a`); still unproven against a real control-plane outage.
 3. Traefik API authentication: code half done in 16f (`2edaa98`, optional credentials file, basic auth to loopback
    only); still open: Traefik's JSON shapes, reload timing and the authenticated API observed against a real Traefik.
@@ -299,7 +314,7 @@ From step 16 (hardening before any gate flips; plan in tasks/16-plan.md; commits
 ## Resume order and commands
 
 1. Read this file, [tasks/todo.md](../tasks/todo.md) (its slice 9a step-result blocks record every correction and why), [MEMORY.md](../MEMORY.md), then ADR 0001, ADR 0003, ADR 0004 (including its 2026-09-17 amendments), and ADR 0005. For webhook changes also read ADR 0002 and migration checks.
-2. Before relying on checkout from agent execution, run/preflight the pending privileged Linux checkout smoke with Makefile's explicit test-checkout-integration contract on provisioned XFS prjquota plus delegated cgroup v2; keep the top-level checkout milestone unchecked until it passes.
+2. The privileged Linux checkout smoke passed on the acer (2026-11-13); re-run it (deploy/host/diagnose.sh) after any helper change, as documented by with Makefile's explicit test-checkout-integration contract on provisioned XFS prjquota plus delegated cgroup v2; keep the top-level checkout milestone unchecked until it passes.
 3. Inspect git status --short, touched migrations, and focused tests before editing. Do not reset, clean, overwrite shared uncommitted files, or use blanket git add.
 4. Create/approve a detailed plan in tasks/todo.md for a nontrivial slice, including transaction ownership, lock order, negative tests, migration, and rollback behavior.
 5. Run make check, go test -race ./..., and a fresh PostgreSQL 18 integration run using CI's AUTODEPLOY_TEST_DATABASE_URL contract (`-p 1` across internal/store/postgres, internal/agent/http, internal/web, and migrations). Run Linux cross-builds where tagged code changes; finish with git diff --check and independent review/QA.
