@@ -399,8 +399,9 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	var priorAttemptCount int
 	var jobAvailableAt time.Time
 	var cancelRequestedAt *time.Time
-	err = tx.QueryRow(ctx, `SELECT owner_id, project_id, environment_id, server_id, deployment_id, repository_id, full_ref, commit_sha, state, available_at, cancel_requested_at, attempt_count FROM agent_jobs WHERE id=$1 FOR UPDATE SKIP LOCKED`, jobID).
-		Scan(&ownerID, &projectID, &jobEnvironmentID, &jobServerID, &deploymentID, &repositoryID, &ref, &commitSHA, &jobState, &jobAvailableAt, &cancelRequestedAt, &priorAttemptCount)
+	var rollbackTargetReleaseID *string
+	err = tx.QueryRow(ctx, `SELECT owner_id, project_id, environment_id, server_id, deployment_id, repository_id, full_ref, commit_sha, state, available_at, cancel_requested_at, attempt_count, rollback_target_release_id FROM agent_jobs WHERE id=$1 FOR UPDATE SKIP LOCKED`, jobID).
+		Scan(&ownerID, &projectID, &jobEnvironmentID, &jobServerID, &deploymentID, &repositoryID, &ref, &commitSHA, &jobState, &jobAvailableAt, &cancelRequestedAt, &priorAttemptCount, &rollbackTargetReleaseID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return queue.ClaimedLease{}, false, nil
 	}
@@ -434,7 +435,45 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	var freshBindings []frozenBinding
 	var freshLiterals []frozenLiteral
 	var prevAttemptID int64
-	if plannedAttemptNumber == 1 {
+	// A rollback job (step 20D) restarts the target's retained container: its
+	// candidate release is the TARGET (no release row of its own), its frozen
+	// execution config and bindings are the target's winning attempt's, and its
+	// strategy and drain come from the live environment config (D-R2).
+	var rollbackSourceAttemptID int64
+	rollbackRuntimeInstanceID := ""
+	if rollbackTargetReleaseID != nil {
+		winning, found, werr := winningActivationAttempt(ctx, tx, *rollbackTargetReleaseID)
+		if werr != nil {
+			return queue.ClaimedLease{}, false, werr
+		}
+		if !found {
+			return queue.ClaimedLease{}, false, fmt.Errorf("%w: rollback job %d target release %s has no succeeded activation", ErrAgentLeaseCorruptState, jobID, *rollbackTargetReleaseID)
+		}
+		rollbackSourceAttemptID = winning
+		rollbackRuntimeInstanceID = dockerid.AttemptRuntimeInstanceID(winning)
+	}
+	if plannedAttemptNumber == 1 && rollbackTargetReleaseID != nil {
+		// Same rule as enqueue (D-R3): a frozen secret version revoked since is
+		// a definite, permanent refusal. The job is cancelled with its
+		// deployment before any attempt exists.
+		revoked, rerr := frozenSecretRevoked(ctx, tx, rollbackSourceAttemptID)
+		if rerr != nil {
+			return queue.ClaimedLease{}, false, rerr
+		}
+		if revoked {
+			if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusCancelled, now, r.inject); err != nil {
+				return queue.ClaimedLease{}, false, err
+			}
+			if _, err = tx.Exec(ctx, `UPDATE agent_jobs SET state='cancelled', updated_at=$2 WHERE id=$1 AND state=$3`, jobID, now, jobState); err != nil {
+				return queue.ClaimedLease{}, false, fmt.Errorf("cancel rollback job with a revoked secret: %w", err)
+			}
+			if err = appendAgentJobEvent(ctx, tx, jobID, nil, "cancelled"); err != nil {
+				return queue.ClaimedLease{}, false, err
+			}
+			return queue.ClaimedLease{}, false, nil
+		}
+		prevAttemptID = rollbackSourceAttemptID
+	} else if plannedAttemptNumber == 1 {
 		var bindingsOK bool
 		freshBindings, bindingsOK, err = resolveRuntimeSecretBindings(ctx, tx, environmentID)
 		if err != nil {
@@ -534,7 +573,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	var frozenConfig frozenExecutionSnapshot
 	var frozenBindings []frozenBinding
 	var frozenLiterals []frozenLiteral
-	if plannedAttemptNumber == 1 {
+	if plannedAttemptNumber == 1 && rollbackTargetReleaseID == nil {
 		frozenConfig = runtimeConfig
 		frozenBindings = freshBindings
 		frozenLiterals = freshLiterals
@@ -548,7 +587,11 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 			return queue.ClaimedLease{}, false, err
 		}
 	} else {
-		frozenConfig, err = copyPreviousAttemptExecution(ctx, tx, attemptID, prevAttemptID)
+		if plannedAttemptNumber == 1 {
+			frozenConfig, err = copyTargetAttemptExecution(ctx, tx, attemptID, prevAttemptID, runtimeConfig.ReleaseStrategy, runtimeConfig.DrainSeconds)
+		} else {
+			frozenConfig, err = copyPreviousAttemptExecution(ctx, tx, attemptID, prevAttemptID)
+		}
 		if err != nil {
 			return queue.ClaimedLease{}, false, err
 		}
@@ -571,10 +614,15 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 	// the exact same digest attempt 1 stored, since both were just copied
 	// forward verbatim; any disagreement is ErrAgentLeaseCorruptState, not
 	// a silently accepted overwrite.
-	configDigest := computeConfigDigest(frozenConfig, frozenBindings, frozenLiterals)
-	releaseID, err := ensureRelease(ctx, tx, deploymentID, environmentID, commitSHA, frozenConfig.ReleaseStrategy, configDigest)
-	if err != nil {
-		return queue.ClaimedLease{}, false, err
+	var releaseID string
+	if rollbackTargetReleaseID != nil {
+		releaseID = *rollbackTargetReleaseID
+	} else {
+		configDigest := computeConfigDigest(frozenConfig, frozenBindings, frozenLiterals)
+		releaseID, err = ensureRelease(ctx, tx, deploymentID, environmentID, commitSHA, frozenConfig.ReleaseStrategy, configDigest)
+		if err != nil {
+			return queue.ClaimedLease{}, false, err
+		}
 	}
 	if err = r.inject("release"); err != nil {
 		return queue.ClaimedLease{}, false, err
@@ -587,7 +635,7 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		return queue.ClaimedLease{}, false, err
 	}
 
-	return queue.ClaimedLease{
+	lease := queue.ClaimedLease{
 		JobID: jobID, AttemptID: attemptID, AttemptNumber: attemptNumber, Fence: newFence,
 		OwnerID: ownerID, ProjectID: projectID, EnvironmentID: environmentID, DeploymentID: deploymentID,
 		RepositoryID: repositoryID, Ref: ref, CommitSHA: commitSHA,
@@ -596,10 +644,14 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		CPUMillis: frozenConfig.CPUMillis, MemoryBytes: frozenConfig.MemoryBytes,
 		RestartPolicy: frozenConfig.RestartPolicy, DrainSeconds: frozenConfig.DrainSeconds,
 		HealthGatePath: frozenConfig.HealthGatePath, HealthGateHost: frozenConfig.HealthGateHost,
-		ReleaseID: releaseID, SecretBindings: toQueueSecretBindings(frozenBindings),
+		ReleaseID: releaseID, RollbackTargetRuntimeInstanceID: rollbackRuntimeInstanceID, SecretBindings: toQueueSecretBindings(frozenBindings),
 		LiteralBindings: toQueueLiteralBindings(frozenLiterals),
 		LeaseExpiresAt:  leaseExpiresAt, AuthorityExpiresAt: leaseExpiresAt,
-	}, true, nil
+	}
+	if rollbackTargetReleaseID != nil {
+		lease.RollbackTargetReleaseID = *rollbackTargetReleaseID
+	}
+	return lease, true, nil
 }
 
 // transitionDeployment moves deploymentID to target inside tx, reusing
@@ -1248,8 +1300,29 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 
 	var deploymentID string
 	var cancelRequestedAt *time.Time
-	if err = tx.QueryRow(ctx, `SELECT deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID, &cancelRequestedAt); err != nil {
+	var rollbackTarget *string
+	var rollbackSourceReleaseID string
+	if err = tx.QueryRow(ctx, `SELECT deployment_id, cancel_requested_at, rollback_target_release_id FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID, &cancelRequestedAt, &rollbackTarget); err != nil {
 		return queue.ActivationResult{}, fmt.Errorf("lock agent job for activate: %w", err)
+	}
+	// The backend runtime instance this activation routes to. A deployment job
+	// activates a container it created as its own attempt; a rollback job (step
+	// 20D) activates the TARGET release's original container, whose instance is
+	// the target's winning (non-rollback) activation attempt's. Both the fresh
+	// and the replay branch below use this one value.
+	candidateInstanceID := dockerid.AttemptRuntimeInstanceID(attemptID)
+	if rollbackTarget != nil {
+		winning, found, werr := winningActivationAttempt(ctx, tx, *rollbackTarget)
+		if werr != nil {
+			return queue.ActivationResult{}, werr
+		}
+		if !found {
+			return queue.ActivationResult{}, fmt.Errorf("%w: rollback target release %s has no succeeded activation", ErrAgentLeaseCorruptState, *rollbackTarget)
+		}
+		candidateInstanceID = dockerid.AttemptRuntimeInstanceID(winning)
+		if rollbackSourceReleaseID, err = rollbackIntentSource(ctx, tx, deploymentID); err != nil {
+			return queue.ActivationResult{}, err
+		}
 	}
 
 	var attemptState, attemptServerID string
@@ -1329,8 +1402,14 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		// transition, no deployment transition (both already happened on the
 		// original call and are not repeated), no new event.
 		var hostname string
-		if err = tx.QueryRow(ctx, `SELECT hostname FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&hostname); err != nil {
+		var replayActive *string
+		if err = tx.QueryRow(ctx, `SELECT hostname, active_release_id FROM route_heads WHERE environment_id=$1 FOR UPDATE`, environmentID).Scan(&hostname, &replayActive); err != nil {
 			return queue.ActivationResult{}, fmt.Errorf("lock route head for activate replay: %w", err)
+		}
+		// A rollback's source must still be the active release (a deploy may
+		// have activated since the original authorization).
+		if rollbackTarget != nil && (replayActive == nil || *replayActive != rollbackSourceReleaseID) {
+			return queue.ActivationResult{}, ErrRollbackSourceChanged
 		}
 		// The predecessor is derived from the operation's own stored
 		// expected_active_release_id, never from the current route head, so a
@@ -1338,7 +1417,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		// existingReleaseID and existingExpectedActiveReleaseID are FK-validated
 		// release ids (release_operations.release_id / expected_active_release_id).
 		var predecessorReleaseID, predecessorRuntimeInstanceID string
-		predecessorReleaseID, predecessorRuntimeInstanceID, err = derivePredecessor(ctx, tx, existingExpectedActiveReleaseID, existingReleaseID, dockerid.AttemptRuntimeInstanceID(attemptID))
+		predecessorReleaseID, predecessorRuntimeInstanceID, err = derivePredecessor(ctx, tx, existingExpectedActiveReleaseID, existingReleaseID, candidateInstanceID)
 		if err != nil {
 			return queue.ActivationResult{}, err
 		}
@@ -1350,7 +1429,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 			Hostname:                     hostname,
 			EntrypointName:               traefik.DefaultEntrypointName,
 			CertResolverName:             traefik.DefaultCertResolverName,
-			BackendRuntimeInstanceID:     dockerid.AttemptRuntimeInstanceID(attemptID),
+			BackendRuntimeInstanceID:     candidateInstanceID,
 			RouteDigest:                  "sha256:" + hex.EncodeToString(existingRouteDigest),
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -1425,14 +1504,41 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	// looked up non-locking (deployment_id is immutable) then locked.
 	var releaseID, releaseState string
 	var releaseImageDigest []byte
-	err = tx.QueryRow(ctx, `SELECT id, state, image_digest FROM releases WHERE deployment_id=$1 FOR UPDATE`, deploymentID).Scan(&releaseID, &releaseState, &releaseImageDigest)
+	if rollbackTarget != nil && (activeReleaseID == nil || *activeReleaseID != rollbackSourceReleaseID) {
+		return queue.ActivationResult{}, ErrRollbackSourceChanged
+	}
+	if rollbackTarget != nil {
+		// A rollback needs a release to leave: with no active release there is
+		// nothing to roll back from, and the finalize would have no source.
+		if expected := activeReleaseID; expected == nil || *expected == "" {
+			return queue.ActivationResult{}, ErrAgentLeaseActivationCandidateNotReady
+		}
+		err = tx.QueryRow(ctx, `SELECT id, state, image_digest FROM releases WHERE id=$1 FOR UPDATE`, *rollbackTarget).Scan(&releaseID, &releaseState, &releaseImageDigest)
+	} else {
+		err = tx.QueryRow(ctx, `SELECT id, state, image_digest FROM releases WHERE deployment_id=$1 FOR UPDATE`, deploymentID).Scan(&releaseID, &releaseState, &releaseImageDigest)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return queue.ActivationResult{}, fmt.Errorf("%w: deployment %s has no release row", ErrAgentLeaseCorruptState, deploymentID)
 	}
 	if err != nil {
 		return queue.ActivationResult{}, fmt.Errorf("lock candidate release for activate: %w", err)
 	}
+	if rollbackTarget != nil {
+		// Only a retained release is a rollback candidate. It already has its
+		// write-once image digest and needs no candidate -> ready transition;
+		// the presented digest (the agent reads it from the container) must
+		// equal the stored one.
+		if releaseState != "retained" {
+			return queue.ActivationResult{}, ErrAgentLeaseActivationCandidateNotReady
+		}
+		if len(releaseImageDigest) != 32 || [32]byte(releaseImageDigest) != imageDigest {
+			return queue.ActivationResult{}, ErrAgentLeaseIntegrityConflict
+		}
+		releaseState = "rollback"
+	}
 	switch releaseState {
+	case "rollback":
+		// Validated above; nothing to write at authorization time.
 	case "candidate":
 		// First time this release becomes ready: the write-once image_digest
 		// set and the candidate->ready transition happen together, in the
@@ -1483,7 +1589,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		Hostname:                 hostname,
 		EntrypointName:           traefik.DefaultEntrypointName,
 		CertResolverName:         traefik.DefaultCertResolverName,
-		BackendRuntimeInstanceID: dockerid.AttemptRuntimeInstanceID(attemptID),
+		BackendRuntimeInstanceID: candidateInstanceID,
 		BackendPort:              containerPort,
 		BackendScheme:            containerScheme,
 		ReleaseID:                releaseID,
@@ -1509,7 +1615,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 	// Predecessor identity for the agent's later drain-and-stop (step 10e):
 	// a plain read, no lock, after every lock this function takes; the slot
 	// lock held above serializes every writer that could change it.
-	predecessorReleaseID, predecessorRuntimeInstanceID, err := derivePredecessor(ctx, tx, expectedActiveReleaseID, releaseID, dockerid.AttemptRuntimeInstanceID(attemptID))
+	predecessorReleaseID, predecessorRuntimeInstanceID, err := derivePredecessor(ctx, tx, expectedActiveReleaseID, releaseID, candidateInstanceID)
 	if err != nil {
 		return queue.ActivationResult{}, err
 	}
@@ -1550,7 +1656,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		Hostname:                     hostname,
 		EntrypointName:               traefik.DefaultEntrypointName,
 		CertResolverName:             traefik.DefaultCertResolverName,
-		BackendRuntimeInstanceID:     dockerid.AttemptRuntimeInstanceID(attemptID),
+		BackendRuntimeInstanceID:     candidateInstanceID,
 		RouteDigest:                  routeDigestHex,
 	}, nil
 }
@@ -1584,13 +1690,15 @@ func derivePredecessor(ctx context.Context, tx pgx.Tx, expectedActiveReleaseID *
 		return "", "", fmt.Errorf("%w: predecessor release %s equals the candidate release", ErrAgentLeaseCorruptState, releaseID)
 	}
 	var predecessorAttemptID int64
-	err = tx.QueryRow(ctx, `SELECT attempt_id FROM release_operations WHERE release_id=$1 AND kind='activate' AND state=$2 ORDER BY id DESC LIMIT 1`,
-		releaseID, activationStateSucceeded).Scan(&predecessorAttemptID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", "", fmt.Errorf("%w: active release %s has no succeeded activate operation", ErrAgentLeaseCorruptState, releaseID)
-	}
+	// Non-rollback operations only: a rollback re-activates the same container,
+	// so its own (newer) operation must not redefine the instance.
+	var found bool
+	predecessorAttemptID, found, err = winningActivationAttempt(ctx, tx, releaseID)
 	if err != nil {
 		return "", "", fmt.Errorf("derive predecessor runtime instance: %w", err)
+	}
+	if !found {
+		return "", "", fmt.Errorf("%w: active release %s has no succeeded activate operation", ErrAgentLeaseCorruptState, releaseID)
 	}
 	runtimeInstanceID = dockerid.AttemptRuntimeInstanceID(predecessorAttemptID)
 	if runtimeInstanceID == candidateRuntimeInstanceID {
@@ -1684,6 +1792,102 @@ func truncateOnRuneBoundary(s string, maxBytes int) string {
 	return s[:cut]
 }
 
+// rollbackIntentSource returns the release a rollback was requested from.
+func rollbackIntentSource(ctx context.Context, tx pgx.Tx, deploymentID string) (string, error) {
+	var source string
+	err := tx.QueryRow(ctx, `SELECT source_release_id FROM rollback_intents WHERE deployment_id=$1`, deploymentID).Scan(&source)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", fmt.Errorf("%w: rollback deployment %s has no intent", ErrAgentLeaseCorruptState, deploymentID)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read rollback intent source: %w", err)
+	}
+	return source, nil
+}
+
+func rollbackIntentSourceForJob(ctx context.Context, tx pgx.Tx, jobID int64) (string, error) {
+	var deploymentID string
+	if err := tx.QueryRow(ctx, `SELECT deployment_id FROM agent_jobs WHERE id=$1`, jobID).Scan(&deploymentID); err != nil {
+		return "", fmt.Errorf("read rollback job deployment: %w", err)
+	}
+	return rollbackIntentSource(ctx, tx, deploymentID)
+}
+
+// activationCandidateInstance is the runtime instance an activation routes to:
+// the attempt's own, or for a rollback job the target's original container's.
+func activationCandidateInstance(ctx context.Context, tx pgx.Tx, jobID int64, releaseID string, attemptID int64) (string, error) {
+	rollback, err := isRollbackJob(ctx, tx, jobID)
+	if err != nil {
+		return "", err
+	}
+	if !rollback {
+		return dockerid.AttemptRuntimeInstanceID(attemptID), nil
+	}
+	winning, found, err := winningActivationAttempt(ctx, tx, releaseID)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", fmt.Errorf("%w: rollback target release %s has no succeeded activation", ErrAgentLeaseCorruptState, releaseID)
+	}
+	return dockerid.AttemptRuntimeInstanceID(winning), nil
+}
+
+// isRollbackJob reports whether jobID is a rollback job (step 20D). The caller
+// holds the job row.
+func isRollbackJob(ctx context.Context, tx pgx.Tx, jobID int64) (bool, error) {
+	var rollback bool
+	if err := tx.QueryRow(ctx, `SELECT rollback_target_release_id IS NOT NULL FROM agent_jobs WHERE id=$1`, jobID).Scan(&rollback); err != nil {
+		return false, fmt.Errorf("read job kind for activation finalize: %w", err)
+	}
+	return rollback, nil
+}
+
+// lockActivationDeployments locks the deployment row(s) an activation success
+// writes (ADR 0004 position 6) and returns deploymentID's status. A rollback
+// writes two: its own and the source deployment's (the deployment of the active
+// release it replaces, healthy -> rolled_back), locked together in ascending id
+// so no transaction can hold them in the opposite order.
+func lockActivationDeployments(ctx context.Context, tx pgx.Tx, jobID int64, deploymentID string, expectedActiveReleaseID *string) (string, error) {
+	ids := []string{deploymentID}
+	rollback, err := isRollbackJob(ctx, tx, jobID)
+	if err != nil {
+		return "", err
+	}
+	if rollback && expectedActiveReleaseID != nil {
+		var source string
+		if err = tx.QueryRow(ctx, `SELECT deployment_id FROM releases WHERE id=$1`, *expectedActiveReleaseID).Scan(&source); err != nil {
+			return "", fmt.Errorf("read rollback source deployment id: %w", err)
+		}
+		if source != deploymentID {
+			ids = append(ids, source)
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT id, status FROM deployments WHERE id = ANY($1) ORDER BY id FOR UPDATE`, ids)
+	if err != nil {
+		return "", fmt.Errorf("lock deployments for activation: %w", err)
+	}
+	defer rows.Close()
+	status, seen := "", 0
+	for rows.Next() {
+		var id, st string
+		if err = rows.Scan(&id, &st); err != nil {
+			return "", fmt.Errorf("scan deployment for activation: %w", err)
+		}
+		if id == deploymentID {
+			status = st
+		}
+		seen++
+	}
+	if err = rows.Err(); err != nil {
+		return "", fmt.Errorf("lock deployments for activation: %w", err)
+	}
+	if seen != len(ids) {
+		return "", pgx.ErrNoRows
+	}
+	return status, nil
+}
+
 // activationFinalizeInput is everything finalizeActivationSucceeded needs,
 // already loaded and verified by the caller under the slot/job/attempt/
 // operation locks. Step 10c-2b's operator-declared "activated" reconciliation
@@ -1734,6 +1938,10 @@ func validateFinalizeFromState(fromState string) error {
 // the job; Complete is never called afterwards. It does not commit.
 func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, tx pgx.Tx, in activationFinalizeInput) error {
 	if err := validateFinalizeFromState(in.fromState); err != nil {
+		return err
+	}
+	rollback, err := isRollbackJob(ctx, tx, in.jobID)
+	if err != nil {
 		return err
 	}
 	if err := transitionDeployment(ctx, tx, r.deployments, in.deploymentID, deployment.StatusHealthy, in.now, r.inject); err != nil {
@@ -1795,7 +2003,13 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 	if err = rows.Err(); err != nil {
 		return fmt.Errorf("lock releases for activation result: %w", err)
 	}
-	if states[in.candidateReleaseID] != "ready" {
+	// A rollback's candidate is the retained target (step 20D); every other
+	// candidate is ready.
+	candidateFrom := "ready"
+	if rollback {
+		candidateFrom = "retained"
+	}
+	if states[in.candidateReleaseID] != candidateFrom {
 		return fmt.Errorf("%w: candidate release %s is %q at activation result", ErrAgentLeaseCorruptState, in.candidateReleaseID, states[in.candidateReleaseID])
 	}
 	if in.expectedActiveReleaseID != nil {
@@ -1809,11 +2023,38 @@ func (r *AgentLeaseRepository) finalizeActivationSucceeded(ctx context.Context, 
 			return fmt.Errorf("retain predecessor release: %w", err)
 		}
 	}
-	if _, err = tx.Exec(ctx, `UPDATE releases SET state='active', updated_at=$2 WHERE id=$1 AND state='ready'`, in.candidateReleaseID, in.now); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE releases SET state='active', updated_at=$2 WHERE id=$1 AND state=$3`, in.candidateReleaseID, in.now, candidateFrom); err != nil {
 		return fmt.Errorf("activate candidate release: %w", err)
 	}
 	if err = r.inject("release_active"); err != nil {
 		return err
+	}
+	if rollback {
+		source, serr := rollbackIntentSourceForJob(ctx, tx, in.jobID)
+		if serr != nil {
+			return serr
+		}
+		if in.expectedActiveReleaseID == nil || *in.expectedActiveReleaseID != source {
+			return ErrRollbackSourceChanged
+		}
+	}
+	if rollback && in.expectedActiveReleaseID != nil {
+		// The deployment of the release this rollback left (the "source") goes
+		// healthy -> rolled_back. Its row was locked with this deployment's, in
+		// ascending id (lockActivationDeployments), before anything above. A
+		// source already past healthy (e.g. rolled back before) is left alone.
+		var sourceDeploymentID, sourceStatus string
+		if err = tx.QueryRow(ctx, `SELECT d.id, d.status FROM releases r JOIN deployments d ON d.id=r.deployment_id WHERE r.id=$1`, *in.expectedActiveReleaseID).Scan(&sourceDeploymentID, &sourceStatus); err != nil {
+			return fmt.Errorf("read rollback source deployment: %w", err)
+		}
+		if sourceStatus == string(deployment.StatusHealthy) {
+			if err = transitionDeployment(ctx, tx, r.deployments, sourceDeploymentID, deployment.StatusRolledBack, in.now, r.inject); err != nil {
+				return err
+			}
+		}
+		if err = r.inject("source_rolled_back"); err != nil {
+			return err
+		}
 	}
 
 	// Pointer and revision move in ONE update; validate_route_head_update
@@ -2381,7 +2622,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 	// admin AssignRouteHostname path, and no test exercises that contention.
 	// The recheck is believed sound (the route head is locked FOR UPDATE
 	// before it is read) but that is reasoning, not a tested claim.
-	_, err = tx.Exec(ctx, `SELECT 1 FROM deployments WHERE id=$1 FOR UPDATE`, deploymentID)
+	_, err = lockActivationDeployments(ctx, tx, jobID, deploymentID, op.expectedActiveReleaseID)
 	if err == nil {
 		err = r.inject("deployment_lock")
 	}

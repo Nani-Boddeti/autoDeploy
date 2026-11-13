@@ -84,7 +84,8 @@ func (r *AgentLeaseRepository) RecordDrainResult(ctx context.Context, serverID s
 		return err
 	}
 	var attemptServerID, environmentID, attemptState string
-	if err = tx.QueryRow(ctx, `SELECT server_id, environment_id, state FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&attemptServerID, &environmentID, &attemptState); err != nil {
+	var jobID int64
+	if err = tx.QueryRow(ctx, `SELECT server_id, environment_id, state, job_id FROM agent_job_attempts WHERE id=$1`, attemptID).Scan(&attemptServerID, &environmentID, &attemptState, &jobID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrServerAuthorizationDenied
 		}
@@ -108,7 +109,11 @@ func (r *AgentLeaseRepository) RecordDrainResult(ctx context.Context, serverID s
 	if expectedActiveReleaseID == nil || *expectedActiveReleaseID != predecessorReleaseID {
 		return ErrAgentLeaseIntegrityConflict
 	}
-	_, derivedRuntimeInstanceID, err := derivePredecessor(ctx, tx, expectedActiveReleaseID, releaseID, dockerid.AttemptRuntimeInstanceID(attemptID))
+	candidateInstanceID, err := activationCandidateInstance(ctx, tx, jobID, releaseID, attemptID)
+	if err != nil {
+		return err
+	}
+	_, derivedRuntimeInstanceID, err := derivePredecessor(ctx, tx, expectedActiveReleaseID, releaseID, candidateInstanceID)
 	if err != nil {
 		return err
 	}

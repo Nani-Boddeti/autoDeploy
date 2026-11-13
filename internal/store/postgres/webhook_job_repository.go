@@ -450,7 +450,11 @@ func (r *WebhookJobRepository) enqueueVerifiedPushTx(ctx context.Context, tx pgx
 // keeps its own sanitized error. It never starts or commits a tx.
 func (r *WebhookJobRepository) insertQueuedDeploymentTx(ctx context.Context, tx pgx.Tx, d deployment.Deployment, j queue.Job, integrityErr error) (int64, error) {
 	var jobID int64
-	if err := tx.QueryRow(ctx, `INSERT INTO agent_jobs(schema_version,job_kind,owner_id,project_id,environment_id,server_id,deployment_id,repository_id,full_ref,commit_sha,priority,available_at,idempotency_key,payload_digest,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, int16(j.Version), j.Kind, j.OwnerID, j.ProjectID, j.EnvironmentID, j.ServerID, j.DeploymentID, j.RepositoryID, j.Ref, j.CommitSHA, j.Priority, j.AvailableAt, j.IdempotencyKey, j.PayloadDigest[:], j.State).Scan(&jobID); err != nil {
+	var rollbackTarget *string
+	if j.RollbackTargetReleaseID != "" {
+		rollbackTarget = &j.RollbackTargetReleaseID
+	}
+	if err := tx.QueryRow(ctx, `INSERT INTO agent_jobs(schema_version,job_kind,owner_id,project_id,environment_id,server_id,deployment_id,repository_id,full_ref,commit_sha,priority,available_at,idempotency_key,payload_digest,state,rollback_target_release_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`, int16(j.Version), j.Kind, j.OwnerID, j.ProjectID, j.EnvironmentID, j.ServerID, j.DeploymentID, j.RepositoryID, j.Ref, j.CommitSHA, j.Priority, j.AvailableAt, j.IdempotencyKey, j.PayloadDigest[:], j.State, rollbackTarget).Scan(&jobID); err != nil {
 		if isUniqueViolation(err) {
 			return 0, integrityErr
 		}

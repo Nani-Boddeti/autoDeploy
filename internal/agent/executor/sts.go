@@ -157,6 +157,9 @@ type stsRelease struct {
 	lease    agentclient.Lease
 	identity docker.ReleaseResourceIdentity
 	env      []docker.ContainerEnv
+	// retained (rollback, step 20D): the candidate is the target's existing
+	// container, started rather than created.
+	retained bool
 
 	// stopSent: the predecessor may be down and a restart is owed on failure.
 	// Set when a stop was issued and ended stopped or unknown; not when it was
@@ -225,17 +228,29 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		}
 	}
 
-	inspect, err := e.docker.EnsureReleaseRuntimeContainer(ctx, docker.RunContainerRequest{
-		Identity:      s.identity,
-		CPUMillis:     lease.CPUMillis,
-		MemoryBytes:   lease.MemoryBytes,
-		RestartPolicy: lease.RestartPolicy,
-		Env:           s.env,
-	}, e.network)
-	if err != nil {
-		class := docker.ClassifyFailure(err)
-		logs.Linef(logship.StreamActivation, "release: candidate start failed (%s)", class)
-		return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate start failed (%s)", class))
+	var inspect docker.ContainerInspect
+	var err error
+	if s.retained {
+		var res restartResult
+		inspect, res = e.startRetained(ctx, stopTarget{EnvironmentID: lease.EnvironmentID, ReleaseID: lease.ReleaseID, RuntimeInstanceID: s.identity.RuntimeInstanceID})
+		if res.Status != restartStarted {
+			class := e.retainedStartFailure(res, logs)
+			logs.Linef(logship.StreamActivation, "release: retained candidate start failed (%s)", class)
+			return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; retained candidate start failed (%s)", class))
+		}
+	} else {
+		inspect, err = e.docker.EnsureReleaseRuntimeContainer(ctx, docker.RunContainerRequest{
+			Identity:      s.identity,
+			CPUMillis:     lease.CPUMillis,
+			MemoryBytes:   lease.MemoryBytes,
+			RestartPolicy: lease.RestartPolicy,
+			Env:           s.env,
+		}, e.network)
+		if err != nil {
+			class := docker.ClassifyFailure(err)
+			logs.Linef(logship.StreamActivation, "release: candidate start failed (%s)", class)
+			return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate start failed (%s)", class))
+		}
 	}
 	networkID, _, err := resolveNetworkAndIP(inspect)
 	if err != nil {

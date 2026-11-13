@@ -75,6 +75,9 @@ type leaseView struct {
 	ReleaseID            string               `json:"release_id"`
 	SecretBindings       []secretBindingView  `json:"secret_bindings"`
 	LiteralBindings      []literalBindingView `json:"literal_bindings"`
+	// Set only for a rollback lease (step 20D); omitted otherwise.
+	RollbackTargetReleaseID         string `json:"rollback_target_release_id,omitempty"`
+	RollbackTargetRuntimeInstanceID string `json:"rollback_target_runtime_instance_id,omitempty"`
 }
 
 func formatDeadline(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
@@ -115,6 +118,9 @@ func newLeaseView(l queue.ClaimedLease) leaseView {
 		ReleaseID:            l.ReleaseID,
 		SecretBindings:       bindings,
 		LiteralBindings:      literals,
+
+		RollbackTargetReleaseID:         l.RollbackTargetReleaseID,
+		RollbackTargetRuntimeInstanceID: l.RollbackTargetRuntimeInstanceID,
 	}
 }
 

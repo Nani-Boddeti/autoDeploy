@@ -63,6 +63,7 @@ func stateTone(state string) string {
 	case "queued", "assigned", "fetching", "building", "starting", "health_checking", "activating", "leased", "retry_wait", "candidate", "started":
 		return "busy"
 	default:
+		// "rolled_back" and the other terminal states are neutral.
 		return "neutral"
 	}
 }
@@ -435,6 +436,12 @@ type deploymentDetailView struct {
 	RetryMoved  bool
 	RetryNonce  string
 	RetryCommit string
+	// CanRollback renders the Roll back form (step 20D) for a retained release
+	// the store reports eligible.
+	CanRollback       bool
+	RollbackCSRF      string
+	RollbackNonce     string
+	RollbackReleaseID string
 }
 
 // retryableStatuses are the terminal statuses from which a deployment may be
@@ -531,6 +538,9 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		if !h.offerRetry(w, r, p, d, &view) {
 			return
 		}
+	}
+	if !h.offerRollback(w, r, p, d, &view) {
+		return
 	}
 	for _, e := range d.StatusEvents {
 		view.StatusEvents = append(view.StatusEvents, statusEventRow{At: formatTimestamp(e.OccurredAt), From: orDash(e.FromStatus), To: e.ToStatus, Revision: strconv.FormatInt(e.Revision, 10)})

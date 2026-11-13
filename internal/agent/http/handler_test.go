@@ -842,3 +842,25 @@ func TestProgressMapsAuthorizationFailureToGenericUnauthorized(t *testing.T) {
 		t.Fatalf("status=%d, want 401", w.Code)
 	}
 }
+
+func TestLeaseViewCarriesRollbackTargetOnlyForRollbackLeases(t *testing.T) {
+	now := time.Now()
+	base := queue.ClaimedLease{JobID: 1, AttemptID: 2, Fence: 3, EnvironmentID: "env", DeploymentID: "dep", ReleaseID: "rel", LeaseExpiresAt: now, AuthorityExpiresAt: now}
+	plain, err := json.Marshal(newLeaseView(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "rollback") {
+		t.Fatalf("deployment lease leaks rollback fields: %s", plain)
+	}
+	base.RollbackTargetReleaseID, base.RollbackTargetRuntimeInstanceID = "rel", "77"
+	rolled, err := json.Marshal(newLeaseView(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"rollback_target_release_id":"rel"`, `"rollback_target_runtime_instance_id":"77"`} {
+		if !strings.Contains(string(rolled), want) {
+			t.Fatalf("missing %s in %s", want, rolled)
+		}
+	}
+}

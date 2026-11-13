@@ -323,8 +323,8 @@ func (r *AgentLeaseRepository) resolveDeclared(ctx context.Context, tx pgx.Tx, d
 	// Deployment (6) -> route head (6b) -> releases ascending (activated only),
 	// all locked BEFORE the clock is read. The helper re-locks them, which is a
 	// no-op for this transaction.
-	var deploymentStatus string
-	if err = tx.QueryRow(ctx, `SELECT status FROM deployments WHERE id=$1 FOR UPDATE`, deploymentID).Scan(&deploymentStatus); err != nil {
+	deploymentStatus, err := lockActivationDeployments(ctx, tx, jobID, deploymentID, op.expectedActiveReleaseID)
+	if err != nil {
 		return fmt.Errorf("lock deployment for activation resolution: %w", err)
 	}
 	if deploymentStatus != string(deployment.StatusActivating) {

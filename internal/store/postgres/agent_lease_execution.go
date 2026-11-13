@@ -270,13 +270,38 @@ func copyPreviousFrozenLiteralValues(ctx context.Context, tx pgx.Tx, newAttemptI
 // no-update/no-delete triggers), so nothing can be concurrently mutating it
 // for this unlocked read to race against.
 func copyPreviousAttemptExecution(ctx context.Context, tx pgx.Tx, newAttemptID, prevAttemptID int64) (frozenExecutionSnapshot, error) {
-	var cfg frozenExecutionSnapshot
-	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host FROM agent_job_attempt_execution WHERE attempt_id=$1`, prevAttemptID).
-		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision, &cfg.HealthGatePath, &cfg.HealthGateHost); err != nil {
-		return frozenExecutionSnapshot{}, fmt.Errorf("load previous attempt %d execution for copy-forward: %w", prevAttemptID, err)
+	cfg, err := loadAttemptExecution(ctx, tx, prevAttemptID)
+	if err != nil {
+		return frozenExecutionSnapshot{}, err
 	}
 	if err := insertAttemptExecution(ctx, tx, newAttemptID, cfg); err != nil {
 		return frozenExecutionSnapshot{}, fmt.Errorf("copy agent job attempt execution forward: %w", err)
+	}
+	return cfg, nil
+}
+
+// copyTargetAttemptExecution is copyPreviousAttemptExecution for attempt 1 of a
+// rollback (step 20D, owner decision D-R2): everything is frozen from the
+// target's winning attempt EXCEPT release_strategy and drain_seconds, which come
+// from the live environment config the claim holds FOR SHARE, so a rollback
+// switches the way the environment is configured to switch now.
+func copyTargetAttemptExecution(ctx context.Context, tx pgx.Tx, newAttemptID, targetAttemptID int64, liveStrategy string, liveDrainSeconds int) (frozenExecutionSnapshot, error) {
+	cfg, err := loadAttemptExecution(ctx, tx, targetAttemptID)
+	if err != nil {
+		return frozenExecutionSnapshot{}, err
+	}
+	cfg.ReleaseStrategy, cfg.DrainSeconds = liveStrategy, liveDrainSeconds
+	if err := insertAttemptExecution(ctx, tx, newAttemptID, cfg); err != nil {
+		return frozenExecutionSnapshot{}, fmt.Errorf("freeze rollback attempt execution: %w", err)
+	}
+	return cfg, nil
+}
+
+func loadAttemptExecution(ctx context.Context, tx pgx.Tx, attemptID int64) (frozenExecutionSnapshot, error) {
+	var cfg frozenExecutionSnapshot
+	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host FROM agent_job_attempt_execution WHERE attempt_id=$1`, attemptID).
+		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision, &cfg.HealthGatePath, &cfg.HealthGateHost); err != nil {
+		return frozenExecutionSnapshot{}, fmt.Errorf("load attempt %d execution for copy-forward: %w", attemptID, err)
 	}
 	return cfg, nil
 }

@@ -218,3 +218,18 @@ func TestClaimIsNotRetried(t *testing.T) {
 		t.Fatalf("claim attempts = %d, want 1", n)
 	}
 }
+
+func TestClaimParsesRollbackLeaseFields(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"leases":[{"job_id":1,"attempt_id":2,"attempt_number":1,"fence":3,"project_id":"p","environment_id":"e","deployment_id":"d","repository_id":1,"ref":"refs/heads/main","commit_sha":"abc","lease_expires_at":"2026-11-13T10:00:00Z","authority_expires_at":"2026-11-13T10:00:00Z","release_id":"rel","rollback_target_release_id":"rel","rollback_target_runtime_instance_id":"77","secret_bindings":[],"literal_bindings":[]}]}`))
+	}))
+	defer srv.Close()
+	leases, err := newTestClient(t, srv, nil).Claim(context.Background(), true)
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("leases=%v err=%v", leases, err)
+	}
+	if leases[0].RollbackTargetReleaseID != "rel" || leases[0].RollbackTargetRuntimeInstanceID != "77" {
+		t.Fatalf("lease %+v", leases[0])
+	}
+}

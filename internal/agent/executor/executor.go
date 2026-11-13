@@ -203,6 +203,12 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	materializer.onFetched = logs.SetSecrets
 	tracker := &phaseTracker{logs: logs}
 
+	// Step 20D: a rollback restarts a retained container; no checkout, build
+	// or create happens (rollback.go).
+	if lease.RollbackTargetReleaseID != "" {
+		return e.executeRollback(ctx, lease, tracker, progress, logs)
+	}
+
 	if err := tracker.advance(ctx, progress, lease.AttemptID, lease.Fence, deployment.StatusFetching); err != nil {
 		return e.outcome(lease, false, queue.FailureClassTransient)
 	}

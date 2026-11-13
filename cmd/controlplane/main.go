@@ -191,6 +191,9 @@ func run(ctx context.Context) error {
 	webOptions.RouteHeadAdmin = postgres.NewRouteHeadRepository(pool)
 	webOptions.OperationsReader = postgres.NewOperationsReadRepository(pool)
 	webOptions.DeploymentCanceller = leaseRepository
+	// Rollback (step 20D) restarts a retained container; it needs no GitHub
+	// access, so it is wired whether or not the GitHub App subsystem is enabled.
+	webOptions.Rollback = postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
 	webOptions.DeploymentLogReader = postgres.NewDeploymentLogRepository(pool)
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {

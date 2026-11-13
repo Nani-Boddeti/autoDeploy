@@ -115,6 +115,7 @@ type Config struct {
 	DeploymentCanceller   DeploymentCanceller
 	DeploymentLogReader   DeploymentLogReader
 	ManualDeploy          ManualDeployStore
+	Rollback              RollbackStore
 	CommitResolver        githubapp.CommitResolver
 	Now                   func() time.Time
 	Random                io.Reader
@@ -270,6 +271,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.deploymentManual(w, r)
+	case "/deployments/rollback":
+		if r.URL.RawQuery != "" || h.config.Rollback == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.deploymentRollback(w, r)
 	case "/servers/register":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)

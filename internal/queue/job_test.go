@@ -61,3 +61,35 @@ func TestJobRejectsNoncanonicalTimeZeroSHAAndAmbiguousScopeDigest(t *testing.T) 
 		t.Fatal("ambiguous fields share digest")
 	}
 }
+
+func TestRollbackExecutionJobCarriesAndBindsItsTarget(t *testing.T) {
+	at := time.Unix(1, 0)
+	j, err := NewRollbackExecutionJob("owner", "project", "environment", "server", "deployment", 4, "refs/heads/main", "0123456789abcdef0123456789abcdef01234567", "release-a", "key-1", 0, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Kind != KindRollbackExecution || j.RollbackTargetReleaseID != "release-a" || j.Validate() != nil {
+		t.Fatalf("job %+v", j)
+	}
+	other, err := NewRollbackExecutionJob("owner", "project", "environment", "server", "deployment", 4, "refs/heads/main", "0123456789abcdef0123456789abcdef01234567", "release-b", "key-1", 0, at)
+	if err != nil || other.PayloadDigest == j.PayloadDigest {
+		t.Fatalf("the target must be part of the payload digest: %v", err)
+	}
+	// Target and kind must agree, both ways.
+	bad := j
+	bad.RollbackTargetReleaseID = ""
+	if bad.Validate() == nil {
+		t.Fatal("rollback job without a target accepted")
+	}
+	plain, err := NewDeploymentExecutionJob("owner", "project", "environment", "server", "deployment", 4, "refs/heads/main", "0123456789abcdef0123456789abcdef01234567", "key-1", 0, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain.RollbackTargetReleaseID = "release-a"
+	if plain.Validate() == nil {
+		t.Fatal("deployment job with a rollback target accepted")
+	}
+	if _, err = NewRollbackExecutionJob("owner", "project", "environment", "server", "deployment", 4, "refs/heads/main", "0123456789abcdef0123456789abcdef01234567", "", "key-1", 0, at); err == nil {
+		t.Fatal("empty target accepted")
+	}
+}

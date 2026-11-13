@@ -843,6 +843,45 @@ run on a real host.
   (position 1, as every agent path); every other read is a plain non-locking SELECT of immutable columns. The lock
   order above is unchanged. Visibility only: nothing acts on the row.
 
+### Rollback (step 20D)
+
+- Migration 000025: `agent_jobs.job_kind` also allows `rollback_execution`, with `rollback_target_release_id` (FK to
+  `releases`, immutable, CHECK: set exactly for that kind); `UNIQUE(deployment_id, job_kind)` is unchanged. Immutable
+  `rollback_intents` (owner, actor, source release, target release, request nonce `UNIQUE(owner_id, request_nonce)`,
+  deployment id `UNIQUE`) mirrors `manual_deployment_intents`.
+- `EnqueueRollback`, one READ COMMITTED transaction, no GitHub rows. Lock order: administrator session and user
+  `FOR UPDATE` (position 1) -> environment slot `FOR UPDATE` (3) -> route head and the target and active release rows
+  `FOR SHARE` (6b, releases ascending id) -> append-only inserts (8): intent, deployment, deployment event, job, job
+  event. The slot lock orders it against claim, activation, cancellation and a concurrent rollback of the same
+  environment (all hold or skip the slot). Replay by `(owner, nonce)` is decided right after the slot lock. Eligibility
+  is evaluated under those locks: target `retained`, route head not flagged, slot not reconciling or occupied, an
+  `active` release in the same environment on the same server, a succeeded activate operation by a non-rollback job, no
+  `revoked` frozen secret version (owner decision D-R3), a runtime config row, and no queued or in-progress deployment.
+  A concurrent webhook or manual enqueue is not serialised by the slot (as in step 19); the slot serialises execution.
+- Claim of a rollback job freezes the TARGET's winning attempt's execution config, secret versions and literals (the
+  copy-forward helpers), except `release_strategy` and `drain_seconds`, which come from the live environment config the
+  claim already holds `FOR SHARE` (D-R2). It creates no release row: the candidate release is the target. A retry copies
+  the previous attempt as usual. The lease carries the target release id and its runtime instance id.
+- Runtime instance of a release = the attempt of its newest SUCCEEDED activate operation made by a NON-rollback job
+  (`winningActivationAttempt`). A rollback restarts the original container, so its own operation never redefines it;
+  `derivePredecessor` uses the same rule.
+- Activate accepts a `retained` candidate for a rollback job only (no candidate -> ready, no image digest write; the
+  presented digest must equal the stored one); it requires an active release to leave. The operation is
+  `kind='activate'`. The success finalize accepts the candidate in `retained`, and moves the source deployment (the
+  deployment of the release being left) `healthy -> rolled_back` in the same transaction. Both deployment rows (the
+  rollback's own and the source's) are locked together in ascending id at position 6, by the activation-result and the
+  operator-resolution paths, before the route head. A source already past `healthy` is left alone.
+- Source check: a rollback is only valid while the release it was requested from is still the active release.
+  Activate (fresh and replay branches) and the success finalize compare the route head's active release (and the
+  operation's expected active release) with `rollback_intents.source_release_id`, read after the slot and job locks (no
+  new lock position). A mismatch is `ErrRollbackSourceChanged`, wrapping the candidate-not-ready refusal, so the agent
+  gets the definite permanent refusal and stops the candidate.
+- Revocation: claim attempt 1 of a rollback re-applies the enqueue rule (D-R3). A revoked frozen secret version cancels
+  the queued job and its deployment with a `cancelled` job event, before any attempt exists. The rollback's drain result
+  derives the predecessor against the target's original instance (`activationCandidateInstance`).
+- Operations: there is no down migration for 000025. Older binaries do not know `rollback_execution` jobs, so queued
+  rollback jobs must be drained (finished or cancelled) before a binary rollback.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

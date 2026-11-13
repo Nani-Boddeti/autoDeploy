@@ -87,6 +87,11 @@ type ClaimedLease struct {
 	ReleaseID       string
 	SecretBindings  []SecretBinding
 	LiteralBindings []LiteralBinding
+	// RollbackTargetReleaseID and RollbackTargetRuntimeInstanceID are set only
+	// for a rollback job (step 20D): the retained release it restarts (equal
+	// to ReleaseID) and the runtime instance of its original container.
+	RollbackTargetReleaseID         string
+	RollbackTargetRuntimeInstanceID string
 }
 
 // RenewalResult is the durable outcome of one successful renewal, including

@@ -112,6 +112,11 @@ type Lease struct {
 	ReleaseID            string
 	SecretBindings       []SecretBinding
 	LiteralBindings      []LiteralBinding
+	// RollbackTargetReleaseID is non-empty only for a rollback lease (step
+	// 20D): the retained release whose container is restarted, with the runtime
+	// instance of that container. ReleaseID equals RollbackTargetReleaseID.
+	RollbackTargetReleaseID         string
+	RollbackTargetRuntimeInstanceID string
 }
 
 // LiteralBinding is one variable's frozen non-secret value. It carries the
@@ -163,6 +168,9 @@ type leaseWire struct {
 	ReleaseID            string               `json:"release_id"`
 	SecretBindings       []secretBindingWire  `json:"secret_bindings"`
 	LiteralBindings      []literalBindingWire `json:"literal_bindings"`
+
+	RollbackTargetReleaseID         string `json:"rollback_target_release_id"`
+	RollbackTargetRuntimeInstanceID string `json:"rollback_target_runtime_instance_id"`
 }
 
 func (w leaseWire) parse() (Lease, error) {
@@ -201,6 +209,9 @@ func (w leaseWire) parse() (Lease, error) {
 		ReleaseID:            w.ReleaseID,
 		SecretBindings:       bindings,
 		LiteralBindings:      literals,
+
+		RollbackTargetReleaseID:         w.RollbackTargetReleaseID,
+		RollbackTargetRuntimeInstanceID: w.RollbackTargetRuntimeInstanceID,
 	}, nil
 }
 
