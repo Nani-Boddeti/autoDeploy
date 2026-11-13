@@ -430,26 +430,8 @@ func (r *WebhookJobRepository) enqueueVerifiedPushTx(ctx context.Context, tx pgx
 		return result, nil
 	}
 
-	var jobID int64
-	if err = tx.QueryRow(ctx, `INSERT INTO agent_jobs(schema_version,job_kind,owner_id,project_id,environment_id,server_id,deployment_id,repository_id,full_ref,commit_sha,priority,available_at,idempotency_key,payload_digest,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, int16(in.Job.Version), in.Job.Kind, in.Job.OwnerID, in.Job.ProjectID, in.Job.EnvironmentID, in.Job.ServerID, in.Job.DeploymentID, in.Job.RepositoryID, in.Job.Ref, in.Job.CommitSHA, in.Job.Priority, in.Job.AvailableAt, in.Job.IdempotencyKey, in.Job.PayloadDigest[:], in.Job.State).Scan(&jobID); err != nil {
-		if isUniqueViolation(err) {
-			return WebhookEnqueueResult{}, ErrWebhookIntegrity
-		}
-		return WebhookEnqueueResult{}, fmt.Errorf("insert queued job: %w", err)
-	}
-	if err = r.inject("job"); err != nil {
-		return WebhookEnqueueResult{}, err
-	}
-	if err = r.deployments.createTxWithHook(ctx, tx, in.Deployment, r.inject); err != nil {
-		if isUniqueViolation(err) || errors.Is(err, ErrAlreadyExists) {
-			return WebhookEnqueueResult{}, ErrWebhookIntegrity
-		}
-		return WebhookEnqueueResult{}, err
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO agent_job_events(job_id,sequence,event_type) VALUES($1,1,'enqueued')`, jobID); err != nil {
-		return WebhookEnqueueResult{}, fmt.Errorf("append enqueue event: %w", err)
-	}
-	if err = r.inject("job_event"); err != nil {
+	jobID, err := r.insertQueuedDeploymentTx(ctx, tx, in.Deployment, in.Job, ErrWebhookIntegrity)
+	if err != nil {
 		return WebhookEnqueueResult{}, err
 	}
 	if err = markDeliveryProcessed(ctx, tx, deliveryID); err != nil {
@@ -461,6 +443,37 @@ func (r *WebhookJobRepository) enqueueVerifiedPushTx(ctx context.Context, tx pgx
 	return WebhookEnqueueResult{DeliveryID: deliveryID, DeploymentID: in.Deployment.Identity().DeploymentID, JobID: jobID}, nil
 }
 
+// insertQueuedDeploymentTx is the persistence core shared by the webhook and
+// manual enqueue paths: the queued agent job, the deployment aggregate with its
+// first event, and the job's enqueue event, in that order, with the same
+// fault-injection stages. Unique violations map to integrityErr so each caller
+// keeps its own sanitized error. It never starts or commits a tx.
+func (r *WebhookJobRepository) insertQueuedDeploymentTx(ctx context.Context, tx pgx.Tx, d deployment.Deployment, j queue.Job, integrityErr error) (int64, error) {
+	var jobID int64
+	if err := tx.QueryRow(ctx, `INSERT INTO agent_jobs(schema_version,job_kind,owner_id,project_id,environment_id,server_id,deployment_id,repository_id,full_ref,commit_sha,priority,available_at,idempotency_key,payload_digest,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`, int16(j.Version), j.Kind, j.OwnerID, j.ProjectID, j.EnvironmentID, j.ServerID, j.DeploymentID, j.RepositoryID, j.Ref, j.CommitSHA, j.Priority, j.AvailableAt, j.IdempotencyKey, j.PayloadDigest[:], j.State).Scan(&jobID); err != nil {
+		if isUniqueViolation(err) {
+			return 0, integrityErr
+		}
+		return 0, fmt.Errorf("insert queued job: %w", err)
+	}
+	if err := r.inject("job"); err != nil {
+		return 0, err
+	}
+	if err := r.deployments.createTxWithHook(ctx, tx, d, r.inject); err != nil {
+		if isUniqueViolation(err) || errors.Is(err, ErrAlreadyExists) {
+			return 0, integrityErr
+		}
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_events(job_id,sequence,event_type) VALUES($1,1,'enqueued')`, jobID); err != nil {
+		return 0, fmt.Errorf("append enqueue event: %w", err)
+	}
+	if err := r.inject("job_event"); err != nil {
+		return 0, err
+	}
+	return jobID, nil
+}
+
 type webhookTarget struct{ ownerID, projectID, environmentID, serverID string }
 
 // Lock order follows ADR 0004: App registration, installation, repository,
@@ -470,21 +483,48 @@ func lockWebhookAuthority(ctx context.Context, tx pgx.Tx, in WebhookEnqueueInput
 }
 
 func lockWebhookAuthorityForPush(ctx context.Context, tx pgx.Tx, appRegistrationID int16, push github.Push) (webhookTarget, error) {
+	return lockGitHubAuthorityChain(ctx, tx, nil, githubAuthorityKey{appRegistrationID: appRegistrationID, installationID: push.InstallationID, accountID: push.OwnerID, repositoryID: push.RepositoryID, ref: push.Ref}, ErrWebhookUnauthorized)
+}
+
+// githubAuthorityKey identifies one authority chain. ownerID and projectID are
+// optional narrowing filters (manual deploys pin both; a push derives the owner
+// from the installation and matches by ref).
+type githubAuthorityKey struct {
+	appRegistrationID         int16
+	installationID, accountID int64
+	repositoryID              int64
+	ref, ownerID, projectID   string
+}
+
+// lockGitHubAuthorityChain FOR SHARE locks app registration, installation,
+// repository, then binding (ADR 0004 order), each rechecking active authority.
+// between, when non-nil, runs after the registration lock and before the
+// installation lock (the manual path takes its admin-session lock there to
+// match DisableInstallation's registration -> session -> installation order).
+func lockGitHubAuthorityChain(ctx context.Context, tx pgx.Tx, between func() error, key githubAuthorityKey, denied error) (webhookTarget, error) {
 	var appID int16
-	if err := tx.QueryRow(ctx, `SELECT id FROM github_app_registrations WHERE id=$1 AND active FOR SHARE`, appRegistrationID).Scan(&appID); err != nil || appID != appRegistrationID {
-		return webhookTarget{}, ErrWebhookUnauthorized
+	if err := tx.QueryRow(ctx, `SELECT id FROM github_app_registrations WHERE id=$1 AND active FOR SHARE`, key.appRegistrationID).Scan(&appID); err != nil || appID != key.appRegistrationID {
+		return webhookTarget{}, denied
+	}
+	if between != nil {
+		if err := between(); err != nil {
+			return webhookTarget{}, err
+		}
 	}
 	var ownerID string
-	if err := tx.QueryRow(ctx, `SELECT owner_id FROM github_installations WHERE installation_id=$1 AND account_id=$2 AND active AND NOT suspended FOR SHARE`, push.InstallationID, push.OwnerID).Scan(&ownerID); err != nil {
-		return webhookTarget{}, ErrWebhookUnauthorized
+	if err := tx.QueryRow(ctx, `SELECT owner_id FROM github_installations WHERE installation_id=$1 AND account_id=$2 AND active AND NOT suspended FOR SHARE`, key.installationID, key.accountID).Scan(&ownerID); err != nil {
+		return webhookTarget{}, denied
+	}
+	if key.ownerID != "" && ownerID != key.ownerID {
+		return webhookTarget{}, denied
 	}
 	var repositoryID int64
-	if err := tx.QueryRow(ctx, `SELECT repository_id FROM github_repositories WHERE repository_id=$1 AND installation_id=$2 AND owner_id=$3 AND github_owner_id=$4 AND active FOR SHARE`, push.RepositoryID, push.InstallationID, ownerID, push.OwnerID).Scan(&repositoryID); err != nil || repositoryID != push.RepositoryID {
-		return webhookTarget{}, ErrWebhookUnauthorized
+	if err := tx.QueryRow(ctx, `SELECT repository_id FROM github_repositories WHERE repository_id=$1 AND installation_id=$2 AND owner_id=$3 AND github_owner_id=$4 AND active FOR SHARE`, key.repositoryID, key.installationID, ownerID, key.accountID).Scan(&repositoryID); err != nil || repositoryID != key.repositoryID {
+		return webhookTarget{}, denied
 	}
 	var target webhookTarget
-	if err := tx.QueryRow(ctx, `SELECT owner_id,project_id,environment_id,server_id FROM github_project_bindings WHERE owner_id=$1 AND repository_id=$2 AND installation_id=$3 AND active AND deploy_ref=$4 AND environment_id IS NOT NULL AND server_id IS NOT NULL FOR SHARE`, ownerID, push.RepositoryID, push.InstallationID, push.Ref).Scan(&target.ownerID, &target.projectID, &target.environmentID, &target.serverID); err != nil {
-		return webhookTarget{}, ErrWebhookUnauthorized
+	if err := tx.QueryRow(ctx, `SELECT owner_id,project_id,environment_id,server_id FROM github_project_bindings WHERE owner_id=$1 AND repository_id=$2 AND installation_id=$3 AND active AND deploy_ref=$4 AND environment_id IS NOT NULL AND server_id IS NOT NULL AND ($5='' OR project_id=$5) FOR SHARE`, ownerID, key.repositoryID, key.installationID, key.ref, key.projectID).Scan(&target.ownerID, &target.projectID, &target.environmentID, &target.serverID); err != nil {
+		return webhookTarget{}, denied
 	}
 	return target, nil
 }
