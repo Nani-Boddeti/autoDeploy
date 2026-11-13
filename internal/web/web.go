@@ -610,7 +610,12 @@ func (h *Handler) githubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, handoffCookie(handoff, h.config.Now()))
-	redirect(w, "/github/setup/complete")
+	// No redirect: this request began on github.com, so a redirect chain stays
+	// cross-site and browsers withhold the SameSite=Strict session cookie at
+	// /github/setup/complete (observed on the acer: bounced to /login). A link on
+	// this same-origin page makes the next navigation same-site.
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = githubContinueTemplate.Execute(w, nil)
 }
 func (h *Handler) githubCompleteGet(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil {

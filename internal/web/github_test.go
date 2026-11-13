@@ -137,7 +137,9 @@ func TestGitHubSetupRoutesKeepCallbackUnauthorised(t *testing.T) {
 	callback := "/github/setup/callback?state=" + state.Query().Get("state") + "&installation_id=11&setup_action=install"
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "https://admin.example.test"+callback, nil))
-	if rr.Code != http.StatusSeeOther || store.reserved != 1 || store.completed != 0 || rr.Header().Get("Location") != "/github/setup/complete" {
+	// 200 with a same-origin link, not a redirect: the cross-site redirect chain
+	// would drop the SameSite=Strict session cookie at /github/setup/complete.
+	if rr.Code != http.StatusOK || store.reserved != 1 || store.completed != 0 || rr.Header().Get("Location") != "" || !strings.Contains(rr.Body.String(), `<a href="/github/setup/complete">`) {
 		t.Fatalf("callback side effect: %d reserve=%d complete=%d", rr.Code, store.reserved, store.completed)
 	}
 	var handoff *http.Cookie

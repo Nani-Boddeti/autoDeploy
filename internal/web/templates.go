@@ -27,6 +27,7 @@ var (
 	loginTemplate             = parsePage("login")
 	landingTemplate           = parsePage("landing")
 	githubCompleteTemplate    = parsePage("github-complete")
+	githubContinueTemplate    = parsePage("github-continue")
 	serversTemplate           = parsePage("servers")
 	environmentConfigTemplate = parsePage("environment-config")
 	routeHeadTemplate         = parsePage("environment-route")
