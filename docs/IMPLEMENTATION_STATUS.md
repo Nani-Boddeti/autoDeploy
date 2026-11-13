@@ -1,6 +1,6 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-13. Branch: main at 4f85268, pushed (origin/main = 4f85268); step 20 (UI fixes + slice 11) in progress. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false in committed code. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
+Snapshot: 2026-11-14. Branch: main, pushed; step 20 (UI fixes + slice 11) code-complete except 20F docs; 20E awaiting acer validation. Slices 9a, 9b and 10 are code-complete; step 15 (operations UI + deploy logs) is partial (retry after the real-host run, rollback button with slice 11). Post-step-15 fixes: c9f6219 table/log wrapping CSS, be34361 Referrer-Policy same-origin (no-referrer made browsers send Origin: null and broke every form POST). Migrations run through 000022. Gates executorEnabled/activationEnabled still false in committed code. `.tmp/` is gitignored since 0d4decc; still never use blanket `git add`. Treat the worktree as shared: inspect git status --short before changing or staging anything.
 
 ## Scope and current progress
 
@@ -48,14 +48,14 @@ if it is flipped without being updated deliberately.
   - build: BuildKit build proven; secret mounts and cleanup not exercised.
   - health policies: HTTP proven; TCP/container not run.
   - Traefik: route generation and atomic switch proven; automatic HTTPS via ACME not (private CA used).
-  - release strategies: blue/green with predecessor drain PROVEN (acer attempt 15: switch, then "predecessor stopped"); stop-then-start PROVEN (attempt 17: authorized, predecessor stopped, gate passed, switched). Rollback and retention not done yet (20D/20E).
-  - UI: end to end works; nav links to route/config, an honest activation banner and Retry added (step 20A); rollback button pending (20D).
+  - release strategies: blue/green with predecessor drain PROVEN (acer attempt 15: switch, then "predecessor stopped"); stop-then-start PROVEN (attempt 17: authorized, predecessor stopped, gate passed, switched). Rollback PROVEN (attempt 18: third -> second release, retained container restarted, no build, site serves the second deploy). Retention cleanup committed (20E, e8dc114), not yet validated on the acer.
+  - UI: end to end works; nav links to route/config, an honest activation banner and Retry added (step 20A); "Roll back to this release" button with confirmation (20D); retention cleanup row on the deployment page (20E).
   - packaging: Ubuntu host kit in deploy/host works on the acer; Hetzner target not done.
   - validation: first end-to-end deploy passed.
 - Step 19: admin manual Deploy action (POST /deployments/manual), so deploys need no inbound webhook.
 - Defects found only on the real host (all fixed) are listed in tasks/18-plan.md Progress.
-- Step 20 (tasks/20-plan.md, all owner decisions as recommended): 20A UI fixes; 20E-0 failed candidates are stopped (not left running); 20B drain results recorded on the control plane (migration 000024, POST /agent/v1/drains/result, shown on the deployment page); 20C stop-then-start (agent honours release_strategy; PredecessorStopSent recovery; guarded predecessor restart; no maintenance page in V1); EINTR retry in checkout helpers and clients (cause of intermittent checkout failures). In progress: 20D rollback. Next: 20E retention/cleanup.
-- Gates: still false in committed code; blue/green switch+drain is now proven on a real host; flipping them still needs rollback and crash-recovery validated on a real host.
+- Step 20 (tasks/20-plan.md, all owner decisions as recommended): 20A UI fixes; 20E-0 failed candidates are stopped (not left running); 20B drain results recorded on the control plane (migration 000024, POST /agent/v1/drains/result, shown on the deployment page); 20C stop-then-start (agent honours release_strategy; PredecessorStopSent recovery; guarded predecessor restart; no maintenance page in V1); EINTR retry in checkout helpers and clients (cause of intermittent checkout failures). 20D rollback (cbcddd3, migration 000025: rollback_execution jobs, immutable rollback_intents, refused if the active release changed since the click or a frozen secret is revoked). 20E retention cleanup (e8dc114, migration 000026: retained -> removing, immutable release_cleanups, agent claim/result fence under the slot lock; newest two retained kept, at most seven days; no force; unverified images kept). Follow-ups: failed-candidate 24h cleanup, cleanup state on the route page. Next: install 20E on the acer and verify a cleanup pass, then 20F docs, then the gates decision.
+- Gates: still false in committed code; blue/green switch+drain is now proven on a real host; rollback is proven on the acer too; flipping them still needs crash-recovery and retention cleanup validated on a real host.
 
 ## Architecture and trust boundaries
 
