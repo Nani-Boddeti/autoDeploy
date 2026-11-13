@@ -111,8 +111,10 @@ the trusted bin directory (`gitexecdir`); `MemoryDenyWriteExecute` stays on
 
 The agent reads (never writes) the finished checkout as its docker build
 context: workspaces are granted `checkout:checkout` mode `0750`, the Git child
-runs with umask `027`, and `autodeploy-agent` is a member of the checkout group
-(`install-app.sh`). The agent still cannot modify the workspace.
+runs with umask `022` (normal Git modes, because `docker COPY` keeps file modes and
+images need readable files), and `autodeploy-agent` is a member of the checkout group
+(`install-app.sh`). Only the `0750` workspace root grants access; the agent still cannot
+modify the workspace.
 
 ## Service ordering and hardening
 

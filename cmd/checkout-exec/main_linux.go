@@ -566,10 +566,12 @@ func child() {
 	}
 	unix.CloseOnExec(execFD)
 	unix.CloseOnExec(cwdFD)
-	// The unit runs with UMask=0077, which would make every checked-out file 0600 and unreadable to
-	// the agent (a member of the checkout GID) that builds from the workspace. 0027: group read, no
-	// group write, nothing for others.
-	unix.Umask(0o027)
+	// The unit runs with UMask=0077, which would make every checked-out file 0600. Use the normal
+	// Git modes (0644 files, 0755 dirs): docker COPY preserves file modes, so 0640 files became
+	// unreadable to non-root processes in the image (observed on the acer: nginx answered 403).
+	// Confidentiality comes from the workspace root itself (checkout:checkout 0750: only the
+	// checkout user and the agent group can traverse it), not from per-file modes.
+	unix.Umask(0o022)
 	if unix.CloseRange(6, ^uint(0), 0) != nil {
 		os.Exit(126)
 	}
