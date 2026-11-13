@@ -332,7 +332,10 @@ func (r *Runner) execute(ctx context.Context, lease Lease, workspace int, op che
 	if capture {
 		destination = &output
 	}
-	shared := &outputBudget{w: destination, n: int64(r.config.SpawnLimits.MaxOutput)}
+	// diag keeps the last redacted output bytes so a failed git operation can
+	// say why (found on the acer: checkout failures were otherwise opaque).
+	diag := &tailBuffer{max: 512}
+	shared := &outputBudget{w: io.MultiWriter(destination, diag), n: int64(r.config.SpawnLimits.MaxOutput)}
 	stdoutRedactor, err := lease.RedactingWriter(&limitedWriter{budget: shared})
 	if err != nil {
 		closeFDs(stdoutR, stdoutW, stderrR, stderrW)
@@ -369,7 +372,7 @@ func (r *Runner) execute(ctx context.Context, lease Lease, workspace int, op che
 		if op == checkoutcontain.GitGrepLFS && spawnResult.Class == checkoutcontain.ExitFailed && spawnResult.ExitCode == 1 {
 			return output.String(), errNoMatch
 		}
-		return "", fmt.Errorf("%w: %s exit %d", ErrGitFailed, operationName(op), spawnResult.ExitCode)
+		return "", fmt.Errorf("%w: %s exit %d: %s", ErrGitFailed, operationName(op), spawnResult.ExitCode, diag.lastLine())
 	}
 	return output.String(), nil
 }
@@ -445,4 +448,35 @@ func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
 }
 func operationName(op checkoutcontain.GitOperation) string {
 	return fmt.Sprintf("typed git operation %d", op)
+}
+
+// tailBuffer keeps only the most recent max bytes written to it.
+type tailBuffer struct {
+	mu  sync.Mutex
+	max int
+	b   []byte
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.b = append(t.b, p...)
+	if len(t.b) > t.max {
+		t.b = t.b[len(t.b)-t.max:]
+	}
+	return len(p), nil
+}
+
+// lastLine returns the last non-empty line, with control characters removed.
+func (t *tailBuffer) lastLine() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	lines := strings.Split(strings.TrimSpace(string(t.b)), "\n")
+	last := strings.TrimSpace(lines[len(lines)-1])
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, last)
 }

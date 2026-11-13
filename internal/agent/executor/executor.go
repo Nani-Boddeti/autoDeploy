@@ -205,7 +205,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	checkoutResult, err := e.checkout.Checkout(ctx, lease.AttemptID, lease.Fence)
 	if err != nil {
 		class := classifyPhaseError(ctx, err)
-		logs.Linef(logship.StreamPhase, "checkout: failed (%s)", class)
+		logs.Linef(logship.StreamPhase, "checkout: failed (%s): %v", class, err)
 		return e.outcome(lease, false, class)
 	}
 	logs.Linef(logship.StreamPhase, "checkout: complete")
