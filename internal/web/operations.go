@@ -427,7 +427,18 @@ type deploymentDetailView struct {
 	CanCancel         bool
 	CSRF              string
 	CancelRequestedAt string
+	// CanRetry renders the Retry form (CSRF and RetryNonce are set); RetryMoved
+	// renders the explanatory note instead when the project's binding no longer
+	// targets this deployment's environment.
+	CanRetry    bool
+	RetryMoved  bool
+	RetryNonce  string
+	RetryCommit string
 }
+
+// retryableStatuses are the terminal statuses from which a deployment may be
+// retried: the same commit is re-deployed through POST /deployments/manual.
+var retryableStatuses = map[string]bool{"failed": true, "cancelled": true, "superseded": true}
 
 // cancellableJobStates are the job states RequestCancellation accepts as a
 // new request: queued/retry_wait cancel immediately, leased cooperatively.
@@ -438,6 +449,36 @@ var cancellableJobStates = map[string]bool{"queued": true, "retry_wait": true, "
 // A deployment already activating is refused by the store, so it is hidden.
 func canOfferCancel(d postgres.DeploymentDetail) bool {
 	return cancellableJobStates[d.Job.State] && d.Job.CancelRequestedAt == nil && d.Deployment.Status != "activating"
+}
+
+// offerRetry decides whether the Retry form is shown (current binding only,
+// owner decision A-D2) and fills the view. It returns false after writing an
+// error response.
+func (h *Handler) offerRetry(w http.ResponseWriter, r *http.Request, p auth.Principal, d postgres.DeploymentDetail, view *deploymentDetailView) bool {
+	projects, err := h.config.OperationsReader.ListProjects(r.Context(), p)
+	if err != nil {
+		operationsFailure(w, r, err)
+		return false
+	}
+	current := false
+	for _, pr := range projects {
+		if pr.ProjectID == d.Deployment.ProjectID && pr.HasBinding && pr.BindingActive && pr.BindingEnvironmentID == d.Deployment.EnvironmentID {
+			current = true
+			break
+		}
+	}
+	if !current {
+		view.RetryMoved = true
+		return true
+	}
+	csrf, csrfErr := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	nonce, nonceErr := newManualNonce()
+	if csrfErr != nil || nonceErr != nil {
+		plain(w, http.StatusInternalServerError, "the page could not be loaded; retry\n")
+		return false
+	}
+	view.CanRetry, view.CSRF, view.RetryNonce, view.RetryCommit = true, csrf, nonce, d.Deployment.CommitSHA
+	return true
 }
 
 func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +525,11 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		view.CanCancel, view.CSRF = true, csrf
+	}
+	if h.manualDeployEnabled() && retryableStatuses[d.Deployment.Status] {
+		if !h.offerRetry(w, r, p, d, &view) {
+			return
+		}
 	}
 	for _, e := range d.StatusEvents {
 		view.StatusEvents = append(view.StatusEvents, statusEventRow{At: formatTimestamp(e.OccurredAt), From: orDash(e.FromStatus), To: e.ToStatus, Revision: strconv.FormatInt(e.Revision, 10)})

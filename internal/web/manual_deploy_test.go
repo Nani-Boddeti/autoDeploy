@@ -301,3 +301,77 @@ func TestProjectsPageNoDeployFormWhenDisabled(t *testing.T) {
 		t.Fatal("deploy form rendered without dependencies")
 	}
 }
+
+const retryTestSHA = "0123456789abcdef0123456789abcdef01234567"
+
+func retryDetailPage(t *testing.T, status, detailEnv, bindingEnv string, bindingActive bool) (string, *Handler, auth.Principal) {
+	t.Helper()
+	h, _, _, p := manualHandler(t)
+	stub := h.config.OperationsReader.(*operationsStub)
+	stub.detail = sampleDetail("failed", false)
+	stub.detail.Deployment.Status, stub.detail.Deployment.EnvironmentID, stub.detail.Deployment.CommitSHA = status, detailEnv, retryTestSHA
+	stub.projects = []postgres.ProjectSummary{{ProjectID: "proj", HasBinding: true, BindingActive: bindingActive, RepositoryDefaultRef: "refs/heads/main", BindingEnvironmentID: bindingEnv}}
+	return opsGet(h, p, http.MethodGet, "/deployments/detail?id=dep-1").Body.String(), h, p
+}
+
+func TestDeploymentDetailRetryFormForTerminalStatuses(t *testing.T) {
+	for _, status := range []string{"failed", "cancelled", "superseded"} {
+		page, _, _ := retryDetailPage(t, status, "env", "env", true)
+		if got := strings.Count(page, `action="/deployments/manual"`); got != 1 {
+			t.Fatalf("%s: forms = %d", status, got)
+		}
+		for _, want := range []string{`name="project_id" value="proj"`, `name="mode" value="sha"`, `name="commit_sha" value="` + retryTestSHA + `"`, `name="csrf" value="`, "Retry this commit"} {
+			if !strings.Contains(page, want) {
+				t.Errorf("%s: missing %q", status, want)
+			}
+		}
+		if n := nonceInputRE.FindAllStringSubmatch(page, -1); len(n) != 1 || len(n[0][1]) != 32 {
+			t.Fatalf("%s: nonce %v", status, n)
+		}
+		if strings.Contains(page, "style=") || strings.Contains(page, "environment changed") {
+			t.Errorf("%s: unexpected content", status)
+		}
+	}
+}
+
+func TestDeploymentDetailRetryExactlyFiveFieldsDistinctNonce(t *testing.T) {
+	a, h, p := retryDetailPage(t, "failed", "env", "env", true)
+	form := a[strings.Index(a, `action="/deployments/manual"`):]
+	form = form[:strings.Index(form, "</form>")]
+	if got := strings.Count(form, "<input"); got != 5 {
+		t.Fatalf("inputs = %d: %s", got, form)
+	}
+	b := opsGet(h, p, http.MethodGet, "/deployments/detail?id=dep-1").Body.String()
+	na, nb := nonceInputRE.FindStringSubmatch(a), nonceInputRE.FindStringSubmatch(b)
+	if na == nil || nb == nil || na[1] == nb[1] {
+		t.Fatalf("nonce reused: %v %v", na, nb)
+	}
+}
+
+func TestDeploymentDetailRetryHidden(t *testing.T) {
+	for _, status := range []string{"queued", "building", "activating", "healthy", "rolled_back"} {
+		if page, _, _ := retryDetailPage(t, status, "env", "env", true); strings.Contains(page, "/deployments/manual") {
+			t.Errorf("%s: retry offered", status)
+		}
+	}
+	for name, c := range map[string]struct {
+		binding string
+		active  bool
+	}{"env differs": {"other", true}, "binding inactive": {"env", false}} {
+		page, _, _ := retryDetailPage(t, "failed", "env", c.binding, c.active)
+		if strings.Contains(page, "/deployments/manual") || !strings.Contains(page, "environment changed; deploy from the projects page.") {
+			t.Errorf("%s: form or note wrong", name)
+		}
+	}
+}
+
+func TestDeploymentDetailRetryHiddenWhenDisabled(t *testing.T) {
+	h, stub, p := operationsHandler(t)
+	stub.detail = sampleDetail("failed", false)
+	stub.detail.Deployment.Status = "failed"
+	stub.projects = []postgres.ProjectSummary{{ProjectID: "proj", HasBinding: true, BindingActive: true, BindingEnvironmentID: "env"}}
+	page := opsGet(h, p, http.MethodGet, "/deployments/detail?id=dep-1").Body.String()
+	if strings.Contains(page, "/deployments/manual") || strings.Contains(page, "environment changed") {
+		t.Fatal("retry rendered without manual deploy")
+	}
+}
