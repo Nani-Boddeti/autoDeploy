@@ -89,7 +89,11 @@ ProtectClock=yes
 ProtectHostname=yes
 LockPersonality=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# RestrictSUIDSGID is OFF: with it systemd answers openat2 with ENOSYS (it cannot inspect
+# open_how.mode), and the credential reader (internal/credential) opens every path component with
+# openat2 -- observed on the acer: "control plane unavailable at main.go:85". NoNewPrivileges=yes
+# still prevents gaining privileges from any setuid file.
+RestrictSUIDSGID=no
 RestrictNamespaces=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service
