@@ -124,7 +124,10 @@ type BuildRequest struct {
 // from buildx's own --metadata-file output. Everything downstream (Step 6)
 // runs the container by ImageDigest, never a tag.
 type BuildResult struct {
-	ImageDigest  string
+	ImageDigest string
+	// ConfigDigest is the config blob digest (classic image store) or, when
+	// buildx reports none (containerd image store), the image digest, i.e. the
+	// loaded image's local ID.
 	ConfigDigest string
 }
 
@@ -158,6 +161,10 @@ var reservedSecretEnvVars = map[string]struct{}{
 	"BUILDKIT_HOST":     {},
 	"BUILDX_BUILDER":    {},
 	"BUILDX_CONFIG":     {},
+
+	// Pinned by subprocessEnv; a secret must not be able to flip them back.
+	"BUILDX_GIT_INFO":            {},
+	"BUILDX_METADATA_PROVENANCE": {},
 }
 
 // subprocessEnvAllowlist is the complete set of environment variables the
@@ -195,6 +202,14 @@ func subprocessEnv(secretEnv []string) []string {
 			env = append(env, name+"="+v)
 		}
 	}
+	// Fixed, non-secret buildx behaviour switches (never overridable by the
+	// ambient environment or a secret binding; see reservedSecretEnvVars for
+	// BUILDX_*): BUILDX_GIT_INFO=0 stops buildx probing the context for a git
+	// repository (the checkout is deliberately not a usable repository for this
+	// user and the probe only produces a warning), and
+	// BUILDX_METADATA_PROVENANCE=disabled keeps buildx.build.provenance out of
+	// the --metadata-file JSON.
+	env = append(env, "BUILDX_GIT_INFO=0", "BUILDX_METADATA_PROVENANCE=disabled")
 	return append(env, secretEnv...)
 }
 
@@ -333,12 +348,20 @@ func resolveDockerfilePath(contextDir, dockerfilePath string) (string, error) {
 //
 // Shape (labels and secrets sorted for determinism):
 //
-//	buildx build --progress=plain --file <path>
+//	buildx build --progress=plain --file <path> --provenance=false --sbom=false
 //	  --label <k>=<v> [--label <k>=<v> ...]
 //	  --secret id=<opaque>,env=<VAR> [--secret id=<opaque>,env=<VAR> ...]
 //	  --metadata-file <path> --load <contextDir>
 func buildxArgv(dockerfile string, labels map[string]string, secrets []resolvedBuildSecret, metadataFile string) ([]string, []string) {
-	args := []string{"buildx", "build", "--progress=plain", "--file", dockerfile}
+	// --provenance=false --sbom=false: with the containerd image store
+	// (Docker >= 29 default) buildx otherwise exports an OCI index holding an
+	// attestation manifest next to the image, so --metadata-file carries no
+	// containerimage.config.digest and the image's local ID becomes the index
+	// digest. A single image manifest is what the run path addresses, and the
+	// provenance attestation embeds the build's invocation (build args, source
+	// layout) that ADR 0003 requires to stay out of anything persisted with
+	// the image. See ADR 0003 amendments.
+	args := []string{"buildx", "build", "--progress=plain", "--file", dockerfile, "--provenance=false", "--sbom=false"}
 
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
@@ -387,7 +410,8 @@ func validateBuildRequest(req BuildRequest) error {
 }
 
 // buildMetadata is the subset of buildx's --metadata-file JSON this
-// package relies on.
+// package relies on. containerimage.config.digest is present only with the
+// classic image store; the containerd image store never writes it.
 type buildMetadata struct {
 	ImageDigest  string `json:"containerimage.digest"`
 	ConfigDigest string `json:"containerimage.config.digest"`
@@ -402,10 +426,17 @@ func parseBuildMetadata(data []byte) (BuildResult, error) {
 	if err != nil {
 		return BuildResult{}, fmt.Errorf("%w: %v", ErrBuildFailed, err)
 	}
-	configDigest, err := requireHexDigest("containerimage.config.digest", meta.ConfigDigest)
-	if err != nil {
-		return BuildResult{}, fmt.Errorf("%w: %v", ErrBuildFailed, err)
+	configDigest := imageDigest
+	if meta.ConfigDigest != "" {
+		configDigest, err = requireHexDigest("containerimage.config.digest", meta.ConfigDigest)
+		if err != nil {
+			return BuildResult{}, fmt.Errorf("%w: %v", ErrBuildFailed, err)
+		}
 	}
+	// Containerd image store: no config digest is reported and the loaded
+	// image's ID is the manifest digest itself, so that is the identity this
+	// host can address (Client.resolveLocalImage probes both). The value only
+	// feeds the config-digest label and the local image lookup.
 	return BuildResult{ImageDigest: imageDigest, ConfigDigest: configDigest}, nil
 }
 

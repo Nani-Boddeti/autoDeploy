@@ -208,6 +208,7 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 	imageDigest, ok := parseImageDigest(imageDigestStr)
 	if !ok {
 		// The build result is malformed: nothing was authorized.
+		logship.FromContext(ctx).Linef(logship.StreamActivation, "activation: build result digest is malformed; nothing authorized")
 		return e.outcome(lease, false, queue.FailureClassCorruptState)
 	}
 	if ctx.Err() != nil {

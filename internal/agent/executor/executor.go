@@ -248,6 +248,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	if err != nil {
 		class := docker.ClassifyFailure(err)
 		logs.Linef(logship.StreamPhase, "build: failed (%s)", class)
+		logs.Diagf(logship.StreamPhase, "build: failed (%s): %v", class, err)
 		return e.outcome(lease, false, class)
 	}
 	logs.Linef(logship.StreamPhase, "build: complete")
@@ -261,7 +262,10 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 
 	env, err := e.containerEnv(ctx, materializer, lease)
 	if err != nil {
-		return e.outcome(lease, false, classifyPhaseError(ctx, err))
+		class := classifyPhaseError(ctx, err)
+		logs.Linef(logship.StreamPhase, "run: environment preparation failed (%s)", class)
+		logs.Diagf(logship.StreamPhase, "run: environment preparation failed (%s): %v", class, err)
+		return e.outcome(lease, false, class)
 	}
 
 	identity := docker.ReleaseResourceIdentity{
@@ -290,6 +294,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	if err != nil {
 		class := docker.ClassifyFailure(err)
 		logs.Linef(logship.StreamPhase, "run: failed (%s)", class)
+		logs.Diagf(logship.StreamPhase, "run: failed (%s): %v", class, err)
 		return e.outcome(lease, false, class)
 	}
 
@@ -305,7 +310,10 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	// IP present) -- a malformed inspect result must still fail closed here.
 	networkID, _, err := resolveNetworkAndIP(inspect)
 	if err != nil {
-		return e.outcome(lease, false, docker.ClassifyFailure(err))
+		class := docker.ClassifyFailure(err)
+		logs.Linef(logship.StreamHealth, "health gate: container network check failed (%s)", class)
+		logs.Diagf(logship.StreamHealth, "health gate: container network check failed (%s): %v", class, err)
+		return e.outcome(lease, false, class)
 	}
 
 	gateResult, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
@@ -317,11 +325,13 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	if err != nil {
 		class := docker.ClassifyFailure(err)
 		logs.Linef(logship.StreamHealth, "health gate: error (%s)", class)
+		logs.Diagf(logship.StreamHealth, "health gate: error (%s): %v", class, err)
 		return e.outcome(lease, false, class)
 	}
 	if !gateResult.Success {
 		class := docker.ClassifyHealthGateResult(gateResult)
 		logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s class=%s)", gateResult.Reason, class)
+		logs.Diagf(logship.StreamHealth, "health gate: failed: last_probe=%q exit_code=%d oom_killed=%t", gateResult.LastProbe, gateResult.ExitCode, gateResult.OOMKilled)
 		return e.outcome(lease, false, class)
 	}
 	logs.Linef(logship.StreamHealth, "health gate: passed")

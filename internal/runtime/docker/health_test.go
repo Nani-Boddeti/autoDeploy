@@ -430,3 +430,25 @@ func TestHTTPProbeRequestTargetIsByteIdenticalToConfiguredPath(t *testing.T) {
 		})
 	}
 }
+
+func TestHTTPProbeTraceRecordsLastOutcome(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	ip, target := newHTTPProbeTarget(srv, "/healthz")
+	trace := &probeTrace{}
+	probe := newHTTPProbeTraced(ip, target, trace)
+	if ok, err := probe(context.Background()); ok || err != nil {
+		t.Fatalf("want (false,nil), got (%v,%v)", ok, err)
+	}
+	if got := trace.get(); got != "status=404" {
+		t.Fatalf("trace = %q", got)
+	}
+	srv.Close()
+	if ok, _ := probe(context.Background()); ok {
+		t.Fatal("want failure on closed server")
+	}
+	if got := trace.get(); !strings.HasPrefix(got, "error: ") {
+		t.Fatalf("trace = %q", got)
+	}
+}

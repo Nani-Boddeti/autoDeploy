@@ -480,6 +480,15 @@ executor wiring, agent log endpoint sanitizer). Decisions are in `tasks/15g-plan
   output is not masked (it cannot reach the build). The checkout credential is not reachable by the shipper
   because checkout output is not shipped. A PEM block split across chunks is only partly caught server-side.
 
+## Amendments (2026-11-13)
+
+- **Build attestations are disabled** (`--provenance=false --sbom=false`, plus `BUILDX_METADATA_PROVENANCE=disabled`
+  and `BUILDX_GIT_INFO=0` pinned in the buildx subprocess environment). Provenance embeds the build invocation
+  (build args, frontend, source layout) alongside the image; disabling it removes that persistence risk instead of
+  relying on its content being secret-free. Side effect that matters operationally: with the containerd image store
+  the image stays a single manifest (no attestation index), and `--metadata-file` carries no
+  `containerimage.config.digest`, so the loaded image's ID (the manifest digest) is used as the config identity.
+
 ## References
 
 - [Go crypto/cipher package](https://pkg.go.dev/crypto/cipher)

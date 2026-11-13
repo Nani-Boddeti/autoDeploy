@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -568,4 +569,32 @@ func TestInterleavedControlBytesCannotSplitSecretPastRedactor(t *testing.T) {
 		a.Close()
 		assertNoSecret(t, fs, secrets)
 	}
+}
+
+// Diagf writes the journal only: redacted, newline-flattened, never shipped.
+func TestDiagfJournalOnlyAndRedacted(t *testing.T) {
+	fs := &fakeSender{}
+	a := testFactory(t, fs, nil).Start(1, 1)
+	a.SetSecrets(syntheticSecrets())
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	a.Diagf(StreamPhase, "run: failed: dial unix /var/run/docker.sock: runtime-secret-BBBB2222\nsecond line")
+	os.Stderr = orig
+	w.Close()
+	journal, _ := io.ReadAll(r)
+	a.Close()
+
+	if !strings.Contains(string(journal), "dial unix /var/run/docker.sock") || strings.Contains(string(journal), "BBBB2222") || strings.Count(string(journal), "\n") != 1 {
+		t.Fatalf("journal line wrong: %q", journal)
+	}
+	if got := collect(fs.chunks(StreamPhase)); strings.Contains(got, "docker.sock") {
+		t.Fatalf("Diagf must not ship: %q", got)
+	}
+	var nilAttempt *Attempt
+	nilAttempt.Diagf(StreamPhase, "x") // nil-safe
 }

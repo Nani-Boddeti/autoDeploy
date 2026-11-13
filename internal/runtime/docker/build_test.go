@@ -255,10 +255,42 @@ func TestParseBuildMetadataRejectsInvalidDigest(t *testing.T) {
 	}
 }
 
-func TestParseBuildMetadataRejectsMissingField(t *testing.T) {
-	data := []byte(`{"containerimage.digest":"sha256:` + strings.Repeat("a", 64) + `"}`)
+// Containerd image store: no config digest in the metadata; the image digest
+// (the loaded image's ID) stands in. Real buildx output captured on Docker
+// 29 with provenance disabled, plus the provenance-on index shape.
+func TestParseBuildMetadataContainerdStoreOmitsConfigDigest(t *testing.T) {
+	data := []byte(`{"containerimage.descriptor":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:` + strings.Repeat("a", 64) + `","size":1996},"containerimage.digest":"sha256:` + strings.Repeat("a", 64) + `","image.name":"moby-dangling@sha256:` + strings.Repeat("a", 64) + `"}`)
+	result, err := parseBuildMetadata(data)
+	if err != nil {
+		t.Fatalf("parseBuildMetadata: %v", err)
+	}
+	want := "sha256:" + strings.Repeat("a", 64)
+	if result.ImageDigest != want || result.ConfigDigest != want {
+		t.Fatalf("want both digests %s, got %+v", want, result)
+	}
+}
+
+func TestParseBuildMetadataRejectsMalformedConfigDigest(t *testing.T) {
+	data := []byte(`{"containerimage.digest":"sha256:` + strings.Repeat("a", 64) + `","containerimage.config.digest":"nope"}`)
 	if _, err := parseBuildMetadata(data); !errors.Is(err, ErrBuildFailed) {
-		t.Fatalf("want ErrBuildFailed for missing config digest, got %v", err)
+		t.Fatalf("want ErrBuildFailed for malformed config digest, got %v", err)
+	}
+}
+
+func TestParseBuildMetadataRejectsMissingImageDigest(t *testing.T) {
+	data := []byte(`{"containerimage.config.digest":"sha256:` + strings.Repeat("b", 64) + `"}`)
+	if _, err := parseBuildMetadata(data); !errors.Is(err, ErrBuildFailed) {
+		t.Fatalf("want ErrBuildFailed for missing image digest, got %v", err)
+	}
+}
+
+func TestBuildxArgvDisablesAttestations(t *testing.T) {
+	argv, _ := buildxArgv("Dockerfile", nil, nil, "/tmp/meta.json")
+	joined := " " + strings.Join(argv, " ") + " "
+	for _, f := range []string{" --provenance=false ", " --sbom=false ", " --load "} {
+		if !strings.Contains(joined, f) {
+			t.Fatalf("argv missing %q: %v", f, argv)
+		}
 	}
 }
 
@@ -622,5 +654,17 @@ func TestBuildUnsupportedOrLinuxWrapperMatchesUnexported(t *testing.T) {
 	}
 	if !errors.Is(err, ErrUnsupportedPlatform) {
 		t.Fatalf("want ErrUnsupportedPlatform on %s, got %v", runtime.GOOS, err)
+	}
+}
+
+func TestSubprocessEnvPinsBuildxBehaviourSwitches(t *testing.T) {
+	t.Setenv("BUILDX_GIT_INFO", "1") // ambient value must not win; it is not allowlisted
+	env := subprocessEnv(nil)
+	has := map[string]bool{}
+	for _, e := range env {
+		has[e] = true
+	}
+	if !has["BUILDX_GIT_INFO=0"] || !has["BUILDX_METADATA_PROVENANCE=disabled"] || has["BUILDX_GIT_INFO=1"] {
+		t.Fatalf("buildx switches not pinned: %v", env)
 	}
 }

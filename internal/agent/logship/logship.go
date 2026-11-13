@@ -29,6 +29,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -350,6 +351,36 @@ func (a *Attempt) Linef(stream Stream, format string, args ...any) {
 	asm := newAssembler(func(body string) { a.enqueueLocked(stream, body) })
 	asm.write(text)
 	asm.flushFinal()
+}
+
+// Diagf writes one diagnostic line to the agent journal ONLY (never shipped to
+// the control plane), redacted over the secret set like Linef. It exists for
+// underlying error text (Engine error bodies, socket paths, exec failures)
+// that Linef's contract forbids shipping to tenant-visible logs but an
+// operator needs on the host to see why a phase failed. Nil-safe. Newlines
+// in the text are flattened so one failure stays one journal line.
+func (a *Attempt) Diagf(stream Stream, format string, args ...any) {
+	if a == nil {
+		return
+	}
+	if !stream.valid() {
+		stream = StreamSystem
+	}
+	text := []byte(strings.ReplaceAll(fmt.Sprintf(format, args...), "\n", " ") + "\n")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.secrets) > 0 {
+		var out bytes.Buffer
+		red, err := crypto.NewRedactingWriter(&out, a.secrets)
+		if err != nil {
+			return
+		}
+		if _, err := red.Write(text); err != nil || red.Close() != nil {
+			return
+		}
+		text = out.Bytes()
+	}
+	fmt.Fprintf(os.Stderr, "attempt %d [%s] diag: %s", a.attemptID, stream, text)
 }
 
 // enqueueLocked assigns (stream, seq) and queues body, or counts a drop when

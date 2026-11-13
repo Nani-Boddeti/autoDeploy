@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"autodeploy/internal/healthgate"
@@ -164,6 +165,32 @@ type ContainerStatus struct {
 	State     ContainerState
 	ExitCode  int
 	OOMKilled bool
+	// LastProbe describes the final probe attempt ("status=404" or the
+	// transport error, e.g. "dial tcp ...: connection refused") so a gate that
+	// times out is never opaque. Never carries response body content. Empty
+	// when no probe ran.
+	LastProbe string
+}
+
+// probeTrace remembers the outcome of the most recent probe attempt.
+type probeTrace struct {
+	mu   sync.Mutex
+	last string
+}
+
+func (t *probeTrace) set(s string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.last = s
+	t.mu.Unlock()
+}
+
+func (t *probeTrace) get() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.last
 }
 
 // ContainerStateFunc reports the candidate's current status. The other
@@ -197,6 +224,10 @@ type HealthGateResult struct {
 	// own, which classify differently.
 	ExitCode  int
 	OOMKilled bool
+	// LastProbe describes the final probe attempt ("status=404" or the
+	// transport error, e.g. "dial tcp ...: connection refused") so a gate that
+	// times out is never opaque. Never carries response body content.
+	LastProbe string
 }
 
 // runHealthGate is the gate loop's pure implementation, parameterized by
@@ -307,14 +338,17 @@ func (c *Client) RunHealthGate(ctx context.Context, containerID, networkID strin
 		return HealthGateResult{}, err
 	}
 
-	probe := newHTTPProbe(ip, target)
+	trace := &probeTrace{}
+	probe := newHTTPProbeTraced(ip, target, trace)
 	state := func(ctx context.Context) (ContainerStatus, error) {
 		return c.containerRunningState(ctx, containerID)
 	}
 
 	gateCtx, cancel := context.WithTimeout(ctx, healthGateOverallDeadline)
 	defer cancel()
-	return runHealthGate(gateCtx, probe, state, healthGateProbeInterval, healthGateProbeTimeout, healthGateConsecutiveSuccesses)
+	res, err := runHealthGate(gateCtx, probe, state, healthGateProbeInterval, healthGateProbeTimeout, healthGateConsecutiveSuccesses)
+	res.LastProbe = trace.get()
+	return res, err
 }
 
 // containerNetworkIP resolves the container's IP address on the given
@@ -382,6 +416,12 @@ func (c *Client) containerRunningState(ctx context.Context, containerID string) 
 // Host header" even though certificate verification itself is skipped (see
 // InsecureSkipVerify's comment below).
 func newHTTPProbe(ip string, target HealthGateTarget) HealthProbeFunc {
+	return newHTTPProbeTraced(ip, target, nil)
+}
+
+// newHTTPProbeTraced is newHTTPProbe that also records each attempt's
+// outcome in trace (nil: not recorded).
+func newHTTPProbeTraced(ip string, target HealthGateTarget, trace *probeTrace) HealthProbeFunc {
 	dialer := &net.Dialer{}
 	addr := net.JoinHostPort(ip, strconv.Itoa(target.Port))
 	transport := &http.Transport{
@@ -457,10 +497,12 @@ func newHTTPProbe(ip string, target HealthGateTarget) HealthProbeFunc {
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			trace.set("error: " + err.Error())
 			return false, nil
 		}
 		defer resp.Body.Close()
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, healthGateMaxBodyBytes))
+		trace.set(fmt.Sprintf("status=%d", resp.StatusCode))
 		return resp.StatusCode >= 200 && resp.StatusCode < 300, nil
 	}
 }
