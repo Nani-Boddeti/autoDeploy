@@ -81,8 +81,11 @@ func reopenWorkspace(rootFD, received int) (int, error) {
 	if match == "" {
 		return -1, errWorkspaceNotFound
 	}
+	// O_PATH: the workspace is checkout-owned 0700 and this helper has no
+	// CAP_DAC_OVERRIDE, so O_RDONLY gets EACCES (observed on the acer). The FD is
+	// only fstat'd and fchdir'd (by the child, which owns the directory).
 	fd, err := unix.Openat2(rootFD, match, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC,
+		Flags:   unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC,
 		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_XDEV | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if err != nil {

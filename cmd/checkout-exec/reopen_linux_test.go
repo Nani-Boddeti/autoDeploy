@@ -150,3 +150,24 @@ func TestValidRootDirectoryRejectsNonRootOwnerAndWritableMode(t *testing.T) {
 		t.Fatal("non-root-owned directory accepted")
 	}
 }
+
+// The real workspace is checkout-owned 0700 and the helper lacks
+// CAP_DAC_OVERRIDE, so it has no read permission; mode 0000 reproduces that
+// for an unprivileged owner. O_PATH must still re-open it.
+func TestReopenWorkspaceWithoutReadPermission(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	root := mkWorkspaces(t, ".checkout-0000000c")
+	ws := filepath.Join(root, ".checkout-0000000c")
+	rootFD, recv := openDir(t, root), openDir(t, ws)
+	if err := os.Chmod(ws, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(ws, 0o700) })
+	fd, err := reopenWorkspace(rootFD, recv)
+	if err != nil {
+		t.Fatalf("reopen of an unreadable workspace: %v", err)
+	}
+	_ = unix.Close(fd)
+}
