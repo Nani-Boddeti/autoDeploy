@@ -5,11 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -53,7 +56,9 @@ const (
 func main() {
 	if err := run(context.Background()); err != nil {
 		logger, closeLogger := controlplaneLogger(os.Stderr, nil)
-		logger.Print("control plane unavailable")
+		// Only the source line of the failing startup step is logged: error
+		// text can carry configuration values (e.g. a database URL).
+		logger.Print("control plane unavailable" + failureSite(err))
 		_ = closeLogger.Close()
 		os.Exit(1)
 	}
@@ -77,50 +82,50 @@ func (nopCloser) Close() error { return nil }
 func run(ctx context.Context) error {
 	dsn, err := config.DatabaseURLFromEnvironment()
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	webConfig, err := config.WebConfigFromEnvironment()
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	throttleKeys, err := config.UsernameThrottleKeyRingFromEnvironment()
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	defer pool.Close()
 	repository := postgres.NewAuthRepository(pool)
 	if err = repository.Ping(ctx); err != nil {
-		return err
+		return failAt(err)
 	}
 	enabled, err := config.SecretSubsystemEnabled()
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	if enabled {
 		ring, generation, ringErr := config.KEKRingAndGenerationFromEnvironment()
 		if ringErr != nil {
-			return errors.New("secret subsystem unavailable")
+			return failAt(errors.New("secret subsystem unavailable"))
 		}
 		if readyErr := secretLedgerReady(ctx, postgres.NewKeyRepository(pool), ring, generation); readyErr != nil {
-			return errors.New("secret subsystem unavailable")
+			return failAt(errors.New("secret subsystem unavailable"))
 		}
 	}
 	policy, err := repository.LoadPasswordPolicy(ctx)
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	dummy, err := auth.BuildDummyPasswordVerifier(policy)
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, DummyPassword: dummy}
 	githubConfig, err := config.GitHubAppConfigFromEnvironment()
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	var webhookHandler http.Handler
 	// checkoutStore and checkoutService back the agent-facing checkout routes
@@ -135,26 +140,26 @@ func run(ctx context.Context) error {
 	if githubConfig.Enabled {
 		webhookSecrets, webhookErr := config.GitHubWebhookSecretRingFromEnvironment()
 		if webhookErr != nil {
-			return errors.New("GitHub setup unavailable")
+			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		defer clearWebhookSecrets(&webhookSecrets)
 		signer, signerErr := config.GitHubAppSignerFromMountedKey(githubConfig)
 		if signerErr != nil {
-			return errors.New("GitHub setup unavailable")
+			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		provider, providerErr := githubapp.NewHTTPProvider(signer, "autodeploy-controlplane")
 		if providerErr != nil {
-			return errors.New("GitHub setup unavailable")
+			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		identity := githubapp.AppIdentity{AppID: githubConfig.AppID, ClientID: githubConfig.ClientID, Slug: githubConfig.Slug}
 		owner := githubapp.Owner{AccountID: githubConfig.OwnerAccountID, Type: githubConfig.OwnerType}
 		githubRepository := postgres.NewGitHubRepository(pool)
 		if registerErr := githubRepository.EnsureAppRegistration(ctx, identity, owner); registerErr != nil {
-			return errors.New("GitHub setup unavailable")
+			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		setup, setupErr := githubapp.NewSetupService(githubRepository, provider, identity, owner, rand.Reader)
 		if setupErr != nil {
-			return errors.New("GitHub setup unavailable")
+			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		webOptions.GitHubSetup, webOptions.GitHubInstallationURL = setup, githubConfig.InstallationURL
 		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
@@ -164,7 +169,7 @@ func run(ctx context.Context) error {
 		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
 		checkoutService, err = githubapp.NewCheckoutService(githubRepository, provider)
 		if err != nil {
-			return errors.New("GitHub setup unavailable")
+			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		checkoutStore = githubRepository
 	}
@@ -185,7 +190,7 @@ func run(ctx context.Context) error {
 	webOptions.DeploymentLogReader = postgres.NewDeploymentLogRepository(pool)
 	agentConfig, err := config.AgentConfigFromEnvironment()
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	var agentHandler http.Handler
 	var sweeper *postgres.AgentLeaseSweeper
@@ -240,14 +245,14 @@ func run(ctx context.Context) error {
 	}
 	handler, err := web.New(repository, webOptions)
 	if err != nil {
-		return err
+		return failAt(err)
 	}
 	httpHandler := composeHTTPHandler(handler, webhookHandler, agentHandler)
 	if enabled {
 		httpHandler = secretReadyHandler(httpHandler, func(requestContext context.Context) error {
 			ring, generation, loadErr := config.KEKRingAndGenerationFromEnvironment()
 			if loadErr != nil {
-				return errors.New("secret subsystem unavailable")
+				return failAt(errors.New("secret subsystem unavailable"))
 			}
 			return secretLedgerReady(requestContext, postgres.NewKeyRepository(pool), ring, generation)
 		})
@@ -289,7 +294,7 @@ func run(ctx context.Context) error {
 	select {
 	case err = <-errorsChannel:
 		if !errors.Is(err, http.ErrServerClosed) {
-			return err
+			return failAt(err)
 		}
 		return nil
 	case <-ctx.Done():
@@ -439,4 +444,34 @@ func secretReadyHandler(next http.Handler, ready func(context.Context) error) ht
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// startupError records where run() failed without exposing the error text.
+type startupError struct {
+	err  error
+	site string
+}
+
+func (e startupError) Error() string { return e.err.Error() }
+func (e startupError) Unwrap() error { return e.err }
+
+// failAt tags err with the caller's file:line (nil stays nil).
+func failAt(err error) error {
+	if err == nil {
+		return nil
+	}
+	_, file, line, ok := runtime.Caller(1)
+	if !ok {
+		return err
+	}
+	return startupError{err: err, site: fmt.Sprintf("%s:%d", filepath.Base(file), line)}
+}
+
+// failureSite returns " at file:line" for a startupError, else "".
+func failureSite(err error) string {
+	var se startupError
+	if errors.As(err, &se) {
+		return " at " + se.site
+	}
+	return ""
 }
