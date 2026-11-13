@@ -271,6 +271,11 @@ func canonicalControl(name, value string) string {
 	want := make(map[string]string)
 	for _, f := range fields[1:] {
 		p := strings.SplitN(f, "=", 2)
+		// The kernel always prints all four io.max keys on read-back ("... riops=max wiops=max"); an
+		// unset IOPS limit is "max" and is ignored, any other IOPS value is still a conflicting limit.
+		if len(p) == 2 && (p[0] == "riops" || p[0] == "wiops") && p[1] == "max" {
+			continue
+		}
 		if len(p) != 2 || (p[0] != "rbps" && p[0] != "wbps") || want[p[0]] != "" {
 			return ""
 		}

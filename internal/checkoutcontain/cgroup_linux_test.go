@@ -31,6 +31,9 @@ func TestControlReadbackCanonicalization(t *testing.T) {
 	if canonicalControl("io.max", "8:0 wbps=12 rbps=11") != want {
 		t.Fatal("io order not canonical")
 	}
+	if canonicalControl("io.max", "8:0 rbps=11 wbps=12 riops=max wiops=max\n") != want {
+		t.Fatal("kernel io.max read-back with unset iops rejected")
+	}
 	if canonicalControl("io.max", "8:0 rbps=11 wbps=12 riops=1") != "" {
 		t.Fatal("extra io limit accepted")
 	}

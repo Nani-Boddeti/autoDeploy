@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,7 +56,9 @@ type service struct {
 }
 
 func main() {
-	if len(os.Args) == 2 && os.Args[1] == "--checkout-child" {
+	// The child is re-executed as: --checkout-child <uid> <gid> <git args...> (spawn()). Matching
+	// len==2 sent every child into flag parsing ("flag provided but not defined", exit 2) so git never ran.
+	if isChildInvocation(os.Args) {
 		child()
 		return
 	}
@@ -88,6 +91,7 @@ func main() {
 	defer stop()
 	_ = s.serve(ctx) // Serve drains every handler before returning.
 }
+func isChildInvocation(args []string) bool { return len(args) >= 2 && args[1] == "--checkout-child" }
 func newService(c config) (*service, error) {
 	if !validConfig(c) {
 		return nil, errors.New("invalid")
@@ -535,6 +539,11 @@ func child() {
 	unix.CloseOnExec(execFD)
 	unix.CloseOnExec(cwdFD)
 	if unix.CloseRange(6, ^uint(0), 0) != nil {
+		os.Exit(126)
+	}
+	// seccomp is per-thread: pin this thread, filter it, and execveat from it (see seccomp_linux.go).
+	runtime.LockOSThread()
+	if installNamespaceFilter() != nil {
 		os.Exit(126)
 	}
 	if err := execveat(execFD, append([]string{"git"}, os.Args[4:]...), os.Environ()); err != nil {

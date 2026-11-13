@@ -66,6 +66,10 @@ func TestServiceConfigRejectsMatchingAgentAndCheckoutGID(t *testing.T) {
 
 func TestValidWorkspaceRequiresExactOwnerAndMode(t *testing.T) {
 	workspace := t.TempDir()
+	// t.TempDir's leaf is 0777&^umask: group-writable under umask 0002 (Ubuntu default), which validWorkspace rightly rejects.
+	if err := os.Chmod(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	fd, err := unix.Open(workspace, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("open workspace: %v", err)
@@ -97,5 +101,15 @@ func TestFixedEnvironmentIsNotCallerControlled(t *testing.T) {
 	}
 	if len(fixedEnv(false)) >= len(fixedEnv(true)) {
 		t.Fatal("askpass environment not constrained")
+	}
+}
+
+func TestChildInvocationMatchesSpawnArgv(t *testing.T) {
+	// spawn() execs: /proc/self/exe --checkout-child <uid> <gid> <git args...>; it must reach child().
+	if !isChildInvocation([]string{"/proc/self/exe", "--checkout-child", "801", "801", "init", "--quiet"}) {
+		t.Fatal("spawn argv not recognised as child mode")
+	}
+	if isChildInvocation([]string{"checkout-exec", "--socket", "/x"}) || isChildInvocation([]string{"checkout-exec"}) {
+		t.Fatal("service argv treated as child mode")
 	}
 }

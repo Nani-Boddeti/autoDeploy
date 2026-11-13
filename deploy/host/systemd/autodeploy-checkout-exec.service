@@ -86,7 +86,12 @@ RestrictRealtime=yes
 # openat2 -> ENOSYS, exit 126). Setuid creation stays harmless: NoNewPrivileges=yes and
 # the checkout volume is mounted nosuid.
 RestrictSUIDSGID=no
-RestrictNamespaces=yes
+# RestrictNamespaces is deliberately OFF: systemd enforces it by answering clone3 with ENOSYS, and
+# Go's os/exec (SysProcAttr.UseCgroupFD, the CLONE_INTO_CGROUP spawn in checkoutcontain.Leaf.Start)
+# has no clone fallback, so every spawn failed "function not implemented" (reproduced on the acer
+# with a transient unit, systemd 255). The git child gets the equivalent seccomp filter (no
+# new namespaces, clone3 -> ENOSYS) installed by cmd/checkout-exec/seccomp_linux.go before execveat.
+RestrictNamespaces=no
 RemoveIPC=yes
 ReadOnlyPaths=/etc -/boot
 # Deliberately NOT set, with the reason:
