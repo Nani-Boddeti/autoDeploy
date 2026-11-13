@@ -205,7 +205,7 @@ func sendFixed(fd int, body []byte, fds []int) error {
 	} else if len(fds) != 0 {
 		return ErrInvalid
 	}
-	n, err := unix.SendmsgN(fd, body, oob, nil, 0)
+	n, err := sendmsgNRetry(fd, body, oob, nil, 0)
 	if err != nil || n != len(body) {
 		return ErrUnavailable
 	}
@@ -215,7 +215,7 @@ func sendFixed(fd int, body []byte, fds []int) error {
 func receiveReply(fd int, wantFD bool) ([16]byte, int, error) {
 	var out [16]byte
 	body, oob := make([]byte, 24), make([]byte, unix.CmsgSpace(4))
-	n, on, flags, _, err := unix.Recvmsg(fd, body, oob, unix.MSG_CMSG_CLOEXEC)
+	n, on, flags, _, err := recvmsgRetry(fd, body, oob, unix.MSG_CMSG_CLOEXEC)
 	got := -1
 	// Inspect ancillary data before framing validation so malformed replies cannot
 	// leak an installed descriptor. Invalid ancillary lengths cannot name data.

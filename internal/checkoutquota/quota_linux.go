@@ -200,7 +200,7 @@ func (s *Service) Serve(ctx context.Context) error {
 	}()
 	defer close(done)
 	for {
-		conn, _, e := unix.Accept4(fd, unix.SOCK_CLOEXEC)
+		conn, _, e := accept4Retry(fd, unix.SOCK_CLOEXEC)
 		if e != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -277,7 +277,7 @@ func (s *Service) serveConn(fd int) {
 	}
 	body := make([]byte, 40)
 	oob := make([]byte, unix.CmsgSpace(4))
-	n, on, flags, _, err := unix.Recvmsg(fd, body, oob, unix.MSG_CMSG_CLOEXEC)
+	n, on, flags, _, err := recvmsgRetry(fd, body, oob, unix.MSG_CMSG_CLOEXEC)
 	// Parse rights before interpreting the request. Every malformed/rejected
 	// request closes every received descriptor rather than leaking it to the
 	// privileged daemon.
@@ -332,7 +332,7 @@ func (s *Service) serveConn(fd int) {
 		control = unix.UnixRights(outFD)
 		defer unix.Close(outFD)
 	}
-	if _, sendErr := unix.SendmsgN(fd, reply, control, nil, 0); sendErr != nil && outFD >= 0 {
+	if _, sendErr := sendmsgNRetry(fd, reply, control, nil, 0); sendErr != nil && outFD >= 0 {
 		// An unacknowledged descriptor must never become a permanently active
 		// inaccessible checkout when delivery fails.
 		_ = s.withdrawOffer(outFD, handle)
@@ -388,7 +388,7 @@ func (s *Service) handleAllocateConn(conn int, limits Limits) {
 	_ = unix.SetsockoptTimeval(conn, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Sec: ackDeadlineSeconds})
 	body := make([]byte, 40)
 	oob := make([]byte, unix.CmsgSpace(4))
-	n, on, flags, _, recvErr := unix.Recvmsg(conn, body, oob, unix.MSG_CMSG_CLOEXEC)
+	n, on, flags, _, recvErr := recvmsgRetry(conn, body, oob, unix.MSG_CMSG_CLOEXEC)
 	if on < 0 || on > len(oob) {
 		_ = s.withdrawOffer(workspace, handle)
 		return
@@ -421,7 +421,7 @@ func (s *Service) sendReply(fd int, handle [16]byte, outFD int, err error) error
 	if outFD >= 0 {
 		control = unix.UnixRights(outFD)
 	}
-	_, sendErr := unix.SendmsgN(fd, reply, control, nil, 0)
+	_, sendErr := sendmsgNRetry(fd, reply, control, nil, 0)
 	return sendErr
 }
 func oneReceivedFD(oob []byte) (int, error) {

@@ -197,7 +197,7 @@ func (s *service) serve(ctx context.Context) error {
 		return err
 	}
 	for {
-		c, _, err := unix.Accept4(fd, unix.SOCK_CLOEXEC)
+		c, _, err := accept4Retry(fd, unix.SOCK_CLOEXEC)
 		if err != nil {
 			if ctx.Err() != nil {
 				break
@@ -267,7 +267,7 @@ func (s *service) handle(fd int) {
 	}
 	body := make([]byte, checkoutcontain.SpawnFrameSizeForService())
 	oob := make([]byte, unix.CmsgSpace(4*4))
-	n, on, flags, _, err := unix.Recvmsg(fd, body, oob, unix.MSG_CMSG_CLOEXEC)
+	n, on, flags, _, err := recvmsgRetry(fd, body, oob, unix.MSG_CMSG_CLOEXEC)
 	fds, e := receivedFDs(oob[:max(0, on)])
 	if err != nil || flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 || e != nil {
 		closeFDs(fds)
@@ -294,7 +294,7 @@ func (s *service) handle(fd int) {
 	} else if code != 0 {
 		reply[3], reply[7] = 1, byte(code)
 	}
-	_ = unix.Sendmsg(fd, reply, nil, nil, 0)
+	_, _ = sendmsgNRetry(fd, reply, nil, nil, 0)
 }
 func receivedFDs(oob []byte) ([]int, error) {
 	msgs, err := unix.ParseSocketControlMessage(oob)

@@ -47,7 +47,7 @@ func (c SpawnClient) Run(ctx context.Context, r SpawnRequest) (SpawnResult, erro
 	if r.AskpassReadFD >= 0 {
 		fds = append(fds, r.AskpassReadFD)
 	}
-	if n, e := unix.SendmsgN(fd, frame[:], unix.UnixRights(fds...), nil, 0); e != nil || n != len(frame) {
+	if n, e := sendmsgNRetry(fd, frame[:], unix.UnixRights(fds...), nil, 0); e != nil || n != len(frame) {
 		return SpawnResult{}, fmt.Errorf("%w: send request: %v", ErrUnavailable, e)
 	}
 	// SCM_RIGHTS duplicates descriptors. Close our write ends immediately so
@@ -228,6 +228,9 @@ func drainOutput(ctx context.Context, fd int, w io.Writer, budget *outputBudget)
 		}
 		ready := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR}}
 		if _, err := unix.Poll(ready, 100); err != nil {
+			if err == unix.EINTR {
+				continue // signal-interrupted poll (e.g. Go preemption); retry
+			}
 			return err
 		}
 		if ready[0].Revents == 0 {
@@ -257,7 +260,7 @@ func receiveSpawnReply(ctx context.Context, fd int) (SpawnResult, error) {
 	}
 	b := make([]byte, spawnReplySize)
 	oob := make([]byte, unix.CmsgSpace(4))
-	n, on, flags, _, err := unix.Recvmsg(fd, b, oob, unix.MSG_CMSG_CLOEXEC)
+	n, on, flags, _, err := recvmsgRetry(fd, b, oob, unix.MSG_CMSG_CLOEXEC)
 	// Parse and close ancillary data before rejecting it, including malformed
 	// replies, so a malicious service cannot leak client descriptors.
 	if on > 0 {

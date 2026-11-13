@@ -236,7 +236,7 @@ func readControl(dirFD int, name string) (string, error) {
 	}
 	defer unix.Close(fd)
 	b := make([]byte, 4096)
-	n, err := unix.Read(fd, b)
+	n, err := readRetry(fd, b)
 	if err != nil || n == len(b) {
 		return "", ErrUnavailable
 	}
@@ -247,7 +247,7 @@ func writeExact(dirFD int, name, value string) bool {
 	if err != nil {
 		return false
 	}
-	n, err := unix.Write(fd, []byte(value))
+	n, err := writeRetry(fd, []byte(value))
 	closeErr := unix.Close(fd)
 	if err != nil || n != len(value) || closeErr != nil {
 		return false
@@ -356,7 +356,7 @@ func writeKill(fd int) bool {
 	if err != nil {
 		return false
 	}
-	n, err := unix.Write(killFD, []byte("1"))
+	n, err := writeRetry(killFD, []byte("1"))
 	closeErr := unix.Close(killFD)
 	return err == nil && n == 1 && closeErr == nil
 }
