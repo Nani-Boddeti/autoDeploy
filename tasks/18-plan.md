@@ -116,3 +116,7 @@ summarized in this file. Repo checks unchanged (gates false, `go test ./...` gre
   (92ab769); (12) re-open needs O_PATH (no read perm without DAC_OVERRIDE) (f3ac066). Workflow: one-shot
   deploy/host/diagnose.sh per owner sudo run (owner declined passwordless sudo).
 - Next: 18e app side (Postgres, Traefik, control plane, agent; needs owner GitHub App for checkout routes).
+- FOUND on the acer (18e): the UI has no button that POSTs /github/setup (landing.html only offers the
+  installation-id reconcile form), so the state-protected install flow cannot be started from the UI. Workaround used:
+  install the App directly on GitHub, then reconcile by installation id (App-authenticated API lookup). Fix later: add
+  a "Install GitHub App" form on the landing page posting to /github/setup.
