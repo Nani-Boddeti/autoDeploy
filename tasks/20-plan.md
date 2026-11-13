@@ -63,4 +63,6 @@ lock-order fix; flagged-head trigger; agent_jobs owner index; persisting executo
   drain candidate instance, pill gated on release state, recovery/operator tests). PROVEN ON THE ACER 2026-11-13:
   attempt 18 rolled back third (STS) -> second release: no build, predecessor stopped, gate passed, route switched;
   site serves "Second deploy" again.
-- Next: 20E retention/cleanup (migration 000026), then 20F docs.
+- 20E retention cleanup e8dc114 (review PASS WITH NOTES; fix: never remove an unverified image). Follow-ups:
+  failed-candidate 24h cleanup, cleanup state on route page. Acer validation pending (owner paused 2026-11-14).
+- Next: acer install + cleanup check, then 20F docs.
