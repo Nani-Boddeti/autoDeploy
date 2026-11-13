@@ -687,6 +687,10 @@ func (h *Handler) githubCompletePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err = h.config.GitHubSetup.Complete(r.Context(), c.Value, p); err != nil {
+		var stage githubapp.SetupStageError
+		if errors.As(err, &stage) {
+			fmt.Fprintf(os.Stderr, "github setup complete failed at: %s\n", stage.Stage)
+		}
 		badRequest(w)
 		return
 	}

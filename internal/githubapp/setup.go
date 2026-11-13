@@ -135,26 +135,26 @@ func (s *SetupService) Callback(ctx context.Context, state string, installationI
 func (s *SetupService) Complete(ctx context.Context, handoff string, p auth.Principal) error {
 	d, err := HandoffDigest(handoff)
 	if err != nil {
-		return ErrSetupUnavailable
+		return setupStage("complete: handoff digest")
 	}
 	installation, err := s.store.PendingInstallation(ctx, d, p)
 	if err != nil {
-		return ErrSetupUnavailable
+		return setupStage("complete: pending installation (handoff unknown, expired, or another session)")
 	} // Provider work precedes authority consumption so a transient error is retryable.
 	app, err := s.provider.GetApp(ctx)
 	if err != nil || VerifyApp(app, s.identity, s.owner) != nil {
-		return ErrSetupUnavailable
+		return setupStage("complete: App lookup or identity")
 	}
 	actual, err := s.provider.GetInstallation(ctx, installation.ID)
 	if err != nil || actual.ID != installation.ID || actual.Suspended || actual.Account != s.owner {
-		return ErrSetupUnavailable
+		return setupStage("complete: installation lookup or ownership")
 	}
 	repositories, err := s.provider.ListInstallationRepositories(ctx, actual.ID)
 	if err != nil {
-		return ErrSetupUnavailable
+		return setupStage("complete: list installation repositories (discovery token)")
 	}
 	if err = s.store.CompleteHandoff(ctx, d, p, actual, repositories); err != nil {
-		return ErrSetupUnavailable
+		return setupStage("complete: store handoff")
 	}
 	return nil
 }

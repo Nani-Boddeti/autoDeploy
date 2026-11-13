@@ -138,3 +138,16 @@ func TestQAPaginationAcceptsDocumentedMaximum(t *testing.T) {
 		t.Fatalf("repositories = %d, error = %v; want 1000", len(repositories), err)
 	}
 }
+
+// An App installed on chosen repositories mints discovery tokens with
+// repository_selection "selected" (observed on the acer); they must be accepted.
+func TestQADiscoveryTokenAcceptsSelectedInstallation(t *testing.T) {
+	for _, selection := range []string{"all", "selected"} {
+		provider := qaProvider(t, roundTrip(func(*http.Request) (*http.Response, error) {
+			return response(http.StatusCreated, fmt.Sprintf(`{"token":"opaque discovery value","expires_at":%q,"permissions":{"metadata":"read"},"repository_selection":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339), selection)), nil
+		}))
+		if _, err := provider.MintDiscoveryToken(context.Background(), 7); err != nil {
+			t.Fatalf("selection %q: %v", selection, err)
+		}
+	}
+}

@@ -185,7 +185,10 @@ func (p *HTTPProvider) mint(ctx context.Context, id int64, repos []int64, discov
 		return Token{}, p.revokeInvalidMint(ctx, &wire.Token)
 	}
 	if discovery {
-		if wire.RepositorySelection != "all" || !exactPermissions(wire.Permissions, map[string]string{"metadata": "read"}) {
+		// The selection mirrors how the App is installed: "all", or "selected" when
+		// installed on chosen repositories (the safer choice; observed on the acer).
+		// A metadata-only discovery token is no broader either way.
+		if (wire.RepositorySelection != "all" && wire.RepositorySelection != "selected") || !exactPermissions(wire.Permissions, map[string]string{"metadata": "read"}) {
 			return Token{}, p.revokeInvalidMint(ctx, &wire.Token)
 		}
 		return Token{Value: wire.Token, ExpiresAt: wire.ExpiresAt, Permissions: wire.Permissions}, nil
