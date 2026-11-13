@@ -52,7 +52,12 @@ UMask=0077
 # root-owned file through the owner permission bits. Write confinement here is
 # only the read-only paths below plus the git child running as the checkout uid.
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
-AmbientCapabilities=
+# Ambient = bounding: observed on the acer, the running helper had CapPrm 0x61 (no CAP_SETUID)
+# while CapBnd was 0xe1, so the fork child's setuid(checkout uid) failed with EPERM (exit 125).
+# The helper is exec'd twice (systemd -> launcher -> checkout-exec) under NoNewPrivileges;
+# ambient capabilities are the kernel's mechanism for keeping them across execve. They are
+# cleared automatically when the git child switches to the checkout uid.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_KILL
 NoNewPrivileges=yes
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM

@@ -49,6 +49,9 @@ enable_controllers "$unit_cgroup/leaves"
 dev="$(findmnt -n -o MAJ:MIN --target "$AUTODEPLOY_CHECKOUT_ROOT" | tr -d ' ')"
 [[ "$dev" =~ ^[0-9]+:[0-9]+$ ]] || die "cannot determine block device of $AUTODEPLOY_CHECKOUT_ROOT"
 
+# Log capability sets (journal) so a missing CAP_SETUID/SETGID is visible, not a silent exit.
+grep -E '^Cap(Prm|Eff|Bnd|Amb):' /proc/self/status | tr '\n' ' ' >&2 || true
+printf '\n' >&2
 exec "$AUTODEPLOY_CHECKOUT_BIN_ROOT/checkout-exec" \
   --socket "$AUTODEPLOY_CHECKOUT_SPAWN_SOCKET" \
   --bin-root "$AUTODEPLOY_CHECKOUT_BIN_ROOT" \
