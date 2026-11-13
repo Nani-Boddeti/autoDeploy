@@ -12,6 +12,16 @@ import (
 
 var ErrSetupUnavailable = errors.New("GitHub setup unavailable")
 
+// SetupStageError is ErrSetupUnavailable tagged with the failing step. Stage
+// names are fixed strings (no GitHub response text, no secrets), so callers
+// may log them; errors.Is(err, ErrSetupUnavailable) still holds.
+type SetupStageError struct{ Stage string }
+
+func (e SetupStageError) Error() string        { return ErrSetupUnavailable.Error() }
+func (e SetupStageError) Is(target error) bool { return target == ErrSetupUnavailable }
+
+func setupStage(stage string) error { return SetupStageError{Stage: stage} }
+
 // SetupStore is deliberately capability-only: callback reservation cannot
 // activate an installation or bind a project.
 type SetupStore interface {
@@ -77,16 +87,16 @@ func (s *SetupService) Start(ctx context.Context, p auth.Principal) (string, err
 }
 func (s *SetupService) Callback(ctx context.Context, state string, installationID int64, action string) (string, error) {
 	if action != "install" || installationID <= 0 {
-		return "", ErrSetupUnavailable
+		return "", setupStage("callback input")
 	}
 	d, err := SetupDigest(state)
 	if err != nil {
-		return "", ErrSetupUnavailable
+		return "", setupStage("state digest")
 	}
 	// Take a short-lived callback lease before provider calls. This bounds
 	// replay-driven provider work while preserving retryability on failure.
 	if err = s.store.BeginCallback(ctx, d); err != nil {
-		return "", ErrSetupUnavailable
+		return "", setupStage("state lookup (unknown, expired or used)")
 	}
 	reserved := false
 	defer func() {
@@ -95,12 +105,18 @@ func (s *SetupService) Callback(ctx context.Context, state string, installationI
 		}
 	}()
 	app, err := s.provider.GetApp(ctx)
-	if err != nil || VerifyApp(app, s.identity, s.owner) != nil {
-		return "", ErrSetupUnavailable
+	if err != nil {
+		return "", setupStage("GitHub GET /app (App JWT, key, clock or network)")
+	}
+	if VerifyApp(app, s.identity, s.owner) != nil {
+		return "", setupStage("App identity mismatch (app id, client id, slug or owner)")
 	}
 	installation, err := s.provider.GetInstallation(ctx, installationID)
-	if err != nil || installation.ID != installationID || installation.Suspended || installation.Account != s.owner {
-		return "", ErrSetupUnavailable
+	if err != nil {
+		return "", setupStage("GitHub GET installation")
+	}
+	if installation.ID != installationID || installation.Suspended || installation.Account != s.owner {
+		return "", setupStage("installation not owned by the configured account, or suspended")
 	}
 	handoff, err := NewCapability(s.random)
 	if err != nil {
@@ -111,7 +127,7 @@ func (s *SetupService) Callback(ctx context.Context, state string, installationI
 		return "", ErrSetupUnavailable
 	}
 	if err = s.store.ReserveCallback(ctx, d, hd, installation); err != nil {
-		return "", ErrSetupUnavailable
+		return "", setupStage("reserve callback")
 	}
 	reserved = true
 	return handoff, nil

@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -599,6 +601,11 @@ func (h *Handler) githubCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	handoff, err := h.config.GitHubSetup.Callback(r.Context(), q.Get("state"), installationID, q.Get("setup_action"))
 	if err != nil {
+		var stage githubapp.SetupStageError
+		if errors.As(err, &stage) {
+			// Fixed step name only (githubapp.SetupStageError); diagnosable from the journal.
+			fmt.Fprintf(os.Stderr, "github setup callback failed at: %s\n", stage.Stage)
+		}
 		badRequest(w)
 		return
 	}
