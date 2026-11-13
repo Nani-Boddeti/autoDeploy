@@ -1,6 +1,7 @@
 package gitcheckout
 
 import (
+	"autodeploy/internal/crypto"
 	"context"
 	"errors"
 	"io"
@@ -270,4 +271,39 @@ func TestCheckoutRejectsNilLease(t *testing.T) {
 	if _, err := runner.Checkout(context.Background(), (*githubapp.CheckoutLease)(nil)); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("typed-nil lease: err=%v, want ErrInvalidConfig", err)
 	}
+}
+
+// strictLease mirrors the agent's real lease (internal/agent/checkout.Lease):
+// it refuses to build a redactor before Start, failing closed.
+type strictLease struct {
+	*githubapp.CheckoutLease
+	started bool
+}
+
+func (l *strictLease) Start(ctx context.Context) error {
+	if err := l.CheckoutLease.Start(ctx); err != nil {
+		return err
+	}
+	l.started = true
+	return nil
+}
+
+func (l *strictLease) RedactingWriter(dst io.Writer) (*crypto.RedactingWriter, error) {
+	if !l.started {
+		return nil, errors.New("redactor requested before Start")
+	}
+	return l.CheckoutLease.RedactingWriter(dst)
+}
+
+// Every git operation needs a redactor, so the lease must be started before
+// the first one (found on the acer: git init failed with a bare ErrGitFailed).
+func TestCheckoutStartsLeaseBeforeFirstGitOperation(t *testing.T) {
+	q := &fakeQuota{alloc: qaAllocation(t)}
+	s := &fakeSpawn{quota: q}
+	lease := &strictLease{CheckoutLease: qaLease(t, &qaStore{}, &qaProvider{})}
+	result, err := qaRunner(t, q, s).Checkout(context.Background(), lease)
+	if err != nil {
+		t.Fatalf("checkout with a start-before-redact lease: %v", err)
+	}
+	_ = result.Close()
 }

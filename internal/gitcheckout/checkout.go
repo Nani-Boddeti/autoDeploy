@@ -251,14 +251,18 @@ func (r *Runner) Checkout(ctx context.Context, lease Lease) (result *Result, err
 	result = &Result{quota: r.config.Quota, alloc: alloc}
 	cleanupResult = result
 
+	// Start the credential lease before the first git operation: every git run
+	// redacts its output against the lease token, and the lease refuses to build
+	// a redactor before Start (fail closed). Starting it after init/remote-add
+	// made the first git command fail with a bare ErrGitFailed (found on the acer).
+	if err = lease.Start(checkoutCtx); err != nil {
+		return nil, errors.Join(ErrGitFailed, err)
+	}
 	if err = r.run(checkoutCtx, lease, alloc.Workspace, checkoutcontain.GitInit, "", "", -1, false); err != nil {
 		return nil, err
 	}
 	if err = r.run(checkoutCtx, lease, alloc.Workspace, checkoutcontain.GitRemoteAddOrigin, "", binding.CloneURL, -1, false); err != nil {
 		return nil, err
-	}
-	if err = lease.Start(checkoutCtx); err != nil {
-		return nil, errors.Join(ErrGitFailed, err)
 	}
 	broker, brokerErr := lease.NewAskPassBroker()
 	if brokerErr != nil {
