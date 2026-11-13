@@ -177,8 +177,11 @@ func preflightCgroup(t *testing.T, root string) {
 	if err != nil {
 		t.Fatalf("read delegated cgroup controllers: %v", err)
 	}
+	// The kernel ends the file with "\n"; split on whitespace so the last
+	// controller is still found (padding with spaces missed "pids\n").
+	enabled := " " + strings.Join(strings.Fields(string(b)), " ") + " "
 	for _, controller := range []string{"cpu", "io", "memory", "pids"} {
-		if !strings.Contains(" "+string(b)+" ", " "+controller+" ") {
+		if !strings.Contains(enabled, " "+controller+" ") {
 			t.Fatalf("delegated cgroup controller %q missing from cgroup.subtree_control", controller)
 		}
 	}
