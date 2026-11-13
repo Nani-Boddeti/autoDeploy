@@ -339,108 +339,51 @@ func (d *Drainer) process(ctx context.Context, rec state.PendingDrain) {
 		return
 	}
 
-	// 3. Resolve the target by its deterministic container name.
-	name, err := docker.ContainerName(rec.PredecessorRuntimeInstanceID)
-	if err != nil {
+	// 3-6. Resolve by container name, exact label identity (owner and server
+	// labels are not in the drain record and deliberately not checked: the
+	// runtime instance id is the decimal attempt id, globally unique, so
+	// environment + release + runtime-instance + managed + kind identify
+	// exactly one container), stop by inspected ID, wait. Shared with the
+	// executor's failed-candidate stop (stopguard.go).
+	res := guardedStop(ctx, d.Docker, stopTarget{
+		EnvironmentID:           rec.EnvironmentID,
+		ReleaseID:               rec.PredecessorReleaseID,
+		RuntimeInstanceID:       rec.PredecessorRuntimeInstanceID,
+		ForbidReleaseID:         rec.ReleaseID,
+		ForbidRuntimeInstanceID: rec.BackendRuntimeInstanceID,
+	}, d.stopGrace(), d.waitTimeout(), defaultDrainWaitInterval)
+	name, _ := docker.ContainerName(rec.PredecessorRuntimeInstanceID)
+	switch res.Status {
+	case stopInterrupted:
+	case stopInvalid:
 		d.fail(rec, drainSummaryIdentityError+": invalid runtime instance id", false)
-		return
-	}
-	inspected, err := d.Docker.InspectContainer(ctx, name)
-	switch {
-	case ctx.Err() != nil:
-		return
-	case errors.Is(err, docker.ErrContainerNotFound):
-		// Any 404 discharges the obligation; WARN so an unexpected 404 (proxy,
-		// odd daemon path) is visible rather than a quiet INFO.
-		d.logger().Printf("agent drainer WARN attempt %d: inspect answered not-found for predecessor %s", rec.AttemptID, name)
-		d.done(rec, "predecessor container is already gone; nothing to stop")
-		return
-	case err != nil:
-		d.failEngine(rec, "inspect predecessor", err)
-		return
-	}
-
-	// 4. Label guard (exact identity). Owner and server labels are not in the
-	// drain record and deliberately not checked: the runtime instance id is the
-	// decimal attempt id (globally unique), so environment + release +
-	// runtime-instance + managed + kind identify exactly one container.
-	reason, err := d.checkIdentity(ctx, rec, inspected.ID)
-	switch {
-	case ctx.Err() != nil:
-		return
-	case err != nil:
-		d.failEngine(rec, "look up predecessor labels", err)
-		return
-	case reason != "":
-		d.fail(rec, drainSummaryIdentityError+": "+reason, false)
-		return
-	}
-
-	// 5. Already stopped.
-	if !inspected.State.Running && !inspected.State.Restarting && !inspected.State.Paused && alreadyStopped(inspected.State.Status) {
+	case stopMismatch:
+		d.fail(rec, drainSummaryIdentityError+": "+res.Reason, false)
+	case stopAlreadyStopped:
 		d.done(rec, "predecessor already stopped")
-		return
-	}
-
-	// 6. Stop the verified container (pinned by its inspected ID, not the
-	// name), then wait until it is really stopped.
-	target := inspected.ID
-	if err := d.Docker.StopContainer(ctx, target, d.stopGrace()); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		if errors.Is(err, docker.ErrContainerNotFound) {
+	case stopStopped:
+		d.done(rec, "predecessor stopped")
+	case stopGone:
+		switch res.Step {
+		case stepInspect:
+			// Any 404 discharges the obligation; WARN so an unexpected 404
+			// (proxy, odd daemon path) is visible rather than a quiet INFO.
+			d.logger().Printf("agent drainer WARN attempt %d: inspect answered not-found for predecessor %s", rec.AttemptID, name)
+			d.done(rec, "predecessor container is already gone; nothing to stop")
+		case stepStop:
 			d.done(rec, "predecessor container vanished before the stop")
-			return
-		}
-		d.failEngine(rec, "stop predecessor", err)
-		return
-	}
-	if _, err := d.Docker.WaitStopped(ctx, target, d.waitTimeout(), defaultDrainWaitInterval); err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		if errors.Is(err, docker.ErrContainerNotFound) {
+		default:
 			d.done(rec, "predecessor container vanished while stopping")
-			return
 		}
-		d.failEngine(rec, "wait for predecessor to stop", err)
-		return
+	case stopEngineError:
+		op := map[stopStep]string{
+			stepInspect: "inspect predecessor",
+			stepLabels:  "look up predecessor labels",
+			stepStop:    "stop predecessor",
+			stepWait:    "wait for predecessor to stop",
+		}[res.Step]
+		d.failEngine(rec, op, res.Err)
 	}
-	d.done(rec, "predecessor stopped")
-}
-
-// checkIdentity returns an empty reason when exactly one container matches the
-// predecessor's full identity labels, is the inspected one, and no label names
-// the new release or runtime instance; otherwise a reason.
-func (d *Drainer) checkIdentity(ctx context.Context, rec state.PendingDrain, inspectedID string) (reason string, err error) {
-	want := map[string]string{
-		docker.LabelManaged:           "true",
-		docker.LabelKind:              docker.KindReleaseRuntimeContainer,
-		docker.LabelEnvironmentID:     rec.EnvironmentID,
-		docker.LabelReleaseID:         rec.PredecessorReleaseID,
-		docker.LabelRuntimeInstanceID: rec.PredecessorRuntimeInstanceID,
-	}
-	matches, err := d.Docker.ListContainersByLabels(ctx, want)
-	if err != nil {
-		return "", err
-	}
-	if len(matches) != 1 {
-		return fmt.Sprintf("%d containers match the predecessor labels, want exactly 1", len(matches)), nil
-	}
-	m := matches[0]
-	if inspectedID == "" || m.ID != inspectedID {
-		return "labelled container is not the container named for the predecessor", nil
-	}
-	if m.Labels[docker.LabelReleaseID] == rec.ReleaseID || m.Labels[docker.LabelRuntimeInstanceID] == rec.BackendRuntimeInstanceID {
-		return "container labels name the new release or runtime instance", nil
-	}
-	for k, v := range want {
-		if got, ok := m.Labels[k]; !ok || got != v {
-			return "label " + k + " missing or different", nil
-		}
-	}
-	return "", nil
 }
 
 func alreadyStopped(status string) bool {

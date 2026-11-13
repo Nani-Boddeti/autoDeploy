@@ -92,8 +92,48 @@ type fakeDocker struct {
 	gateErr    error
 	gateN      int
 	blockGate  bool
+	onGate     func()
 	lastTarget docker.HealthGateTarget
 	lastNetID  string
+
+	// Guarded-stop seam (failed-candidate cleanup). The zero value answers
+	// inspect with not-found, so tests that do not care see a no-op stop.
+	inspectResult docker.ContainerInspect
+	inspectErr    error
+	listResult    []docker.ContainerSummary
+	listErr       error
+	stopErr       error
+	waitErr       error
+	inspectNames  []string
+	listLabels    []map[string]string
+	stoppedIDs    []string
+	waitedIDs     []string
+}
+
+func (f *fakeDocker) InspectContainer(_ context.Context, id string) (docker.ContainerInspect, error) {
+	f.inspectNames = append(f.inspectNames, id)
+	if f.inspectErr != nil {
+		return docker.ContainerInspect{}, f.inspectErr
+	}
+	if f.inspectResult.ID == "" {
+		return docker.ContainerInspect{}, docker.ErrContainerNotFound
+	}
+	return f.inspectResult, nil
+}
+
+func (f *fakeDocker) ListContainersByLabels(_ context.Context, labels map[string]string) ([]docker.ContainerSummary, error) {
+	f.listLabels = append(f.listLabels, labels)
+	return f.listResult, f.listErr
+}
+
+func (f *fakeDocker) StopContainer(_ context.Context, id string, _ time.Duration) error {
+	f.stoppedIDs = append(f.stoppedIDs, id)
+	return f.stopErr
+}
+
+func (f *fakeDocker) WaitStopped(_ context.Context, id string, _, _ time.Duration) (docker.ContainerInspect, error) {
+	f.waitedIDs = append(f.waitedIDs, id)
+	return docker.ContainerInspect{}, f.waitErr
 }
 
 func (f *fakeDocker) Probe(ctx context.Context) (docker.VersionInfo, error) {
@@ -110,6 +150,9 @@ func (f *fakeDocker) RunHealthGate(ctx context.Context, containerID, networkID s
 	f.gateN++
 	f.lastTarget = target
 	f.lastNetID = networkID
+	if f.onGate != nil {
+		f.onGate()
+	}
 	if f.blockGate {
 		<-ctx.Done()
 		return docker.HealthGateResult{}, ctx.Err()

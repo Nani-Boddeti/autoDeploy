@@ -55,6 +55,10 @@ type dockerRuntime interface {
 	Probe(ctx context.Context) (docker.VersionInfo, error)
 	EnsureReleaseRuntimeContainer(ctx context.Context, req docker.RunContainerRequest, networkNameOrID string) (docker.ContainerInspect, error)
 	RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, target docker.HealthGateTarget) (docker.HealthGateResult, error)
+	// DrainDocker (inspect, label lookup, stop, wait; deliberately no remove
+	// or kill) backs the guarded stop of a candidate that fails before
+	// authorization (stopFailedCandidate).
+	DrainDocker
 }
 
 // Config is everything NewExecutor needs to assemble a production Executor.
@@ -298,49 +302,90 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		return e.outcome(lease, false, class)
 	}
 
-	if err := tracker.advance(ctx, progress, lease.AttemptID, lease.Fence, deployment.StatusHealthChecking); err != nil {
-		return e.outcome(lease, false, queue.FailureClassTransient)
-	}
+	// The candidate now exists. Any outcome that ends the attempt strictly
+	// BEFORE activation was authorized leaves it running (restart policy
+	// unless-stopped keeps it alive), so it is stopped here -- never removed
+	// (ADR 0005: a failed candidate is stopped and retained 24h; removal is
+	// retention's job). After authorization (HandedOff, or an unknown
+	// authorization answer) the route may already point at it: it is left
+	// alone.
+	out := func() agentclient.Outcome {
+		if err := tracker.advance(ctx, progress, lease.AttemptID, lease.Fence, deployment.StatusHealthChecking); err != nil {
+			return e.outcome(lease, false, queue.FailureClassTransient)
+		}
 
-	// The IP itself is no longer needed here: RunHealthGate resolves it
-	// internally from containerID+networkID (see health.go's
-	// containerNetworkIP) now that the Host header comes from the
-	// configured lease value, not a synthesized ip:port. resolveNetworkAndIP
-	// is still called for its validation (exactly one network, a resolved
-	// IP present) -- a malformed inspect result must still fail closed here.
-	networkID, _, err := resolveNetworkAndIP(inspect)
-	if err != nil {
-		class := docker.ClassifyFailure(err)
-		logs.Linef(logship.StreamHealth, "health gate: container network check failed (%s)", class)
-		logs.Diagf(logship.StreamHealth, "health gate: container network check failed (%s): %v", class, err)
-		return e.outcome(lease, false, class)
-	}
+		// The IP itself is no longer needed here: RunHealthGate resolves it
+		// internally from containerID+networkID (see health.go's
+		// containerNetworkIP) now that the Host header comes from the
+		// configured lease value, not a synthesized ip:port. resolveNetworkAndIP
+		// is still called for its validation (exactly one network, a resolved
+		// IP present) -- a malformed inspect result must still fail closed here.
+		networkID, _, err := resolveNetworkAndIP(inspect)
+		if err != nil {
+			class := docker.ClassifyFailure(err)
+			logs.Linef(logship.StreamHealth, "health gate: container network check failed (%s)", class)
+			logs.Diagf(logship.StreamHealth, "health gate: container network check failed (%s): %v", class, err)
+			return e.outcome(lease, false, class)
+		}
 
-	gateResult, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
-		Host:   lease.HealthGateHost,
-		Path:   lease.HealthGatePath,
-		Port:   lease.ContainerPort,
-		Scheme: lease.ContainerScheme,
-	})
-	if err != nil {
-		class := docker.ClassifyFailure(err)
-		logs.Linef(logship.StreamHealth, "health gate: error (%s)", class)
-		logs.Diagf(logship.StreamHealth, "health gate: error (%s): %v", class, err)
-		return e.outcome(lease, false, class)
-	}
-	if !gateResult.Success {
-		class := docker.ClassifyHealthGateResult(gateResult)
-		logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s class=%s)", gateResult.Reason, class)
-		logs.Diagf(logship.StreamHealth, "health gate: failed: last_probe=%q exit_code=%d oom_killed=%t", gateResult.LastProbe, gateResult.ExitCode, gateResult.OOMKilled)
-		return e.outcome(lease, false, class)
-	}
-	logs.Linef(logship.StreamHealth, "health gate: passed")
+		gateResult, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
+			Host:   lease.HealthGateHost,
+			Path:   lease.HealthGatePath,
+			Port:   lease.ContainerPort,
+			Scheme: lease.ContainerScheme,
+		})
+		if err != nil {
+			class := docker.ClassifyFailure(err)
+			logs.Linef(logship.StreamHealth, "health gate: error (%s)", class)
+			logs.Diagf(logship.StreamHealth, "health gate: error (%s): %v", class, err)
+			return e.outcome(lease, false, class)
+		}
+		if !gateResult.Success {
+			class := docker.ClassifyHealthGateResult(gateResult)
+			logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s class=%s)", gateResult.Reason, class)
+			logs.Diagf(logship.StreamHealth, "health gate: failed: last_probe=%q exit_code=%d oom_killed=%t", gateResult.LastProbe, gateResult.ExitCode, gateResult.OOMKilled)
+			return e.outcome(lease, false, class)
+		}
+		logs.Linef(logship.StreamHealth, "health gate: passed")
 
-	// Health gate passed: run the activation sequence. A completed sequence
-	// is never reported through Complete -- the activation-result report
-	// closes the attempt server-side.
-	return e.activate(ctx, lease, buildResult.ImageDigest)
+		// Health gate passed: run the activation sequence. A completed sequence
+		// is never reported through Complete -- the activation-result report
+		// closes the attempt server-side.
+		return e.activate(ctx, lease, buildResult.ImageDigest)
+	}()
+	if !out.HandedOff && !out.AuthorizationUnknown {
+		e.stopFailedCandidate(ctx, lease, identity, logs)
+	}
+	return out
 }
+
+// stopFailedCandidate stops (never removes) the exact candidate container of
+// an attempt that ended before activation was authorized. It runs on a
+// bounded detached context so a cancelled lease still cleans up. A failed
+// stop is only logged: the attempt's outcome class does not change.
+func (e *Executor) stopFailedCandidate(ctx context.Context, lease agentclient.Lease, identity docker.ReleaseResourceIdentity, logs *logship.Attempt) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), candidateStopTimeout)
+	defer cancel()
+	res := guardedStop(sctx, e.docker, stopTarget{
+		EnvironmentID:     identity.EnvironmentID,
+		ReleaseID:         identity.ReleaseID,
+		RuntimeInstanceID: identity.RuntimeInstanceID,
+	}, candidateStopGrace, candidateStopWait, time.Second)
+	switch res.Status {
+	case stopStopped, stopAlreadyStopped, stopGone:
+		logs.Linef(logship.StreamPhase, "run: failed candidate stopped")
+	default:
+		logs.Linef(logship.StreamPhase, "run: failed candidate could not be stopped")
+		e.logger.Printf("agent executor WARN attempt %d: failed candidate %s was NOT stopped (status=%d step=%q reason=%q): %v",
+			lease.AttemptID, identity.RuntimeInstanceID, res.Status, res.Step, res.Reason, res.Err)
+	}
+}
+
+const (
+	candidateStopTimeout = 30 * time.Second
+	candidateStopGrace   = 10 * time.Second
+	candidateStopWait    = 15 * time.Second
+)
 
 // teeWriter copies build output to the existing local writer and, additively,
 // to the shipper. The shipper's writer never blocks or fails, so the local
