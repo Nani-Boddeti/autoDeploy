@@ -740,14 +740,13 @@ func (s *Service) cleanupLocked(fd int, record allocation) error {
 			return ErrUnavailable
 		}
 	}
-	q, err := getQuota(int(s.root.Fd()), int(record.ID))
-	if err != nil || q.Blocks != 0 || q.Inodes != 0 {
+	if !usageCleared(int(s.root.Fd()), int(record.ID)) {
 		return ErrRetryable
 	}
-	if err = clearLimits(int(s.root.Fd()), record.ID); err != nil {
+	if err := clearLimits(int(s.root.Fd()), record.ID); err != nil {
 		return ErrUnavailable
 	}
-	if err = unix.Unlinkat(int(s.root.Fd()), record.Name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
+	if err := unix.Unlinkat(int(s.root.Fd()), record.Name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
 		return ErrUnavailable
 	}
 	return s.completeLocked(record)
@@ -1010,6 +1009,17 @@ func setLimits(root, id int, l Limits) error {
 	q := diskQuota{Version: 1, Flags: fsProjectQuota, FieldMask: fsDqBlkHard | fsDqInoHard, ID: uint32(id), BlockHard: blocks, InodeHard: l.Inodes}
 	return quotactlFD(root, qXSetQLim, id, unsafe.Pointer(&q))
 }
+
+// usageCleared reports zero block and inode usage for a project. XFS answers
+// Q_XGETQUOTA with ENOENT when no dquot exists, i.e. zero usage and no limits
+// (observed on the acer for every released workspace), so ENOENT is "cleared".
+func usageCleared(root, id int) bool {
+	q, err := getQuota(root, id)
+	if errors.Is(err, unix.ENOENT) {
+		return true
+	}
+	return err == nil && q.Blocks == 0 && q.Inodes == 0
+}
 func getQuota(root, id int) (diskQuota, error) {
 	q := diskQuota{Version: 1, Flags: fsProjectQuota, ID: uint32(id)}
 	return q, quotactlFD(root, qXGetQuota, id, unsafe.Pointer(&q))
@@ -1176,8 +1186,7 @@ func (s *Service) reconcile() error {
 			if !errors.Is(err, unix.ENOENT) {
 				continue
 			}
-			q, qe := getQuota(int(s.root.Fd()), int(a.ID))
-			if qe != nil || q.Blocks != 0 || q.Inodes != 0 {
+			if !usageCleared(int(s.root.Fd()), int(a.ID)) {
 				continue
 			}
 			if err = clearLimits(int(s.root.Fd()), a.ID); err != nil {
@@ -1204,8 +1213,7 @@ func (s *Service) reconcile() error {
 			continue
 		}
 		unix.Close(fd)
-		q, qe := getQuota(int(s.root.Fd()), int(a.ID))
-		if qe != nil || q.Blocks != 0 || q.Inodes != 0 || clearLimits(int(s.root.Fd()), a.ID) != nil {
+		if !usageCleared(int(s.root.Fd()), int(a.ID)) || clearLimits(int(s.root.Fd()), a.ID) != nil {
 			continue
 		}
 		if unlinkErr := unix.Unlinkat(int(s.root.Fd()), name, unix.AT_REMOVEDIR); unlinkErr != nil && !errors.Is(unlinkErr, unix.ENOENT) {
@@ -1224,6 +1232,9 @@ func verifyProjectCleared(fd int) error {
 }
 func clearLimits(rootfd int, id uint32) error {
 	q, err := getQuota(rootfd, int(id))
+	if errors.Is(err, unix.ENOENT) {
+		return nil // no dquot: no usage and no limits (XFS frees it once both are zero)
+	}
 	if err != nil {
 		return err
 	}
@@ -1233,6 +1244,9 @@ func clearLimits(rootfd int, id uint32) error {
 		return err
 	}
 	q, err = getQuota(rootfd, int(id))
+	if errors.Is(err, unix.ENOENT) {
+		return nil // zero limits and usage: XFS dropped the dquot
+	}
 	if err != nil || q.BlockHard != 0 || q.InodeHard != 0 {
 		return ErrUnavailable
 	}
