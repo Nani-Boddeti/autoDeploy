@@ -53,4 +53,10 @@ Maintenance service; rollback by image recreate; container runtime logs; build-c
 lock-order fix; flagged-head trigger; agent_jobs owner index; persisting executor_available.
 
 ## Progress
-(empty)
+- 20A (links, banner, Retry) 58ad2c0 + 365d0a9; 20E-0 stop failed candidates bc628c0; 20B drain results 96ea4ac;
+  20C stop-then-start 63f7095 (review PASS, fixes applied); EINTR retry in checkout helpers/clients 8e5742e (cause of
+  intermittent checkout failures: raw Poll/Recvmsg/Accept4 returned EINTR under Go preemption; helpers' accept loops
+  exited on it).
+- PROVEN ON THE ACER 2026-11-13: blue/green with predecessor drain (attempt 15, "predecessor stopped"), stop-then-start
+  (attempt 17: authorized -> predecessor stopped -> gate passed -> switched), Retry as the trigger.
+- Next: 20D rollback, then 20E retention after rollback is proven.
