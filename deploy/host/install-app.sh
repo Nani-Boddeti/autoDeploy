@@ -393,6 +393,13 @@ for u in "${UNITS[@]}"; do
 done
 systemctl daemon-reload
 for u in "${UNITS[@]}"; do systemctl enable "$u.service" >/dev/null 2>&1; done
+# Apply pending migrations whenever the database is up: binaries from a newer
+# commit can need schema the running database lacks (found on the acer: the
+# manual deploy table from migration 000023 was missing). migrate is idempotent.
+if systemctl is-active --quiet autodeploy-postgres.service && [[ -s "$ETC_DIR/controlplane/database-url" ]]; then
+  log "applying pending database migrations"
+  "$LIB_DIR/autodeploy-run" migrate || die "database migration failed"
+fi
 
 # A running service keeps its old binary/config until restarted. PostgreSQL is left alone.
 if ((WAS_TRAEFIK && TRAEFIK_CHANGED)); then log "restarting autodeploy-traefik"; systemctl restart autodeploy-traefik.service; fi
