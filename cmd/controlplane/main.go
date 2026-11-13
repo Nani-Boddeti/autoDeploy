@@ -162,6 +162,7 @@ func run(ctx context.Context) error {
 			return failAt(errors.New("GitHub setup unavailable"))
 		}
 		webOptions.GitHubSetup, webOptions.GitHubInstallationURL = setup, githubConfig.InstallationURL
+		webOptions.RepositoryLister = githubRepository
 		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
 		// Manual deploy (step 19d) needs the GitHub App provider to resolve and
 		// verify commits, so it is only wired when the subsystem is enabled.

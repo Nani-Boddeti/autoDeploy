@@ -26,4 +26,13 @@ terminal required), writes `/etc/autodeploy/controlplane-github.env` (non-secret
 control plane, printing the last journal lines. Re-running is safe; existing secrets are never
 overwritten. Afterwards `shred -u` the `.pem`, set the App webhook (`/webhooks/github`, secret from
 `/etc/autodeploy/controlplane/github-webhook-secret-1`, event `push`), then use `/github/setup` in
-the UI to install the App and `/github/bindings` to bind the repository.
+the UI to install the App (landing page button) and bind the repository with the "Bind a repository"
+form on the landing page (POST `/github/bindings`).
+
+## First deploy order (UI)
+
+Bind (project ID, environment ID, branch, server) -> Projects page "Deploy" (this creates the job that
+makes the environment known) -> Servers page: environment runtime configuration -> route hostname ->
+only then enroll and start the agent, so the first claim finds a complete configuration. The agent
+reads the finished checkout through the `autodeploy-checkout` group (workspace mode 0750); the checkout
+helper fetches over HTTPS through `git-remote-https` (install-checkout.sh installs it next to git).

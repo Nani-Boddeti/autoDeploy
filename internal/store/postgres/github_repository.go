@@ -452,6 +452,49 @@ func (r *GitHubRepository) BindRepository(ctx context.Context, principal auth.Pr
 	return tx.Commit(ctx)
 }
 
+// BindableRepository is one repository the owner can bind to a project: active,
+// on an active, non-suspended installation. FullName is GitHub's owner/name.
+type BindableRepository struct {
+	RepositoryID  int64
+	FullName      string
+	DefaultBranch string // empty when GitHub did not report one
+	BoundProject  string // project already bound to it ("" if none)
+}
+
+// ListBindableRepositories feeds the binding form: without it the owner would have
+// to look up numeric GitHub repository IDs by hand. Owner-scoped, read-only,
+// session re-validated live like every admin read.
+func (r *GitHubRepository) ListBindableRepositories(ctx context.Context, principal auth.Principal) ([]BindableRepository, error) {
+	if r == nil || r.pool == nil || principal.Validate() != nil {
+		return nil, ErrGitHubDenied
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin list repositories: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
+		return nil, ErrGitHubDenied
+	}
+	rows, err := tx.Query(ctx, `SELECT r.repository_id, r.full_name, COALESCE(r.default_branch,''), COALESCE(b.project_id,'') FROM github_repositories r JOIN github_installations i ON i.installation_id=r.installation_id AND i.owner_id=r.owner_id LEFT JOIN github_project_bindings b ON b.repository_id=r.repository_id AND b.owner_id=r.owner_id AND b.active WHERE r.owner_id=$1 AND r.active AND i.active AND NOT i.suspended ORDER BY r.full_name LIMIT 200`, principal.OwnerID)
+	if err != nil {
+		return nil, fmt.Errorf("query repositories: %w", err)
+	}
+	defer rows.Close()
+	var out []BindableRepository
+	for rows.Next() {
+		var repo BindableRepository
+		if err = rows.Scan(&repo.RepositoryID, &repo.FullName, &repo.DefaultBranch, &repo.BoundProject); err != nil {
+			return nil, fmt.Errorf("scan repository: %w", err)
+		}
+		out = append(out, repo)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("read repositories: %w", err)
+	}
+	return out, nil
+}
+
 // DisableInstallation fails closed for one owner-scoped installation. It is
 // idempotent: a prior disable is accepted without creating duplicate audits.
 func (r *GitHubRepository) DisableInstallation(ctx context.Context, principal auth.Principal, installationID int64, audit string) error {

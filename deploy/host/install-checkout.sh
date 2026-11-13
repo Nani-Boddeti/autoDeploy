@@ -7,15 +7,17 @@
 #   trusted binary directory, quota ledger, and the helper systemd units.
 #
 # Usage (as root):
-#   install-checkout.sh [--git FILE] [--image-size SIZE] BINDIR
+#   install-checkout.sh [--git FILE] [--git-remote-https FILE] [--image-size SIZE] BINDIR
 #
 #   BINDIR  directory with prebuilt linux/amd64 binaries:
-#             checkout-quota-service, checkout-exec, git (see --git),
+#             checkout-quota-service, checkout-exec, git (see --git), git-remote-https,
 #             github-askpass (optional; only needed for authenticated fetches)
 #           and optionally SHA256SUMS (sha256sum format, basename entries; when present
 #           EVERY file above must be listed and match, else the install stops; when
 #           absent a loud warning is printed). Inputs are copied to a root-only staging
 #           directory first and everything is validated and installed from the copies.
+#   --git-remote-https FILE   the static git-remote-https (default BINDIR/git-remote-https); installed
+#           next to git, which execs it for every https fetch.
 #   --git   use FILE as the trusted git instead of BINDIR/git. checkout-exec only
 #           accepts a root-owned ELF of type ET_EXEC (statically linked, non-PIE);
 #           the distribution /usr/bin/git is a PIE and is refused. In SHA256SUMS it is
@@ -93,17 +95,19 @@ source "$KIT_DIR/stage-lib.sh"
 
 # ---- arguments ----------------------------------------------------------------
 GIT_SRC=""
+GIT_HTTPS_SRC=""
 BINDIR=""
 while (($#)); do
   case "$1" in
     --git) GIT_SRC="${2:?--git needs a file}"; shift 2 ;;
+    --git-remote-https) GIT_HTTPS_SRC="${2:?--git-remote-https needs a file}"; shift 2 ;;
     --image-size) IMAGE_SIZE="${2:?--image-size needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,37p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,39p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) die "unknown option: $1" ;;
     *) [[ -z "$BINDIR" ]] || die "only one BINDIR allowed"; BINDIR="$1"; shift ;;
   esac
 done
-[[ -n "$BINDIR" ]] || die "usage: install-checkout.sh [--git FILE] [--image-size SIZE] BINDIR"
+[[ -n "$BINDIR" ]] || die "usage: install-checkout.sh [--git FILE] [--git-remote-https FILE] [--image-size SIZE] BINDIR"
 
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "Linux x86_64 only"
@@ -127,9 +131,13 @@ GIT_SRC="${GIT_SRC:-$BINDIR/git}"
 stage_copy "$BINDIR/checkout-quota-service" checkout-quota-service checkout-quota-service
 stage_copy "$BINDIR/checkout-exec" checkout-exec checkout-exec
 stage_copy "$GIT_SRC" git git
+# git fetches over https through this helper, which git execs from its compiled-in exec path
+# (the trusted bin dir: build-static-git.sh sets gitexecdir=bin). Without it every fetch fails.
+GIT_HTTPS_SRC="${GIT_HTTPS_SRC:-$BINDIR/git-remote-https}"
+stage_copy "$GIT_HTTPS_SRC" git-remote-https git-remote-https
 [[ ! -e "$BINDIR/github-askpass" ]] || stage_copy "$BINDIR/github-askpass" github-askpass github-askpass
 stage_verify "$BINDIR"
-for b in checkout-quota-service checkout-exec git github-askpass; do
+for b in checkout-quota-service checkout-exec git git-remote-https github-askpass; do
   if [[ -e "$STAGE/$b" ]]; then stage_require_elf "$b" "$b"; fi
 done
 if [[ "$(elf_bytes "$STAGE/git" 16 2)" != 0200 ]]; then
@@ -292,6 +300,7 @@ log "installing helper binaries into $BIN_DIR (root:root 0755)"
 install_file "$STAGE/checkout-quota-service" "$BIN_DIR/checkout-quota-service" 0755 || true
 install_file "$STAGE/checkout-exec" "$BIN_DIR/checkout-exec" 0755 || true
 install_file "$STAGE/git" "$BIN_DIR/git" 0755 || true
+install_file "$STAGE/git-remote-https" "$BIN_DIR/git-remote-https" 0755 || true
 if [[ -e "$STAGE/github-askpass" ]]; then
   # checkout-exec hard-codes this path as GIT_ASKPASS for authenticated fetches.
   install_file "$STAGE/github-askpass" "$LIB_DIR/github-askpass" 0755 || true

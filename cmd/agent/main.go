@@ -68,8 +68,11 @@ const executorEnabled = false
 // conservative fixed values, not yet operator-tunable; revisit alongside
 // flipping executorEnabled if a real host needs different bounds.
 const (
-	defaultCheckoutQuotaBytes      = 10 << 30 // 10 GiB
-	defaultCheckoutQuotaInodes     = 2_000_000
+	// Must not exceed the quota helper's configured maximum (AUTODEPLOY_CHECKOUT_QUOTA_BYTES/INODES
+	// in checkout.env; the helper refuses any larger request, so every checkout would fail). The
+	// defaults equal the kit's defaults; the unit passes the configured values explicitly.
+	defaultCheckoutQuotaBytes      = 2 << 30 // 2 GiB
+	defaultCheckoutQuotaInodes     = 400_000
 	defaultCheckoutSpawnTimeoutSec = 120
 	defaultCheckoutSpawnMaxOutput  = 1 << 20 // matches checkoutcontain's own upper bound
 )
@@ -124,6 +127,8 @@ type command struct {
 	checkoutQuotaSocket string
 	checkoutSpawnSocket string
 	checkoutAgentGID    uint32
+	checkoutQuotaBytes  uint64 // 0 = defaultCheckoutQuotaBytes
+	checkoutQuotaInodes uint64 // 0 = defaultCheckoutQuotaInodes
 	environmentNetwork  string
 
 	// Activation (Step 10d-5b). Like the fields above they are parsed for
@@ -189,6 +194,19 @@ func parseArgs(args []string) (command, error) {
 				return command{}, fmt.Errorf("invalid --checkout-agent-gid: %w", err)
 			}
 			c.checkoutAgentGID = uint32(gid)
+		case "--checkout-quota-bytes", "--checkout-quota-inodes":
+			if c.action != "run" {
+				return command{}, fmt.Errorf("%s is only valid for run", flag)
+			}
+			n, err := strconv.ParseUint(value, 10, 63)
+			if err != nil || n == 0 {
+				return command{}, fmt.Errorf("invalid %s", flag)
+			}
+			if flag == "--checkout-quota-bytes" {
+				c.checkoutQuotaBytes = n
+			} else {
+				c.checkoutQuotaInodes = n
+			}
 		case "--environment-network":
 			if c.action != "run" {
 				return command{}, errors.New("--environment-network is only valid for run")
@@ -534,11 +552,18 @@ func buildExecutor(ctx context.Context, c command, client *agentclient.Client, l
 	if err != nil {
 		return nil, fmt.Errorf("configure docker engine client: %w", err)
 	}
+	quotaBytes, quotaInodes := c.checkoutQuotaBytes, c.checkoutQuotaInodes
+	if quotaBytes == 0 {
+		quotaBytes = defaultCheckoutQuotaBytes
+	}
+	if quotaInodes == 0 {
+		quotaInodes = defaultCheckoutQuotaInodes
+	}
 	checkoutRunner, err := gitcheckout.NewProductionRunner(gitcheckout.ProductionConfig{
 		QuotaSocketPath: c.checkoutQuotaSocket,
 		SpawnSocketPath: c.checkoutSpawnSocket,
 		AgentGID:        c.checkoutAgentGID,
-		QuotaLimits:     checkoutquota.Limits{Bytes: defaultCheckoutQuotaBytes, Inodes: defaultCheckoutQuotaInodes},
+		QuotaLimits:     checkoutquota.Limits{Bytes: quotaBytes, Inodes: quotaInodes},
 		SpawnLimits:     checkoutcontain.SpawnLimits{TimeoutSeconds: defaultCheckoutSpawnTimeoutSec, MaxOutput: defaultCheckoutSpawnMaxOutput},
 	})
 	if err != nil {

@@ -97,12 +97,22 @@ PIDs, I/O, CPU quota/period, duration, output, and block device major/minor.
 The service rejects incomplete bounds. The Git executable is opened from the
 trusted root-owned directory at startup; do not point it at an arbitrary PATH.
 
-Widening the spawn service's `RestrictAddressFamilies` beyond `AF_UNIX` (for an
-HTTPS fetch by the Git child, which inherits the unit's restrictions) must be
-paired with `IPAddressDeny=` for `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`,
-`172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, and `fc00::/7`, plus
-`IPAddressAllow=` for the resolver and fetch destinations; otherwise the child can
-reach host-local services.
+The spawn service's Git child fetches over HTTPS and inherits the unit's
+restrictions, so the unit sets `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+(owner decision 2026-11-13) paired with `IPAddressDeny=` for loopback, RFC 1918,
+CGNAT, link-local, multicast and IPv6 ULA ranges, and a single
+`IPAddressAllow=127.0.0.53/32` for the systemd-resolved stub named in
+`/etc/resolv.conf` (allow is evaluated before deny). Without the deny list the
+child could reach host-local services (PostgreSQL, the Traefik API, the control
+plane on the Docker bridge). The static `git-remote-https` sits next to `git` in
+the trusted bin directory (`gitexecdir`); `MemoryDenyWriteExecute` stays on
+(verified: static musl git over TLS runs under it). If the resolver is not
+`127.0.0.53`, adjust `IPAddressAllow=`; `preflight-checkout.sh` checks this.
+
+The agent reads (never writes) the finished checkout as its docker build
+context: workspaces are granted `checkout:checkout` mode `0750`, the Git child
+runs with umask `027`, and `autodeploy-agent` is a member of the checkout group
+(`install-app.sh`). The agent still cannot modify the workspace.
 
 ## Service ordering and hardening
 
@@ -114,7 +124,7 @@ exist with expected ownership and mode.
 
 Apply service hardening compatible with the needed kernel interfaces: a
 minimal writable-path allowlist, `NoNewPrivileges`, private temporary storage,
-restricted address families (Unix only for the helpers), and capability/syscall
+restricted address families (Unix only for the quota helper; the spawn helper additionally needs IP for the HTTPS fetch, filtered as above), and capability/syscall
 allowlists tested on the target distribution. Do not weaken the helpers merely
 to make a unit start. Ensure unit ordering restarts the agent after either
 helper changes, and remove stale sockets only from the root-owned runtime

@@ -59,7 +59,7 @@ func TestPrivilegedHelperIsolation(t *testing.T) {
 		t.Fatalf("quota allocation (requires live root quota helper and XFS prjquota): %v", err)
 	}
 	var workspaceStat unix.Stat_t
-	if err := unix.Fstat(alloc.Workspace, &workspaceStat); err != nil || workspaceStat.Uid != c.checkoutUID || workspaceStat.Gid != c.checkoutGID || workspaceStat.Mode&0o777 != 0o700 {
+	if err := unix.Fstat(alloc.Workspace, &workspaceStat); err != nil || workspaceStat.Uid != c.checkoutUID || workspaceStat.Gid != c.checkoutGID || workspaceStat.Mode&0o777 != 0o750 {
 		t.Fatalf("active workspace ownership/mode = uid=%d gid=%d mode=%#o, err=%v", workspaceStat.Uid, workspaceStat.Gid, workspaceStat.Mode&0o777, err)
 	}
 	cleaned := false
@@ -93,7 +93,7 @@ func TestPrivilegedHelperIsolation(t *testing.T) {
 	if err != nil || result.Class != checkoutcontain.ExitSuccess || result.ExitCode != 0 {
 		t.Fatalf("GitInit through root spawn helper = %#v, %v\ngit stdout: %q\ngit stderr: %q", result, err, gitStdout.String(), gitStderr.String())
 	}
-	// The agent cannot traverse the checkout-owned 0700 workspace after GitInit.
+	// The agent cannot write the checkout-owned 0750 workspace after GitInit (it may read it, as the build context).
 	// A successful typed response therefore attests that checkout-exec accepted
 	// the descriptor only after its UID:GID validation and ran its child with the
 	// fixed credential, whose exactIdentity check also requires no extra groups.

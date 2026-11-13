@@ -177,6 +177,12 @@ docker_group_exact() { # only the agent (plus, harmlessly, admins) may hold dock
 }
 check "$AGENT_USER is in group docker; $CHECKOUT_USER and $CP_USER are not" docker_group_exact
 
+checkout_group_read_access() { # the agent builds from the checkout workspace (mode 0750, group checkout)
+  id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$CHECKOUT_USER" \
+    && ! id -nG "$CP_USER" | tr ' ' '\n' | grep -qx "$CHECKOUT_USER"
+}
+check "$AGENT_USER is in group $CHECKOUT_USER (read-only build context); $CP_USER is not" checkout_group_read_access
+
 # ---- Traefik management API --------------------------------------------------------
 # Credentials come from the agent's file and are fed to curl on stdin (-K -), so they
 # never reach argv; nothing is printed.

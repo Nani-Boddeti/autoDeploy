@@ -196,6 +196,7 @@ func (f *adoptFakeEngine) handler(t *testing.T) http.Handler {
 	mux.HandleFunc("/v1.44/networks/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(t, w, NetworkInspect{ID: strings.Repeat("a", 64), Name: "env-net"})
 	})
+	mux.HandleFunc("/v1.44/images/", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("{}")) })
 	mux.HandleFunc("/v1.44/containers/create", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.createCalls++

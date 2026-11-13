@@ -667,7 +667,11 @@ func (s *Service) Ack(handle [16]byte) error {
 		_ = s.withdrawOfferLocked(fd, handle)
 		return ErrUnavailable
 	}
-	if err = unix.Fchmod(fd, 0o700); err != nil {
+	// 0750, not 0700: the agent is a member of the checkout GID and must read (never write) the
+	// finished checkout, because `docker buildx build` runs as the agent and sends the workspace as
+	// its build context. With 0700 the agent could not even chdir into it (found by static audit
+	// before the first deploy). Group has no write bit; checkout-exec's validWorkspace requires that.
+	if err = unix.Fchmod(fd, workspaceMode); err != nil {
 		_ = s.withdrawOfferLocked(fd, handle)
 		return ErrUnavailable
 	}
@@ -774,6 +778,9 @@ func (s *Service) matchesRecordFD(fd int, a allocation) error {
 	return nil
 }
 
+// workspaceMode is the granted workspace's mode: checkout identity full, its group read/traverse.
+const workspaceMode = 0o750
+
 func (s *Service) verifyRecordFD(fd int, a allocation, requireCheckoutAccess bool) error {
 	var st unix.Stat_t
 	if unix.Fstat(fd, &st) != nil || uint64(st.Dev) != a.Dev || st.Ino != a.Ino || st.Mode&unix.S_IFMT != unix.S_IFDIR {
@@ -783,7 +790,8 @@ func (s *Service) verifyRecordFD(fd int, a allocation, requireCheckoutAccess boo
 	if err != nil || m != s.mount {
 		return ErrDenied
 	}
-	if requireCheckoutAccess && (st.Uid != s.cfg.CheckoutUID || st.Gid != s.cfg.CheckoutGID || st.Mode&0o777 != 0o700) {
+	// 0700 is still accepted: an allocation granted by an earlier release of this service.
+	if requireCheckoutAccess && (st.Uid != s.cfg.CheckoutUID || st.Gid != s.cfg.CheckoutGID || (st.Mode&0o777 != workspaceMode && st.Mode&0o777 != 0o700)) {
 		return ErrDenied
 	}
 	if !requireCheckoutAccess && (st.Uid != 0 || st.Mode&0o777 != 0) {

@@ -142,7 +142,7 @@ else skp "ledger $STATE exists, regular, root:root 0600 [root]"; fi
 # ---- trusted binary directory ---------------------------------------------------
 bin_files_trusted() {
   local f
-  for f in checkout-quota-service checkout-exec git; do
+  for f in checkout-quota-service checkout-exec git git-remote-https; do
     [[ -f "$BIN/$f" && ! -L "$BIN/$f" && "$(stat -c '%u' "$BIN/$f")" == 0 ]] || return 1
     (((8#$(stat -c '%a' "$BIN/$f") & 8#6022) == 0)) || return 1
     [[ -x "$BIN/$f" ]] || return 1
@@ -153,6 +153,32 @@ git_is_et_exec() { # checkout-exec only accepts ELF type ET_EXEC (static, non-PI
   [[ "$(od -An -v -tx1 -j16 -N2 "$BIN/git" | tr -d ' \n')" == 0200 ]]
 }
 check "trusted git is ELF ET_EXEC (static, non-PIE), as checkout-exec requires" git_is_et_exec
+
+# ---- https fetch from the sandbox ---------------------------------------------------
+# The spawn helper runs git with RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6, private/loopback
+# destinations denied (IPAddressDeny=) and only the systemd-resolved stub 127.0.0.53 allowed back in.
+resolver_is_stub() { # every nameserver must be the allowed stub, else DNS (hence every fetch) fails
+  local n
+  n="$(awk '$1=="nameserver" {print $2}' /etc/resolv.conf)"
+  [[ -n "$n" ]] && ! grep -qvx '127.0.0.53' <<<"$n"
+}
+check "/etc/resolv.conf names only 127.0.0.53 (the unit's IPAddressAllow; edit the unit otherwise)" resolver_is_stub
+exec_unit_network_filter() {
+  local show
+  show="$(systemctl show "$EXEC_UNIT" -p RestrictAddressFamilies -p IPAddressDeny -p IPAddressAllow)"
+  grep -q 'RestrictAddressFamilies=.*AF_INET6' <<<"$show" && grep -q 'IPAddressAllow=.*127.0.0.53' <<<"$show" \
+    && grep -q 'IPAddressDeny=.*10.0.0.0/8' <<<"$show"
+}
+check "$EXEC_UNIT allows only DNS + public destinations (RestrictAddressFamilies, IPAddressDeny/Allow loaded)" exec_unit_network_filter
+sandbox_files_readable() { # [root] what git+libcurl read as the checkout identity
+  local f
+  for f in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ssl/certs/ca-certificates.crt "$BIN/git-remote-https" /usr/local/lib/autodeploy/github-askpass; do
+    runuser -u "$CHECKOUT_USER" -- test -r "$f" || return 1
+  done
+  runuser -u "$CHECKOUT_USER" -- test -x /usr/local/lib/autodeploy/github-askpass
+}
+if is_root; then check "$CHECKOUT_USER can read resolv.conf (via the systemd-resolved link), hosts, nsswitch, CA bundle, git-remote-https, askpass [root]" sandbox_files_readable
+else skp "$CHECKOUT_USER can read resolv.conf, hosts, nsswitch, CA bundle, git-remote-https, askpass [root]"; fi
 
 # ---- sockets --------------------------------------------------------------------
 socket_ok() { # path

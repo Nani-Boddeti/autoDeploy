@@ -1,8 +1,10 @@
 # AutoDeploy deployment agent (cmd/agent), step 18a-2.
 #
 # Identity: autodeploy-agent (uid/gid 800, created by install-checkout.sh; its primary
-# group is the checkout-helper socket group) plus membership of the `docker` group
-# (install-app.sh). docker-group membership is ROOT-EQUIVALENT on this host: whoever
+# group is the checkout-helper socket group) plus membership of the `docker` group and of
+# the checkout GID group autodeploy-checkout (install-app.sh): the latter gives READ-ONLY
+# access (workspace mode 0750) to the finished checkout, which `docker buildx build` sends
+# as its build context. docker-group membership is ROOT-EQUIVALENT on this host: whoever
 # can talk to /var/run/docker.sock can start a privileged container. That is inherent
 # to an agent that drives dockerd, so the hardening below protects the agent from
 # accidents and from the network, not the host from a compromised agent.
@@ -52,6 +54,8 @@ ExecStart=/usr/local/lib/autodeploy/app/agent run \
   --checkout-quota-socket ${AUTODEPLOY_CHECKOUT_QUOTA_SOCKET} \
   --checkout-spawn-socket ${AUTODEPLOY_CHECKOUT_SPAWN_SOCKET} \
   --checkout-agent-gid ${AUTODEPLOY_CHECKOUT_AGENT_GID} \
+  --checkout-quota-bytes ${AUTODEPLOY_CHECKOUT_QUOTA_BYTES} \
+  --checkout-quota-inodes ${AUTODEPLOY_CHECKOUT_QUOTA_INODES} \
   --environment-network ${AUTODEPLOY_ENV_NETWORK} \
   --traefik-route-dir ${AUTODEPLOY_AGENT_ROUTE_DIR} \
   --traefik-api-url http://127.0.0.1:8080 \

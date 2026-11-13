@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -314,6 +317,11 @@ func (c *Client) EnsureReleaseRuntimeContainer(ctx context.Context, req RunConta
 		return ContainerInspect{}, err
 	}
 	payload := buildContainerCreatePayload(req, labels)
+	imageRef, err := c.resolveLocalImage(ctx, req.Identity)
+	if err != nil {
+		return ContainerInspect{}, err
+	}
+	payload.Image = imageRef
 
 	id, err := c.CreateContainer(ctx, name, payload)
 	if err != nil {
@@ -346,4 +354,39 @@ func (c *Client) EnsureReleaseRuntimeContainer(ctx context.Context, req RunConta
 		return ContainerInspect{}, err
 	}
 	return c.InspectContainer(ctx, id)
+}
+
+// resolveLocalImage returns the digest reference under which the locally
+// loaded image is actually addressable on this daemon. With the classic
+// (graph driver) image store the image ID is the config digest; with the
+// containerd image store (the default for new Docker >= 29 installs, and
+// what the acer runs: "containerd-snapshotter=true" in the dockerd journal)
+// the image ID is the manifest digest (buildx's containerimage.digest) and
+// the config digest is not an addressable reference. Both are immutable
+// content digests, never tags; the config digest is tried first, then the
+// manifest digest. Neither resolving is a configuration error: retrying
+// the same deployment will not make the image appear.
+func (c *Client) resolveLocalImage(ctx context.Context, id ReleaseResourceIdentity) (string, error) {
+	candidates := []string{
+		"sha256:" + strings.TrimPrefix(id.ConfigDigest, "sha256:"),
+		"sha256:" + strings.TrimPrefix(id.ImageDigest, "sha256:"),
+	}
+	for _, ref := range candidates {
+		resp, err := c.do(ctx, "image-inspect", http.MethodGet, "/images/"+url.PathEscape(ref)+"/json")
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
+			_ = resp.Body.Close()
+			return ref, nil
+		case resp.StatusCode == http.StatusNotFound:
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody))
+			_ = resp.Body.Close()
+		default:
+			return "", checkStatus(resp, "image-inspect")
+		}
+	}
+	return "", &EngineError{Class: ErrClassConfiguration, Op: "image-inspect", Err: errors.New("built image is not in the local image store under its config or manifest digest")}
 }

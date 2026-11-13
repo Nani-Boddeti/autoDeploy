@@ -463,3 +463,40 @@ func TestGitHubSchemaRejectsMalformedMetadataAndExpiredHandoff(t *testing.T) {
 	}
 	_ = time.Second // documents time-sensitive database assertions without a client clock dependency.
 }
+
+func TestGitHubListBindableRepositoriesIsOwnerScopedAndShowsBinding(t *testing.T) {
+	repo, _, p := freshGitHubRepository(t)
+	ctx := context.Background()
+	state, handoff := digest(31), digest(32)
+	if err := repo.CreateSetupState(ctx, githubapp.SetupStateInput{Digest: state, Principal: p}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.ReserveCallback(ctx, state, handoff, installation()); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CompleteHandoff(ctx, handoff, p, installation(), repositories()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.ListBindableRepositories(ctx, p)
+	if err != nil || len(got) != 1 || got[0].RepositoryID != 201 || got[0].FullName != "owner/repo" || got[0].DefaultBranch != "main" || got[0].BoundProject != "" {
+		t.Fatalf("unbound listing = %+v err=%v", got, err)
+	}
+	if err = repo.BindRepository(ctx, p, binding("opaque_project"), "bind-list"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = repo.ListBindableRepositories(ctx, p); err != nil || len(got) != 1 || got[0].BoundProject != "opaque_project" {
+		t.Fatalf("bound listing = %+v err=%v", got, err)
+	}
+	// A suspended/disabled installation's repositories are not offered.
+	if err = repo.DisableInstallation(ctx, p, 101, "disable-list"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = repo.ListBindableRepositories(ctx, p); err != nil || len(got) != 0 {
+		t.Fatalf("disabled installation still listed: %+v err=%v", got, err)
+	}
+	other := p
+	other.OwnerID = "other-owner"
+	if _, err = repo.ListBindableRepositories(ctx, other); err == nil {
+		t.Fatal("principal with a foreign owner was accepted")
+	}
+}

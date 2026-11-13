@@ -185,6 +185,18 @@ if ! id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx docker; then
   # Supplementary groups are read at process start: a running agent needs a restart to get docker.
   mark AGENT_CHANGED
 fi
+# checkout group: READ-ONLY access to the finished checkout. The quota helper grants workspaces
+# as checkout:checkout 0750 and the git child runs with umask 027, so group members can read but
+# never write. `docker buildx build` runs as the agent and sends the workspace as build context;
+# with checkout-only access (the earlier 0700) it could not even chdir into it. The checkout
+# identity itself must stay out of the agent's own groups (checked by install-checkout.sh).
+CHECKOUT_GROUP=autodeploy-checkout
+getent group "$CHECKOUT_GROUP" >/dev/null || die "group $CHECKOUT_GROUP not found: run install-checkout.sh first"
+log "adding $AGENT_USER to group $CHECKOUT_GROUP (read-only build-context access)"
+if ! id -nG "$AGENT_USER" | tr ' ' '\n' | grep -qx "$CHECKOUT_GROUP"; then
+  usermod -aG "$CHECKOUT_GROUP" "$AGENT_USER"
+  mark AGENT_CHANGED
+fi
 for u in "$CP_USER" autodeploy-checkout; do
   if id -u "$u" >/dev/null 2>&1 && id -nG "$u" | tr ' ' '\n' | grep -qx docker; then die "$u must not be in the docker group"; fi
 done

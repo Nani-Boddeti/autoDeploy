@@ -55,6 +55,12 @@ type Repository interface {
 // this interface never exposes a credential or enrollment digest, only
 // caller-supplied digests going in. A nil ServerAdmin disables all of these
 // routes (same nil-disables convention as GitHubSetup below): they 404.
+// RepositoryLister feeds the repository-binding form on the landing page. nil hides
+// the form's repository list (the numeric ID can still be typed).
+type RepositoryLister interface {
+	ListBindableRepositories(context.Context, auth.Principal) ([]postgres.BindableRepository, error)
+}
+
 type ServerAdmin interface {
 	ListServers(context.Context, auth.Principal) ([]postgres.ServerSummary, error)
 	RegisterServer(context.Context, auth.Principal, postgres.RegisterServerInput) (server.Server, time.Time, error)
@@ -98,6 +104,7 @@ type Config struct {
 	PasswordPolicy        auth.Argon2Policy
 	DummyPassword         auth.DummyPasswordVerifier
 	GitHubSetup           *githubapp.SetupService
+	RepositoryLister      RepositoryLister
 	GitHubInstallationURL string
 	ServerAdmin           ServerAdmin
 	RuntimeConfigAdmin    RuntimeConfigAdmin
@@ -554,9 +561,36 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
+	view := landingView{CSRF: csrf, ShowBind: h.config.GitHubSetup != nil}
+	if view.ShowBind {
+		// Best effort: a failed lookup only hides the pick-lists; the form still accepts typed IDs.
+		if h.config.RepositoryLister != nil {
+			if repos, err := h.config.RepositoryLister.ListBindableRepositories(r.Context(), principal); err == nil {
+				view.Repositories = repos
+			}
+		}
+		if h.config.ServerAdmin != nil {
+			if servers, err := h.config.ServerAdmin.ListServers(r.Context(), principal); err == nil {
+				for _, srv := range servers {
+					view.Servers = append(view.Servers, landingServer{ID: srv.ID, Name: srv.Name})
+				}
+			}
+		}
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = landingTemplate.Execute(w, struct{ CSRF string }{csrf})
+	_ = landingTemplate.Execute(w, view)
 }
+
+// landingView is the landing page's data. The binding form posts to /github/bindings, whose
+// handler (githubBind) already existed without any form, so no repository could ever be bound.
+type landingView struct {
+	CSRF         string
+	ShowBind     bool
+	Repositories []postgres.BindableRepository
+	Servers      []landingServer
+}
+
+type landingServer struct{ ID, Name string }
 
 func (h *Handler) githubSetup(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil || h.provenance(r) != nil {

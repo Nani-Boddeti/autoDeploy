@@ -531,3 +531,22 @@ func TestWriteRefusesNonRegularExistingFile(t *testing.T) {
 		t.Fatalf("expected ErrNotRegularFile, got %v", err)
 	}
 }
+
+// The agent unit runs with UMask=0077; the route file must still end up 0640 so
+// Traefik (reading as a supplementary group, no capabilities) can open it.
+func TestWriteRouteFileModeIsUmaskIndependent(t *testing.T) {
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	dir := t.TempDir()
+	r := validRoute()
+	if _, err := Write(dir, r); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, routeFileName(r.EnvironmentID)))
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if fi.Mode().Perm() != routeFileMode {
+		t.Fatalf("file mode under umask 077 = %v, want %v", fi.Mode().Perm(), routeFileMode)
+	}
+}

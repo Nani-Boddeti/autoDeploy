@@ -299,12 +299,40 @@ type ensureFakeEngine struct {
 	created         []containerCreateRequest
 	startCalls      []string
 	inspectResponse ContainerInspect
+	// localImages lists the image references the fake daemon knows; nil means every
+	// reference resolves (the classic image store case).
+	localImages []string
+	// missFirstProbes answers the first N image probes 404 whatever their reference.
+	missFirstProbes int
+	imageProbes     []string
 }
 
 func (f *ensureFakeEngine) mux(t *testing.T) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1.44/containers/json", labelFilterHandler(t, f.existing))
+	mux.HandleFunc("/v1.44/images/", func(w http.ResponseWriter, r *http.Request) {
+		ref := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.44/images/"), "/json")
+		f.imageProbes = append(f.imageProbes, ref)
+		if len(f.imageProbes) <= f.missFirstProbes {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("no such image"))
+			return
+		}
+		if f.localImages != nil {
+			found := false
+			for _, known := range f.localImages {
+				found = found || known == ref
+			}
+			if !found {
+				w.WriteHeader(http.StatusNotFound)
+				w.Write([]byte("no such image"))
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte("{}"))
+	})
 	mux.HandleFunc("/v1.44/networks/", func(w http.ResponseWriter, r *http.Request) {
 		if f.networkMissing {
 			w.WriteHeader(http.StatusNotFound)
@@ -455,5 +483,51 @@ func TestEnsureReleaseRuntimeContainerNameConflictIsCorruptState(t *testing.T) {
 	}
 	if got := ClassifyFailure(err); string(got) != "corrupt_state" {
 		t.Fatalf("ClassifyFailure = %v, want corrupt_state", got)
+	}
+}
+
+// With the containerd image store (the acer) the config digest is not an addressable image
+// reference; the manifest digest is. The container must then be created from the manifest digest.
+func TestEnsureReleaseRuntimeContainerFallsBackToManifestDigest(t *testing.T) {
+	req := validRunRequest()
+	manifest := "sha256:" + strings.TrimPrefix(req.Identity.ImageDigest, "sha256:")
+	f := &ensureFakeEngine{
+		networkID:       strings.Repeat("d", 64),
+		createID:        "newcontainer",
+		inspectResponse: runningInspect("newcontainer"),
+		missFirstProbes: 1,
+	}
+	c, err := newClient(startFakeEngine(t, f.mux(t)))
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	if _, err = c.EnsureReleaseRuntimeContainer(context.Background(), req, "env-net"); err != nil {
+		t.Fatalf("EnsureReleaseRuntimeContainer: %v", err)
+	}
+	if len(f.created) != 1 || f.created[0].Image != manifest {
+		t.Fatalf("created = %+v, want one container from %s", f.created, manifest)
+	}
+	if len(f.imageProbes) != 2 {
+		t.Fatalf("image probes = %v, want config digest then manifest digest", f.imageProbes)
+	}
+}
+
+func TestEnsureReleaseRuntimeContainerFailsWhenImageUnresolvable(t *testing.T) {
+	f := &ensureFakeEngine{
+		networkID:   strings.Repeat("d", 64),
+		createID:    "newcontainer",
+		localImages: []string{},
+	}
+	c, err := newClient(startFakeEngine(t, f.mux(t)))
+	if err != nil {
+		t.Fatalf("newClient: %v", err)
+	}
+	_, err = c.EnsureReleaseRuntimeContainer(context.Background(), validRunRequest(), "env-net")
+	var engineErr *EngineError
+	if !errors.As(err, &engineErr) || engineErr.Class != ErrClassConfiguration {
+		t.Fatalf("err = %v, want a configuration EngineError", err)
+	}
+	if len(f.created) != 0 {
+		t.Fatalf("created %d containers despite no resolvable image", len(f.created))
 	}
 }

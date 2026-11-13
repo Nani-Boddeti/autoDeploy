@@ -434,3 +434,25 @@ func TestTraefikCredentialsFileRejectsUntrustedFile(t *testing.T) {
 		}
 	}
 }
+
+// The quota helper refuses requests above its configured maximum, so the unit passes the
+// configured values; invalid ones must be rejected at startup, not at the first checkout.
+func TestParseArgsCheckoutQuotaLimits(t *testing.T) {
+	c, err := parseArgs(runArgs("--checkout-quota-bytes", "2147483648", "--checkout-quota-inodes", "400000"))
+	if err != nil {
+		t.Fatalf("parseArgs: %v", err)
+	}
+	if c.checkoutQuotaBytes != 2147483648 || c.checkoutQuotaInodes != 400000 {
+		t.Fatalf("%+v", c)
+	}
+	for _, args := range [][]string{
+		runArgs("--checkout-quota-bytes", "0"),
+		runArgs("--checkout-quota-inodes", "-1"),
+		runArgs("--checkout-quota-bytes", "abc"),
+		{"enroll", "--base-url", "https://cp.example", "--server-id", "server_1", "--state-dir", "/var/lib/agent", "--checkout-quota-bytes", "1"},
+	} {
+		if _, err := parseArgs(args); err == nil {
+			t.Fatalf("expected an error for args=%v", args)
+		}
+	}
+}

@@ -12,6 +12,7 @@ After=srv-autodeploy-checkout.mount
 AssertPathIsDirectory=/usr/local/lib/autodeploy/bin
 AssertFileIsExecutable=/usr/local/lib/autodeploy/bin/checkout-exec
 AssertFileIsExecutable=/usr/local/lib/autodeploy/bin/git
+AssertFileIsExecutable=/usr/local/lib/autodeploy/bin/git-remote-https
 AssertFileIsExecutable=/usr/local/lib/autodeploy/checkout-exec-launch
 
 [Service]
@@ -63,15 +64,26 @@ SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 SystemCallArchitectures=native
 # The seccomp filter and these restrictions are inherited by the git child.
-# AF_UNIX only follows docs/checkout-isolation.md, but means git cannot reach the
-# network from here: an https fetch (GitFetchExact) will fail until this is
-# widened to AF_UNIX AF_INET AF_INET6 (deliberate decision pending, see report).
-# WHEN WIDENING: pair it with IPAddressDeny= for 127.0.0.0/8 ::1/128 10.0.0.0/8
-# 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 (the git child would
-# otherwise reach PostgreSQL, the Traefik API on 127.0.0.1:8080, the control plane
-# on the bridge gateway and the Docker bridge), and IPAddressAllow= for the DNS
-# resolver(s) and the fetch destinations. Never widen without this pairing.
-RestrictAddressFamilies=AF_UNIX
+# Network (owner decision 2026-11-13): the git child fetches over HTTPS, so the helper needs
+# AF_INET/AF_INET6; AF_UNIX stays for the helper's own socket. The seccomp/address-family
+# restriction and the IP filter below are inherited by the git child and its cgroup leaf.
+#   IPAddressDeny=  everything the git child must never reach: loopback (PostgreSQL, Traefik API
+#                   127.0.0.1:8080), the Docker bridge/control plane (172.16/12, 172.29.0.1:8081),
+#                   RFC 1918 LAN, CGNAT/tailscale, link-local (169.254/16 incl. cloud metadata),
+#                   multicast and IPv6 ULA. systemd 255 keywords: localhost = 127.0.0.0/8 + ::1,
+#                   link-local = 169.254.0.0/16 + fe80::/64, multicast = 224.0.0.0/4 + ff00::/8;
+#                   the explicit prefixes below are redundant on purpose.
+#   IPAddressAllow= is evaluated BEFORE IPAddressDeny (systemd.resource-control(5): a match in
+#                   Allow wins), so the single hole is the systemd-resolved stub 127.0.0.53/32
+#                   named in /etc/resolv.conf (preflight-checkout.sh fails if it ever differs).
+#                   Everything else is public internet; the control plane hands out only
+#                   https://github.com/... clone URLs.
+# Needed inside the sandbox and present: /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf,
+# /etc/hosts, /etc/nsswitch.conf, /etc/ssl/certs/ca-certificates.crt (nothing is hidden: no
+# ProtectSystem, PrivateNetwork or TemporaryFileSystem; /etc is merely read-only).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 ::1/128 fc00::/7
+IPAddressAllow=127.0.0.53/32
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectHome=yes
@@ -113,7 +125,7 @@ ReadOnlyPaths=/etc -/boot
 #    are descriptor-relative (trusted_linux.go:64,:82; cgroup_linux.go:135,:219,:310).
 #  ProtectKernelTunables/ProtectControlGroups: make /sys (cgroupfs) read-only;
 #    the helper must write its delegated subtree.
-#  PrivateNetwork: not needed given AF_UNIX-only, and would block future fetches.
+#  PrivateNetwork: would block the https fetch; the IP filter above is the network boundary.
 #
 # Set instead, on paths the helper never traverses with RESOLVE_NO_XDEV:
 #   ReadOnlyPaths=/etc -/boot   (neither is on any path above)

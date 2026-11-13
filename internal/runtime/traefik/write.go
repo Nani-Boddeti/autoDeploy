@@ -266,7 +266,17 @@ func createTempFile(dir, base string) (*os.File, string, error) {
 			}
 			return nil, "", fmt.Errorf("traefik: create temp file %s: %w", path, err)
 		}
-		return os.NewFile(uintptr(fd), path), path, nil
+		f := os.NewFile(uintptr(fd), path)
+		// The open mode is masked by the process umask: the agent unit runs with
+		// UMask=0077, which turned 0640 into 0600 and left the route file unreadable to
+		// Traefik (it reads as supplementary group, --group-add, with every capability
+		// dropped). fchmod is not subject to the umask.
+		if err := f.Chmod(routeFileMode); err != nil {
+			_ = f.Close()
+			_ = syscall.Unlink(path)
+			return nil, "", fmt.Errorf("traefik: set mode on temp file %s: %w", path, err)
+		}
+		return f, path, nil
 	}
 	return nil, "", fmt.Errorf("traefik: could not create a unique temp file after %d attempts: %w", maxAttempts, lastErr)
 }
