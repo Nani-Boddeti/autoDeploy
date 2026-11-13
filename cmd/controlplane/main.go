@@ -186,6 +186,9 @@ func run(ctx context.Context) error {
 	// method set directly (Slice 9a Step 3d), so no adapter type is needed
 	// here the way serverAdmin composes two repositories above.
 	webOptions.RuntimeConfigAdmin = postgres.NewEnvironmentRuntimeConfigRepository(pool)
+	// The route page (hostname assignment) was never wired, so /environments/route
+	// always 404ed (found on the acer). RouteHeadRepository satisfies web.RouteHeadAdmin.
+	webOptions.RouteHeadAdmin = postgres.NewRouteHeadRepository(pool)
 	webOptions.OperationsReader = postgres.NewOperationsReadRepository(pool)
 	webOptions.DeploymentCanceller = leaseRepository
 	webOptions.DeploymentLogReader = postgres.NewDeploymentLogRepository(pool)
