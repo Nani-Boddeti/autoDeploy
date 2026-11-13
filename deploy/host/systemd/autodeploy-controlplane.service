@@ -34,6 +34,9 @@ Type=simple
 User=autodeploy-controlplane
 Group=autodeploy-controlplane
 EnvironmentFile=/etc/autodeploy/controlplane.env
+# Written by enable-github.sh (GitHub App + secret subsystem). Optional, and read after the main
+# file: install-app.sh regenerates controlplane.env and must never carry these settings.
+EnvironmentFile=-/etc/autodeploy/controlplane-github.env
 ExecStart=/usr/local/lib/autodeploy/app/controlplane
 # Exits when PostgreSQL or the bridge address is not up yet; retry quickly.
 Restart=on-failure

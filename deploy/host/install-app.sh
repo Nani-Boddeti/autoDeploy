@@ -11,7 +11,7 @@
 #   install-app.sh BINDIR
 #
 #   BINDIR  directory with prebuilt linux/amd64 binaries: controlplane, agent, migrate,
-#           admin (GOOS=linux GOARCH=amd64 go build ./cmd/...), and optionally SHA256SUMS
+#           admin, secrets (GOOS=linux GOARCH=amd64 go build ./cmd/...), and optionally SHA256SUMS
 #           (sha256sum format; when present every binary must be listed and match, when
 #           absent a loud warning is printed). Inputs are copied to a root-only staging
 #           directory first; validation and installation use the copies.
@@ -119,9 +119,9 @@ AGENT_GID="$(id -g "$AGENT_USER")"
 
 log "staging and validating inputs"
 stage_init
-for b in controlplane agent migrate admin; do stage_copy "$BINDIR/$b" "$b" "$b"; done
+for b in controlplane agent migrate admin secrets; do stage_copy "$BINDIR/$b" "$b" "$b"; done
 stage_verify "$BINDIR"
-for b in controlplane agent migrate admin; do stage_require_elf "$b" "$b"; done
+for b in controlplane agent migrate admin secrets; do stage_require_elf "$b" "$b"; done
 for f in traefik/traefik.yml traefik/autodeploy-api.yml traefik/autodeploy-tls.yml libexec/autodeploy-run \
   systemd/autodeploy-postgres.service systemd/autodeploy-traefik.service \
   systemd/autodeploy-controlplane.service systemd/autodeploy-agent.service; do
@@ -229,7 +229,7 @@ chown root:"$AGENT_USER" "$ROUTE_DIR"
 
 # ---- 3. binaries --------------------------------------------------------------------
 log "installing binaries into $APP_DIR (root:root 0755)"
-for b in controlplane agent migrate admin; do
+for b in controlplane agent migrate admin secrets; do
   if install_file "$STAGE/$b" "$APP_DIR/$b" 0755; then
     case "$b" in controlplane) mark CP_CHANGED ;; agent) mark AGENT_CHANGED ;; *) ;; esac
   fi

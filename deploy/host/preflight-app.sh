@@ -256,7 +256,7 @@ route_files_ok() {
 check "installer route files (api, tls, controlplane) are root-owned 0644 in the route directory" route_files_ok
 bins_ok() {
   local b
-  for b in controlplane agent migrate admin; do
+  for b in controlplane agent migrate admin secrets; do
     [[ "$(stat -c '%u:%a' "/usr/local/lib/autodeploy/app/$b" 2>/dev/null)" == 0:755 ]] || return 1
   done
 }
