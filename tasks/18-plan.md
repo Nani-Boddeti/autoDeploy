@@ -120,3 +120,13 @@ summarized in this file. Repo checks unchanged (gates false, `go test ./...` gre
   installation-id reconcile form), so the state-protected install flow cannot be started from the UI. Workaround used:
   install the App directly on GitHub, then reconcile by installation id (App-authenticated API lookup). Fix later: add
   a "Install GitHub App" form on the landing page posting to /github/setup.
+- 18e DONE 2026-11-13: FIRST REAL END-TO-END DEPLOY on the acer (attempt 13): checkout (HTTPS fetch, quota, spawn)
+  -> BuildKit build -> container -> health gate passed -> activation authorized (route revision 1) -> Traefik route
+  switched and verified -> reported; https://demo.autodeploy.test returns 200 via the private CA. Defects found on
+  the way (all fixed + committed): missing GitHub setup button; Strict-cookie cross-site redirect; App needs push
+  event; discovery token rejected "selected"; checkout token rejected implicit metadata (2 places); route page never
+  wired; migrations not applied on reinstall; lease started after first git op (redactor fail-closed); workspace
+  unreadable to the agent (0750 + group); route file mode under UMask; agent quota > helper cap; buildx index under
+  the containerd store (provenance off, config digest optional); git umask 027 made image files unreadable (403).
+  Follow-ups: route/config pages missing from nav; static "execution disabled" banner; ReserveCheckout lock order;
+  validate_route_head_update trigger for flagged heads; gates still false in committed code (acer runs gated build).
