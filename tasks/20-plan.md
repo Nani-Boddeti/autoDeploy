@@ -59,4 +59,8 @@ lock-order fix; flagged-head trigger; agent_jobs owner index; persisting executo
   exited on it).
 - PROVEN ON THE ACER 2026-11-13: blue/green with predecessor drain (attempt 15, "predecessor stopped"), stop-then-start
   (attempt 17: authorized -> predecessor stopped -> gate passed -> switched), Retry as the trigger.
-- Next: 20D rollback, then 20E retention after rollback is proven.
+- 20D rollback cbcddd3 (review PASS WITH NOTES; fixes: source-changed refusal, claim-time revoked-secret cancel,
+  drain candidate instance, pill gated on release state, recovery/operator tests). PROVEN ON THE ACER 2026-11-13:
+  attempt 18 rolled back third (STS) -> second release: no build, predecessor stopped, gate passed, route switched;
+  site serves "Second deploy" again.
+- Next: 20E retention/cleanup (migration 000026), then 20F docs.
