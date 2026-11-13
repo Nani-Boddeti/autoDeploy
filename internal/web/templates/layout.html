@@ -4,4 +4,4 @@
 {{define "headrefreshfast"}}{{template "headtop"}}<meta http-equiv="refresh" content="3"><title>{{.}}</title></head><body>{{end}}
 {{define "nav"}}<header class="site"><a class="brand" href="/">AutoDeploy</a><nav aria-label="Primary"><a href="/"{{if eq . "home"}} aria-current="page"{{end}}>Overview</a><a href="/projects"{{if eq . "projects"}} aria-current="page"{{end}}>Projects</a><a href="/deployments"{{if eq . "deployments"}} aria-current="page"{{end}}>Deployments</a><a href="/servers"{{if eq . "servers"}} aria-current="page"{{end}}>Servers</a><a href="/#github"{{if eq . "github"}} aria-current="page"{{end}}>GitHub</a></nav></header>{{end}}
 {{define "foot"}}</body></html>{{end}}
-{{define "execnotice"}}<p class="notice" role="note">Deployment execution and traffic activation are disabled in this build. Records here may be queued, but nothing runs on a host yet, and no release is receiving traffic from this control plane.</p>{{end}}
+{{define "execnotice"}}<p class="notice" role="note">Traffic activation is disabled on this control plane.</p>{{end}}

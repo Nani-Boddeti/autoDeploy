@@ -216,7 +216,8 @@ type projectRow struct {
 	Repository      string
 	DeployRef       string
 	BindingState    string
-	Environments    string
+	Environments    []environmentLink
+	NoEnvironments  bool
 	HasLatest       bool
 	LatestStatus    string
 	LatestTone      string
@@ -228,10 +229,28 @@ type projectRow struct {
 	Nonce     string
 }
 
+// environmentLink is an environment id with the hrefs of its runtime config
+// and route pages; ids are query-escaped here so the templates stay dumb.
+type environmentLink struct{ ID, ConfigHref, RouteHref string }
+
+func newEnvironmentLink(id string) environmentLink {
+	q := "?environment_id=" + url.QueryEscape(id)
+	return environmentLink{ID: id, ConfigHref: "/environments/config" + q, RouteHref: "/environments/route" + q}
+}
+
+func environmentLinks(ids []string) []environmentLink {
+	links := make([]environmentLink, 0, len(ids))
+	for _, id := range ids {
+		links = append(links, newEnvironmentLink(id))
+	}
+	return links
+}
+
 type projectsView struct {
-	Projects  []projectRow
-	CanDeploy bool
-	CSRF      string
+	ExecNotice bool
+	Projects   []projectRow
+	CanDeploy  bool
+	CSRF       string
 }
 
 func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +263,7 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := projectsView{}
+	view := projectsView{ExecNotice: !h.config.ActivationEnabled}
 	if h.manualDeployEnabled() {
 		csrf, csrfErr := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
 		if csrfErr != nil {
@@ -255,12 +274,13 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, pr := range projects {
 		row := projectRow{
-			ProjectID:    pr.ProjectID,
-			ProjectHref:  deploymentsHref(postgres.DeploymentFilter{ProjectID: pr.ProjectID}, ""),
-			Repository:   orDash(pr.RepositoryFullName),
-			DeployRef:    orDash(pr.RepositoryDefaultRef),
-			BindingState: "no binding",
-			Environments: orDash(strings.Join(pr.EnvironmentIDs, ", ")),
+			ProjectID:      pr.ProjectID,
+			ProjectHref:    deploymentsHref(postgres.DeploymentFilter{ProjectID: pr.ProjectID}, ""),
+			Repository:     orDash(pr.RepositoryFullName),
+			DeployRef:      orDash(pr.RepositoryDefaultRef),
+			BindingState:   "no binding",
+			Environments:   environmentLinks(pr.EnvironmentIDs),
+			NoEnvironments: len(pr.EnvironmentIDs) == 0,
 		}
 		if pr.HasBinding {
 			row.BindingState = "inactive"
@@ -296,6 +316,8 @@ type deploymentRow struct {
 	DetailHref      string
 	ProjectID       string
 	EnvironmentID   string
+	ConfigHref      string
+	RouteHref       string
 	ServerID        string
 	Commit          string
 	Status          string
@@ -308,6 +330,7 @@ type deploymentRow struct {
 }
 
 type deploymentsView struct {
+	ExecNotice    bool
 	Deployments   []deploymentRow
 	ProjectID     string
 	EnvironmentID string
@@ -321,6 +344,7 @@ func newDeploymentRow(d postgres.DeploymentSummary) deploymentRow {
 	return deploymentRow{
 		ID: d.DeploymentID, DetailHref: detailHref(d.DeploymentID),
 		ProjectID: d.ProjectID, EnvironmentID: d.EnvironmentID, ServerID: d.ServerID,
+		ConfigHref: newEnvironmentLink(d.EnvironmentID).ConfigHref, RouteHref: newEnvironmentLink(d.EnvironmentID).RouteHref,
 		Commit: d.ShortCommit(), Status: d.Status, StatusTone: stateTone(d.Status),
 		JobState: d.JobState, JobTone: stateTone(d.JobState), CancelRequested: d.CancelRequested,
 		CreatedAt: formatTimestamp(d.CreatedAt), UpdatedAt: formatTimestamp(d.UpdatedAt),
@@ -359,7 +383,7 @@ func (h *Handler) deploymentsList(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := deploymentsView{ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
+	view := deploymentsView{ExecNotice: !h.config.ActivationEnabled, ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
 	for _, d := range list.Items {
 		view.Deployments = append(view.Deployments, newDeploymentRow(d))
 	}
@@ -380,6 +404,7 @@ type attemptRow struct {
 type instanceRow struct{ ID, Attempt, Fence, State, Tone, Created string }
 
 type deploymentDetailView struct {
+	ExecNotice   bool
 	Title        string
 	Refresh      bool
 	RefreshEvery string
@@ -439,7 +464,8 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := deploymentDetailView{
-		Title: "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
+		ExecNotice: !h.config.ActivationEnabled,
+		Title:      "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
 		Refresh: !terminalJobStates[d.Job.State], RefreshEvery: strconv.Itoa(detailRefreshSeconds),
 		Active: d.ReleaseIsActive, JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
 		JobCreated: formatTimestamp(d.Job.CreatedAt), JobUpdated: formatTimestamp(d.Job.UpdatedAt),

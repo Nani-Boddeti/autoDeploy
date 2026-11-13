@@ -179,7 +179,7 @@ func TestLogsEscapesBody(t *testing.T) {
 func TestLogsEmptyState(t *testing.T) {
 	h, _, _, p := logsHandler(t)
 	body := opsGet(h, p, http.MethodGet, "/deployments/logs?id=dep-1").Body.String()
-	if !strings.Contains(body, "No log lines recorded. Deployment execution is disabled in this build, or this deployment has not run.") {
+	if !strings.Contains(body, "No log lines yet for this deployment.") {
 		t.Fatal("empty state text missing")
 	}
 }

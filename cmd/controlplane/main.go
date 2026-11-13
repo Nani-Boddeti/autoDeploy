@@ -122,7 +122,7 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return failAt(err)
 	}
-	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, DummyPassword: dummy}
+	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, DummyPassword: dummy, ActivationEnabled: activationEnabled}
 	githubConfig, err := config.GitHubAppConfigFromEnvironment()
 	if err != nil {
 		return failAt(err)

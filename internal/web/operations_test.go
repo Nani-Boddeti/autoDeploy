@@ -196,7 +196,7 @@ func TestDeploymentsFiltersCursorAndOlderLink(t *testing.T) {
 	}
 	body := rr.Body.String()
 	wantOlder := "/deployments?" + url.Values{"project_id": {"proj&x"}, "environment_id": {"env"}, "after": {encodeDeploymentCursor(next)}}.Encode()
-	for _, want := range []string{"Older deployments", "href=\"" + strings.ReplaceAll(wantOlder, "&", "&amp;") + "\"", "cancel requested", "/deployments/detail?id=dep-1", "<code>0123456789ab</code>", `aria-current="page">Deployments`, "execution and traffic activation are disabled"} {
+	for _, want := range []string{"Older deployments", "href=\"" + strings.ReplaceAll(wantOlder, "&", "&amp;") + "\"", "cancel requested", "/deployments/detail?id=dep-1", "<code>0123456789ab</code>", `aria-current="page">Deployments`, "Traffic activation is disabled on this control plane."} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
@@ -294,7 +294,7 @@ func TestDetailLiveBadgeOnlyWhenActive(t *testing.T) {
 	if !strings.Contains(b, "live on route") {
 		t.Fatal("badge missing for active release")
 	}
-	for _, want := range []string{"execution and traffic activation are disabled", "<code>abcdef012345</code>", "recreate", "Status timeline", "running"} {
+	for _, want := range []string{"Traffic activation is disabled on this control plane.", "<code>abcdef012345</code>", "recreate", "Status timeline", "running"} {
 		if !strings.Contains(b, want) {
 			t.Errorf("detail missing %q", want)
 		}
@@ -345,7 +345,7 @@ func TestProjectsPageContentAndEmptyState(t *testing.T) {
 		{ProjectID: "orphan"},
 	}
 	b := opsGet(h, p, http.MethodGet, "/projects").Body.String()
-	for _, want := range []string{"o/r", "refs/heads/main", "active", "a, b", "<code>0123456789ab</code>", "/deployments/detail?id=dep-1", "/deployments?project_id=proj", "no binding", "none yet", `aria-current="page">Projects`} {
+	for _, want := range []string{"o/r", "refs/heads/main", "active", "a (<a href=\"/environments/config?environment_id=a\">config</a>", `href="/environments/route?environment_id=b"`, "<code>0123456789ab</code>", "/deployments/detail?id=dep-1", "/deployments?project_id=proj", "no binding", "none yet", `aria-current="page">Projects`} {
 		if !strings.Contains(b, want) {
 			t.Errorf("projects page missing %q", want)
 		}

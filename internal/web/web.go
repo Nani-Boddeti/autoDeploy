@@ -96,6 +96,8 @@ type RouteHeadAdmin interface {
 }
 
 type Config struct {
+	// ActivationEnabled hides the "activation disabled" notice when true.
+	ActivationEnabled     bool
 	PublicOrigin          string
 	CSRFKeys              auth.CSRFKeyRing
 	UsernameThrottleKeys  auth.UsernameThrottleKeyRing
@@ -781,7 +783,7 @@ func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
 		view.Servers = append(view.Servers, serverRow{ID: s.ID, Name: s.Name, Status: string(s.Status), CreatedAt: formatTimestamp(s.CreatedAt), LastHeartbeatAt: formatTimestamp(s.LastHeartbeatAt), ActiveCredentialVersion: formatCredentialVersion(s.ActiveCredentialVersion), Enrollment: string(s.Enrollment)})
 	}
 	for _, e := range environments {
-		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since), Activation: activationLabel(e.Activation)})
+		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, ConfigHref: newEnvironmentLink(e.EnvironmentID).ConfigHref, RouteHref: newEnvironmentLink(e.EnvironmentID).RouteHref, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since), Activation: activationLabel(e.Activation)})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = serversTemplate.Execute(w, view)
@@ -1815,7 +1817,7 @@ type serverRow struct {
 	ID, Name, Status, CreatedAt, LastHeartbeatAt, ActiveCredentialVersion, Enrollment string
 }
 type reconcilingRow struct {
-	EnvironmentID, AttemptID, JobID, ServerID, Since, Activation string
+	EnvironmentID, ConfigHref, RouteHref, AttemptID, JobID, ServerID, Since, Activation string
 }
 type serversView struct {
 	CSRF                    string
