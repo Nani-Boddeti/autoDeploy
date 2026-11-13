@@ -836,6 +836,13 @@ run on a real host.
 - Errors: only "no row" outcomes and explicit owner/session mismatches are unauthorized. Other database errors
   stay retryable.
 
+### Predecessor drain result (step 20B)
+
+- Table `release_drain_results` (migration 000024), immutable, one row per activating attempt. `RecordDrainResult`
+  (POST `/agent/v1/drains/result`, credential only, no lease or fence) takes only the server credential `FOR SHARE`
+  (position 1, as every agent path); every other read is a plain non-locking SELECT of immutable columns. The lock
+  order above is unchanged. Visibility only: nothing acts on the row.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

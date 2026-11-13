@@ -314,6 +314,22 @@ func (c *Client) Reconcile(ctx context.Context, environmentID string, attemptID,
 	return c.post(ctx, pathReconcile, req, nil, true)
 }
 
+// ReportDrainResult reports what the predecessor drain for the activating
+// attemptID ended in (step 20B; visibility only). Credential-authenticated, no
+// lease or fence. A 200 and a terminal 409 (ConflictCode) both mean the server
+// will never take another answer; 503/transport errors are retried by post and
+// returned for the caller to back off and re-send.
+func (c *Client) ReportDrainResult(ctx context.Context, attemptID int64, predecessorReleaseID, predecessorRuntimeInstanceID, outcome, summary string) error {
+	req := struct {
+		AttemptID                    int64  `json:"attempt_id"`
+		PredecessorReleaseID         string `json:"predecessor_release_id"`
+		PredecessorRuntimeInstanceID string `json:"predecessor_runtime_instance_id"`
+		Outcome                      string `json:"outcome"`
+		Summary                      string `json:"summary"`
+	}{attemptID, predecessorReleaseID, predecessorRuntimeInstanceID, outcome, summary}
+	return c.post(ctx, pathDrainResult, req, nil, true)
+}
+
 const (
 	routeDigestPrefix              = "sha256:"
 	maxActivationFailureSummaryLen = 2048

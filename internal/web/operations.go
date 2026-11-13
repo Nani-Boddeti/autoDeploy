@@ -410,6 +410,7 @@ type deploymentDetailView struct {
 	RefreshEvery string
 	Summary      deploymentRow
 	Active       bool
+	Drain        *drainResultView
 	JobID        string
 	JobAttempts  string
 	JobCreated   string
@@ -508,7 +509,7 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		ExecNotice: !h.config.ActivationEnabled,
 		Title:      "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
 		Refresh: !terminalJobStates[d.Job.State], RefreshEvery: strconv.Itoa(detailRefreshSeconds),
-		Active: d.ReleaseIsActive, JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
+		Active: d.ReleaseIsActive, Drain: newDrainResultView(d.PredecessorDrain), JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
 		JobCreated: formatTimestamp(d.Job.CreatedAt), JobUpdated: formatTimestamp(d.Job.UpdatedAt),
 		BackHref: deploymentsHref(postgres.DeploymentFilter{ProjectID: d.Deployment.ProjectID}, ""),
 	}

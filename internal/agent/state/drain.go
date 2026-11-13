@@ -46,9 +46,42 @@ type DrainPhase string
 const (
 	// DrainPending: the stop is owed (or being retried).
 	DrainPending DrainPhase = "pending"
-	// DrainStopFailed: the last stop attempt failed; kept as evidence.
+	// DrainStopFailed: the last stop attempt failed; kept as evidence. With
+	// an Outcome it is the terminal, server-acknowledged evidence
+	// (Reported=true); without one it is a retryable or not-yet-terminal failure.
 	DrainStopFailed DrainPhase = "stop_failed"
+	// DrainReportPending: the drain reached a terminal Outcome that the control
+	// plane has not acknowledged yet (step 20B). The record must survive until
+	// a 200 or a terminal 409; success outcomes are then deleted and failure
+	// outcomes move to stop_failed with Reported=true.
+	DrainReportPending DrainPhase = "report_pending"
 )
+
+// Terminal drain outcomes (step 20B); the wire values of the drain-result
+// report (postgres.DrainOutcome*).
+const (
+	DrainOutcomeStopped        = "stopped"
+	DrainOutcomeAlreadyStopped = "already_stopped"
+	DrainOutcomeGone           = "gone"
+	DrainOutcomeStopFailed     = "stop_failed"
+	DrainOutcomeRouteMoved     = "route_moved"
+	DrainOutcomeIdentityError  = "identity_error"
+)
+
+// DrainOutcomeIsFailure reports whether outcome is one a stop failure evidence
+// record is kept for (as opposed to the success outcomes, deleted once acked).
+func DrainOutcomeIsFailure(outcome string) bool {
+	switch outcome {
+	case DrainOutcomeStopFailed, DrainOutcomeRouteMoved, DrainOutcomeIdentityError:
+		return true
+	}
+	return false
+}
+
+func validDrainOutcome(outcome string) bool {
+	return DrainOutcomeIsFailure(outcome) || outcome == DrainOutcomeStopped ||
+		outcome == DrainOutcomeAlreadyStopped || outcome == DrainOutcomeGone
+}
 
 // PendingDrain is one durable obligation to stop a predecessor release.
 type PendingDrain struct {
@@ -67,8 +100,30 @@ type PendingDrain struct {
 	// Retryable is meaningful only in stop_failed (false in pending): the
 	// drainer may try again. Permanent failures (guard refusals, configuration
 	// errors, exhausted attempts) are kept as non-retryable evidence.
-	Retryable            bool
+	Retryable bool
+	// Outcome is the terminal result reported to the control plane (step 20B):
+	// empty until the drain ends. ResultSummary is the bounded text sent with a
+	// report_pending record; once acknowledged, a failure outcome keeps its text
+	// in FailureSummary and Reported is true. Old-shape files lack all three
+	// (omitted on disk when zero). Downgrade caveat as in 10d/10e: a binary
+	// without these fields cannot read a record that carries them (strict
+	// decode), so let the drainer finish before a downgrade.
+	Outcome              string
+	ResultSummary        string
+	Reported             bool
 	CreatedAt, UpdatedAt time.Time
+}
+
+// rank orders the monotone report lifecycle: 0 = pre-terminal, 1 = terminal
+// outcome awaiting acknowledgement, 2 = acknowledged failure evidence.
+func (d PendingDrain) rank() int {
+	switch {
+	case d.Phase == DrainReportPending:
+		return 1
+	case d.Phase == DrainStopFailed && d.Outcome != "":
+		return 2
+	}
+	return 0
 }
 
 // DrainFromActivation derives the drain obligation of a successful result_ready
@@ -118,8 +173,17 @@ func (d PendingDrain) validate() error {
 	case d.Attempts < 0:
 		return bad("attempts must not be negative")
 	}
+	if d.Outcome != "" && !validDrainOutcome(d.Outcome) {
+		return bad("unknown outcome")
+	}
+	if d.Phase != DrainReportPending && d.ResultSummary != "" {
+		return bad("result summary only belongs to report_pending")
+	}
 	switch d.Phase {
 	case DrainPending:
+		if d.Outcome != "" || d.Reported {
+			return bad("pending drain must not carry an outcome")
+		}
 		if d.FailureSummary != "" {
 			return bad("pending drain must not carry a failure summary")
 		}
@@ -132,6 +196,19 @@ func (d PendingDrain) validate() error {
 		}
 		if !utf8.ValidString(d.FailureSummary) {
 			return bad("failure summary must be valid UTF-8")
+		}
+		if d.Outcome == "" && d.Reported {
+			return bad("reported stop_failed needs an outcome")
+		}
+		if d.Outcome != "" && (!DrainOutcomeIsFailure(d.Outcome) || !d.Reported || d.Retryable) {
+			return bad("stop_failed outcome must be a non-retryable acknowledged failure outcome")
+		}
+	case DrainReportPending:
+		if d.Outcome == "" || d.Reported || d.Retryable || d.FailureSummary != "" {
+			return bad("report_pending needs an outcome and no failure summary, retry or reported flag")
+		}
+		if d.ResultSummary == "" || len(d.ResultSummary) > maxDrainSummaryLn || !utf8.ValidString(d.ResultSummary) {
+			return bad("result summary must be 1..2048 valid UTF-8 bytes")
 		}
 	default:
 		return bad("unknown phase")
@@ -154,6 +231,9 @@ type drainWire struct {
 	FailureSummary               string    `json:"failure_summary"`
 	Attempts                     int       `json:"attempts"`
 	Retryable                    bool      `json:"retryable"`
+	Outcome                      string    `json:"outcome,omitempty"`
+	ResultSummary                string    `json:"result_summary,omitempty"`
+	Reported                     bool      `json:"reported,omitempty"`
 	CreatedAt                    time.Time `json:"created_at"`
 	UpdatedAt                    time.Time `json:"updated_at"`
 }
@@ -167,7 +247,9 @@ func (d PendingDrain) marshal() ([]byte, error) {
 		DrainSeconds:                 d.DrainSeconds, ArmedAt: d.ArmedAt,
 		ObservedRouteDigest: hexDigest(d.ObservedRouteDigest),
 		Phase:               string(d.Phase), FailureSummary: d.FailureSummary,
-		Attempts: d.Attempts, Retryable: d.Retryable, CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+		Attempts: d.Attempts, Retryable: d.Retryable,
+		Outcome: d.Outcome, ResultSummary: d.ResultSummary, Reported: d.Reported,
+		CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
 	})
 }
 
@@ -188,6 +270,7 @@ func unmarshalDrain(contents []byte) (PendingDrain, error) {
 		DrainSeconds:                 w.DrainSeconds, ArmedAt: w.ArmedAt.UTC(),
 		ObservedRouteDigest: observed, Phase: DrainPhase(w.Phase),
 		FailureSummary: w.FailureSummary, Attempts: w.Attempts, Retryable: w.Retryable,
+		Outcome: w.Outcome, ResultSummary: w.ResultSummary, Reported: w.Reported,
 		CreatedAt: w.CreatedAt.UTC(), UpdatedAt: w.UpdatedAt.UTC(),
 	}
 	if err := d.validate(); err != nil {
@@ -314,12 +397,22 @@ func (d DrainStore) save(p PendingDrain, arm bool) error {
 		if arm {
 			return nil
 		}
+		// Report lifecycle is monotone: once terminal the outcome is fixed, and
+		// an acknowledged record never changes.
+		if pr, vr := p.rank(), prev.rank(); pr < vr || (vr >= 1 && p.Outcome != prev.Outcome) {
+			return ErrDrainRegressed
+		} else if vr == 2 && (p.Phase != prev.Phase || p.FailureSummary != prev.FailureSummary || p.Attempts != prev.Attempts) {
+			return ErrDrainRegressed
+		} else if vr == 1 && pr == 1 && p.ResultSummary != prev.ResultSummary {
+			return ErrDrainRegressed
+		}
 		if p.Attempts < prev.Attempts || (prev.Phase == DrainStopFailed && p.Phase == DrainPending && p.Attempts <= prev.Attempts) {
 			return ErrDrainRegressed
 		}
 		p.ArmedAt = prev.ArmedAt
 		p.CreatedAt = prev.CreatedAt
-		if p.Phase == prev.Phase && p.FailureSummary == prev.FailureSummary && p.Attempts == prev.Attempts && p.Retryable == prev.Retryable {
+		if p.Phase == prev.Phase && p.FailureSummary == prev.FailureSummary && p.Attempts == prev.Attempts && p.Retryable == prev.Retryable &&
+			p.Outcome == prev.Outcome && p.ResultSummary == prev.ResultSummary && p.Reported == prev.Reported {
 			return nil
 		}
 	} else {

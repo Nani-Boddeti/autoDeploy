@@ -128,19 +128,52 @@ func newDrainDockerFake() *drainDockerFake {
 	return f
 }
 
+// drainReporterFake records reports and answers from errs (one per call; empty
+// = success).
+type drainReporterFake struct {
+	mu    sync.Mutex
+	errs  []error
+	calls []drainReport
+}
+
+type drainReport struct {
+	attempt                  int64
+	predRelease, predRuntime string
+	outcome, summary         string
+}
+
+func (f *drainReporterFake) ReportDrainResult(_ context.Context, attemptID int64, rel, rt, outcome, summary string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, drainReport{attemptID, rel, rt, outcome, summary})
+	if len(f.errs) == 0 {
+		return nil
+	}
+	err := f.errs[0]
+	f.errs = f.errs[1:]
+	return err
+}
+
+func (f *drainReporterFake) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
 type drainHarness struct {
-	t      *testing.T
-	root   string
-	store  state.DrainStore
-	docker *drainDockerFake
-	d      *Drainer
-	t0     time.Time
-	now    time.Time
-	digest string
-	exists bool
-	rdErr  error
-	logs   *bytes.Buffer
-	mono   time.Time
+	reporter *drainReporterFake
+	t        *testing.T
+	root     string
+	store    state.DrainStore
+	docker   *drainDockerFake
+	d        *Drainer
+	t0       time.Time
+	now      time.Time
+	digest   string
+	exists   bool
+	rdErr    error
+	logs     *bytes.Buffer
+	mono     time.Time
 }
 
 func newDrainHarness(t *testing.T) *drainHarness {
@@ -158,6 +191,7 @@ func newDrainHarness(t *testing.T) *drainHarness {
 	h := &drainHarness{
 		t: t, root: root, store: store, docker: newDrainDockerFake(), t0: t0, now: t0,
 		digest: routeDigestString(drainTestDigest), exists: true, logs: &bytes.Buffer{}, mono: t0,
+		reporter: &drainReporterFake{},
 	}
 	h.d = h.newDrainer()
 	return h
@@ -165,7 +199,7 @@ func newDrainHarness(t *testing.T) *drainHarness {
 
 func (h *drainHarness) newDrainer() *Drainer {
 	return &Drainer{
-		Store: h.store, Docker: h.docker, RouteDir: "/route-dir",
+		Store: h.store, Docker: h.docker, RouteDir: "/route-dir", Reporter: h.reporter,
 		Logger:      log.New(h.logs, "", 0),
 		ReadDigest:  func(string, string) (string, bool, error) { return h.digest, h.exists, h.rdErr },
 		Now:         func() time.Time { return h.now },

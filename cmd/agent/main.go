@@ -437,7 +437,7 @@ func buildActivation(c command, client *agentclient.Client, stateStore state.Sto
 	}
 	drainer := &executor.Drainer{
 		Store: drains, Docker: dockerClient, RouteDir: c.traefikRouteDir,
-		Logger: logger, StopGrace: c.drainStopGrace,
+		Reporter: client, Logger: logger, StopGrace: c.drainStopGrace,
 	}
 	if err := drainer.Validate(); err != nil {
 		return activationParts{}, fmt.Errorf("configure predecessor drainer: %w", err)

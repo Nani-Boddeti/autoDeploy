@@ -207,6 +207,7 @@ type DeploymentDetail struct {
 	RuntimeInstances     []RuntimeInstanceView // newest first, <= MaxDetailRuntimeInstances
 	RouteActiveReleaseID string
 	ReleaseIsActive      bool
+	PredecessorDrain     *DrainResultView // nil until the agent reports one
 }
 
 // requireLiveSession mirrors lockAdministratorSession's predicate without
@@ -483,6 +484,9 @@ WHERE rh.environment_id=$1`, d.Job.EnvironmentID, principal.OwnerID).Scan(&activ
 	if active != nil {
 		d.RouteActiveReleaseID = *active
 		d.ReleaseIsActive = d.Release != nil && d.Release.ID == *active
+	}
+	if d.PredecessorDrain, err = readDrainResult(ctx, tx, d.Job.ID); err != nil {
+		return DeploymentDetail{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return DeploymentDetail{}, fmt.Errorf("commit deployment detail: %w", err)

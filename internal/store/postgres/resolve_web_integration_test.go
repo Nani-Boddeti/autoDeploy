@@ -110,7 +110,7 @@ func (h resolveHarness) listed() bool {
 	if rr.Code != http.StatusOK {
 		h.t.Fatalf("GET /servers = %d", rr.Code)
 	}
-	return strings.Contains(rr.Body.String(), `<td>`+h.env.EnvironmentID+`</td>`)
+	return strings.Contains(rr.Body.String(), `<td>`+h.env.EnvironmentID+` (`)
 }
 
 const (
