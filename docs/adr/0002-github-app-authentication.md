@@ -279,6 +279,25 @@ Costs:
 - Failed persistence returns a non-success webhook response; successful durable receipt returns
   within GitHub's delivery timeout.
 
+## Amendments (2026-11-13)
+
+### Manual deployment authorization (step 19)
+
+- An authenticated owner-role administrator session with CSRF and request-provenance checks may create a
+  deployment through `POST /deployments/manual` without any webhook. The GitHub App may run with webhooks
+  inactive.
+- Authorization is the same locked chain as a verified push: App registration active, installation active and
+  not suspended, repository active and accessible, explicit active project binding with environment and server
+  set, plus owner scope (binding owner = the administrator's owner). Environment, server, repository and ref
+  come only from the binding, never from the form.
+- The commit is the bound branch head, or a given full 40-hex SHA that exists and is reachable from the bound
+  branch (GitHub compare status identical or ahead). It is resolved with an installation token narrowed to
+  Contents:read on that single repository, revoked on every path, never persisted or logged. No new App
+  permission.
+- The resolved installation, repository and ref are passed to the enqueue and compared with the locked rows. A
+  rebind in between fails closed (conflict or unauthorized, nothing written).
+- The administrator, not a webhook sender, is the recorded actor.
+
 ## References
 
 - [About authentication with a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/about-authentication-with-a-github-app)

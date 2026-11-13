@@ -815,6 +815,27 @@ run on a real host.
   bumping the revision would make an `activated` declaration impossible. The `validate_route_head_update` trigger
   does not yet enforce this; recorded as a defence-in-depth follow-up.
 
+## Amendments (2026-11-13)
+
+### Manual deployment intents (step 19)
+
+- Table `manual_deployment_intents` (migration 000023): actor, owner, binding, repository, ref, commit SHA,
+  request nonce, deployment id (unique), created_at. `UNIQUE(owner_id, request_nonce)`. Immutable (no update or
+  delete). It is also the audit record. `deployments` and `agent_jobs` are unchanged.
+- One READ COMMITTED transaction, in this order: app registration `FOR SHARE`; administrator session and user
+  `FOR UPDATE`; installation; repository; binding `FOR SHARE`; transaction-scoped advisory lock on
+  (environment, commit SHA); replay check by nonce; in-flight check; then intent, deployment, deployment event,
+  agent job and job event. Session-before-registration ordering was rejected because it deadlocks with
+  installation disable and repository binding.
+- Idempotency: the nonce is generated per form render. The same nonce with the same payload returns the existing
+  deployment. The same nonce with a different payload is a conflict. A new nonce allows a deliberate redeploy.
+- In flight = a queued or in-progress deployment for the same owner, environment and commit
+  (`deployment.ActiveStatuses`). A healthy deployment does not block a redeploy.
+- Accepted: a concurrent webhook push and manual deploy of the same commit may both create deployments. Environment
+  execution slots serialise their execution.
+- Errors: only "no row" outcomes and explicit owner/session mismatches are unauthorized. Other database errors
+  stay retryable.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)
