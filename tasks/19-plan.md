@@ -59,3 +59,4 @@ revoked, sanitized errors); touching shared webhook code (refactor first, existi
   document; lows: invariant failures -> internal error, owner-scope the in-flight check, deterministic advisory-lock
   test, rebind-race test, healthy test. FOLLOW-UP (pre-existing): ReserveCheckout/revalidateTx/
   RevalidateCheckoutBinding lock FOR UPDATE OF b,r,i,a without registration first -> latent cycle vs SHARE chain.
+- 19c review fixes applied (uncommitted): fixes 1-4 as listed above; a concurrent webhook push and a manual deploy of the same commit may both create deployments (the advisory lock is manual-only); environment slots serialise execution; accepted.

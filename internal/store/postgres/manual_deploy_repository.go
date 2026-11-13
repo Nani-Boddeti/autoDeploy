@@ -19,14 +19,18 @@ import (
 )
 
 // ManualDeployInput is everything an owner supplies. The repository, ref,
-// environment and server always come from the project's binding row.
-// ExpectedRef is an optional guard: when set, a binding whose ref changed since
-// the commit was resolved is refused rather than deploying under the new ref.
+// environment and server always come from the project's binding row. The three
+// Expected* fields are REQUIRED and are the installation, repository and ref
+// the commit was resolved against (ManualDeployTarget): a binding that changed
+// since is refused with ErrManualDeployConflict rather than deploying a commit
+// verified for one repository under another.
 type ManualDeployInput struct {
-	ProjectID    string
-	CommitSHA    string
-	RequestNonce string
-	ExpectedRef  string
+	ProjectID              string
+	CommitSHA              string
+	RequestNonce           string
+	ExpectedInstallationID int64
+	ExpectedRepositoryID   int64
+	ExpectedRef            string
 }
 
 // ManualDeployResult identifies the durable deployment and job. Replayed is
@@ -75,16 +79,31 @@ func (r *WebhookJobRepository) ManualDeployTarget(ctx context.Context, principal
 		return 0, 0, "", fmt.Errorf("begin manual deploy target: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if requireLiveSession(ctx, tx, principal) != nil {
-		return 0, 0, "", ErrManualDeployUnauthorized
+	if err = requireLiveSessionRow(ctx, tx, principal); err != nil {
+		return 0, 0, "", manualDenied(err, "manual deploy target session")
 	}
 	if err = readManualBinding(ctx, tx, principal.OwnerID, projectID, true).Scan(&installationID, new(int64), &repositoryID, &fullRef); err != nil {
-		return 0, 0, "", ErrManualDeployUnauthorized
+		return 0, 0, "", manualDenied(err, "manual deploy target binding")
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, 0, "", fmt.Errorf("commit manual deploy target: %w", err)
 	}
 	return installationID, repositoryID, fullRef, nil
+}
+
+// manualLockKey is the text hashed into the manual-only advisory lock that
+// serialises manual deploys of one commit to one environment.
+func manualLockKey(environmentID, commitSHA string) string {
+	return "autodeploy:manual:" + environmentID + ":" + commitSHA
+}
+
+// manualDenied maps only "no such row" to ErrManualDeployUnauthorized; any
+// other database error is wrapped so the caller reports a retryable failure.
+func manualDenied(err error, what string) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrManualDeployUnauthorized
+	}
+	return fmt.Errorf("%s: %w", what, err)
 }
 
 // readManualBinding reads the owner's bound project and its installation
@@ -108,7 +127,7 @@ func (r *WebhookJobRepository) EnqueueManualDeploy(ctx context.Context, principa
 	if r == nil || r.pool == nil || r.deployments == nil || principal.Validate() != nil {
 		return ManualDeployResult{}, ErrManualDeployUnauthorized
 	}
-	if !github.ValidOpaqueID(in.ProjectID) || !github.ValidCommitSHA(in.CommitSHA) || !validManualNonce(in.RequestNonce) || (in.ExpectedRef != "" && !github.ValidBranchRef(in.ExpectedRef)) {
+	if !github.ValidOpaqueID(in.ProjectID) || !github.ValidCommitSHA(in.CommitSHA) || !validManualNonce(in.RequestNonce) || in.ExpectedInstallationID <= 0 || in.ExpectedRepositoryID <= 0 || !github.ValidBranchRef(in.ExpectedRef) {
 		return ManualDeployResult{}, ErrManualDeployInvalid
 	}
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
@@ -117,32 +136,37 @@ func (r *WebhookJobRepository) EnqueueManualDeploy(ctx context.Context, principa
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// Unlocked read only to learn which chain to lock; every fact is re-proven
-	// by the locking queries below (a concurrent rebind fails closed).
+	// Unlocked read only to learn which chain to lock (the account id is not
+	// part of the expected values). The expected values are compared to it now,
+	// and the locking queries below re-prove each of them against the locked rows
+	// (a concurrent rebind between this read and the locks fails closed):
+	//   installation id -> github_installations lock `installation_id=$1`, and the
+	//                      binding lock `installation_id=$3`
+	//   repository id   -> github_repositories lock `repository_id=$1`, and the
+	//                      binding lock `repository_id=$2`
+	//   ref             -> binding lock `deploy_ref=$4`
+	//   project/owner   -> binding lock `owner_id=$1`, `project_id=$5`
 	var installationID, accountID, repositoryID int64
 	var ref string
 	if err = readManualBinding(ctx, tx, principal.OwnerID, in.ProjectID, false).Scan(&installationID, &accountID, &repositoryID, &ref); err != nil {
-		return ManualDeployResult{}, ErrManualDeployUnauthorized
+		return ManualDeployResult{}, manualDenied(err, "manual deploy binding read")
 	}
-	if in.ExpectedRef != "" && in.ExpectedRef != ref {
+	if installationID != in.ExpectedInstallationID || repositoryID != in.ExpectedRepositoryID || ref != in.ExpectedRef {
 		return ManualDeployResult{}, ErrManualDeployConflict
 	}
 	target, err := lockGitHubAuthorityChain(ctx, tx, func() error {
-		if lockAdministratorSession(ctx, tx, principal) != nil {
-			return ErrManualDeployUnauthorized
+		if serr := lockAdministratorSessionRow(ctx, tx, principal); serr != nil {
+			return manualDenied(serr, "manual deploy session lock")
 		}
 		return nil
-	}, githubAuthorityKey{appRegistrationID: 1, installationID: installationID, accountID: accountID, repositoryID: repositoryID, ref: ref, ownerID: principal.OwnerID, projectID: in.ProjectID}, ErrManualDeployUnauthorized)
+	}, githubAuthorityKey{appRegistrationID: 1, installationID: installationID, accountID: accountID, repositoryID: repositoryID, ref: ref, ownerID: principal.OwnerID, projectID: in.ProjectID, strictErrors: true}, ErrManualDeployUnauthorized)
 	if err != nil {
 		return ManualDeployResult{}, err
-	}
-	if in.ExpectedRef != "" && in.ExpectedRef != ref {
-		return ManualDeployResult{}, ErrManualDeployConflict
 	}
 	// Serializes concurrent manual deploys of one commit to one environment so
 	// the in-flight check below cannot be raced. Taken after every row lock of
 	// the chain and held by no other path, so it cannot form a cycle.
-	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "autodeploy:manual:"+target.environmentID+":"+in.CommitSHA); err != nil {
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, manualLockKey(target.environmentID, in.CommitSHA)); err != nil {
 		return ManualDeployResult{}, fmt.Errorf("manual deploy serialize: %w", err)
 	}
 	want := manualPayload{projectID: in.ProjectID, repositoryID: repositoryID, ref: ref, sha: in.CommitSHA}
@@ -155,8 +179,19 @@ func (r *WebhookJobRepository) EnqueueManualDeploy(ctx context.Context, principa
 		}
 		return result, nil
 	}
+	// In flight means queued or in progress only (deployment.ActiveStatuses): a
+	// deliberate redeploy of a healthy or terminal commit is allowed. Scoped to
+	// the owner through the deployment's execution job, so another owner's rows
+	// are never observed. A concurrent webhook push of the same commit is not
+	// serialised by this lock, so a push and a manual deploy of one commit may
+	// both create deployments; environment slots serialise their execution and
+	// this is accepted.
+	active := make([]string, 0, 8)
+	for _, status := range deployment.ActiveStatuses() {
+		active = append(active, string(status))
+	}
 	var inFlight bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM deployments WHERE environment_id=$1 AND commit_sha=$2 AND status NOT IN ('failed','cancelled','superseded','rolled_back'))`, target.environmentID, in.CommitSHA).Scan(&inFlight); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM deployments d JOIN agent_jobs j ON j.deployment_id=d.id AND j.job_kind='deployment_execution' WHERE j.owner_id=$1 AND d.environment_id=$2 AND d.commit_sha=$3 AND d.status = ANY($4))`, principal.OwnerID, target.environmentID, in.CommitSHA, active).Scan(&inFlight); err != nil {
 		return ManualDeployResult{}, fmt.Errorf("manual deploy in-flight check: %w", err)
 	}
 	if inFlight {
@@ -170,11 +205,11 @@ func (r *WebhookJobRepository) EnqueueManualDeploy(ctx context.Context, principa
 	deploymentID, jobKey := manualIDs(target, repositoryID, ref, in.CommitSHA, in.RequestNonce)
 	d, err := deployment.New(deployment.Identity{DeploymentID: deploymentID, ProjectID: target.projectID, EnvironmentID: target.environmentID, ServerID: target.serverID, CommitSHA: in.CommitSHA}, now)
 	if err != nil {
-		return ManualDeployResult{}, ErrManualDeployConflict
+		return ManualDeployResult{}, fmt.Errorf("manual deploy build deployment: %w", err)
 	}
 	j, err := queue.NewDeploymentExecutionJob(target.ownerID, target.projectID, target.environmentID, target.serverID, string(deploymentID), repositoryID, ref, in.CommitSHA, jobKey, 0, now)
 	if err != nil {
-		return ManualDeployResult{}, ErrManualDeployConflict
+		return ManualDeployResult{}, fmt.Errorf("manual deploy build job: %w", err)
 	}
 	var intentID int64
 	err = tx.QueryRow(ctx, `INSERT INTO manual_deployment_intents(owner_id,actor_user_id,binding_project_id,repository_id,full_ref,commit_sha,request_nonce,deployment_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (owner_id,request_nonce) DO NOTHING RETURNING id`, principal.OwnerID, principal.UserID, in.ProjectID, repositoryID, ref, in.CommitSHA, in.RequestNonce, string(deploymentID)).Scan(&intentID)

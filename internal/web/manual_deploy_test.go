@@ -185,7 +185,7 @@ func TestManualDeployHeadSuccessUsesBindingRefNotForm(t *testing.T) {
 	if rs.headCalls != 1 || rs.verifyCalls != 0 || rs.gotRef != "refs/heads/release" || rs.gotInst != 11 || rs.gotRepo != 22 {
 		t.Fatalf("resolver %+v", rs)
 	}
-	want := postgres.ManualDeployInput{ProjectID: "proj", CommitSHA: manualTestSHA, RequestNonce: "nonce-0123456789abcdef", ExpectedRef: "refs/heads/release"}
+	want := postgres.ManualDeployInput{ProjectID: "proj", CommitSHA: manualTestSHA, RequestNonce: "nonce-0123456789abcdef", ExpectedInstallationID: 11, ExpectedRepositoryID: 22, ExpectedRef: "refs/heads/release"}
 	if st.gotInput != want || st.gotOwner != "owner" || st.gotProject != "proj" {
 		t.Fatalf("enqueue %+v owner=%q", st.gotInput, st.gotOwner)
 	}
@@ -203,7 +203,7 @@ func TestManualDeploySHASuccessVerifiesOnBindingRef(t *testing.T) {
 	if rs.verifyCalls != 1 || rs.headCalls != 0 || rs.gotRef != "refs/heads/main" || rs.gotSHA != manualTestSHA {
 		t.Fatalf("resolver %+v", rs)
 	}
-	if st.gotInput.CommitSHA != manualTestSHA || st.gotInput.ExpectedRef != "refs/heads/main" {
+	if st.gotInput.CommitSHA != manualTestSHA || st.gotInput.ExpectedRef != "refs/heads/main" || st.gotInput.ExpectedInstallationID != 11 || st.gotInput.ExpectedRepositoryID != 22 {
 		t.Fatalf("enqueue %+v", st.gotInput)
 	}
 }
@@ -224,7 +224,7 @@ func TestManualDeployErrorMapping(t *testing.T) {
 		{"ref not found", nil, githubapp.ErrRefNotFound, nil, 422, "the bound branch was not found\n"},
 		{"commit not found", nil, githubapp.ErrCommitNotFound, nil, 422, "that commit was not found in the repository\n"},
 		{"commit not on ref", nil, githubapp.ErrCommitNotOnRef, nil, 422, "that commit is not on the bound branch\n"},
-		{"in flight", nil, nil, postgres.ErrManualDeployInFlight, 409, "this commit is already deployed or deploying in this environment\n"},
+		{"in flight", nil, nil, postgres.ErrManualDeployInFlight, 409, "this commit is already deploying in this environment\n"},
 		{"conflict", nil, nil, postgres.ErrManualDeployConflict, 409, "this form was already submitted with different values; reload the page\n"},
 		{"unavailable", nil, githubapp.ErrGitHubUnavailable, nil, 503, "GitHub is unavailable; try again\n"},
 		{"invalid", nil, nil, postgres.ErrManualDeployInvalid, 400, "bad request\n"},

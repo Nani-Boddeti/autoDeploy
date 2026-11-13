@@ -213,11 +213,24 @@ type DeploymentDetail struct {
 // FOR UPDATE, so a revoked, expired or mismatched session is denied but the
 // read never blocks (or is blocked by) a session-row writer.
 func requireLiveSession(ctx context.Context, tx pgx.Tx, principal auth.Principal) error {
+	if requireLiveSessionRow(ctx, tx, principal) != nil {
+		return ErrServerAuthorizationDenied
+	}
+	return nil
+}
+
+// requireLiveSessionRow returns the raw database error (pgx.ErrNoRows when no
+// live session matches) for callers that must not fold operational failures
+// into an authorization denial.
+func requireLiveSessionRow(ctx context.Context, tx pgx.Tx, principal auth.Principal) error {
 	var live int
 	err := tx.QueryRow(ctx, `SELECT 1 FROM admin_sessions s JOIN users u ON u.id=s.user_id AND u.owner_id=s.owner_id WHERE s.id=$1 AND s.user_id=$2 AND s.owner_id=$3 AND s.auth_revision=$4 AND u.auth_revision=$4 AND u.status='active' AND s.revoked_at IS NULL AND s.idle_expires_at>clock_timestamp() AND s.absolute_expires_at>clock_timestamp()`,
 		principal.SessionID, principal.UserID, principal.OwnerID, int64(principal.AuthRevision)).Scan(&live)
-	if err != nil || live != 1 {
-		return ErrServerAuthorizationDenied
+	if err != nil {
+		return err
+	}
+	if live != 1 {
+		return pgx.ErrNoRows
 	}
 	return nil
 }

@@ -350,3 +350,20 @@ func ExecutionOrder(status Status) (int, bool) {
 		return 0, false
 	}
 }
+
+// ActiveStatuses returns the statuses of a deployment that is queued or in
+// progress: on the execution path before it becomes healthy. Healthy and every
+// terminal status are excluded.
+func ActiveStatuses() []Status {
+	return []Status{StatusQueued, StatusAssigned, StatusFetching, StatusBuilding, StatusStarting, StatusHealthChecking, StatusActivating}
+}
+
+// IsActive reports whether status is one of ActiveStatuses.
+func IsActive(status Status) bool {
+	for _, active := range ActiveStatuses() {
+		if status == active {
+			return true
+		}
+	}
+	return false
+}

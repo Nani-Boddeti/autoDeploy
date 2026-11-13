@@ -68,13 +68,23 @@ func administratorActor(principal auth.Principal) AuditActor {
 // concurrently, by another request) cannot ride through on a stale
 // principal.
 func lockAdministratorSession(ctx context.Context, tx pgx.Tx, principal auth.Principal) error {
-	if principal.Validate() != nil {
+	if principal.Validate() != nil || lockAdministratorSessionRow(ctx, tx, principal) != nil {
 		return ErrServerAuthorizationDenied
 	}
+	return nil
+}
+
+// lockAdministratorSessionRow locks the live session and user rows and returns
+// the raw database error, so a caller can tell "no such live session"
+// (pgx.ErrNoRows) from an operational failure.
+func lockAdministratorSessionRow(ctx context.Context, tx pgx.Tx, principal auth.Principal) error {
 	var locked int
 	err := tx.QueryRow(ctx, `SELECT 1 FROM admin_sessions s JOIN users u ON u.id=s.user_id AND u.owner_id=s.owner_id WHERE s.id=$1 AND s.user_id=$2 AND s.owner_id=$3 AND s.auth_revision=$4 AND u.auth_revision=$4 AND u.status='active' AND s.revoked_at IS NULL AND s.idle_expires_at>clock_timestamp() AND s.absolute_expires_at>clock_timestamp() FOR UPDATE OF s,u`, principal.SessionID, principal.UserID, principal.OwnerID, int64(principal.AuthRevision)).Scan(&locked)
-	if err != nil || locked != 1 {
-		return ErrServerAuthorizationDenied
+	if err != nil {
+		return err
+	}
+	if locked != 1 {
+		return pgx.ErrNoRows
 	}
 	return nil
 }

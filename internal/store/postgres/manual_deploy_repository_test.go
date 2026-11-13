@@ -40,7 +40,7 @@ func countManual(t *testing.T, pool *pgxpool.Pool) manualCounts {
 }
 
 func manualIn(sha, nonce string) ManualDeployInput {
-	return ManualDeployInput{ProjectID: "project", CommitSHA: sha, RequestNonce: nonce}
+	return ManualDeployInput{ProjectID: "project", CommitSHA: sha, RequestNonce: nonce, ExpectedInstallationID: 101, ExpectedRepositoryID: 201, ExpectedRef: "refs/heads/main"}
 }
 
 func TestManualDeployHappyPathWritesOneOfEachFromBinding(t *testing.T) {
@@ -123,11 +123,14 @@ func TestManualDeployValidationBeforeSQL(t *testing.T) {
 	_, repo, principal := manualFixture(t, 116)
 	ctx := context.Background()
 	for name, in := range map[string]ManualDeployInput{
-		"short nonce": manualIn(manualSHA1, "short"),
-		"bad nonce":   manualIn(manualSHA1, "nonce with spaces!!!"),
-		"upper sha":   manualIn(strings.ToUpper(manualSHA1), manualNonce),
-		"zero sha":    manualIn(strings.Repeat("0", 40), manualNonce),
-		"empty proj":  {CommitSHA: manualSHA1, RequestNonce: manualNonce},
+		"short nonce":              manualIn(manualSHA1, "short"),
+		"bad nonce":                manualIn(manualSHA1, "nonce with spaces!!!"),
+		"upper sha":                manualIn(strings.ToUpper(manualSHA1), manualNonce),
+		"zero sha":                 manualIn(strings.Repeat("0", 40), manualNonce),
+		"empty proj":               {CommitSHA: manualSHA1, RequestNonce: manualNonce, ExpectedInstallationID: 101, ExpectedRepositoryID: 201, ExpectedRef: "refs/heads/main"},
+		"no expected installation": {ProjectID: "project", CommitSHA: manualSHA1, RequestNonce: manualNonce, ExpectedRepositoryID: 201, ExpectedRef: "refs/heads/main"},
+		"no expected repository":   {ProjectID: "project", CommitSHA: manualSHA1, RequestNonce: manualNonce, ExpectedInstallationID: 101, ExpectedRef: "refs/heads/main"},
+		"no expected ref":          {ProjectID: "project", CommitSHA: manualSHA1, RequestNonce: manualNonce, ExpectedInstallationID: 101, ExpectedRepositoryID: 201},
 	} {
 		if _, err := repo.EnqueueManualDeploy(ctx, principal, in); !errors.Is(err, ErrManualDeployInvalid) {
 			t.Fatalf("%s err=%v", name, err)
@@ -137,9 +140,6 @@ func TestManualDeployValidationBeforeSQL(t *testing.T) {
 	bad.Role = ""
 	if _, err := repo.EnqueueManualDeploy(ctx, bad, manualIn(manualSHA1, manualNonce)); !errors.Is(err, ErrManualDeployUnauthorized) {
 		t.Fatalf("bad principal err=%v", err)
-	}
-	if _, err := repo.EnqueueManualDeploy(ctx, principal, ManualDeployInput{ProjectID: "project", CommitSHA: manualSHA1, RequestNonce: manualNonce, ExpectedRef: "refs/heads/other"}); !errors.Is(err, ErrManualDeployConflict) {
-		t.Fatalf("expected-ref mismatch err=%v", err)
 	}
 }
 
@@ -170,6 +170,25 @@ func TestManualDeployDeniedChainWritesNothing(t *testing.T) {
 			t.Fatalf("%s wrote rows: %+v", name, c)
 		}
 	}
+}
+
+// secondAdminPrincipal creates another admin user with a live session in the
+// same owner, so two enqueues share no session or user row lock.
+func secondAdminPrincipal(t *testing.T, pool *pgxpool.Pool, owner string) auth.Principal {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO users(id,owner_id,username,role,password_phc,password_policy_revision) VALUES('user-2',$1,'second-admin','owner',repeat('x',68),1)`, owner); err != nil {
+		t.Fatal(err)
+	}
+	token := testToken(t, 201)
+	if _, err := NewAuthRepository(pool).CreateSession(ctx, "session-2", token, LoginUser{ID: "user-2", OwnerID: owner, AuthRevision: 1, Active: true}, nil, "login-2", "limit-2"); err != nil {
+		t.Fatal(err)
+	}
+	p, err := NewAuthRepository(pool).ValidateSession(ctx, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // otherOwnerPrincipal creates a second owner with a live session.
@@ -335,5 +354,214 @@ func TestManualDeployConcurrentSameNonceReplays(t *testing.T) {
 	}
 	if c := countManual(t, githubRepo.pool); c != (manualCounts{1, 1, 1, 1, 1}) {
 		t.Fatalf("counts=%+v", c)
+	}
+}
+
+func waitForAdvisoryWaiters(t *testing.T, ctx context.Context, pool *pgxpool.Pool, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted AND ((classid::bigint<<32)|objid::bigint)=hashtextextended($1,0)`, key).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d ungranted advisory lock requests; saw %d", want, count)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestManualDeployInFlightCheckRunsAfterAdvisoryLock holds the exact advisory
+// lock key in a side transaction, proves (pg_locks) that two enqueues by different
+// admins are both queued on it, then releases and expects exactly one
+// deployment: the in-flight check must run after the lock is granted.
+func TestManualDeployInFlightCheckRunsAfterAdvisoryLock(t *testing.T) {
+	githubRepo, repo, principal := manualFixture(t, 152)
+	ctx := context.Background()
+	holder, err := githubRepo.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx) //nolint:errcheck
+	key := manualLockKey("environment", manualSHA1)
+	if _, err = holder.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, key); err != nil {
+		t.Fatal(err)
+	}
+	// Two different admins of one owner share no session/user row lock, so both
+	// reach the advisory lock and only it can serialise them.
+	second := secondAdminPrincipal(t, githubRepo.pool, principal.OwnerID)
+	errs := make(chan error, 2)
+	for i, p := range []auth.Principal{principal, second} {
+		nonce := []string{"lock-nonce-aaaaaaaaaaaa", "lock-nonce-bbbbbbbbbbbb"}[i]
+		go func() {
+			_, e := repo.EnqueueManualDeploy(ctx, p, manualIn(manualSHA1, nonce))
+			errs <- e
+		}()
+	}
+	waitForAdvisoryWaiters(t, ctx, githubRepo.pool, key, 2)
+	if c := countManual(t, githubRepo.pool); c != (manualCounts{}) {
+		t.Fatalf("rows written while the advisory lock was held: %+v", c)
+	}
+	if err = holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var ok, inflight int
+	for range 2 {
+		switch e := <-errs; {
+		case e == nil:
+			ok++
+		case errors.Is(e, ErrManualDeployInFlight):
+			inflight++
+		default:
+			t.Fatalf("unexpected err=%v", e)
+		}
+	}
+	if ok != 1 || inflight != 1 {
+		t.Fatalf("ok=%d inflight=%d", ok, inflight)
+	}
+	if c := countManual(t, githubRepo.pool); c != (manualCounts{1, 1, 1, 1, 1}) {
+		t.Fatalf("counts=%+v", c)
+	}
+}
+
+// TestManualDeployRebindRaceFailsClosed holds an uncommitted rebind of the
+// binding row, proves the enqueue is blocked on the binding lock, commits, and
+// expects a refusal with zero rows.
+func TestManualDeployRebindRaceFailsClosed(t *testing.T) {
+	cases := map[string]string{
+		"ref changed": `UPDATE github_project_bindings SET deploy_ref='refs/heads/other' WHERE project_id='project'`,
+		"deactivated": `UPDATE github_project_bindings SET active=false WHERE project_id='project'`,
+		"unbound":     `DELETE FROM github_project_bindings WHERE project_id='project'`,
+	}
+	seed := byte(154)
+	for name, mutation := range cases {
+		seed += 2
+		githubRepo, repo, principal := manualFixture(t, seed)
+		ctx := context.Background()
+		side, err := githubRepo.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = side.Exec(ctx, mutation); err != nil {
+			side.Rollback(ctx) //nolint:errcheck
+			t.Fatalf("%s setup: %v", name, err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			_, e := repo.EnqueueManualDeploy(ctx, principal, manualIn(manualSHA1, manualNonce))
+			done <- e
+		}()
+		waitForLockWaiters(t, ctx, githubRepo.pool, "FROM github_project_bindings WHERE owner_id", 1)
+		if err = side.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case e := <-done:
+			if !errors.Is(e, ErrManualDeployConflict) && !errors.Is(e, ErrManualDeployUnauthorized) {
+				t.Fatalf("%s: err=%v", name, e)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: enqueue did not return", name)
+		}
+		if c := countManual(t, githubRepo.pool); c != (manualCounts{}) {
+			t.Fatalf("%s wrote rows: %+v", name, c)
+		}
+	}
+}
+
+func TestManualDeployExpectedValuesMismatchConflicts(t *testing.T) {
+	githubRepo, repo, principal := manualFixture(t, 170)
+	ctx := context.Background()
+	for name, mutate := range map[string]func(*ManualDeployInput){
+		"installation": func(in *ManualDeployInput) { in.ExpectedInstallationID = 999 },
+		"repository":   func(in *ManualDeployInput) { in.ExpectedRepositoryID = 999 },
+		"ref":          func(in *ManualDeployInput) { in.ExpectedRef = "refs/heads/other" },
+	} {
+		in := manualIn(manualSHA1, manualNonce)
+		mutate(&in)
+		if _, err := repo.EnqueueManualDeploy(ctx, principal, in); !errors.Is(err, ErrManualDeployConflict) {
+			t.Fatalf("%s mismatch err=%v", name, err)
+		}
+		if c := countManual(t, githubRepo.pool); c != (manualCounts{}) {
+			t.Fatalf("%s mismatch wrote rows: %+v", name, c)
+		}
+	}
+}
+
+func TestManualDeployHealthyCommitMayBeRedeployed(t *testing.T) {
+	githubRepo, repo, principal := manualFixture(t, 172)
+	ctx := context.Background()
+	first, err := repo.EnqueueManualDeploy(ctx, principal, manualIn(manualSHA1, manualNonce))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployments := NewDeploymentRepository(githubRepo.pool)
+	d, err := deployments.GetByID(ctx, first.DeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range deployment.ActiveStatuses()[1:] {
+		if d, err = d.Transition(status, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		if err = deployments.Save(ctx, d); err != nil {
+			t.Fatal(err)
+		}
+		// Every active phase still blocks a second deploy of the commit.
+		if _, err = repo.EnqueueManualDeploy(ctx, principal, manualIn(manualSHA1, "blocked-"+string(status)+"-nonce")); !errors.Is(err, ErrManualDeployInFlight) {
+			t.Fatalf("status %s err=%v", status, err)
+		}
+	}
+	if d, err = d.Transition(deployment.StatusHealthy, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err = deployments.Save(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	next, err := repo.EnqueueManualDeploy(ctx, principal, manualIn(manualSHA1, "redeploy-nonce-0123456789"))
+	if err != nil || next.DeploymentID == first.DeploymentID {
+		t.Fatalf("healthy redeploy result=%+v err=%v", next, err)
+	}
+}
+
+// TestManualDeployDatabaseErrorIsNotUnauthorized cancels the context while the
+// enqueue is blocked on the installation lock: the operational failure must not
+// be reported as an authorization denial.
+func TestManualDeployDatabaseErrorIsNotUnauthorized(t *testing.T) {
+	githubRepo, repo, principal := manualFixture(t, 174)
+	bg := context.Background()
+	side, err := githubRepo.pool.Begin(bg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer side.Rollback(bg) //nolint:errcheck
+	if _, err = side.Exec(bg, `UPDATE github_installations SET active=active WHERE installation_id=101`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, e := repo.EnqueueManualDeploy(ctx, principal, manualIn(manualSHA1, manualNonce))
+		done <- e
+	}()
+	waitForLockWaiters(t, bg, githubRepo.pool, "FROM github_installations", 1)
+	cancel()
+	select {
+	case e := <-done:
+		if e == nil || errors.Is(e, ErrManualDeployUnauthorized) || errors.Is(e, ErrManualDeployConflict) || errors.Is(e, ErrManualDeployInvalid) {
+			t.Fatalf("cancelled enqueue err=%v", e)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("enqueue did not return after cancel")
+	}
+	cctx, ccancel := context.WithCancel(bg)
+	ccancel()
+	if _, _, _, err = repo.ManualDeployTarget(cctx, principal, "project"); err == nil || errors.Is(err, ErrManualDeployUnauthorized) {
+		t.Fatalf("cancelled target err=%v", err)
 	}
 }

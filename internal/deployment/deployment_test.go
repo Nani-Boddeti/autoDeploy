@@ -277,3 +277,21 @@ func deploymentAt(t *testing.T, target Status) Deployment {
 	}
 	return next
 }
+
+func TestActiveStatusesAreExactlyTheNonHealthyExecutionPath(t *testing.T) {
+	for _, status := range []Status{StatusQueued, StatusAssigned, StatusFetching, StatusBuilding, StatusStarting, StatusHealthChecking, StatusActivating} {
+		if !IsActive(status) {
+			t.Fatalf("%s must be active", status)
+		}
+	}
+	for _, status := range []Status{StatusHealthy, StatusFailed, StatusCancelled, StatusSuperseded, StatusRolledBack, "bogus"} {
+		if IsActive(status) {
+			t.Fatalf("%s must not be active", status)
+		}
+	}
+	for _, status := range ActiveStatuses() {
+		if _, onPath := ExecutionOrder(status); !onPath || status == StatusHealthy {
+			t.Fatalf("%s is not an in-progress path status", status)
+		}
+	}
+}

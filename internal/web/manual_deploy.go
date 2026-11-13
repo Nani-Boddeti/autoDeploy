@@ -105,7 +105,7 @@ func (h *Handler) deploymentManual(w http.ResponseWriter, r *http.Request) {
 		manualDeployFailure(w, err)
 		return
 	}
-	result, err := h.config.ManualDeploy.EnqueueManualDeploy(r.Context(), p, postgres.ManualDeployInput{ProjectID: projectID, CommitSHA: sha, RequestNonce: v.Get("request_nonce"), ExpectedRef: fullRef})
+	result, err := h.config.ManualDeploy.EnqueueManualDeploy(r.Context(), p, postgres.ManualDeployInput{ProjectID: projectID, CommitSHA: sha, RequestNonce: v.Get("request_nonce"), ExpectedInstallationID: installationID, ExpectedRepositoryID: repositoryID, ExpectedRef: fullRef})
 	if err != nil {
 		manualDeployFailure(w, err)
 		return
@@ -126,7 +126,7 @@ func manualDeployFailure(w http.ResponseWriter, err error) {
 	case errors.Is(err, githubapp.ErrCommitNotOnRef):
 		plain(w, http.StatusUnprocessableEntity, "that commit is not on the bound branch\n")
 	case errors.Is(err, postgres.ErrManualDeployInFlight):
-		plain(w, http.StatusConflict, "this commit is already deployed or deploying in this environment\n")
+		plain(w, http.StatusConflict, "this commit is already deploying in this environment\n")
 	case errors.Is(err, postgres.ErrManualDeployConflict):
 		plain(w, http.StatusConflict, "this form was already submitted with different values; reload the page\n")
 	case errors.Is(err, githubapp.ErrGitHubUnavailable):

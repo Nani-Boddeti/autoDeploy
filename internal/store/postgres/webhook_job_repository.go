@@ -494,6 +494,21 @@ type githubAuthorityKey struct {
 	installationID, accountID int64
 	repositoryID              int64
 	ref, ownerID, projectID   string
+	// strictErrors makes only pgx.ErrNoRows map to the caller's denial; any other
+	// database error is wrapped and returned as-is (the manual path, so a
+	// cancelled context or dropped connection is a retryable failure, not a
+	// 403). The webhook path leaves it false and keeps mapping every error to
+	// its denial.
+	strictErrors bool
+}
+
+// chainDenied maps a failed locking query to the caller's denial, or (strict)
+// wraps a non-ErrNoRows database error.
+func chainDenied(err error, key githubAuthorityKey, denied error, what string) error {
+	if key.strictErrors && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock %s: %w", what, err)
+	}
+	return denied
 }
 
 // lockGitHubAuthorityChain FOR SHARE locks app registration, installation,
@@ -504,6 +519,9 @@ type githubAuthorityKey struct {
 func lockGitHubAuthorityChain(ctx context.Context, tx pgx.Tx, between func() error, key githubAuthorityKey, denied error) (webhookTarget, error) {
 	var appID int16
 	if err := tx.QueryRow(ctx, `SELECT id FROM github_app_registrations WHERE id=$1 AND active FOR SHARE`, key.appRegistrationID).Scan(&appID); err != nil || appID != key.appRegistrationID {
+		if err != nil {
+			return webhookTarget{}, chainDenied(err, key, denied, "app registration")
+		}
 		return webhookTarget{}, denied
 	}
 	if between != nil {
@@ -513,18 +531,21 @@ func lockGitHubAuthorityChain(ctx context.Context, tx pgx.Tx, between func() err
 	}
 	var ownerID string
 	if err := tx.QueryRow(ctx, `SELECT owner_id FROM github_installations WHERE installation_id=$1 AND account_id=$2 AND active AND NOT suspended FOR SHARE`, key.installationID, key.accountID).Scan(&ownerID); err != nil {
-		return webhookTarget{}, denied
+		return webhookTarget{}, chainDenied(err, key, denied, "installation")
 	}
 	if key.ownerID != "" && ownerID != key.ownerID {
 		return webhookTarget{}, denied
 	}
 	var repositoryID int64
 	if err := tx.QueryRow(ctx, `SELECT repository_id FROM github_repositories WHERE repository_id=$1 AND installation_id=$2 AND owner_id=$3 AND github_owner_id=$4 AND active FOR SHARE`, key.repositoryID, key.installationID, ownerID, key.accountID).Scan(&repositoryID); err != nil || repositoryID != key.repositoryID {
+		if err != nil {
+			return webhookTarget{}, chainDenied(err, key, denied, "repository")
+		}
 		return webhookTarget{}, denied
 	}
 	var target webhookTarget
 	if err := tx.QueryRow(ctx, `SELECT owner_id,project_id,environment_id,server_id FROM github_project_bindings WHERE owner_id=$1 AND repository_id=$2 AND installation_id=$3 AND active AND deploy_ref=$4 AND environment_id IS NOT NULL AND server_id IS NOT NULL AND ($5='' OR project_id=$5) FOR SHARE`, ownerID, key.repositoryID, key.installationID, key.ref, key.projectID).Scan(&target.ownerID, &target.projectID, &target.environmentID, &target.serverID); err != nil {
-		return webhookTarget{}, denied
+		return webhookTarget{}, chainDenied(err, key, denied, "binding")
 	}
 	return target, nil
 }
