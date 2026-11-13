@@ -35,6 +35,7 @@ const (
 
 type config struct {
 	socket, binRoot, gitName, cgroupRoot         string
+	checkoutRoot                                 string
 	agentUID, agentGID, checkoutUID, checkoutGID uint
 	memory, pids, io, cpuQuota, cpuPeriod        uint64
 	major, minor                                 uint
@@ -53,6 +54,7 @@ type service struct {
 	parent               int
 	socketName           string
 	socketDev, socketIno uint64
+	rootFD               int // checkout root, opened in this mount namespace
 }
 
 func main() {
@@ -68,6 +70,7 @@ func main() {
 	fs.StringVar(&c.binRoot, "bin-root", "", "trusted binary directory")
 	fs.StringVar(&c.gitName, "git-name", "git", "git executable basename")
 	fs.StringVar(&c.cgroupRoot, "cgroup-root", "", "delegated cgroup root")
+	fs.StringVar(&c.checkoutRoot, "checkout-root", "", "absolute checkout root (XFS mount point)")
 	fs.UintVar(&c.agentUID, "agent-uid", 0, "agent uid")
 	fs.UintVar(&c.agentGID, "agent-gid", 0, "agent primary gid")
 	fs.UintVar(&c.checkoutUID, "checkout-uid", 0, "checkout uid")
@@ -105,26 +108,34 @@ func newService(c config) (*service, error) {
 	if err != nil {
 		return nil, err
 	}
+	rootFD, err := openCheckoutRoot(c.checkoutRoot)
+	if err != nil {
+		_ = git.Close()
+		return nil, err
+	}
 	m, err := checkoutcontain.New(c.cgroupRoot, checkoutcontain.Limits{MemoryMax: c.memory, PIDsMax: c.pids, IOMax: c.io, CPUQuota: c.cpuQuota, CPUPeriod: c.cpuPeriod, DeviceMajor: uint32(c.major), DeviceMinor: uint32(c.minor)})
 	if err != nil {
 		_ = git.Close()
+		_ = unix.Close(rootFD)
 		return nil, err
 	}
 	if !validSelfExecutable() || unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != nil {
 		_ = git.Close()
 		_ = m.Close()
+		_ = unix.Close(rootFD)
 		return nil, errors.New("unsafe daemon")
 	}
 	nnp, e := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
 	if e != nil || nnp != 1 {
 		_ = git.Close()
 		_ = m.Close()
+		_ = unix.Close(rootFD)
 		return nil, errors.New("unsafe daemon")
 	}
-	return &service{cfg: c, git: git, manager: m, sem: make(chan struct{}, 8)}, nil
+	return &service{cfg: c, git: git, manager: m, sem: make(chan struct{}, 8), rootFD: rootFD}, nil
 }
 func validConfig(c config) bool {
-	return os.Geteuid() == 0 && c.agentUID != 0 && c.agentGID != 0 && c.checkoutUID != 0 && c.checkoutGID != 0 && c.agentUID != c.checkoutUID && c.agentGID != c.checkoutGID && c.timeout > 0 && c.timeout <= 10*time.Minute && c.maxOutput > 0 && c.maxOutput <= maxOutput && filepath.IsAbs(c.socket) && !strings.ContainsAny(c.socket, "\x00\r\n")
+	return os.Geteuid() == 0 && c.agentUID != 0 && c.agentGID != 0 && c.checkoutUID != 0 && c.checkoutGID != 0 && c.agentUID != c.checkoutUID && c.agentGID != c.checkoutGID && c.timeout > 0 && c.timeout <= 10*time.Minute && c.maxOutput > 0 && c.maxOutput <= maxOutput && filepath.IsAbs(c.socket) && filepath.IsAbs(c.checkoutRoot) && filepath.Clean(c.checkoutRoot) == c.checkoutRoot && c.checkoutRoot != "/" && !strings.ContainsAny(c.checkoutRoot, "\x00\r\n") && !strings.ContainsAny(c.socket, "\x00\r\n")
 }
 func validSelfExecutable() bool {
 	fd, err := unix.Open("/proc/self/exe", unix.O_RDONLY|unix.O_CLOEXEC, 0)
@@ -141,6 +152,9 @@ func validSelfExecutable() bool {
 	return err == unix.ENODATA
 }
 func (s *service) close() {
+	if s.rootFD > 0 {
+		_ = unix.Close(s.rootFD)
+	}
 	if s.git != nil {
 		_ = s.git.Close()
 	}
@@ -378,7 +392,21 @@ func (s *service) spawn(parent context.Context, op checkoutcontain.GitOperation,
 		}
 	}()
 	exe := dup(int(s.git.Fd()))
-	cwdCopy, stdoutCopy, stderrCopy := dup(workspace), dup(stdout), dup(stderr)
+	// The received workspace FD belongs to another mount namespace (see reopen_linux.go);
+	// the child's cwd must be an FD opened through this service's own checkout root.
+	cwdCopy, reopenErr := reopenWorkspace(s.rootFD, workspace)
+	if reopenErr == nil && !validWorkspace(cwdCopy, uint32(s.cfg.checkoutUID), uint32(s.cfg.checkoutGID)) {
+		_ = unix.Close(cwdCopy)
+		reopenErr = errWorkspaceNotFound
+	}
+	if reopenErr != nil {
+		closeRawFDs(exe)
+		return 126, false
+	}
+	// Received copy is no longer needed; disarm the deferred closeFDs for it.
+	_ = unix.Close(workspace)
+	fds[0] = -1
+	stdoutCopy, stderrCopy := dup(stdout), dup(stderr)
 	// The child receives only duplicates. Keeping the received write ends open
 	// in the daemon would suppress EOF at the client and deadlock pipe drains.
 	_ = unix.Close(stdout)

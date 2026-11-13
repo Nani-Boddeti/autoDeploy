@@ -57,6 +57,7 @@ exec "$AUTODEPLOY_CHECKOUT_BIN_ROOT/checkout-exec" \
   --bin-root "$AUTODEPLOY_CHECKOUT_BIN_ROOT" \
   --git-name git \
   --cgroup-root "$unit_cgroup/leaves" \
+  --checkout-root "$AUTODEPLOY_CHECKOUT_ROOT" \
   --agent-uid "$AUTODEPLOY_CHECKOUT_AGENT_UID" \
   --agent-gid "$AUTODEPLOY_CHECKOUT_AGENT_GID" \
   --checkout-uid "$AUTODEPLOY_CHECKOUT_UID" \
