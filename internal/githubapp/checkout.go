@@ -329,5 +329,5 @@ func revocationError(err error) error {
 }
 
 func validCheckoutToken(t Token, repositoryID int64, now time.Time) bool {
-	return validToken(t.Value, t.ExpiresAt, now) && t.Contents == "read" && exactPermissions(t.Permissions, map[string]string{"contents": "read"}) && len(t.RepositoryIDs) == 1 && t.RepositoryIDs[0] == repositoryID
+	return validToken(t.Value, t.ExpiresAt, now) && t.Contents == "read" && checkoutPermissions(t.Permissions) && len(t.RepositoryIDs) == 1 && t.RepositoryIDs[0] == repositoryID
 }

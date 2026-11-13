@@ -166,3 +166,17 @@ func TestCheckoutPermissionsAllowOnlyImplicitMetadata(t *testing.T) {
 		}
 	}
 }
+
+// GitHub includes metadata:read in checkout tokens; the checkout service's own
+// re-validation must accept it too (found on the acer: checkout/start 503).
+func TestValidCheckoutTokenAcceptsImplicitMetadata(t *testing.T) {
+	now := time.Now()
+	tok := Token{Value: "opaque", ExpiresAt: now.Add(time.Hour), Contents: "read", RepositoryIDs: []int64{42}, Permissions: map[string]string{"contents": "read", "metadata": "read"}}
+	if !validCheckoutToken(tok, 42, now) {
+		t.Fatal("checkout token with implicit metadata rejected")
+	}
+	tok.Permissions = map[string]string{"contents": "read", "issues": "read"}
+	if validCheckoutToken(tok, 42, now) {
+		t.Fatal("checkout token with an extra permission accepted")
+	}
+}

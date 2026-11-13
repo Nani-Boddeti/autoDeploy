@@ -2,7 +2,9 @@ package agenthttp
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -306,11 +308,14 @@ func (h Handler) handleCheckoutStart(w http.ResponseWriter, r *http.Request) {
 
 	lease, err := h.CheckoutActivator.Activate(r.Context(), req.ReservationID)
 	if err != nil {
+		// Step and error class only: the token never reaches an error value.
+		fmt.Fprintf(os.Stderr, "agent checkout start failed at activate: %v\n", err)
 		h.CheckoutRegistry.releaseStart(req.ReservationID)
 		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
 	if err := lease.Start(r.Context()); err != nil {
+		fmt.Fprintf(os.Stderr, "agent checkout start failed at lease start: %v\n", err)
 		// Start failed: the durable lease was never marked running, so the
 		// credential must never be returned. Close what Activate opened so
 		// no minted token is left live with nothing that can use it.
@@ -327,6 +332,7 @@ func (h Handler) handleCheckoutStart(w http.ResponseWriter, r *http.Request) {
 	// remote agent is its own operation and says so.
 	token, err := lease.DeliverToken()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent checkout start failed at token delivery: %v\n", err)
 		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
