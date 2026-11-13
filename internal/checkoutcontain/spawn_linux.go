@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"os"
@@ -47,7 +48,7 @@ func (c SpawnClient) Run(ctx context.Context, r SpawnRequest) (SpawnResult, erro
 		fds = append(fds, r.AskpassReadFD)
 	}
 	if n, e := unix.SendmsgN(fd, frame[:], unix.UnixRights(fds...), nil, 0); e != nil || n != len(frame) {
-		return SpawnResult{}, ErrUnavailable
+		return SpawnResult{}, fmt.Errorf("%w: send request: %v", ErrUnavailable, e)
 	}
 	// SCM_RIGHTS duplicates descriptors. Close our write ends immediately so
 	// the readers can observe EOF once the service/child releases theirs.
@@ -112,7 +113,7 @@ func (c SpawnClient) Run(ctx context.Context, r SpawnRequest) (SpawnResult, erro
 			pending--
 			if e != nil {
 				cancel()
-				responseErr = ErrUnavailable
+				responseErr = fmt.Errorf("drain output: %w", e)
 			}
 		case got := <-response:
 			reply, responseErr, gotResponse = got.result, got.err, true
@@ -121,7 +122,7 @@ func (c SpawnClient) Run(ctx context.Context, r SpawnRequest) (SpawnResult, erro
 				e := <-drainErr
 				pending--
 				if e != nil {
-					responseErr = ErrUnavailable
+					responseErr = fmt.Errorf("drain output after reply: %w", e)
 				}
 			}
 		}
@@ -132,7 +133,9 @@ func (c SpawnClient) Run(ctx context.Context, r SpawnRequest) (SpawnResult, erro
 	}
 	wg.Wait()
 	if responseErr != nil {
-		return SpawnResult{Class: ExitIndeterminate}, ErrUnavailable
+		// Keep errors.Is(err, ErrUnavailable) for callers, but say which part
+		// failed (found on the acer: the bare message hid the cause).
+		return SpawnResult{Class: ExitIndeterminate}, fmt.Errorf("%w: %v", ErrUnavailable, responseErr)
 	}
 	return reply, nil
 }
@@ -261,7 +264,7 @@ func receiveSpawnReply(ctx context.Context, fd int) (SpawnResult, error) {
 		closeReplyFDs(oob[:on])
 	}
 	if err != nil || n != len(b) || on != 0 || flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 {
-		return SpawnResult{}, ErrUnavailable
+		return SpawnResult{}, fmt.Errorf("%w: reply recvmsg n=%d oob=%d flags=%#x: %v", ErrUnavailable, n, on, flags, err)
 	}
 	status, code := binary.BigEndian.Uint32(b[:4]), binary.BigEndian.Uint32(b[4:8])
 	if code > 255 || binary.BigEndian.Uint32(b[8:]) != 0 || binary.BigEndian.Uint32(b[12:]) != 0 {
