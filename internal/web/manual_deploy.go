@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/githubapp"
@@ -93,7 +95,7 @@ func (h *Handler) deploymentManual(w http.ResponseWriter, r *http.Request) {
 	}
 	installationID, repositoryID, fullRef, err := h.config.ManualDeploy.ManualDeployTarget(r.Context(), p, projectID)
 	if err != nil {
-		manualDeployFailure(w, err)
+		manualDeployFailure(w, err, "target lookup")
 		return
 	}
 	if mode == manualModeHead {
@@ -102,18 +104,18 @@ func (h *Handler) deploymentManual(w http.ResponseWriter, r *http.Request) {
 		err = h.config.CommitResolver.VerifyCommitOnRef(r.Context(), installationID, repositoryID, fullRef, sha)
 	}
 	if err != nil {
-		manualDeployFailure(w, err)
+		manualDeployFailure(w, err, "commit resolution (GitHub)")
 		return
 	}
 	result, err := h.config.ManualDeploy.EnqueueManualDeploy(r.Context(), p, postgres.ManualDeployInput{ProjectID: projectID, CommitSHA: sha, RequestNonce: v.Get("request_nonce"), ExpectedInstallationID: installationID, ExpectedRepositoryID: repositoryID, ExpectedRef: fullRef})
 	if err != nil {
-		manualDeployFailure(w, err)
+		manualDeployFailure(w, err, "enqueue")
 		return
 	}
 	redirect(w, detailHref(string(result.DeploymentID)))
 }
 
-func manualDeployFailure(w http.ResponseWriter, err error) {
+func manualDeployFailure(w http.ResponseWriter, err error, stage string) {
 	switch {
 	case errors.Is(err, postgres.ErrManualDeployInvalid), errors.Is(err, githubapp.ErrInvalidRef), errors.Is(err, githubapp.ErrInvalidCommitSHA):
 		badRequest(w)
@@ -132,6 +134,9 @@ func manualDeployFailure(w http.ResponseWriter, err error) {
 	case errors.Is(err, githubapp.ErrGitHubUnavailable):
 		plain(w, http.StatusServiceUnavailable, "GitHub is unavailable; try again\n")
 	default:
+		// Unexpected: record the step and error class for the operator (GitHub
+		// errors are sanitized ProviderErrors; store errors carry no secrets).
+		fmt.Fprintf(os.Stderr, "manual deploy failed at %s: %v\n", stage, err)
 		plain(w, http.StatusInternalServerError, "the deployment could not be queued; retry\n")
 	}
 }

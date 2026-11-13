@@ -151,3 +151,18 @@ func TestQADiscoveryTokenAcceptsSelectedInstallation(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckoutPermissionsAllowOnlyImplicitMetadata(t *testing.T) {
+	ok := []map[string]string{{"contents": "read"}, {"contents": "read", "metadata": "read"}}
+	bad := []map[string]string{{}, {"metadata": "read"}, {"contents": "write"}, {"contents": "read", "metadata": "write"}, {"contents": "read", "issues": "read"}}
+	for _, p := range ok {
+		if !checkoutPermissions(p) {
+			t.Fatalf("rejected %v", p)
+		}
+	}
+	for _, p := range bad {
+		if checkoutPermissions(p) {
+			t.Fatalf("accepted %v", p)
+		}
+	}
+}

@@ -193,7 +193,7 @@ func (p *HTTPProvider) mint(ctx context.Context, id int64, repos []int64, discov
 		}
 		return Token{Value: wire.Token, ExpiresAt: wire.ExpiresAt, Permissions: wire.Permissions}, nil
 	}
-	if wire.RepositorySelection != "selected" || !exactPermissions(wire.Permissions, map[string]string{"contents": "read"}) || len(wire.Repositories) != 1 || wire.Repositories[0].ID != repos[0] {
+	if wire.RepositorySelection != "selected" || !checkoutPermissions(wire.Permissions) || len(wire.Repositories) != 1 || wire.Repositories[0].ID != repos[0] {
 		return Token{}, p.revokeInvalidMint(ctx, &wire.Token)
 	}
 	return Token{Value: wire.Token, ExpiresAt: wire.ExpiresAt, RepositoryIDs: []int64{wire.Repositories[0].ID}, Contents: "read", Permissions: wire.Permissions}, nil
@@ -332,4 +332,22 @@ func rateReset(h http.Header, now time.Time) (time.Duration, error) {
 		return 0, errors.New("invalid rate reset")
 	}
 	return d, nil
+}
+
+// checkoutPermissions accepts exactly contents:read, optionally with the
+// metadata:read that GitHub grants every installation token implicitly. Any
+// other permission, or any write access, is refused.
+func checkoutPermissions(got map[string]string) bool {
+	if got["contents"] != "read" {
+		return false
+	}
+	for key, value := range got {
+		if key == "contents" {
+			continue
+		}
+		if key != "metadata" || value != "read" {
+			return false
+		}
+	}
+	return true
 }
