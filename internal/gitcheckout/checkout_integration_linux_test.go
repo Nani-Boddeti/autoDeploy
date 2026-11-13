@@ -77,6 +77,7 @@ func TestPrivilegedHelperIsolation(t *testing.T) {
 		t.Fatalf("duplicate allocated workspace: %v", err)
 	}
 	stdoutR, stdoutW, stderrR, stderrW := integrationPipes(t)
+	var gitStdout, gitStderr bytes.Buffer
 	result, err := spawn.Run(context.Background(), checkoutcontain.SpawnRequest{
 		Operation:     checkoutcontain.GitInit,
 		WorkspaceFD:   workspace,
@@ -85,12 +86,12 @@ func TestPrivilegedHelperIsolation(t *testing.T) {
 		StdoutReadFD:  stdoutR,
 		StderrReadFD:  stderrR,
 		AskpassReadFD: -1,
-		Stdout:        &bytes.Buffer{},
-		Stderr:        &bytes.Buffer{},
+		Stdout:        &gitStdout,
+		Stderr:        &gitStderr,
 		Limits:        r.config.SpawnLimits,
 	})
 	if err != nil || result.Class != checkoutcontain.ExitSuccess || result.ExitCode != 0 {
-		t.Fatalf("GitInit through root spawn helper = %#v, %v", result, err)
+		t.Fatalf("GitInit through root spawn helper = %#v, %v\ngit stdout: %q\ngit stderr: %q", result, err, gitStdout.String(), gitStderr.String())
 	}
 	// The agent cannot traverse the checkout-owned 0700 workspace after GitInit.
 	// A successful typed response therefore attests that checkout-exec accepted
