@@ -39,6 +39,8 @@ const (
 	pathCancelAck        = "/agent/v1/leases/cancel-ack"
 	pathReconcile        = "/agent/v1/environments/reconcile"
 	pathDrainResult      = "/agent/v1/drains/result"
+	pathCleanupClaim     = "/agent/v1/cleanup/claim"
+	pathCleanupResult    = "/agent/v1/cleanup/result"
 	pathMaterialize      = "/agent/v1/leases/materialize-secrets"
 	pathProgress         = "/agent/v1/leases/progress"
 	pathLogs             = "/agent/v1/leases/logs"
@@ -135,6 +137,7 @@ type Handler struct {
 	Canceller                 LeaseCanceller
 	Reconciler                EnvironmentReconciler
 	DrainRecorder             DrainResultRecorder
+	CleanupStore              CleanupStore
 	MaterializationAuthorizer MaterializationAuthorizer
 	SecretMaterializerFactory SecretMaterializerFactory
 	ProgressReporter          ProgressReporter
@@ -207,6 +210,10 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleReconcile(w, r)
 	case pathDrainResult:
 		h.handleDrainResult(w, r)
+	case pathCleanupClaim:
+		h.handleCleanupClaim(w, r)
+	case pathCleanupResult:
+		h.handleCleanupResult(w, r)
 	case pathMaterialize:
 		h.handleMaterializeSecrets(w, r)
 	case pathProgress:

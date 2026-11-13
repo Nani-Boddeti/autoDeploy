@@ -341,6 +341,46 @@ func (c *Client) ReportDrainResult(ctx context.Context, attemptID int64, predece
 	return c.post(ctx, pathDrainResult, req, nil, true)
 }
 
+// CleanupItem is one release the control plane authorizes this agent to remove
+// (step 20E). Every field is server-derived; the agent only uses them to find
+// the container by its exact labels.
+type CleanupItem struct {
+	CleanupID         int64  `json:"cleanup_id"`
+	ReleaseID         string `json:"release_id"`
+	EnvironmentID     string `json:"environment_id"`
+	RuntimeInstanceID string `json:"runtime_instance_id"`
+	ImageDigest       string `json:"image_digest"`
+}
+
+// ClaimCleanups asks the control plane for at most limit retained releases to
+// remove. The server moves each to 'removing' in the same transaction and hands
+// still-open cleanups out again, so a lost answer or report is simply retried.
+func (c *Client) ClaimCleanups(ctx context.Context, limit int) ([]CleanupItem, error) {
+	req := struct {
+		Limit int `json:"limit"`
+	}{limit}
+	var resp struct {
+		Cleanups []CleanupItem `json:"cleanups"`
+	}
+	if err := c.post(ctx, pathCleanupClaim, req, &resp, true); err != nil {
+		return nil, err
+	}
+	return resp.Cleanups, nil
+}
+
+// ReportCleanupResult reports the outcome of removing one claimed release. It is
+// idempotent per cleanup id on the server. errorClass is empty for "removed".
+func (c *Client) ReportCleanupResult(ctx context.Context, cleanupID int64, result, errorClass string, imageKept bool, summary string) error {
+	req := struct {
+		CleanupID  int64  `json:"cleanup_id"`
+		Result     string `json:"result"`
+		ErrorClass string `json:"error_class"`
+		ImageKept  bool   `json:"image_kept"`
+		Summary    string `json:"summary"`
+	}{cleanupID, result, errorClass, imageKept, summary}
+	return c.post(ctx, pathCleanupResult, req, nil, true)
+}
+
 const (
 	routeDigestPrefix              = "sha256:"
 	maxActivationFailureSummaryLen = 2048

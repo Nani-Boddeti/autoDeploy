@@ -60,7 +60,7 @@ func stateTone(state string) string {
 		return "ok"
 	case "failed", "dead":
 		return "bad"
-	case "queued", "assigned", "fetching", "building", "starting", "health_checking", "activating", "leased", "retry_wait", "candidate", "started":
+	case "queued", "assigned", "fetching", "building", "starting", "health_checking", "activating", "leased", "retry_wait", "candidate", "started", "removing":
 		return "busy"
 	default:
 		// "rolled_back" and the other terminal states are neutral.
@@ -412,6 +412,7 @@ type deploymentDetailView struct {
 	Summary      deploymentRow
 	Active       bool
 	Drain        *drainResultView
+	Cleanup      *cleanupView
 	JobID        string
 	JobAttempts  string
 	JobCreated   string
@@ -516,7 +517,7 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		ExecNotice: !h.config.ActivationEnabled,
 		Title:      "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
 		Refresh: !terminalJobStates[d.Job.State], RefreshEvery: strconv.Itoa(detailRefreshSeconds),
-		Active: d.ReleaseIsActive, Drain: newDrainResultView(d.PredecessorDrain), JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
+		Active: d.ReleaseIsActive, Drain: newDrainResultView(d.PredecessorDrain), Cleanup: newCleanupView(d.ReleaseCleanup), JobID: strconv.FormatInt(d.Job.ID, 10), JobAttempts: strconv.Itoa(d.Job.AttemptCount),
 		JobCreated: formatTimestamp(d.Job.CreatedAt), JobUpdated: formatTimestamp(d.Job.UpdatedAt),
 		BackHref: deploymentsHref(postgres.DeploymentFilter{ProjectID: d.Deployment.ProjectID}, ""),
 	}

@@ -882,6 +882,51 @@ run on a real host.
 - Operations: there is no down migration for 000025. Older binaries do not know `rollback_execution` jobs, so queued
   rollback jobs must be drained (finished or cancelled) before a binary rollback.
 
+### Retention cleanup (step 20E)
+
+- Migration 000026: the release trigger gains `retained -> removing` (nothing else changes; `removing -> removed` was
+  already legal, `active -> removing` stays illegal, `failed` and `removed` stay terminal). Immutable `release_cleanups`
+  (one row per cleanup claim: release, server, environment, `claimed_at`, then a one-time write of `result`
+  `removed|failed|skipped`, `error_class`, `image_kept`, `outcome_summary`, `completed_at`). Never deleted; updates other
+  than that single write are refused. `UNIQUE` partial indexes: at most one open row per release, at most one `removed`
+  row per release. An insert trigger requires the release to be `removing` in the same environment. There is no down migration for 000026. An
+  older control plane would neither hand out nor finish open cleanups, leaving releases in `removing`, so roll the binary
+  back only when no cleanup is open.
+- DB-state fence (owner decision B-D6). The agent never decides eligibility. `POST /agent/v1/cleanup/claim` (credential
+  only; the server is the credential's, the body carries only `limit` 1..16) runs ONE READ COMMITTED transaction in this
+  order: server credential `FOR SHARE` (position 1) -> candidate environment slots `FOR UPDATE` (3, environment id
+  ascending) -> their route heads `FOR SHARE` (6b) -> eligibility re-evaluated under those locks -> chosen release rows
+  `FOR UPDATE` (6b, id ascending, state re-checked) -> `retained -> removing` and the `release_cleanups` insert (8). The
+  slot lock is the same one `EnqueueRollback`, `Activate` and the activation finalizers take first, so a claim and any of
+  them racing on one release serialize: either the rollback commits first (its queued job protects the release) or the
+  claim does (the release is `removing`, which the rollback refuses as not eligible). Open cleanups of the server are
+  handed out again unchanged (lost answer or lost report); no new row.
+- `POST /agent/v1/cleanup/result` (credential only, idempotent by cleanup id, authority derived: the row must belong to
+  the credential's server, anything else is a 401 that never distinguishes unknown from foreign). Lock order: credential
+  (1) -> the cleanup's slot (3) -> release row (6b) -> cleanup row (locked last). Only `removed` moves the release
+  `removing -> removed`; `failed` and `skipped` leave it `removing` (operator visible on the deployment page). An identical
+  replay is a no-op 200, a different report for a completed cleanup is `integrity_conflict` (first report wins).
+- Eligibility (retained, same server): not the active release; never the target of a queued, leased or retrying job; no
+  release operation of it that is not terminal; environment slot not occupied and not reconciling; route head not
+  flagged; has a known winning activation (container identity). Then it is eligible when it is not among the environment's
+  newest `KeepRetained` (default 2) retained releases by retention time (`releases.updated_at`, set when it was retained)
+  or has been retained longer than `MaxRetainedAge` (default 7 days). Rank counts protected releases too.
+- Retry of a failed or skipped removal: a release left `removing` whose latest cleanup ended `failed` or `skipped` is
+  claimed again with a NEW row after `RetryBackoff` (default 1 hour), at most `MaxAttempts` (default 5) rows in all; after
+  that it stays `removing` for the operator and is never looped on.
+- Agent side: a periodic Cleaner (start-up pass after recovery, then every 10 minutes). For each claim it locates the
+  container by name AND the exact label set (managed, kind, environment, release, runtime instance; exactly one match, the
+  named one, image-digest label equal to the claim's), else reports `skipped`/`identity` and touches nothing. A running
+  container is stopped with the identity-guarded stop, then removed WITHOUT force; the image (the container's own id,
+  accepted only when it equals the container's config-digest label) is removed WITHOUT force and an "in use" refusal is
+  success with `image_kept`. A missing container is success. There is no agent-local pending-report file: an unreported
+  cleanup stays open on the server and is handed out again, every step is idempotent, and the server marks a release
+  removed only on an explicit `removed` report, so a lost report can never make the server believe a removal that did not
+  happen.
+- Not in this step: failed candidate containers (24h). `failed` is terminal in the release machine and a failed candidate's
+  container identity is its prepare attempt, not a winning activation; it needs a `failed -> removing` edge and its own
+  eligibility rules. Follow-up.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

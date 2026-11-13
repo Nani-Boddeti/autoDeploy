@@ -57,13 +57,12 @@ func TestReleaseStateWidenedTransitions(t *testing.T) {
 	mustFail(t, ctx, tx, "expected rejection of active->removing",
 		`UPDATE releases SET state='removing' WHERE id=$1`, releaseID)
 
-	// Illegal: retained -> removing (deferred to slice 11 per this
-	// migration's own decision comment; not a legal edge in this slice).
+	// retained -> removing was deferred by 000018 and added by 000026 (step
+	// 20E); it is covered in 000026_release_cleanups_test.go. The release stays
+	// retained here so nothing below depends on it.
 	if _, err := tx.Exec(ctx, `UPDATE releases SET state='retained' WHERE id=$1`, releaseID); err != nil {
 		t.Fatalf("active->retained (3): %v", err)
 	}
-	mustFail(t, ctx, tx, "expected rejection of retained->removing",
-		`UPDATE releases SET state='removing' WHERE id=$1`, releaseID)
 
 	// Illegal: removed -> active. Build a fresh release and walk it to removed.
 	releaseID2 := insertRelease(t, ctx, tx, f, "candidate")

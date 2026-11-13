@@ -90,6 +90,9 @@ type Agent struct {
 	// Drainer, when non-nil, is started as a goroutine by Run after Recover and
 	// alongside the reporter, stopped by ctx; Run waits for it to return.
 	Drainer DrainRunner
+	// Cleaner, when non-nil, is the retention cleaner (step 20E): started like the
+	// Drainer, after Recover, and stopped by ctx.
+	Cleaner DrainRunner
 
 	// RenewInterval overrides the ADR 0004 30s renewal cadence; zero/negative
 	// uses renewInterval. Production leaves this unset -- it exists so
@@ -137,6 +140,16 @@ func (a *Agent) Run(ctx context.Context) error {
 			defer close(done)
 			if err := a.Drainer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				a.logger().Printf("agent predecessor drainer stopped: %v", err)
+			}
+		}()
+		defer func() { <-done }()
+	}
+	if a.Cleaner != nil {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if err := a.Cleaner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				a.logger().Printf("agent retention cleaner stopped: %v", err)
 			}
 		}()
 		defer func() { <-done }()

@@ -92,6 +92,8 @@ type AgentLeaseRepository struct {
 	pool        *pgxpool.Pool
 	deployments *DeploymentRepository
 	failAfter   func(string) error // test-only deterministic rollback seam
+	// cleanupPolicy overrides DefaultCleanupPolicy (step 20E); nil = default.
+	cleanupPolicy *CleanupPolicy
 }
 
 func NewAgentLeaseRepository(pool *pgxpool.Pool, deployments *DeploymentRepository) *AgentLeaseRepository {

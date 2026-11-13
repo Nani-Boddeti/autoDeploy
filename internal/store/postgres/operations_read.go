@@ -208,6 +208,7 @@ type DeploymentDetail struct {
 	RouteActiveReleaseID string
 	ReleaseIsActive      bool
 	PredecessorDrain     *DrainResultView // nil until the agent reports one
+	ReleaseCleanup       *ReleaseCleanup  // latest retention cleanup of the release; nil when none (step 20E)
 }
 
 // requireLiveSession mirrors lockAdministratorSession's predicate without
@@ -487,6 +488,11 @@ WHERE rh.environment_id=$1`, d.Job.EnvironmentID, principal.OwnerID).Scan(&activ
 	}
 	if d.PredecessorDrain, err = readDrainResult(ctx, tx, d.Job.ID); err != nil {
 		return DeploymentDetail{}, err
+	}
+	if d.Release != nil {
+		if d.ReleaseCleanup, err = readLatestCleanup(ctx, tx, d.Release.ID); err != nil {
+			return DeploymentDetail{}, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return DeploymentDetail{}, fmt.Errorf("commit deployment detail: %w", err)

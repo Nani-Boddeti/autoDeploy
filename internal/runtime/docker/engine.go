@@ -427,8 +427,10 @@ func (c *Client) StartContainer(ctx context.Context, id string) error {
 // candidate directly on its environment-network IP, since release
 // containers publish no ports).
 type ContainerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
+	ID   string `json:"Id"`
+	Name string `json:"Name"`
+	// Image is the image ID the container was created from ("sha256:<hex>").
+	Image string `json:"Image"`
 	State struct {
 		Status   string `json:"Status"`
 		Running  bool   `json:"Running"`
@@ -575,9 +577,8 @@ var ErrStopTimeout = errors.New("docker engine: container did not stop in time")
 // WaitStopped. The 12/64-hex ID form can address any container on the host,
 // so callers must verify ownership by labels before stopping by ID.
 //
-// Removal is deliberately absent from this client (ADR 0005: predecessors
-// are stopped, never removed, in this slice); do not add a remove/kill
-// method here.
+// Stopping never removes. Removal is a separate, non-force pair of calls in
+// remove.go that exists for retention cleanup only; there is no kill method.
 func (c *Client) StopContainer(ctx context.Context, id string, grace time.Duration) error {
 	const op = "container-stop"
 	if err := requireContainerTarget(id); err != nil {

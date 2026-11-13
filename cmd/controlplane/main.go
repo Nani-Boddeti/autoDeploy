@@ -225,6 +225,7 @@ func run(ctx context.Context) error {
 				handler.Activator = leaseRepository
 				handler.ActivationReporter = leaseRepository
 				handler.DrainRecorder = leaseRepository
+				handler.CleanupStore = leaseRepository
 			}
 			if enabled {
 				handler.SecretMaterializerFactory = secretMaterializerFactory{postgres.NewSecretRepository(pool)}

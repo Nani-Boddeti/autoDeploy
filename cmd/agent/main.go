@@ -348,6 +348,7 @@ type activationParts struct {
 	reporter *agentclient.ActivationReporter
 	recover  func()
 	drainer  *executor.Drainer
+	cleaner  *executor.Cleaner // nil when the docker client cannot remove (test fakes)
 }
 
 // newDrainDocker builds the drainer's Engine client; a variable so tests can
@@ -442,7 +443,15 @@ func buildActivation(c command, client *agentclient.Client, stateStore state.Sto
 	if err := drainer.Validate(); err != nil {
 		return activationParts{}, fmt.Errorf("configure predecessor drainer: %w", err)
 	}
+	var cleaner *executor.Cleaner
+	if cd, ok := dockerClient.(executor.CleanupDocker); ok {
+		cleaner = &executor.Cleaner{Docker: cd, ControlPlane: client, Logger: logger}
+		if err := cleaner.Validate(); err != nil {
+			return activationParts{}, fmt.Errorf("configure retention cleaner: %w", err)
+		}
+	}
 	return activationParts{
+		cleaner: cleaner,
 		config: executor.ActivationConfig{
 			Client:       client,
 			Observer:     observer,
@@ -525,6 +534,9 @@ func runAgent(c command, stderr io.Writer) error {
 		agent.Reporter = parts.reporter
 		agent.Recover = parts.recover
 		agent.Drainer = parts.drainer
+		if parts.cleaner != nil {
+			agent.Cleaner = parts.cleaner
+		}
 	}
 
 	stopped := make(chan os.Signal, 1)

@@ -61,11 +61,19 @@ func TestInspectContainer404IsNotFoundAndStillAnEngineError(t *testing.T) {
 	}
 }
 
-func TestClientHasNoRemoveOrKillMethod(t *testing.T) {
+// Removal is allowed only as the two non-force retention calls; there is no kill
+// and no method that takes a force flag.
+func TestClientRemovalIsOnlyTheTwoNonForceCalls(t *testing.T) {
 	typ := reflect.TypeOf(&Client{})
+	allowed := map[string]bool{"RemoveContainer": true, "RemoveImage": true}
 	for i := 0; i < typ.NumMethod(); i++ {
-		if n := typ.Method(i).Name; strings.HasPrefix(n, "Remove") || strings.HasPrefix(n, "Kill") {
+		m := typ.Method(i)
+		n := m.Name
+		if strings.HasPrefix(n, "Kill") || (strings.HasPrefix(n, "Remove") && !allowed[n]) {
 			t.Fatalf("client has forbidden method %s", n)
+		}
+		if allowed[n] && m.Type.NumIn() != 3 { // receiver, ctx, id: no force flag
+			t.Fatalf("%s must take only (ctx, id), has %d inputs", n, m.Type.NumIn())
 		}
 	}
 }

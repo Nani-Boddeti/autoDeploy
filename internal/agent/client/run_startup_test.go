@@ -175,6 +175,41 @@ func TestRunStartsDrainerAfterRecoverAndJoinsIt(t *testing.T) {
 	}
 }
 
+func TestRunStartsCleanerAfterRecoverAndJoinsIt(t *testing.T) {
+	events := &eventLog{}
+	fake := &fakeControlPlane{}
+	srv := httptest.NewTLSServer(fake.mux())
+	defer srv.Close()
+	agent := newTestAgent(t, srv, nil, nil)
+	cleaner := &fakeDrainRunner{log: events, stopped: make(chan struct{})}
+	agent.Cleaner = cleaner
+	agent.Recover = func() { events.add("recover") }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- agent.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(events.snapshot()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("cleaner never started; events=%v", events.snapshot())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := events.snapshot(); got[0] != "recover" || got[1] != "drainer-run" {
+		t.Fatalf("events=%v, want recover then the cleaner's run", got)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	select {
+	case <-cleaner.stopped:
+	default:
+		t.Fatal("cleaner goroutine still running after Run returned (leak)")
+	}
+}
+
 func TestReporterValidateRequiresDrains(t *testing.T) {
 	r := &ActivationReporter{}
 	if err := r.Validate(); err == nil {

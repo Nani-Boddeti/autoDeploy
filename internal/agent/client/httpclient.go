@@ -32,6 +32,8 @@ const (
 	pathCancelAck     = "/agent/v1/leases/cancel-ack"
 	pathReconcile     = "/agent/v1/environments/reconcile"
 	pathDrainResult   = "/agent/v1/drains/result"
+	pathCleanupClaim  = "/agent/v1/cleanup/claim"
+	pathCleanupResult = "/agent/v1/cleanup/result"
 	pathActivate      = "/agent/v1/leases/activate"
 	pathActivationRes = "/agent/v1/leases/activation-result"
 	pathMaterialize   = "/agent/v1/leases/materialize-secrets"

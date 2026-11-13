@@ -324,6 +324,11 @@ Accepted V1 defaults:
 - Keep failed candidate resources for at most 24 hours for sanitized diagnostics.
 - Retain compact sanitized release/operation/audit metadata according to the future audit policy.
 
+Implemented in step 20E (ADR 0004 amendment 2026-11-13, "Retention cleanup"): the two-release and seven-day rules and
+the protections below are enforced by the control plane's cleanup claim, never by the agent; the 24-hour failed-candidate
+rule is not implemented yet (follow-up). Owner-accepted (B-D5): a service with no deploys for more than 7 days loses
+its rollback target, because a retained release older than 7 days is eligible regardless of count. `retained -> removing` is now a legal edge (migration 000026).
+
 Cleanup runs in bounded idempotent batches. Active, in-progress, rollback-target,
 reconciliation-owned, and route-referenced resources are protected regardless of age/count.
 
