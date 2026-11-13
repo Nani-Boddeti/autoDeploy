@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -343,6 +344,9 @@ func (a *Attempt) Linef(stream Stream, format string, args ...any) {
 		}
 		text = out.Bytes()
 	}
+	// Tee the (already redacted) structural line to the agent journal so an
+	// operator can follow a deployment on the host without the control plane UI.
+	fmt.Fprintf(os.Stderr, "attempt %d [%s] %s", a.attemptID, stream, text)
 	asm := newAssembler(func(body string) { a.enqueueLocked(stream, body) })
 	asm.write(text)
 	asm.flushFinal()

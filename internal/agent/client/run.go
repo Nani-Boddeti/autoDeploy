@@ -306,6 +306,14 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 	default:
 		err = a.Client.Complete(ctx, lease.AttemptID, lease.Fence, queue.CompletionFailed, outcome.FailureClass, outcome.OperationID, outcome.ResultDigest)
 	}
+	switch {
+	case cancelled:
+		a.logger().Printf("agent attempt %d finished: cancelled", lease.AttemptID)
+	case outcome.Succeeded:
+		a.logger().Printf("agent attempt %d finished: succeeded", lease.AttemptID)
+	default:
+		a.logger().Printf("agent attempt %d finished: failed (%s)", lease.AttemptID, outcome.FailureClass)
+	}
 	if err != nil {
 		a.logger().Print("agent lease outcome report failed")
 	}
