@@ -85,6 +85,18 @@ type PendingActivation struct {
 	PredecessorReleaseID         string // both predecessor ids empty, or both set
 	PredecessorRuntimeInstanceID string
 	DrainSeconds                 int // from the lease; 1..maxDrainSeconds when a predecessor is set
+
+	// PredecessorStopSent is set (false -> true, once) and persisted BEFORE the
+	// stop-then-start strategy stops the predecessor (step 20C), so a crash
+	// after the stop leaves durable evidence that the predecessor may be
+	// down: recovery then restarts it instead of claiming the host is
+	// untouched. It is the one field that may change on an existing record
+	// (never true -> false, never once a result is recorded) and requires a
+	// predecessor. Serialised with omitempty, so every blue/green record keeps
+	// the pre-20C byte shape. Downgrade caveat: decodeStrict rejects unknown
+	// fields, so an older binary treats a record carrying this field as
+	// corrupt; drain such records (let them report) before downgrading.
+	PredecessorStopSent bool
 }
 
 // maxDrainSeconds mirrors the server's frozen drain_seconds bound (1-300).
@@ -129,6 +141,11 @@ func (p PendingActivation) validateDrainFields() error {
 	case p.PredecessorReleaseID == p.ReleaseID:
 		return bad("predecessor release must differ from the release")
 	case p.DrainSeconds < 1:
+		// Contract: the lease's DrainSeconds is frozen from
+		// environment_runtime_configs, whose CHECK (and RuntimeConfigInput
+		// validation) is 1..300 for EVERY strategy, so it is never 0, not even
+		// for stop_then_start (which ignores the value but still carries it).
+		// Do not relax this for stop-then-start records.
 		return bad("drain seconds must be 1..300 when a predecessor is set")
 	}
 	return nil
@@ -154,6 +171,9 @@ func (p PendingActivation) validate() error {
 	}
 	if err := p.validateDrainFields(); err != nil {
 		return err
+	}
+	if p.PredecessorStopSent && !p.HasPredecessor() {
+		return bad("predecessor stop sent requires a predecessor")
 	}
 	switch p.Phase {
 	case PhaseAuthorized:
@@ -214,6 +234,9 @@ type activationWire struct {
 	PredecessorReleaseID         string `json:"predecessor_release_id"`
 	PredecessorRuntimeInstanceID string `json:"predecessor_runtime_instance_id"`
 	DrainSeconds                 int    `json:"drain_seconds"`
+
+	// Absent (omitted when false) outside stop-then-start.
+	PredecessorStopSent bool `json:"predecessor_stop_sent,omitempty"`
 }
 
 func hexDigest(d [32]byte) string { return hex.EncodeToString(d[:]) }
@@ -244,6 +267,7 @@ func (p PendingActivation) marshal() ([]byte, error) {
 		PredecessorReleaseID:         p.PredecessorReleaseID,
 		PredecessorRuntimeInstanceID: p.PredecessorRuntimeInstanceID,
 		DrainSeconds:                 p.DrainSeconds,
+		PredecessorStopSent:          p.PredecessorStopSent,
 	})
 }
 
@@ -283,6 +307,7 @@ func unmarshalActivation(contents []byte) (PendingActivation, error) {
 		PredecessorReleaseID:         w.PredecessorReleaseID,
 		PredecessorRuntimeInstanceID: w.PredecessorRuntimeInstanceID,
 		DrainSeconds:                 w.DrainSeconds,
+		PredecessorStopSent:          w.PredecessorStopSent,
 	}
 	if err := p.validate(); err != nil {
 		return PendingActivation{}, err
@@ -419,6 +444,12 @@ func (a ActivationStore) SaveActivation(p PendingActivation) error {
 			prev.PredecessorReleaseID != p.PredecessorReleaseID ||
 			prev.PredecessorRuntimeInstanceID != p.PredecessorRuntimeInstanceID ||
 			prev.DrainSeconds != p.DrainSeconds {
+			return ErrActivationImmutable
+		}
+		// PredecessorStopSent may flip false -> true on a record that has no
+		// result yet; it never reverts and never changes after a result.
+		if prev.PredecessorStopSent && !p.PredecessorStopSent ||
+			prev.Phase == PhaseResultReady && prev.PredecessorStopSent != p.PredecessorStopSent {
 			return ErrActivationImmutable
 		}
 		if prev.Phase == PhaseResultReady && p.Phase == PhaseAuthorized {

@@ -204,6 +204,15 @@ func newActivationRunner(cfg ActivationConfig, logger *log.Logger) (*activationR
 
 // activate runs the sequence for a lease whose health gate passed.
 func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageDigestStr string) agentclient.Outcome {
+	return e.activateWith(ctx, lease, imageDigestStr, nil)
+}
+
+// activateWith is activate with the stop-then-start release step (step 20C).
+// A nil release is the blue/green path, unchanged: authorize, persist, switch.
+// A non-nil release runs between the persisted authorized record and the
+// switch (stop predecessor, start + gate the candidate) and, on a switch
+// failure, may restore the predecessor.
+func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, imageDigestStr string, release *stsRelease) agentclient.Outcome {
 	a := e.activation
 	imageDigest, ok := parseImageDigest(imageDigestStr)
 	if !ok {
@@ -250,7 +259,11 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 
 	// From here on the switch is authorized: lease cancellation or a stale
 	// renewal must not abandon it half-done.
-	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.timeout)
+	timeout := a.timeout
+	if release != nil {
+		timeout += stsExtraTimeout
+	}
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 
 	logs.Linef(logship.StreamActivation, "activation: authorized (route revision %d)", resp.RouteRevision)
@@ -278,7 +291,18 @@ func (e *Executor) activate(ctx context.Context, lease agentclient.Lease, imageD
 		return agentclient.Outcome{AuthorizationUnknown: true, OperationID: resp.OperationID}
 	}
 
-	observed, summary := a.switchRoute(dctx, lease, resp)
+	var observed [32]byte
+	var summary string
+	if release != nil {
+		summary = release.beforeSwitch(dctx, &rec)
+	}
+	if summary == "" {
+		var prefix func(context.Context) string
+		if release != nil {
+			prefix = func(c context.Context) string { return release.switchFailurePrefix(c, rec) }
+		}
+		observed, summary = a.switchRoute(dctx, lease, resp, prefix)
+	}
 	rec.Phase = state.PhaseResultReady
 	if summary == "" {
 		logs.Linef(logship.StreamActivation, "activation: route switched and verified")
@@ -506,10 +530,18 @@ func (a *activationRunner) armDrain(rec state.PendingActivation) bool {
 // switchRoute runs re-render, revision guard, write, verify and probe. It
 // returns the on-disk digest on success, or a non-empty failure summary.
 // It never rolls back.
-func (a *activationRunner) switchRoute(ctx context.Context, lease agentclient.Lease, resp agentclient.ActivateResponse) ([32]byte, string) {
+//
+// reasonPrefix (nil for blue/green) is called when a step fails, before the
+// summary is built, and its text leads the bounded reason. The stop-then-start
+// release uses it to roll back and report the outcome first.
+func (a *activationRunner) switchRoute(ctx context.Context, lease agentclient.Lease, resp agentclient.ActivateResponse, reasonPrefix func(context.Context) string) ([32]byte, string) {
 	authorized := routeDigestString(resp.RouteDigest)
 	fail := func(step string, reason error) ([32]byte, string) {
-		return [32]byte{}, a.failureSummary(step, reason.Error(), authorized, lease.EnvironmentID)
+		text := reason.Error()
+		if reasonPrefix != nil {
+			text = reasonPrefix(ctx) + "; " + text
+		}
+		return [32]byte{}, a.failureSummary(step, text, authorized, lease.EnvironmentID)
 	}
 
 	if resp.EntrypointName != traefik.DefaultEntrypointName || resp.CertResolverName != traefik.DefaultCertResolverName {

@@ -631,6 +631,49 @@ reporter, recovery and Traefik observer code. Nothing here has run on a real hos
   observation now classifies 401/403 as configuration, so Verify fails immediately instead of polling for the
   verify timeout (still reconciliation-required: the route was written). Unverified against a real Traefik.
 
+### Amendment 2026-11-13 (step 20C): stop-then-start V1, no maintenance route
+
+- **Scope.** The agent now honours `release_strategy = stop_then_start` (blue/green is unchanged). The
+  maintenance-service prerequisite above is deferred: V1 has no maintenance route, so the outage is visible
+  as 502/503 from Traefik for as long as the predecessor is stopped. Owner decision B-D2.
+- **Sequence.** Build while the old release serves; report `health_checking` (an early label, kept so the
+  state machine stays valid without a migration); Traefik preflight; server `Activate` (starts the authorized
+  window); persist the activation record with `PredecessorStopSent=true`; identity-guarded stop of the
+  predecessor (exact labels, never the candidate) and wait until stopped; create + start the candidate; health
+  gate; then the unchanged switch -> verify -> probe -> report. The first deployment skips the stop.
+- **No drain wait, no post-success drain.** Nothing is routed ahead of the stop, so there is no traffic to
+  drain; `drain_seconds` is ignored for this strategy. Because the predecessor is already stopped, no drain is
+  armed after success (`DrainFromActivation` owes nothing when `PredecessorStopSent`).
+- **Failure policy (B-D3).** On a failure after the stop (stop error, candidate start, health gate, or a switch
+  failure before the route file changed) the agent stops the candidate, then restarts the predecessor best
+  effort (guarded identity), and reports an activation FAILURE whose summary states what happened (candidate
+  state, restart ok/failed). The server blocks the environment; the operator declares the outcome. The agent
+  never declares one. The predecessor is not restarted while the candidate could not be confirmed stopped
+  (running both is what this strategy avoids). If the route file may already point at the candidate (on-disk
+  digest equals the authorized one, or is unreadable), both containers are left as found.
+- **Recovery.** A stranded `authorized` record with `PredecessorStopSent` triggers the same rollback (candidate
+  stop, predecessor restart) under the same route-digest rule before the failure is reported; a record without
+  the flag still means the host was untouched. The flag is the only activation field that may change on an
+  existing record (false -> true once). It is omitted when false, so blue/green records keep their old shape;
+  downgrade caveat: an older agent rejects a record carrying it as corrupt, so let such records report first.
+- **Timeout.** The detached authorized-window deadline gains a fixed 8 minute allowance for stop, create,
+  gate and rollback; `ValidateActivationTimeout` and blue/green timeouts are unchanged.
+- **Switch window gate.** After the health gate, the agent refuses to write the route when the remaining
+  authorized-window time is below `ProbeTimeout + verifyTimeout + 30s`; it rolls back (stop candidate, restart
+  predecessor) and reports a failure instead of risking a switch cut off with the candidate serving. Rollback
+  and the predecessor restart run on detached contexts, so an expired window cannot strand the predecessor
+  down; the predecessor stop stays bound to the window (a stop cut off mid-way counts as unknown and is rolled
+  back). The rollback outcome leads the failure reason so truncation cannot drop it.
+- **Server window.** No server change: `ReportActivationResult` has no authority check by design, and the lease
+  loop keeps renewing (authority = now+90s) while the executor runs; job cancel is refused while `activating`.
+  A report is only late if renewals lapse, exactly as for blue/green (then `late_report_recorded`).
+- **Coexistence.** A pending blue/green drain from an earlier deployment of the environment can briefly run
+  alongside a stop-then-start deployment (the drain is a separate durable obligation). Restart policy: the
+  permitted values are `unless-stopped` and `on-failure`, so Docker does not auto-restart the stopped
+  predecessor; were `always` ever allowed, a daemon or host restart would resurrect the stopped predecessor
+  next to the candidate.
+- **Unverified.** Fakes only; not run against a real Docker engine or Traefik.
+
 ## References
 
 - [Traefik file provider](https://doc.traefik.io/traefik/providers/file/)

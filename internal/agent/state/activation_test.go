@@ -681,3 +681,129 @@ func TestScanActivationsDirFailure(t *testing.T) {
 		t.Fatal("zero value must error")
 	}
 }
+
+func stsAuthorized(id int64) PendingActivation {
+	p := authorized(id)
+	p.ReleaseID, p.BackendRuntimeInstanceID = "rel_new", "rt_new"
+	p.PredecessorReleaseID, p.PredecessorRuntimeInstanceID = "rel_old", "rt_old"
+	p.DrainSeconds = 30
+	return p
+}
+
+func TestPredecessorStopSentFlipsOnceAndNeverReverts(t *testing.T) {
+	_, a := newActs(t)
+	p := stsAuthorized(1)
+	if err := a.SaveActivation(p); err != nil {
+		t.Fatal(err)
+	}
+	p.PredecessorStopSent = true
+	if err := a.SaveActivation(p); err != nil {
+		t.Fatalf("false -> true refused: %v", err)
+	}
+	got, ok, err := a.LoadActivation(1)
+	if err != nil || !ok || !got.PredecessorStopSent {
+		t.Fatalf("got %+v ok=%v err=%v", got, ok, err)
+	}
+	p.PredecessorStopSent = false
+	if err := a.SaveActivation(p); !errors.Is(err, ErrActivationImmutable) {
+		t.Fatalf("true -> false: err = %v, want ErrActivationImmutable", err)
+	}
+	// A result keeps the flag; it cannot be dropped or added afterwards.
+	r := stsAuthorized(1)
+	r.PredecessorStopSent = true
+	r.Phase, r.FailureSummary = PhaseResultReady, "x"
+	if err := a.SaveActivation(r); err != nil {
+		t.Fatal(err)
+	}
+	r.PredecessorStopSent = false
+	if err := a.SaveActivation(r); !errors.Is(err, ErrActivationImmutable) {
+		t.Fatalf("flag change after result: err = %v", err)
+	}
+}
+
+func TestPredecessorStopSentFlagAfterResultCannotBeAdded(t *testing.T) {
+	_, a := newActs(t)
+	r := stsAuthorized(2)
+	r.Phase, r.FailureSummary = PhaseResultReady, "x"
+	if err := a.SaveActivation(r); err != nil {
+		t.Fatal(err)
+	}
+	r.PredecessorStopSent = true
+	if err := a.SaveActivation(r); !errors.Is(err, ErrActivationImmutable) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPredecessorStopSentRequiresPredecessorAndOldShapeLoads(t *testing.T) {
+	_, a := newActs(t)
+	p := authorized(3)
+	p.PredecessorStopSent = true
+	if err := a.SaveActivation(p); !errors.Is(err, ErrInvalidActivation) {
+		t.Fatalf("err = %v, want ErrInvalidActivation", err)
+	}
+	// Old-shape bytes (no field) round trip; the field is omitted when false.
+	old := stsAuthorized(4)
+	old.CreatedAt, old.UpdatedAt = time.Now(), time.Now()
+	b, err := old.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "predecessor_stop_sent") {
+		t.Fatalf("false flag must be omitted: %s", b)
+	}
+	got, err := unmarshalActivation(b)
+	if err != nil || got.PredecessorStopSent {
+		t.Fatalf("got %+v err=%v", got, err)
+	}
+}
+
+func TestDrainNotOwedWhenPredecessorAlreadyStopped(t *testing.T) {
+	p := stsAuthorized(5)
+	p.Phase, p.Succeeded, p.ObservedRouteDigest = PhaseResultReady, true, [32]byte{1}
+	if _, owed := DrainFromActivation(p, time.Now()); !owed {
+		t.Fatal("blue/green record must owe a drain")
+	}
+	p.PredecessorStopSent = true
+	if _, owed := DrainFromActivation(p, time.Now()); owed {
+		t.Fatal("stop-then-start record must owe no drain")
+	}
+}
+
+// A stop-then-start record still carries the frozen drain_seconds (1..300 for
+// every strategy per the environment_runtime_configs CHECK), so a predecessor
+// with drain 0 is invalid for it too.
+func TestPredecessorStopSentRecordStillRequiresDrainSeconds(t *testing.T) {
+	_, a := newActs(t)
+	p := stsAuthorized(6)
+	p.PredecessorStopSent = true
+	p.DrainSeconds = 0
+	if err := a.SaveActivation(p); !errors.Is(err, ErrInvalidActivation) {
+		t.Fatalf("err = %v, want ErrInvalidActivation", err)
+	}
+}
+
+// Golden: a blue/green record keeps the pre-20C byte shape (no
+// predecessor_stop_sent key), so older agents still read it.
+func TestBlueGreenRecordMarshalsByteIdenticallyWithoutStopSent(t *testing.T) {
+	p := PendingActivation{
+		AttemptID: 7, Fence: 3, EnvironmentID: "env_a", OperationID: "9001",
+		RouteDigest: [32]byte{0xab}, ImageDigest: [32]byte{0xcd}, RouteRevision: 5,
+		Phase: PhaseAuthorized, CreatedAt: time.Date(2026, 11, 13, 1, 2, 3, 0, time.UTC), UpdatedAt: time.Date(2026, 11, 13, 1, 2, 4, 0, time.UTC),
+		ReleaseID: "rel_new", BackendRuntimeInstanceID: "rt_new",
+		PredecessorReleaseID: "rel_old", PredecessorRuntimeInstanceID: "rt_old", DrainSeconds: 30,
+	}
+	zero := strings.Repeat("0", 64)
+	want := `{"attempt_id":7,"fence":3,"environment_id":"env_a","operation_id":"9001",` +
+		`"route_digest":"ab` + strings.Repeat("0", 62) + `","image_digest":"cd` + strings.Repeat("0", 62) + `","route_revision":5,` +
+		`"phase":"authorized","succeeded":false,"observed_route_digest":"` + zero + `","failure_summary":"",` +
+		`"created_at":"2026-11-13T01:02:03Z","updated_at":"2026-11-13T01:02:04Z",` +
+		`"release_id":"rel_new","backend_runtime_instance_id":"rt_new",` +
+		`"predecessor_release_id":"rel_old","predecessor_runtime_instance_id":"rt_old","drain_seconds":30}`
+	got, err := p.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("blue/green record shape changed:\n got: %s\nwant: %s", got, want)
+	}
+}

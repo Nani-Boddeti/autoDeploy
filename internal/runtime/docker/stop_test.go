@@ -293,3 +293,27 @@ func TestStopContainerAcceptsIDsAndContainerNames(t *testing.T) {
 		}
 	}
 }
+
+// Restarting an already-running predecessor must be a success: the Engine
+// answers 304 Not Modified to a start of a running container.
+func TestStartContainerSuccessStatuses(t *testing.T) {
+	for _, status := range []int{http.StatusNoContent, http.StatusNotModified} {
+		var gotMethod, gotPath string
+		c := stopClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath = r.Method, r.URL.Path
+			w.WriteHeader(status)
+		}))
+		if err := c.StartContainer(context.Background(), stopTestID); err != nil {
+			t.Fatalf("status %d: %v", status, err)
+		}
+		if gotMethod != http.MethodPost || gotPath != "/v1.44/containers/"+stopTestID+"/start" {
+			t.Fatalf("status %d: got %s %s", status, gotMethod, gotPath)
+		}
+	}
+	c := stopClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"boom"}`, http.StatusInternalServerError)
+	}))
+	if err := c.StartContainer(context.Background(), stopTestID); err == nil {
+		t.Fatal("a 500 must be an error")
+	}
+}

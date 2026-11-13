@@ -108,6 +108,7 @@ type fakeDocker struct {
 	listLabels    []map[string]string
 	stoppedIDs    []string
 	waitedIDs     []string
+	startedIDs    []string
 }
 
 func (f *fakeDocker) InspectContainer(_ context.Context, id string) (docker.ContainerInspect, error) {
@@ -134,6 +135,11 @@ func (f *fakeDocker) StopContainer(_ context.Context, id string, _ time.Duration
 func (f *fakeDocker) WaitStopped(_ context.Context, id string, _, _ time.Duration) (docker.ContainerInspect, error) {
 	f.waitedIDs = append(f.waitedIDs, id)
 	return docker.ContainerInspect{}, f.waitErr
+}
+
+func (f *fakeDocker) StartContainer(_ context.Context, id string) error {
+	f.startedIDs = append(f.startedIDs, id)
+	return nil
 }
 
 func (f *fakeDocker) Probe(ctx context.Context) (docker.VersionInfo, error) {

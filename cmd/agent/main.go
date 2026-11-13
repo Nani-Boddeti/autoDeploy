@@ -459,7 +459,13 @@ func buildActivation(c command, client *agentclient.Client, stateStore state.Sto
 		reporter: reporter,
 		drainer:  drainer,
 		recover: func() {
-			executor.RecoverActivations(activations, c.traefikRouteDir, logger)
+			// Production's docker client can also start containers; a
+			// narrower test fake simply disables the stop-then-start restart.
+			var restarter executor.RestartDocker
+			if rd, ok := dockerClient.(executor.RestartDocker); ok {
+				restarter = rd
+			}
+			executor.RecoverActivationsRestarting(activations, c.traefikRouteDir, logger, restarter)
 		},
 	}, nil
 }

@@ -55,10 +55,11 @@ type dockerRuntime interface {
 	Probe(ctx context.Context) (docker.VersionInfo, error)
 	EnsureReleaseRuntimeContainer(ctx context.Context, req docker.RunContainerRequest, networkNameOrID string) (docker.ContainerInspect, error)
 	RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, target docker.HealthGateTarget) (docker.HealthGateResult, error)
-	// DrainDocker (inspect, label lookup, stop, wait; deliberately no remove
-	// or kill) backs the guarded stop of a candidate that fails before
-	// authorization (stopFailedCandidate).
-	DrainDocker
+	// RestartDocker (inspect, label lookup, stop, wait, start; deliberately no
+	// remove or kill) backs the guarded stop of a candidate that fails before
+	// authorization (stopFailedCandidate) and the stop-then-start release
+	// (predecessor stop and best-effort restart).
+	RestartDocker
 }
 
 // Config is everything NewExecutor needs to assemble a production Executor.
@@ -288,6 +289,12 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		ConfigDigest:      buildResult.ConfigDigest,
 	}
 
+	if lease.ReleaseStrategy == releaseStrategyStopThenStart {
+		// Step 20C: the candidate is created only after the predecessor is
+		// stopped, inside the authorized window (sts.go).
+		return e.executeStopThenStart(ctx, lease, identity, env, buildResult.ImageDigest, tracker, progress, logs)
+	}
+
 	inspect, err := e.docker.EnsureReleaseRuntimeContainer(ctx, docker.RunContainerRequest{
 		Identity:      identity,
 		CPUMillis:     lease.CPUMillis,
@@ -362,8 +369,10 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 // stopFailedCandidate stops (never removes) the exact candidate container of
 // an attempt that ended before activation was authorized. It runs on a
 // bounded detached context so a cancelled lease still cleans up. A failed
-// stop is only logged: the attempt's outcome class does not change.
-func (e *Executor) stopFailedCandidate(ctx context.Context, lease agentclient.Lease, identity docker.ReleaseResourceIdentity, logs *logship.Attempt) {
+// stop is only logged: the attempt's outcome class does not change. It
+// reports whether the candidate is confirmed not running (stopped, already
+// stopped, or absent).
+func (e *Executor) stopFailedCandidate(ctx context.Context, lease agentclient.Lease, identity docker.ReleaseResourceIdentity, logs *logship.Attempt) bool {
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), candidateStopTimeout)
 	defer cancel()
 	res := guardedStop(sctx, e.docker, stopTarget{
@@ -374,10 +383,12 @@ func (e *Executor) stopFailedCandidate(ctx context.Context, lease agentclient.Le
 	switch res.Status {
 	case stopStopped, stopAlreadyStopped, stopGone:
 		logs.Linef(logship.StreamPhase, "run: failed candidate stopped")
+		return true
 	default:
 		logs.Linef(logship.StreamPhase, "run: failed candidate could not be stopped")
 		e.logger.Printf("agent executor WARN attempt %d: failed candidate %s was NOT stopped (status=%d step=%q reason=%q): %v",
 			lease.AttemptID, identity.RuntimeInstanceID, res.Status, res.Step, res.Reason, res.Err)
+		return false
 	}
 }
 

@@ -128,9 +128,11 @@ func (d PendingDrain) rank() int {
 
 // DrainFromActivation derives the drain obligation of a successful result_ready
 // activation record. ok is false when there is nothing to drain (failure
-// result, or no predecessor).
+// result, or no predecessor). Nothing is owed either when stop-then-start
+// already stopped the predecessor before the switch (PredecessorStopSent): the
+// post-success drain would only re-stop a stopped container.
 func DrainFromActivation(p PendingActivation, armedAt time.Time) (PendingDrain, bool) {
-	if p.Phase != PhaseResultReady || !p.Succeeded || !p.HasPredecessor() {
+	if p.Phase != PhaseResultReady || !p.Succeeded || !p.HasPredecessor() || p.PredecessorStopSent {
 		return PendingDrain{}, false
 	}
 	return PendingDrain{
