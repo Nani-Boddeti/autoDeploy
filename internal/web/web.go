@@ -103,6 +103,8 @@ type Config struct {
 	OperationsReader      OperationsReader
 	DeploymentCanceller   DeploymentCanceller
 	DeploymentLogReader   DeploymentLogReader
+	ManualDeploy          ManualDeployStore
+	CommitResolver        githubapp.CommitResolver
 	Now                   func() time.Time
 	Random                io.Reader
 }
@@ -247,6 +249,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.deploymentCancel(w, r)
+	case "/deployments/manual":
+		if r.URL.RawQuery != "" || !h.manualDeployEnabled() {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.deploymentManual(w, r)
 	case "/servers/register":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)

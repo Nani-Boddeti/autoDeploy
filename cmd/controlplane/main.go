@@ -158,6 +158,9 @@ func run(ctx context.Context) error {
 		}
 		webOptions.GitHubSetup, webOptions.GitHubInstallationURL = setup, githubConfig.InstallationURL
 		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
+		// Manual deploy (step 19d) needs the GitHub App provider to resolve and
+		// verify commits, so it is only wired when the subsystem is enabled.
+		webOptions.ManualDeploy, webOptions.CommitResolver = webhookRepository, provider
 		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
 		checkoutService, err = githubapp.NewCheckoutService(githubRepository, provider)
 		if err != nil {

@@ -116,7 +116,7 @@ form {
   margin: 0 0 var(--space-md);
 }
 label { display: flex; flex-direction: column; gap: var(--space-xs); font-weight: 500; }
-label:has(> input[type="checkbox"]) { flex-direction: row; align-items: center; font-weight: 400; }
+label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) { flex-direction: row; align-items: center; font-weight: 400; }
 input, select {
   min-height: 36px;
   padding: 6px 10px;
@@ -126,7 +126,7 @@ input, select {
   border: 1px solid var(--line);
   border-radius: var(--radius);
 }
-input[type="checkbox"] { min-height: 0; width: 1.1rem; height: 1.1rem; accent-color: var(--focus); }
+input[type="checkbox"], input[type="radio"] { min-height: 0; width: 1.1rem; height: 1.1rem; accent-color: var(--focus); }
 input:hover, select:hover { border-color: var(--ink-soft); }
 button {
   min-height: 36px;
@@ -164,7 +164,7 @@ tbody tr:last-child td { border-bottom: 0; }
 td form { flex-direction: column; align-items: stretch; gap: var(--space-xs); width: 13rem; max-width: 100%; margin-bottom: var(--space-sm); }
 td form:last-child { margin-bottom: 0; }
 td form button { align-self: flex-start; }
-td form input:not([type="checkbox"]), td form select { width: 100%; min-width: 0; }
+td form input:not([type="checkbox"]):not([type="radio"]), td form select { width: 100%; min-width: 0; }
 /* Narrow viewports: the table scrolls inside its own box. Wider ones use a normal table; main scrolls
    horizontally as a backstop so the page itself never does. */
 @media (max-width: 52rem) {

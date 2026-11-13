@@ -223,9 +223,16 @@ type projectRow struct {
 	LatestCommit    string
 	LatestTime      string
 	LatestDetailURL string
+	// CanDeploy renders the manual Deploy form; Nonce is fresh per render.
+	CanDeploy bool
+	Nonce     string
 }
 
-type projectsView struct{ Projects []projectRow }
+type projectsView struct {
+	Projects  []projectRow
+	CanDeploy bool
+	CSRF      string
+}
 
 func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.operationsPrelude(w, r)
@@ -238,6 +245,14 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := projectsView{}
+	if h.manualDeployEnabled() {
+		csrf, csrfErr := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+		if csrfErr != nil {
+			plain(w, http.StatusInternalServerError, "the page could not be rendered\n")
+			return
+		}
+		view.CanDeploy, view.CSRF = true, csrf
+	}
 	for _, pr := range projects {
 		row := projectRow{
 			ProjectID:    pr.ProjectID,
@@ -260,6 +275,14 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 			row.LatestCommit = d.ShortCommit()
 			row.LatestTime = formatTimestamp(d.CreatedAt)
 			row.LatestDetailURL = detailHref(d.DeploymentID)
+		}
+		if view.CanDeploy && pr.HasBinding && pr.BindingActive && pr.RepositoryDefaultRef != "" {
+			nonce, nonceErr := newManualNonce()
+			if nonceErr != nil {
+				plain(w, http.StatusInternalServerError, "the page could not be rendered\n")
+				return
+			}
+			row.CanDeploy, row.Nonce = true, nonce
 		}
 		view.Projects = append(view.Projects, row)
 	}
