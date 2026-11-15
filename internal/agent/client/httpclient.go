@@ -248,6 +248,18 @@ func (c *Client) attempt(ctx context.Context, path string, payload []byte, out a
 	return nil
 }
 
+// codeInvalidRequest is the error code the control plane sends with a 400
+// (internal/agent/http readJSON/handlers).
+const codeInvalidRequest = "invalid_request"
+
+// errBadRequest is a 400 whose body carried the server's invalid_request code.
+// It is ErrInvalidRequest for every caller (same text, errors.Is) and is
+// distinguishable from a 413 only for the cleanup-claim compatibility fallback.
+type errBadRequest struct{}
+
+func (errBadRequest) Error() string { return ErrInvalidRequest.Error() }
+func (errBadRequest) Unwrap() error { return ErrInvalidRequest }
+
 type wireError struct {
 	Error string `json:"error"`
 }
@@ -264,7 +276,12 @@ func (c *Client) mapStatus(status int, body []byte) error {
 			return ErrStaleLease
 		}
 		return &ConflictError{Code: parsed.Error}
-	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+	case http.StatusBadRequest:
+		if parsed.Error == codeInvalidRequest {
+			return errBadRequest{}
+		}
+		return ErrInvalidRequest
+	case http.StatusRequestEntityTooLarge:
 		return ErrInvalidRequest
 	case http.StatusServiceUnavailable:
 		return ErrServiceUnavailable

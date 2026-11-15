@@ -85,3 +85,7 @@ Per step: gofmt, build, vet both tag sets, `go test -race ./...`; steps with SQL
   superseded) >= 24h; claim-time never-live guard; attempts limited to claiming server; no migration. Review PASS WITH
   NOTES -> one fix round (guard, peek EXISTS(attempt), disjointness + rollback-job tests). Bar: gofmt/build/vet x2/
   make check/race clean; integration sweep 3/3 fresh PG18.
+- 21B-2 DONE 2026-11-15 (commit pending owner OK): agent opts in with kinds (one fallback on 400 invalid_request);
+  per-id exact name+label match, stop on mismatch/error, non-forced removal, image only with verified digest; unknown
+  kind refused. Review PASS WITH NOTES -> fix (vanished-mid-stop keeps image) + branch tests. Bar clean (race, vet x2,
+  make check, linux amd64/arm64). Not validated on a real host yet -> acer session.

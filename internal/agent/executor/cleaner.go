@@ -122,7 +122,7 @@ func (c *Cleaner) Pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		result, class, kept, summary := c.remove(ctx, item)
+		result, class, kept, summary := c.handle(ctx, item)
 		if err := c.ControlPlane.ReportCleanupResult(ctx, item.CleanupID, result, class, kept, resultSummary(summary)); err != nil {
 			if ctx.Err() != nil {
 				return
@@ -133,6 +133,22 @@ func (c *Cleaner) Pass(ctx context.Context) {
 			continue
 		}
 		c.logger().Printf("agent cleaner: release %s cleanup %d: %s", item.ReleaseID, item.CleanupID, result)
+	}
+}
+
+// handle routes one claimed item by kind. "retained" is the 20E path, unchanged.
+// An empty kind is also retained: the client always sets a kind (it substitutes
+// CleanupKindUnknown for an empty or unrecognised one in an extended answer),
+// so empty reaches here only for a 20E-shaped item. Anything else is refused
+// and touches nothing: never guessed to be a failed candidate.
+func (c *Cleaner) handle(ctx context.Context, it agentclient.CleanupItem) (result, class string, imageKept bool, summary string) {
+	switch it.Kind {
+	case "", agentclient.CleanupKindRetained:
+		return c.remove(ctx, it)
+	case agentclient.CleanupKindFailedCandidate:
+		return c.removeFailedCandidate(ctx, it)
+	default:
+		return "skipped", "other", false, "unknown cleanup kind; left alone"
 	}
 }
 

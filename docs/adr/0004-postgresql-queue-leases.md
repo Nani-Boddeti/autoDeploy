@@ -923,7 +923,7 @@ run on a real host.
   cleanup stays open on the server and is handed out again, every step is idempotent, and the server marks a release
   removed only on an explicit `removed` report, so a lost report can never make the server believe a removal that did not
   happen.
-- Failed candidates (step 21B-1, control plane only; the agent side is 21B-2). Production never writes
+- Failed candidates (step 21B-1 control plane, step 21B-2 agent). Production never writes
   `releases.state='failed'`: a failed, cancelled or superseded deployment's release stays `candidate` (no image digest) or `ready`.
   The claim reuses the existing legal edge `candidate|ready -> removing` (no migration, `failed` stays terminal, no
   failure path changes) and the same `release_cleanups` rows, fence, lock order, retry backoff and `MaxAttempts`.
@@ -944,6 +944,11 @@ run on a real host.
   16 or more environments whose candidates are permanently skipped could starve others (same pattern as 20E, not
   redesigned); the digest check cannot lock other environments' slots, so a release in another environment that adopts the
   same digest between claim and removal relies on the agent's non-forced image removal.
+  Agent (21B-2): the claim opts in with `kinds`, falling back once to the plain request on 400 `invalid_request` (older
+  control plane). Per runtime instance id, in order: exact name + exact five-label match, digest label compared only when
+  the claim has a digest, guarded stop, non-forced removal; any identity mismatch or engine error stops the claim. The
+  image is removed once, non-forced, only when the claim has a digest and every removed container verified it; a
+  container that vanished mid-stop or an empty digest keeps the image. Unknown kinds are refused untouched.
 
 ## References
 

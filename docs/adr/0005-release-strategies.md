@@ -326,7 +326,7 @@ Accepted V1 defaults:
 
 Implemented in step 20E (ADR 0004 amendment 2026-11-13, "Retention cleanup"): the two-release and seven-day rules and
 the protections below are enforced by the control plane's cleanup claim, never by the agent; the 24-hour failed-candidate
-rule is implemented control-plane side in step 21B-1 (ADR 0004 amendment, "Failed candidates"; agent side 21B-2). Owner-accepted (B-D5): a service with no deploys for more than 7 days loses
+rule is implemented in steps 21B-1 (control plane) and 21B-2 (agent) (ADR 0004 amendment, "Failed candidates"). Owner-accepted (B-D5): a service with no deploys for more than 7 days loses
 its rollback target, because a retained release older than 7 days is eligible regardless of count. `retained -> removing` is now a legal edge (migration 000026).
 
 Cleanup runs in bounded idempotent batches. Active, in-progress, rollback-target,

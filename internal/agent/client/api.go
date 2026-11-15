@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -341,31 +342,84 @@ func (c *Client) ReportDrainResult(ctx context.Context, attemptID int64, predece
 	return c.post(ctx, pathDrainResult, req, nil, true)
 }
 
+// Cleanup item kinds (step 21B). CleanupKindUnknown is never sent by the
+// control plane: the client substitutes it for any kind it does not know (or an
+// empty one in an extended response) so the Cleaner can refuse the item instead
+// of guessing.
+const (
+	CleanupKindRetained        = "retained"
+	CleanupKindFailedCandidate = "failed_candidate"
+	CleanupKindUnknown         = "unknown"
+)
+
 // CleanupItem is one release the control plane authorizes this agent to remove
-// (step 20E). Every field is server-derived; the agent only uses them to find
-// the container by its exact labels.
+// (steps 20E and 21B). Every field is server-derived; the agent only uses them
+// to find the containers by their exact labels.
+//
+// Kind is "retained" or "failed_candidate" (or CleanupKindUnknown, see above).
+// It is empty only for items built outside the client (tests); the Cleaner
+// treats empty as retained, which is what a 20E item always was. A
+// failed-candidate item has an empty RuntimeInstanceID, one RuntimeInstanceIDs
+// entry per deployment attempt, and an ImageDigest that is empty when the
+// image must be kept.
 type CleanupItem struct {
-	CleanupID         int64  `json:"cleanup_id"`
-	ReleaseID         string `json:"release_id"`
-	EnvironmentID     string `json:"environment_id"`
-	RuntimeInstanceID string `json:"runtime_instance_id"`
-	ImageDigest       string `json:"image_digest"`
+	CleanupID          int64    `json:"cleanup_id"`
+	ReleaseID          string   `json:"release_id"`
+	EnvironmentID      string   `json:"environment_id"`
+	RuntimeInstanceID  string   `json:"runtime_instance_id"`
+	ImageDigest        string   `json:"image_digest"`
+	Kind               string   `json:"kind"`
+	RuntimeInstanceIDs []string `json:"runtime_instance_ids"`
 }
 
-// ClaimCleanups asks the control plane for at most limit retained releases to
-// remove. The server moves each to 'removing' in the same transaction and hands
+// ClaimCleanups asks the control plane for at most limit releases to remove.
+// The request opts in to failed candidates (kinds). A control plane that
+// predates step 21B-1 decodes strictly and answers 400 invalid_request to the
+// unknown field; only then, and only once, the claim is repeated without kinds
+// (the step 20E request and response). Any other error is returned as is.
+// The server moves each release to 'removing' in the same transaction and hands
 // still-open cleanups out again, so a lost answer or report is simply retried.
 func (c *Client) ClaimCleanups(ctx context.Context, limit int) ([]CleanupItem, error) {
-	req := struct {
-		Limit int `json:"limit"`
-	}{limit}
 	var resp struct {
 		Cleanups []CleanupItem `json:"cleanups"`
 	}
-	if err := c.post(ctx, pathCleanupClaim, req, &resp, true); err != nil {
+	req := struct {
+		Limit int      `json:"limit"`
+		Kinds []string `json:"kinds"`
+	}{limit, []string{CleanupKindRetained, CleanupKindFailedCandidate}}
+	err := c.post(ctx, pathCleanupClaim, req, &resp, true)
+	if err == nil {
+		for i := range resp.Cleanups {
+			switch resp.Cleanups[i].Kind {
+			case CleanupKindRetained, CleanupKindFailedCandidate:
+			default:
+				resp.Cleanups[i].Kind = CleanupKindUnknown
+			}
+		}
+		return resp.Cleanups, nil
+	}
+	var bad errBadRequest
+	if !errors.As(err, &bad) {
 		return nil, err
 	}
-	return resp.Cleanups, nil
+	// Older control plane: repeat once in the 20E shape. Its items are retained.
+	legacy := struct {
+		Limit int `json:"limit"`
+	}{limit}
+	var old struct {
+		Cleanups []CleanupItem `json:"cleanups"`
+	}
+	if err := c.post(ctx, pathCleanupClaim, legacy, &old, true); err != nil {
+		return nil, err
+	}
+	for i := range old.Cleanups {
+		if old.Cleanups[i].Kind != "" || len(old.Cleanups[i].RuntimeInstanceIDs) > 0 {
+			old.Cleanups[i].Kind = CleanupKindUnknown // not a 20E item: refuse, never guess
+			continue
+		}
+		old.Cleanups[i].Kind = CleanupKindRetained
+	}
+	return old.Cleanups, nil
 }
 
 // ReportCleanupResult reports the outcome of removing one claimed release. It is
