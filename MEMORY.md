@@ -260,6 +260,26 @@
 
 ## Resume Point
 
+### Current state (2026-11-16) — supersedes older bullets below
+- origin/main = `94dd2ca`, pushed, tree clean. Migrations through 000026. Gates `executorEnabled`/`activationEnabled`
+  still false in committed code; the acer (owner's Ubuntu host) runs a gate-flipped build from
+  deploy/host/build-acer-binaries.sh.
+- Proven on the acer (2026-11-13): first real e2e deploy (attempt 13), blue/green + predecessor drain (15),
+  stop-then-start (17), Retry, rollback (18). Not yet proven: 20E retention cleanup (installed 2026-11-14, nothing
+  eligible yet), step 21B failed-candidate cleanup, env-var injection, crash recovery, ACME.
+- Progress: 10/18 outcomes (~56%), weighted ~75-80%. Open outcomes + reasons: docs/IMPLEMENTATION_STATUS.md.
+- Step 21 (tasks/21-plan.md): 21A docs, 21B failed-candidate cleanup (05bf9de control plane, 514741f agent),
+  21C route-page Releases table (94dd2ca) done. Next: 21D ReserveCheckout lock order (investigate + design for
+  owner approval first), 21E flagged-head trigger, 21F two-resolution-paths check, then one batched acer session
+  (start a deliberately failing deploy early: failed-candidate removal needs 24h).
+- Failed-candidate rule: production never writes `releases.state='failed'`; failed/cancelled/superseded deployments'
+  releases stay candidate/ready and are cleaned via the legal `candidate|ready -> removing` edge. Agents opt in with
+  `kinds:["failed_candidate"]`; non-opted-in responses stay byte-identical (agent and server decode strictly).
+- Owner working style: slow pace, verify before applying, one sub-step at a time, independent review for SQL/lock
+  changes, show the diff before each commit, no Co-Authored-By.
+
+### Older resume notes (historical)
+
 - GitHub webhook ingestion and durable enqueue are complete but uncommitted. The isolated webhook
   route verifies bounded raw bodies with active/retained mounted HMAC secrets before parsing or any
   database call, trusts forwarded HTTPS only from configured proxies, and persists no raw payload,
@@ -354,7 +374,7 @@
   socket, stdlib only; typed label authority; buildx build with BuildKit-session secrets; container
   run by digest; ADR 0005 health gate) plus `internal/agent/executor` wiring it into `cmd/agent`.
 
-## Slice 9b — host execution: written, never run
+## Slice 9b — host execution: code-complete, run on the acer 2026-11-13
 
 - **`cmd/agent` has `const executorEnabled = false`.** The executor is fully assembled behind it, so
   the heartbeat still reports `executor_available=false` and no lease is ever claimed. Flipping that
@@ -382,9 +402,9 @@
   routing belong to slice 10 (below).
 - Prerequisite 2 (health-gate path) was closed by slice 10 Step 0 (migration 000017).
 
-## Slice 10 — blue/green activation: in progress, never run
+## Slice 10 — blue/green activation: code-complete, proven on the acer 2026-11-13
 
-- State 2026-10-19: pushed through 10c-2b H1 (`5f14d43`); migrations through 000021. Next H2 (operator
+- (Historical) State 2026-10-19: pushed through 10c-2b H1 (`5f14d43`); migrations through 000021. Next H2 (operator
   form -> `ResolveActivation`), H3 (delete superseded `Reconcile`/`MarkReconciled`, owner-approved), I
   (ADR 0004 amendment), then 10d (agent activation), 10e (drain/stop). Per-step table:
   docs/IMPLEMENTATION_STATUS.md "Current slice: 10"; reasoning: tasks/todo.md step blocks and
