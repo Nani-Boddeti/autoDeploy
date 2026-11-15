@@ -142,11 +142,15 @@ State transitions must be validated in the domain layer and committed transactio
       and durable job creation.
 - [x] Implement server registration, scoped agent credentials, heartbeat, job leasing, renewal,
       cancellation, and recovery.
-- [ ] Implement isolated checkout of the exact commit with repository and size controls.
+- [x] Implement isolated checkout of the exact commit with repository and size controls.
+      (Proven on the acer 2026-11-13: privileged smoke, quota-limited checkout, real HTTPS fetch, attempt 13.)
 - [ ] Implement Docker/BuildKit build execution, secret mounts, resource/time limits, labels,
-      log redaction, and scoped cleanup.
-- [ ] Implement runtime container creation with environment variables, networks, resource limits,
-      restart policy, and immutable release labels.
+      log redaction, and scoped cleanup. (BuildKit build proven on the acer; secret mounts, limits,
+      build-output redaction and cleanup not exercised.)
+- [x] Implement runtime container creation with environment variables, networks, resource limits,
+      restart policy, and immutable release labels. (Proven on the acer: network, CPU, memory, restart
+      policy, labels. Environment-variable injection has no explicit acer evidence: check in the next acer
+      session.)
 - [ ] Implement HTTP/TCP/container health policies with bounded retries.
 - [ ] Implement Traefik route generation, automatic HTTPS integration, and atomic active-release
       switching.

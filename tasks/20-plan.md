@@ -65,4 +65,6 @@ lock-order fix; flagged-head trigger; agent_jobs owner index; persisting executo
   site serves "Second deploy" again.
 - 20E retention cleanup e8dc114 (review PASS WITH NOTES; fix: never remove an unverified image). Follow-ups:
   failed-candidate 24h cleanup, cleanup state on route page. Acer validation pending (owner paused 2026-11-14).
-- Next: acer install + cleanup check, then 20F docs.
+- 20F DONE 2026-11-15: ADR 0004/0005 amendments already cover 20B-20E; status doc recounted (10/18, weighted
+  ~75-80%), todo checklist ticked for checkout + runtime container, gate 11 closed by 20B. 20E installed on acer
+  2026-11-14; cleanup pass pending (4th deploy or 7 days) -> next acer session (tasks/21-plan.md).
