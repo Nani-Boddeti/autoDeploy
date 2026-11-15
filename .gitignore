@@ -20,3 +20,6 @@
 
 # Intermediate/scratch files (never commit)
 /.tmp/
+
+# Local admin credentials (never commit)
+/admin-credentials.txt
