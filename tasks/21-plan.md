@@ -25,6 +25,39 @@ Hard gates 5-10, 13, 15 already closed (step 16/17); open: 3 (real Traefik obser
   `ReconcileActivation`) once activate ops exist — prove they cannot both resolve one op differently (lock order /
   CAS on op state), or add the guard. Result recorded in status doc gates list.
 
+## 21B design (draft 2026-11-15, awaiting owner approval)
+Finding: failed-candidate removal is NOT implemented (ADR 0005:327-328, ADR 0004:926-928 say follow-up; cleanup
+eligibility is `state='retained'` only, cleanup.go:124-129). Code never writes `releases.state='failed'`: a failed
+deployment's release stays `candidate` (failed before activation authorization; image_digest NULL) or `ready`
+(failed after; digest set). No release_runtime_instances rows exist; container id = attempt id.
+- **D1 (rec.)** reuse the existing legal edge `candidate|ready -> removing` (000018). No release-state migration, no
+  loosening of the `failed` terminal check, no new failure writes. Alternative (rejected): start writing `failed` and
+  add `failed -> removing` = wider behaviour change across every failure path.
+- Eligibility (server, under the slot lock, same claim/result endpoints and fence as 20E, same lock order):
+  release state candidate|ready; deployment terminal failed (or cancelled, D3) and terminal >= 24h ago; no job of the
+  deployment queued/leased/retry_wait; no non-terminal release_operations for the release; release never activated
+  (no succeeded activate op; not any route head's active_release_id); slot idle + not reconciliation_required; route
+  head not flagged; claimed only by the server that ran the attempts. Retained eligibility query untouched.
+- Claim payload: kind=failed_candidate, release id, and the list of the deployment's attempt ids (each may have left
+  a stopped container). Agent: per attempt, exact-label lookup (managed, kind, environment-id, release-id,
+  runtime-instance-id), guardedStop, remove force=false; a missing container is fine.
+- **D2 image** - `ready` (digest in DB): remove image only if no other non-removed release on the server has the same
+  digest, and Docker non-force refuses in-use (kept=true). `candidate` (no digest in DB; common case = health gate
+  failed): **rec. keep the image** (ADR 0005:116-120 requires a DB reference check, impossible without a digest);
+  images then wait for a later build-cache/image prune step. Alternative: trust the container's own label digest.
+- **D3** include cancelled deployments (ADR 0005:50 lists cancellation cleanup) - rec. yes, same rules.
+- Migration: likely none for state; maybe 000027 only if release_cleanups needs a `kind` column (decide after
+  introspecting). Existing test pinning `failed -> removing` refusal stays valid.
+- Not covered (note only): failed earlier attempts of a deployment that later SUCCEEDED leave stopped containers
+  that neither rule removes.
+- Tests: PG integration for every eligibility exclusion (each must fail if its predicate is deleted), agent cleaner
+  tests per attempt list, all 20E tests unchanged and green; full bar + concurrency suite.
+
+**Owner decisions 2026-11-15:** D1 reuse `candidate|ready -> removing`; D2 keep image when DB has no digest; D3
+include cancelled deployments. Split: **21B-1** control plane (eligibility, claim payload, tests; agent untouched),
+**21B-2** agent cleaner (per-attempt removal; empty claim digest = identity by release-id + runtime-instance-id
+labels, image always kept). Each: implement -> full bar -> independent review -> owner sees diff -> commit.
+
 ## Out of scope here — each needs its own plan + owner call
 Health TCP/container policies; observability (metrics, structured logs audit, backup/DR docs; readiness already
 exists); Hetzner packaging; UI gaps (variables, domains); server-side claim idempotency, register dedupe.
@@ -47,3 +80,8 @@ Per step: gofmt, build, vet both tag sets, `go test -race ./...`; steps with SQL
 - 21A DONE 2026-11-15 (docs only): evidence per clause gathered; only checkout + runtime container tickable
   (already counted in 10/18, checklist was stale); env-var injection lacks acer evidence -> acer session. .gitignore
   now ignores /admin-credentials.txt.
+- 21B-1 DONE 2026-11-15 (uncommitted -> commit pending owner OK): control-plane failed-candidate claim behind
+  `kinds:["failed_candidate"]` opt-in (non-opted-in bytes unchanged); failed|cancelled|superseded (owner added
+  superseded) >= 24h; claim-time never-live guard; attempts limited to claiming server; no migration. Review PASS WITH
+  NOTES -> one fix round (guard, peek EXISTS(attempt), disjointness + rollback-job tests). Bar: gofmt/build/vet x2/
+  make check/race clean; integration sweep 3/3 fresh PG18.

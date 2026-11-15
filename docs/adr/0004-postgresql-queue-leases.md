@@ -923,9 +923,27 @@ run on a real host.
   cleanup stays open on the server and is handed out again, every step is idempotent, and the server marks a release
   removed only on an explicit `removed` report, so a lost report can never make the server believe a removal that did not
   happen.
-- Not in this step: failed candidate containers (24h). `failed` is terminal in the release machine and a failed candidate's
-  container identity is its prepare attempt, not a winning activation; it needs a `failed -> removing` edge and its own
-  eligibility rules. Follow-up.
+- Failed candidates (step 21B-1, control plane only; the agent side is 21B-2). Production never writes
+  `releases.state='failed'`: a failed, cancelled or superseded deployment's release stays `candidate` (no image digest) or `ready`.
+  The claim reuses the existing legal edge `candidate|ready -> removing` (no migration, `failed` stays terminal, no
+  failure path changes) and the same `release_cleanups` rows, fence, lock order, retry backoff and `MaxAttempts`.
+  A request opts in with `"kinds":["failed_candidate"]`; without it the response is the 20E one byte for byte (the agent
+  client decodes strictly), and failed-candidate cleanups stay open and invisible to it. Eligibility (same server as the
+  deployment's execution job, under the slot lock, plain reads): release `candidate|ready`, never activated (no
+  succeeded `activate` operation, not a route head's active release), deployment `failed`, `cancelled` or `superseded` for at least
+  `FailedCandidateAge` (24h, `deployments.updated_at`; terminal rows never change again), no job of the deployment
+  queued, leased or retrying, no unresolved release operation, slot idle and not reconciling, route head not flagged.
+  An item carries `kind:"failed_candidate"` and `runtime_instance_ids`: one `AttemptRuntimeInstanceID` per attempt of the
+  deployment (each may have left a stopped container); `runtime_instance_id` is empty. Image (owner decision D2): empty
+  `image_digest` (agent keeps the image) when the release has none or when another release of the server that is not yet
+  `removed` has the same digest; else the digest. A removing release without a succeeded non-rollback activation is a
+  failed candidate, so the redelivery and retry queries split on that fact and `release_cleanups` needs no kind column.
+  Every item, fresh, open or retry, is re-checked under its locked release row (no succeeded `activate` operation of any
+  job, not a route head's active release) before it is handed out; removal is irreversible. Two failed candidates sharing a
+  digest both keep the image (safe; left for a later image prune). Known limits: the environment peek is `LIMIT`ed, so
+  16 or more environments whose candidates are permanently skipped could starve others (same pattern as 20E, not
+  redesigned); the digest check cannot lock other environments' slots, so a release in another environment that adopts the
+  same digest between claim and removal relies on the agent's non-forced image removal.
 
 ## References
 
