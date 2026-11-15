@@ -1376,7 +1376,9 @@ func (h *Handler) environmentRouteGet(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	renderRouteHead(w, buildRouteHeadView(csrf, environmentID, head, found))
+	view := buildRouteHeadView(csrf, environmentID, head, found)
+	view.Releases = h.environmentReleaseRows(r.Context(), p, environmentID)
+	renderRouteHead(w, view)
 }
 
 // renderRouteRejection re-fetches the current route head so a rejected
@@ -1395,6 +1397,7 @@ func (h *Handler) renderRouteRejection(w http.ResponseWriter, r *http.Request, p
 		submitted.ActiveReleaseID = head.ActiveReleaseID
 		submitted.ReconciliationRequired = head.ReconciliationRequired
 	}
+	submitted.Releases = h.environmentReleaseRows(r.Context(), p, submitted.EnvironmentID)
 	renderRouteHead(w, submitted)
 }
 
@@ -1924,6 +1927,7 @@ type routeHeadView struct {
 	ReconciliationRequired bool
 	UpdatedAt              string
 	RouteError             string
+	Releases               []releaseRow
 }
 
 // routeHeadTemplate renders one environment's route head (hostname

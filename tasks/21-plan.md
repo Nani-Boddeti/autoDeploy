@@ -89,3 +89,7 @@ Per step: gofmt, build, vet both tag sets, `go test -race ./...`; steps with SQL
   per-id exact name+label match, stop on mismatch/error, non-forced removal, image only with verified digest; unknown
   kind refused. Review PASS WITH NOTES -> fix (vanished-mid-stop keeps image) + branch tests. Bar clean (race, vet x2,
   make check, linux amd64/arm64). Not validated on a real host yet -> acer session.
+- 21C DONE 2026-11-16: route page "Releases" table (10 newest, state + latest cleanup via newCleanupView), read-only
+  RR tx with session + owner check, omitted on read failure; no new CSS. Bar clean + PG18 integration. Not yet seen in a
+  browser -> acer session. NEXT (2026-11-17): 21D investigation + design for owner approval; consider a deliberate
+  failing deploy on the acer early so the 24h failed-candidate window has elapsed by the main acer session.

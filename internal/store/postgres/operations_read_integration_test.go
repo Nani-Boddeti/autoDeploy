@@ -503,3 +503,87 @@ func TestOperationsReadRouteHeadOwnerScoped(t *testing.T) {
 		t.Fatalf("B leaked A's active release: %q %v %v", b.RouteActiveReleaseID, b.ReleaseIsActive, err)
 	}
 }
+
+func TestListEnvironmentReleasesCleanupOwnerScopedBounded(t *testing.T) {
+	f := newOpsFixture(t, 170)
+	resetWebhookJobs(t, f.pool)
+	ctx := context.Background()
+	f.insertSlot(t)
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := f.pool.Exec(ctx, q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	at := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
+	release := func(owner, id string, minute int, state string) {
+		t.Helper()
+		seedOpsDeployment(t, f.pool, owner, "project", f.envID, "dep-"+id, at.Add(time.Duration(minute)*time.Minute))
+		exec(`INSERT INTO releases(id, deployment_id, environment_id, image_digest, config_digest, commit_sha, strategy, state, created_at, updated_at)
+		 VALUES ($1,$2,$3,decode(repeat('07',32),'hex'),decode(repeat('07',32),'hex'),'0123456789abcdef0123456789abcdef01234567','blue_green','candidate',$4,$4)`,
+			id, "dep-"+id, f.envID, at.Add(time.Duration(minute)*time.Minute))
+		if state != "candidate" {
+			exec(`UPDATE releases SET state=$2 WHERE id=$1`, id, state)
+		}
+	}
+	claim := func(id string) {
+		exec(`INSERT INTO release_cleanups(release_id, server_id, environment_id) VALUES ($1,$2,$3)`, id, f.serverID, f.envID)
+	}
+	// Newest first: open, failed-then-open (2 attempts), removed+image kept, other owner, plain candidate.
+	release(f.ownerID, "r-cand", 1, "candidate")
+	release(f.ownerID, "r-removed", 2, "removing")
+	claim("r-removed")
+	exec(`UPDATE release_cleanups SET result='removed', image_kept=true, completed_at=clock_timestamp() WHERE release_id='r-removed'`)
+	exec(`UPDATE releases SET state='removed' WHERE id='r-removed'`)
+	release(f.ownerID, "r-retry", 3, "removing")
+	claim("r-retry")
+	exec(`UPDATE release_cleanups SET result='failed', error_class='engine', outcome_summary='<b>x</b>', completed_at=clock_timestamp() WHERE release_id='r-retry'`)
+	claim("r-retry")
+	release(f.ownerID, "r-open", 4, "removing")
+	claim("r-open")
+	release(opsOwnerB, "r-other", 5, "candidate")
+
+	got, err := f.repo.ListEnvironmentReleases(ctx, f.principal, f.envID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 0, len(got))
+	for _, g := range got {
+		ids = append(ids, g.ID)
+	}
+	if fmt.Sprint(ids) != "[r-open r-retry r-removed r-cand]" {
+		t.Fatalf("ids = %v (owner B's release must not appear)", ids)
+	}
+	if c := got[0].Cleanup; c == nil || c.Result != "" || c.Attempts != 1 {
+		t.Fatalf("open = %+v", c)
+	}
+	if c := got[1].Cleanup; c == nil || c.Result != "" || c.Attempts != 2 || c.ErrorClass != "" {
+		t.Fatalf("retry latest must be the open claim: %+v", c)
+	}
+	if c := got[2].Cleanup; got[2].State != "removed" || c == nil || c.Result != "removed" || !c.ImageKept || c.CompletedAt == nil {
+		t.Fatalf("removed = %+v %+v", got[2], c)
+	}
+	if got[3].Cleanup != nil || got[3].State != "candidate" {
+		t.Fatalf("candidate = %+v", got[3])
+	}
+	// The other owner sees only its own release; an unknown environment is empty (not an error).
+	gb, err := f.repo.ListEnvironmentReleases(ctx, f.principalB, f.envID)
+	if err != nil || len(gb) != 1 || gb[0].ID != "r-other" {
+		t.Fatalf("owner B = %+v, %v", gb, err)
+	}
+	if none, err := f.repo.ListEnvironmentReleases(ctx, f.principal, "no-such-env"); err != nil || len(none) != 0 {
+		t.Fatalf("unknown env = %+v, %v", none, err)
+	}
+	// Bounded to MaxEnvironmentReleases, newest first.
+	for i := 0; i < 10; i++ {
+		release(f.ownerID, fmt.Sprintf("r-bulk-%d", i), 10+i, "candidate")
+	}
+	got, err = f.repo.ListEnvironmentReleases(ctx, f.principal, f.envID)
+	if err != nil || len(got) != MaxEnvironmentReleases || got[0].ID != "r-bulk-9" {
+		t.Fatalf("bounded = %d first=%v, %v", len(got), got[0].ID, err)
+	}
+	// A revoked/foreign session is denied.
+	if _, err = f.repo.ListEnvironmentReleases(ctx, auth.Principal{UserID: "x", OwnerID: f.ownerID, Role: auth.RoleOwner, AuthRevision: 1, SessionID: "nope"}, f.envID); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("dead session = %v", err)
+	}
+}
