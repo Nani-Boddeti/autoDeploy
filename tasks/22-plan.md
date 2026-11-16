@@ -239,3 +239,15 @@ integration: put then the binding form accepts the printed id and a claim freeze
   environment message, usage sentinel, README note that --name is not stored. Follow-ups: audit actor is
   terminal:autodeploy-controlplane under autodeploy-run (env -i drops SUDO_USER); very long pasted values may hit
   terminal line limits.
+- END OF DAY 2026-11-16: origin/main 369175a. Acer runs build 14bb581 (installed 21:54; 22-2 code, builder caps not
+  yet confirmed: owner did not paste the docker inspect line). Build 369175a (adds secrets put/replace) is STAGED in
+  ~/autodeploy-stage/bin-gated, NOT installed; backups bin-gated.prev-{20261116,e0f2319,1818b54,14bb581}.
+  RESUME (2026-11-17): (1) 24h check: rt-19 gone (`sudo docker ps -a`) and Releases table shows it removed;
+  (2) Round 1: install 369175a + `autodeploy-run secrets secret put --environment uat --name AUTODEPLOY_BUILD_TOKEN
+  --scope build` with throwaway value acer-test-secret-7f3a9c; confirm hidden prompt + terminal restored; get the
+  head id; (3) Round 2: bind it (expect "Dockerfile id: build-secret-0"), add build literal, demo Dockerfile with
+  RUN --mount=type=secret,id=build-secret-0 (+ a cat of it for [REDACTED]) and ARG for the literal; deploy; one
+  sudo command: builder caps (docker inspect buildx_buildkit_autodeploy-build0), `docker history --no-trunc` and
+  `docker save | grep -c` for the value (expect 0), buildx du under the cap; (4) build timeout and memory-cap checks
+  need agent flag overrides (systemd drop-in, owner sudo) -> plan them; (5) crash-recovery test; then tick the build
+  outcome (13/18) and move to Phase 3 (observability). UI (22-3) stays last.

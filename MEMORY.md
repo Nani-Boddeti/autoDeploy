@@ -271,10 +271,13 @@
   Not yet proven: failed release rt-19 removal after 24h (check ~2026-11-17 16:00+), crash recovery, ACME, gate 3.
 - Progress: 12/18 outcomes (~67%; release strategies + health policies ticked 2026-11-16), weighted ~84% (15.05/18,
   see status doc). Hard gates 13/15 closed (open: 3 real Traefik observation, 12 drain before downgrade).
-- Step 22 roadmap: tasks/22-plan.md. 22-1 health policies (1818b54, migration 000028) proven on the acer (attempts
-  21-23). Next per roadmap: 24h rt-19 check, crash recovery, 22-2 build outcome, 22-3 UI outcome (failure reason on the
-  deployment page + overall productive UI with fewer nested clicks + live logs; design with impeccable skill, pastel,
-  owner approves design first).
+- Step 22 roadmap: tasks/22-plan.md (resume block "END OF DAY 2026-11-16" at its end). Done: 22-1 health policies
+  (1818b54, acer-proven); 22-2 build outcome code (14bb581: build timeout, dedicated capped builder "autodeploy-build",
+  cache prune to --build-cache-keep, build-scoped literals as --build-arg, deterministic build-secret ids shown on
+  the config page) and 22-2f secrets put/replace CLI (369175a). Acer runs 14bb581; 369175a staged, not installed.
+  Next: 24h rt-19 check, install 369175a, create a build secret, build checks (caps, secret not in history/layers,
+  [REDACTED] logs, literal, cache bound, timeout/memory via agent flag drop-in), crash recovery, tick build (13/18),
+  then observability. UI (22-3) last by owner decision.
 - Step 21 mac side complete (tasks/21-plan.md): 21A docs; 21B failed-candidate cleanup (05bf9de, 514741f); 21C
   route-page Releases table (94dd2ca); 21D checkout lock order + 21E migration 000027 flagged-head hostname guard
   (77e4435); 21F gate 4 closed + 21G operator resolve form anchored to its attempt (e0f2319).
