@@ -50,13 +50,46 @@ func TestRunWithOutputNeverWritesFailureDetails(t *testing.T) {
 
 type fakeTerminal struct{}
 
-func (fakeTerminal) Close() error { return nil }
+func (fakeTerminal) Close() error                      { return nil }
+func (fakeTerminal) ReadSecret(string) ([]byte, error) { return nil, errors.New("no prompt") }
 
 type fakeSecretOperator struct {
 	init, retire error
 	result       secret.RewrapResult
 	rewrap       error
 	calls        []string
+	// put/replace support
+	envScope, headScope secret.Scope
+	envErr, headErr     error
+	writeErr            error
+	created, replaced   []writeCall
+}
+
+type writeCall struct {
+	scope       secret.Scope
+	versionID   string
+	op          secret.OperationContext
+	plaintext   string
+	compromised bool
+}
+
+func (f *fakeSecretOperator) EnvironmentScope(context.Context, string) (secret.Scope, error) {
+	f.calls = append(f.calls, "env")
+	return f.envScope, f.envErr
+}
+func (f *fakeSecretOperator) HeadScope(context.Context, string) (secret.Scope, error) {
+	f.calls = append(f.calls, "head")
+	return f.headScope, f.headErr
+}
+func (f *fakeSecretOperator) Create(_ context.Context, _ secretcrypto.KeyRing, s secret.Scope, v string, op secret.OperationContext, p []byte) (secret.Metadata, error) {
+	f.calls = append(f.calls, "create")
+	f.created = append(f.created, writeCall{scope: s, versionID: v, op: op, plaintext: string(p)})
+	return secret.Metadata{ID: v, Scope: s, Number: 1}, f.writeErr
+}
+func (f *fakeSecretOperator) Replace(_ context.Context, _ secretcrypto.KeyRing, s secret.Scope, v string, op secret.OperationContext, p []byte, compromised bool) (secret.Metadata, error) {
+	f.calls = append(f.calls, "replace")
+	f.replaced = append(f.replaced, writeCall{scope: s, versionID: v, op: op, plaintext: string(p), compromised: compromised})
+	return secret.Metadata{ID: v, Scope: s, Number: 7}, f.writeErr
 }
 
 func (f *fakeSecretOperator) Close() error { return nil }
@@ -78,7 +111,7 @@ func testSecretDeps(t *testing.T, operator *fakeSecretOperator) secretDependenci
 	if err != nil {
 		t.Fatal(err)
 	}
-	return secretDependencies{loadDatabase: func() (string, error) { return "database", nil }, loadRing: func() (secretcrypto.KeyRing, string, error) { return ring, "0123456789abcdef", nil }, open: func(context.Context, string) (secretOperator, error) { return operator, nil }}
+	return secretDependencies{loadDatabase: func() (string, error) { return "database", nil }, loadRing: func() (secretcrypto.KeyRing, string, error) { return ring, "0123456789abcdef", nil }, open: func(context.Context, string) (secretOperator, error) { return operator, nil }, actor: func() string { return "terminal:tester" }, newID: func(prefix string) (string, error) { return prefix + "-fixed", nil }}
 }
 func TestExecuteWithSanitizesOperationErrorsAndFormatsResults(t *testing.T) {
 	operator := &fakeSecretOperator{}

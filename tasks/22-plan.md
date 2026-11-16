@@ -134,6 +134,32 @@ labels on the image, a `RUN sleep` build hitting a short --build-timeout, a memo
 cache bounded after builds, a build literal reaching the build.
 **Estimate:** ~1.5-2 days + acer session. Review: yes.
 
+## 22-2f design: create/replace secrets from the terminal (2026-11-16, APPROVED: D1-D4 as recommended)
+**Gap (found during the 22-2 acer prep):** no entry point creates a secret value. SecretRepository.Create/Replace and
+secret.Service.CreateWithContext/ReplaceWithContext (encrypt with the active KEK, audit) exist and are tested, but
+nothing outside tests calls them; cmd/secrets only does KEK rotation (init-active-kek, rewrap, can-retire). The
+binding form asks for a "Secret head ID" nobody can obtain, so runtime and build secrets are unusable in practice.
+**Change:** extend the existing terminal-only tool (same preflight: interactive TTY, root-run via autodeploy-run, same
+config and key ring as rotation):
+- `secrets secret put --environment ENV --name VAR --scope runtime|build` -> creates a secret head + version 1 for
+  that environment, prints `secret head id: <id>` and the version number (never the value).
+- `secrets secret replace --secret ID [--compromised]` -> new version on an existing head (ReplaceWithContext /
+  ReplaceCompromisedWithContext); running deployments keep their frozen version.
+- Owner/project are derived from the environment row (no hand-typed owner ids); unknown environment -> clear error.
+- Value entry: hidden prompt, typed twice and compared; never argv, env or a file; bounded length; the buffer zeroed
+  after use (best effort, as elsewhere). Refuse when stdin is not a terminal (D3).
+- Audit: OperationContext with a generated audit id and actor "terminal:<unix user>"; no value in any log line.
+- deploy/host/README: a short "add a secret" section (put -> paste the id into the binding form).
+**Decisions for owner:** D1 terminal command now (recommended; matches the existing terminal-only secrets tool; a web
+form joins the UI rework at the end) vs a web form now. D2 owner/project derived from the environment (recommended).
+D3 interactive hidden prompt only, no piped input (recommended, no plaintext in files or shell history) vs also
+accepting stdin for automation. D4 include `replace` and `--compromised` now (recommended).
+**Tests (fail first):** argument parsing (good/bad), non-TTY refused, mismatched confirmation refused, put calls
+CreateWithContext with the derived scope and never prints the value, replace/compromised paths, unknown environment;
+integration: put then the binding form accepts the printed id and a claim freezes that version.
+**Acer:** owner runs put for a build secret, binds it, then the deferred 22-2 checks (RUN --mount secret, absent from
+`docker history --no-trunc` and `docker save`, [REDACTED] in Logs). Estimate ~0.5 day. Review: yes (secret handling).
+
 ## Progress
 - 2026-11-16: roadmap written; 22-1 investigation started.
 - 2026-11-16: 22-1a DONE (uncommitted): migration 000028 (5 columns both tables, named CHECKs + cross CHECKs,
@@ -204,3 +230,12 @@ cache bounded after builds, a build literal reaching the build.
   t.Fatal in goroutine, -race -count=5 stable); BUILDKIT_/BUILDX_/DOCKER_ prefixes refused for build secret names;
   no cache prune when the build never started; buildx config dir tightened to 0700. Bar: gofmt, build, vet x3 tag
   sets, make check, race ./..., linux amd64/arm64, windows vet; fresh PG18 sweep clean. NEXT: commit, acer validation.
+- 2026-11-16: 22-2f DONE (uncommitted): `secrets secret put --environment ENV --name VAR --scope runtime|build` and
+  `secrets secret replace --secret ID [--compromised]` in cmd/secrets via secret.Service (active KEK, audited);
+  owner/project from agent_jobs for the environment (ambiguous -> refused; unknown until the first deploy); hidden
+  prompt twice on /dev/tty, piped stdin refused before any DB access; value bounded by crypto.MaxPlaintextBytes,
+  constant-time compare, cleared; output = head id + version only. Review PASS WITH NOTES -> fixed: leak assertions
+  on every failure path, terminal echo restored on all returns and on SIGINT/SIGTERM (seam-tested), ambiguous
+  environment message, usage sentinel, README note that --name is not stored. Follow-ups: audit actor is
+  terminal:autodeploy-controlplane under autodeploy-run (env -i drops SUDO_USER); very long pasted values may hit
+  terminal line limits.

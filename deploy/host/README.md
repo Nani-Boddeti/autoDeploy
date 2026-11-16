@@ -29,6 +29,24 @@ overwritten. Afterwards `shred -u` the `.pem`, set the App webhook (`/webhooks/g
 the UI to install the App (landing page button) and bind the repository with the "Bind a repository"
 form on the landing page (POST `/github/bindings`).
 
+## Add a secret
+
+Secret values are entered only on the host terminal (hidden prompt, typed twice; never argv, env or a
+file; refused when stdin is not a terminal). The environment must already be known (first Deploy done).
+
+    sudo /usr/local/lib/autodeploy/autodeploy-run secrets secret put --environment uat --name NPM_TOKEN --scope build
+
+`--scope` is `build` (build-time `RUN --mount=type=secret`) or `runtime` (container environment). The
+command prints `secret head id: <id>` and `version: 1` (never the value). Paste the id into the
+environment's "Add binding" form on the Servers page: kind secret, the same variable name and the same
+scope. `--name` is only validated, not stored: the variable name is set in the binding form, and both
+must match what the Dockerfile or app expects. To rotate:
+
+    sudo /usr/local/lib/autodeploy/autodeploy-run secrets secret replace --secret <id> [--compromised]
+
+This adds a new version; running deployments keep the version frozen at their claim. `--compromised`
+also revokes the previous version (it can no longer materialize, even for a frozen deployment).
+
 ## First deploy order (UI)
 
 Bind (project ID, environment ID, branch, server) -> Projects page "Deploy" (this creates the job that
