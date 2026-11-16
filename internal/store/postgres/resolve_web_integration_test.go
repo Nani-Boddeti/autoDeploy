@@ -256,10 +256,11 @@ func TestResolveFormEndToEndReplay(t *testing.T) {
 }
 
 // RouteMoved: since step 16h AssignRouteHostname refuses a hostname change
-// while the head is flagged, so the move is forced in SQL (a revision bump with
-// the flag untouched, the shape any future writer of a flagged head would
-// leave); the refusal itself is covered by
-// TestAssignRouteHostnameRefusedWhileReconciliationRequired.
+// while the head is flagged, and since 000027 the route_heads trigger refuses it
+// too, so the moved state is forced in SQL with three individually legal writes
+// (clear the flag, move with a revision bump, re-set the flag); the refusals
+// are covered by TestAssignRouteHostnameRefusedWhileReconciliationRequired and
+// the 000027 migration tests.
 func TestResolveFormEndToEndRouteMoved(t *testing.T) {
 	env := postgres.NewActivationBlockForTest(t, 200, false)
 	h := newResolveHarness(t, env)
@@ -272,8 +273,16 @@ func TestResolveFormEndToEndRouteMoved(t *testing.T) {
 	if _, err = heads.AssignRouteHostname(context.Background(), env.Principal, env.EnvironmentID, "moved.example.com", &rev); !errors.Is(err, postgres.ErrRouteHeadReconciliationRequired) {
 		t.Fatalf("AssignRouteHostname on the blocked head: %v, want ErrRouteHeadReconciliationRequired", err)
 	}
-	if _, err = env.Pool.Exec(context.Background(), `UPDATE route_heads SET hostname='moved.example.com', route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`, env.EnvironmentID); err != nil {
-		t.Fatalf("force the route move: %v", err)
+	// The 000027 trigger refuses the move on a flagged head too, so force it
+	// with three individually legal writes: clear flag, move, re-flag.
+	for _, q := range []string{
+		`UPDATE route_heads SET reconciliation_required=false, updated_at=clock_timestamp() WHERE environment_id=$1 AND reconciliation_required`,
+		`UPDATE route_heads SET hostname='moved.example.com', route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`,
+		`UPDATE route_heads SET reconciliation_required=true, updated_at=clock_timestamp() WHERE environment_id=$1 AND NOT reconciliation_required`,
+	} {
+		if tag, err := env.Pool.Exec(context.Background(), q, env.EnvironmentID); err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("force the route move: %s: rows=%d err=%v", q, tag.RowsAffected(), err)
+		}
 	}
 	events, audits := h.count(eventsQuery), h.count(auditQuery)
 	rr := h.resolve("activated")

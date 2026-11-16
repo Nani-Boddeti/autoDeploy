@@ -58,6 +58,89 @@ include cancelled deployments. Split: **21B-1** control plane (eligibility, clai
 **21B-2** agent cleaner (per-attempt removal; empty claim digest = identity by release-id + runtime-instance-id
 labels, image always kept). Each: implement -> full bar -> independent review -> owner sees diff -> commit.
 
+## 21D design (2026-11-16, APPROVED: D1 keep FOR UPDATE, D2 add StartCheckout cross-check)
+**Premise correction.** b,r,i,a are GitHub tables (project_bindings, repositories, installations,
+app_registrations id=1), not the server-credential chain. The relevant order is ADR 0004 (manual deploy section):
+registration -> admin session -> installation -> repository -> binding -> then dependents (checkout reservations
+last: DisableInstallation/ReconcileInstallation invalidate them after b).
+
+**Today (github_repository.go):** one statement `... FOR UPDATE OF b,r,i,a` in RevalidateCheckoutBinding (:86),
+ReserveCheckout (:118), revalidateTx (:213). Rowmarks lock in range-table order b,r,i,a, so registration is LAST.
+BeginMintAttempt (:145) and StartCheckout (:187) also lock the reservation row FOR UPDATE BEFORE revalidateTx.
+Every other writer/locker takes registration first: activeRegistration FOR UPDATE (Disable, Reconcile, Bind,
+CompleteHandoff, CreateSetupState, ReserveCallback), lockLifecycleAuthority/lockGitHubAuthorityChain FOR SHARE.
+
+**Cycles (verified against code; Postgres resolves each with 40P01 after deadlock_timeout, which the checkout
+paths swallow into ErrGitHubDenied -> spurious checkout/build failure, or a failed webhook/admin action):**
+- A: webhook push/manual deploy holds a SHARE, wants i SHARE; checkout holds b,r,i FOR UPDATE, wants a FOR UPDATE.
+- B: Disable/Reconcile/Bind hold a FOR UPDATE, want i/r/b; checkout holds b,r,i, wants a.
+- C: BeginMintAttempt/StartCheckout hold reservation, want b,r,i,a; Disable/Reconcile hold a,i,r,b, want the
+  reservation (invalidatedCheckoutIDs).
+- Not a cycle: checkout vs checkout (same order).
+
+**Change (one shared helper, separate statements so order is by construction, not planner-dependent):**
+1. `lockCheckoutAuthority(ctx, tx, binding)` : `SELECT .. github_app_registrations id=1 AND active FOR UPDATE`
+   -> installation FOR UPDATE (active, not suspended) -> repository FOR UPDATE (active) -> binding FOR UPDATE
+   (active), each scoped by owner; returns the three revisions (+ clone_url for Reserve). Lock modes unchanged
+   (see D1). Any lock/no-row error -> ErrGitHubDenied exactly as today.
+2. ReserveCheckout: helper keyed by (owner, project) -> expire + insert reservation (already last).
+3. revalidateTx -> helper + revision compare. RevalidateCheckoutBinding -> own tx + helper (no prod caller;
+   interface method kept, not deleted).
+4. BeginMintAttempt: unlocked read of the reservation to learn the binding -> helper -> reservation
+   `FOR UPDATE` re-read with `state='reserved' AND expires_at>now AND attempts<1` AND binding/revision columns equal
+   to the unlocked read -> update. StartCheckout: helper with passed b -> reservation FOR UPDATE + state check ->
+   update. ActivateMintAttempt: already authority-then-reservation; only switches to the helper.
+5. ADR 0004: add the checkout paths to the GitHub order paragraph.
+
+**Decisions for owner:**
+- D1 lock modes: keep FOR UPDATE on registration (recommended: pure reorder, zero behavior change; registration
+  acts as a mutex so the i/r/b sub-order cannot matter while it is held) vs FOR SHARE (matches webhook chain, lets
+  checkouts run concurrently; separate-statement i->r->b order keeps it deadlock-free; a behavior change ->
+  separate slice).
+- D2 StartCheckout does not cross-check the reservation's own binding/revision columns against the passed b
+  (ActivateMintAttempt does). Add the same predicate to the reservation re-lock? Recommended yes (tightening only;
+  internal caller always passes the matching b).
+
+**Tests (fail before, pass after; hold the real conflicting lock, detect blocking via pg_blocking_pids, not
+query text):** table-driven over Reserve, BeginMint, ActivateMint, StartCheckout, RevalidateCheckoutBinding:
+tx1 holds registration FOR SHARE (webhook-chain stand-in); run the op in a goroutine; wait until
+`tx1pid = ANY(pg_blocking_pids(pid))` for some backend; probe from tx3 with NOWAIT: installation, repository,
+binding and (mint/start) reservation rows are lockable FOR UPDATE -> the op holds nothing below registration while
+waiting. Today the probes fail with 55P03. Release tx1 -> op succeeds. Plus a variant with tx1 = DisableInstallation
+-style FOR UPDATE on registration -> after release the op is denied (revision bumped), no 40P01. New tests at
+-race -count=20. Reuse webhook_job_repository_test helpers (assertPgSQLState) and qaCheckoutBinding.
+
+**Bar:** gofmt, build, vet both tag sets, make check, `go test -race ./...`, fresh PG18 integration sweep, activation
+concurrency suite `-race -count=20`. Independent review: yes (locks). Estimate 2-3h.
+**Risks:** an unlocked reservation read then re-lock adds a window: closed by the equality re-check under lock.
+Helper must not be called by a tx that already holds a reservation (comment + test via StartCheckout/BeginMint).
+
+## 21E design (2026-11-16, APPROVED: D1 = OLD only)
+**Gate 14:** app refuses a hostname change on a flagged head (AssignRouteHostname, route_head_repository.go:~306,
+ErrRouteHeadReconciliationRequired, under FOR UPDATE); the trigger `validate_route_head_update` (000018 + 000020
+narrow exemption) does not. Trigger today already refuses hostname change when OLD.active_release_id IS NOT NULL,
+so the gap is only a flagged head with no active release (an ambiguous FIRST activation).
+**Every production route_heads UPDATE (introspected):** AssignRouteHostname (hostname + revision+1, only when not
+flagged and no active release); activation success agent_lease_repository.go:~2068 (active_release_id + revision+1 +
+clear flag, hostname unchanged); flag set :~2971 and flag clear activation_resolution.go:~405 (flag only). None
+changes hostname while or when touching the flag -> the new rule refuses nothing production does today.
+**Change:** migration 000027 `CREATE OR REPLACE FUNCTION validate_route_head_update()` = the live body (copied from
+introspection, not reasoned) + one rule:
+`IF OLD.reconciliation_required AND NEW.hostname <> OLD.hostname THEN RAISE
+EXCEPTION 'route head hostname cannot change while reconciliation is required'`.
+D1: OLD OR NEW (recommended: also refuses setting the flag and changing hostname in one statement, which nothing does
+and would be meaningless) vs OLD only (exact mirror of the app check).
+Trigger binding unchanged (BEFORE UPDATE). Forward-only; older binaries never issue such an UPDATE (gate 12 safe).
+**Tests (migrations/000027_*_test.go, direct SQL against the trigger, existing 000018/000020 test helpers):**
+flagged head, no active release: hostname change refused (even with revision+1); clear flag + change hostname in one
+statement refused; flag set/clear alone without revision bump still allowed;
+unflagged hostname change with revision+1 still allowed; existing active-release refusal unchanged. Each refusal
+test fails before the migration. Run the 000018/000020/000021 migration tests + full store sweep (activation and
+resolution paths write route_heads).
+**Bar:** gofmt, build, vet x2, make check, race unit, fresh PG18 sweep; race x20 on route/activation/resolution tests
+(GenuinelyRaces|Races|ConcurrentAssign|TestAssignRouteHostnameRefused|ResolveActivation|ReconcileActivation).
+Review: light. Estimate 1-1.5h.
+
 ## Out of scope here — each needs its own plan + owner call
 Health TCP/container policies; observability (metrics, structured logs audit, backup/DR docs; readiness already
 exists); Hetzner packaging; UI gaps (variables, domains); server-side claim idempotency, register dedupe.
@@ -93,3 +176,22 @@ Per step: gofmt, build, vet both tag sets, `go test -race ./...`; steps with SQL
   RR tx with session + owner check, omitted on read failure; no new CSS. Bar clean + PG18 integration. Not yet seen in a
   browser -> acer session. NEXT (2026-11-17): 21D investigation + design for owner approval; consider a deliberate
   failing deploy on the acer early so the 24h failed-candidate window has elapsed by the main acer session.
+- 21D DONE 2026-11-16 (commit pending owner OK): lockCheckoutAuthority locks registration -> installation ->
+  repository -> binding FOR UPDATE as separate statements; reservation row always last (BeginMint: unlocked read,
+  authority, re-lock with full equality). revalidateTx denies zero/empty ids (orchestrator caught a fail-open the
+  helper's id-learning introduced; test proved it). Review PASS WITH NOTES -> fixes: StartCheckout requires
+  reservation owner/project (D2), ActivateMintAttempt requires owner/project/installation/repository (owner OK,
+  pre-existing gap), test cleanup releases blocker before join, fixture ids from b, probes fail on 0 rows.
+  Every new test failed on old code (55P03 probes / err=nil). Bar: gofmt, build, vet x2, make check, race unit;
+  fresh PG18 sweep x2 (store ~272s); concurrency suite race x20 (1058s); final LockOrder|GitHub|Checkout|
+  ManualDeploy|WebhookJobRepository race x20 (688s). Not exercised on acer (no checkout path change visible
+  there beyond normal deploys). Known: rebind racing ReserveCheckout now denies (safe); 40P01/conn errors still
+  surface as ErrGitHubDenied (pre-existing).
+- 21E DONE 2026-11-16 (commit with 21D): migration 000027 replaces validate_route_head_update with the introspected
+  live body + `IF OLD.reconciliation_required AND NEW.hostname <> OLD.hostname THEN RAISE` (body diff = 3 added lines;
+  binding unchanged). Refusal tests failed before the migration. The rule broke 3 existing tests that forced a hostname
+  move on a flagged head in one UPDATE (state unreachable via the app since 16h): owner chose clear flag -> move
+  (revision+1) -> re-flag, each asserted 1 row, helper forceRouteMovedWhileFlagged; stale comments fixed. Light review
+  PASS WITH NOTES -> confirmed all 4 production route_heads UPDATEs unaffected, allowed cases assert 1 row, OLD-only
+  edge pinned. Bar: gofmt, build, vet x2, make check, race unit; fresh PG18 sweep; migrations 77 PASS; route/
+  activation/resolution race x20 (2070s). Gate 14 closed in status doc. NEXT: 21F gate 4 analysis, then acer session.

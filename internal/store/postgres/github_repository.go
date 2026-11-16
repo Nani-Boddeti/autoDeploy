@@ -82,16 +82,7 @@ func (r *GitHubRepository) RevalidateCheckoutBinding(ctx context.Context, bindin
 		return fmt.Errorf("begin checkout revalidation: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	var bindingRevision, repositoryRevision, installationRevision int64
-	err = tx.QueryRow(ctx, `SELECT b.authorization_revision,r.authorization_revision,i.authorization_revision
-		FROM github_project_bindings b
-		JOIN github_repositories r ON r.repository_id=b.repository_id AND r.owner_id=b.owner_id
-		JOIN github_installations i ON i.installation_id=b.installation_id AND i.owner_id=b.owner_id
-		JOIN github_app_registrations a ON a.id=1 AND a.active
-		WHERE b.owner_id=$1 AND b.project_id=$2 AND b.installation_id=$3 AND b.repository_id=$4
-		AND b.active AND r.active AND i.active AND NOT i.suspended
-		FOR UPDATE OF b,r,i,a`, binding.OwnerID, binding.ProjectID, binding.InstallationID, binding.RepositoryID).Scan(&bindingRevision, &repositoryRevision, &installationRevision)
-	if err != nil || bindingRevision != binding.BindingRevision || repositoryRevision != binding.RepositoryRevision || installationRevision != binding.InstallationRevision {
+	if err = r.revalidateTx(ctx, tx, binding); err != nil {
 		return ErrGitHubDenied
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -113,9 +104,9 @@ func (r *GitHubRepository) ReserveCheckout(ctx context.Context, owner, project, 
 		return githubapp.CheckoutReservation{}, e
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	// The per-binding row is the lock root; upstream authority follows it.
-	var b githubapp.CheckoutBinding
-	e = tx.QueryRow(ctx, `SELECT b.owner_id,b.project_id,b.installation_id,b.repository_id,b.authorization_revision,r.authorization_revision,i.authorization_revision,r.clone_url FROM github_project_bindings b JOIN github_repositories r ON r.repository_id=b.repository_id AND r.owner_id=b.owner_id JOIN github_installations i ON i.installation_id=b.installation_id AND i.owner_id=b.owner_id JOIN github_app_registrations a ON a.id=1 AND a.active WHERE b.owner_id=$1 AND b.project_id=$2 AND b.active AND r.active AND i.active AND NOT i.suspended FOR UPDATE OF b,r,i,a`, owner, project).Scan(&b.OwnerID, &b.ProjectID, &b.InstallationID, &b.RepositoryID, &b.BindingRevision, &b.RepositoryRevision, &b.InstallationRevision, &b.CloneURL)
+	// Authority chain first (registration -> installation -> repository ->
+	// binding); the reservation rows below are always last.
+	b, e := lockCheckoutAuthority(ctx, tx, owner, project, 0, 0)
 	if e != nil || !b.CloneURLValid() {
 		return githubapp.CheckoutReservation{}, ErrGitHubDenied
 	}
@@ -140,14 +131,21 @@ func (r *GitHubRepository) BeginMintAttempt(ctx context.Context, id string) (git
 		return githubapp.CheckoutBinding{}, e
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Unlocked read to learn the binding; the reservation row is locked only
+	// after the authority chain, then re-checked for equality.
 	var b githubapp.CheckoutBinding
 	var attempts int16
-	e = tx.QueryRow(ctx, `SELECT owner_id,project_id,installation_id,repository_id,binding_revision,repository_revision,installation_revision,clone_url,commit_sha,attempts FROM github_checkout_reservations WHERE id=$1 AND state='reserved' AND expires_at>clock_timestamp() FOR UPDATE`, id).Scan(&b.OwnerID, &b.ProjectID, &b.InstallationID, &b.RepositoryID, &b.BindingRevision, &b.RepositoryRevision, &b.InstallationRevision, &b.CloneURL, &b.CommitSHA, &attempts)
+	e = tx.QueryRow(ctx, `SELECT owner_id,project_id,installation_id,repository_id,binding_revision,repository_revision,installation_revision,clone_url,commit_sha,attempts FROM github_checkout_reservations WHERE id=$1 AND state='reserved' AND expires_at>clock_timestamp()`, id).Scan(&b.OwnerID, &b.ProjectID, &b.InstallationID, &b.RepositoryID, &b.BindingRevision, &b.RepositoryRevision, &b.InstallationRevision, &b.CloneURL, &b.CommitSHA, &attempts)
 	if e != nil || attempts >= 1 {
 		return githubapp.CheckoutBinding{}, ErrGitHubDenied
 	}
 	b.ReservationID = id
 	if e = r.revalidateTx(ctx, tx, b); e != nil {
+		return githubapp.CheckoutBinding{}, ErrGitHubDenied
+	}
+	var locked string
+	e = tx.QueryRow(ctx, `SELECT id FROM github_checkout_reservations WHERE id=$1 AND state='reserved' AND expires_at>clock_timestamp() AND attempts<1 AND owner_id=$2 AND project_id=$3 AND installation_id=$4 AND repository_id=$5 AND binding_revision=$6 AND repository_revision=$7 AND installation_revision=$8 AND clone_url=$9 AND commit_sha=$10 FOR UPDATE`, id, b.OwnerID, b.ProjectID, b.InstallationID, b.RepositoryID, b.BindingRevision, b.RepositoryRevision, b.InstallationRevision, b.CloneURL, b.CommitSHA).Scan(&locked)
+	if e != nil {
 		return githubapp.CheckoutBinding{}, ErrGitHubDenied
 	}
 	if _, e = tx.Exec(ctx, `UPDATE github_checkout_reservations SET state='minting',attempts=attempts+1 WHERE id=$1`, id); e != nil {
@@ -167,7 +165,7 @@ func (r *GitHubRepository) ActivateMintAttempt(ctx context.Context, id string, b
 	if e = r.revalidateTx(ctx, tx, b); e != nil {
 		return ErrGitHubDenied
 	}
-	tag, e := tx.Exec(ctx, `UPDATE github_checkout_reservations SET state='active' WHERE id=$1 AND state='minting' AND expires_at>clock_timestamp() AND binding_revision=$2 AND repository_revision=$3 AND installation_revision=$4`, id, b.BindingRevision, b.RepositoryRevision, b.InstallationRevision)
+	tag, e := tx.Exec(ctx, `UPDATE github_checkout_reservations SET state='active' WHERE id=$1 AND state='minting' AND expires_at>clock_timestamp() AND binding_revision=$2 AND repository_revision=$3 AND installation_revision=$4 AND owner_id=$5 AND project_id=$6 AND installation_id=$7 AND repository_id=$8`, id, b.BindingRevision, b.RepositoryRevision, b.InstallationRevision, b.OwnerID, b.ProjectID, b.InstallationID, b.RepositoryID)
 	if e != nil || tag.RowsAffected() != 1 {
 		return ErrGitHubDenied
 	}
@@ -183,9 +181,14 @@ func (r *GitHubRepository) StartCheckout(ctx context.Context, id string, b githu
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Authority chain first, then the reservation row (cross-checked against
+	// the same binding/revision columns ActivateMintAttempt requires).
+	if r.revalidateTx(ctx, tx, b) != nil {
+		return ErrGitHubDenied
+	}
 	var state string
-	err = tx.QueryRow(ctx, `SELECT state FROM github_checkout_reservations WHERE id=$1 AND expires_at>clock_timestamp() FOR UPDATE`, id).Scan(&state)
-	if err != nil || state != "active" || r.revalidateTx(ctx, tx, b) != nil {
+	err = tx.QueryRow(ctx, `SELECT state FROM github_checkout_reservations WHERE id=$1 AND expires_at>clock_timestamp() AND owner_id=$2 AND project_id=$3 AND installation_id=$4 AND repository_id=$5 AND binding_revision=$6 AND repository_revision=$7 AND installation_revision=$8 FOR UPDATE`, id, b.OwnerID, b.ProjectID, b.InstallationID, b.RepositoryID, b.BindingRevision, b.RepositoryRevision, b.InstallationRevision).Scan(&state)
+	if err != nil || state != "active" {
 		return ErrGitHubDenied
 	}
 	tag, err := tx.Exec(ctx, `UPDATE github_checkout_reservations SET state='running' WHERE id=$1 AND state='active' AND expires_at>clock_timestamp()`, id)
@@ -208,10 +211,45 @@ func (r *GitHubRepository) CloseCheckout(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// lockCheckoutAuthority locks the checkout authority chain as separate
+// statements in the global order shared with installation disable/reconcile and
+// the webhook chain: registration, installation, repository, binding. The
+// checkout reservation row, when one is needed, is always locked afterwards. It
+// must never run in a tx that already holds a reservation row lock.
+// installationID/repositoryID are zero when unknown (ReserveCheckout); they are
+// then learned from an unlocked binding read and re-required under the binding
+// lock. Any failure is ErrGitHubDenied.
+func lockCheckoutAuthority(ctx context.Context, tx pgx.Tx, owner, project string, installationID, repositoryID int64) (githubapp.CheckoutBinding, error) {
+	b := githubapp.CheckoutBinding{OwnerID: owner, ProjectID: project, InstallationID: installationID, RepositoryID: repositoryID}
+	if installationID <= 0 || repositoryID <= 0 {
+		if err := tx.QueryRow(ctx, `SELECT installation_id,repository_id FROM github_project_bindings WHERE owner_id=$1 AND project_id=$2 AND active`, owner, project).Scan(&b.InstallationID, &b.RepositoryID); err != nil {
+			return githubapp.CheckoutBinding{}, ErrGitHubDenied
+		}
+	}
+	if err := activeRegistration(ctx, tx); err != nil {
+		return githubapp.CheckoutBinding{}, ErrGitHubDenied
+	}
+	if err := tx.QueryRow(ctx, `SELECT authorization_revision FROM github_installations WHERE installation_id=$1 AND owner_id=$2 AND active AND NOT suspended FOR UPDATE`, b.InstallationID, owner).Scan(&b.InstallationRevision); err != nil {
+		return githubapp.CheckoutBinding{}, ErrGitHubDenied
+	}
+	if err := tx.QueryRow(ctx, `SELECT authorization_revision,clone_url FROM github_repositories WHERE repository_id=$1 AND owner_id=$2 AND active FOR UPDATE`, b.RepositoryID, owner).Scan(&b.RepositoryRevision, &b.CloneURL); err != nil {
+		return githubapp.CheckoutBinding{}, ErrGitHubDenied
+	}
+	if err := tx.QueryRow(ctx, `SELECT authorization_revision FROM github_project_bindings WHERE owner_id=$1 AND project_id=$2 AND installation_id=$3 AND repository_id=$4 AND active FOR UPDATE`, owner, project, b.InstallationID, b.RepositoryID).Scan(&b.BindingRevision); err != nil {
+		return githubapp.CheckoutBinding{}, ErrGitHubDenied
+	}
+	return b, nil
+}
+
 func (r *GitHubRepository) revalidateTx(ctx context.Context, tx pgx.Tx, b githubapp.CheckoutBinding) error {
-	var x, y, z int64
-	e := tx.QueryRow(ctx, `SELECT b.authorization_revision,r.authorization_revision,i.authorization_revision FROM github_project_bindings b JOIN github_repositories r ON r.repository_id=b.repository_id AND r.owner_id=b.owner_id JOIN github_installations i ON i.installation_id=b.installation_id AND i.owner_id=b.owner_id JOIN github_app_registrations a ON a.id=1 AND a.active WHERE b.owner_id=$1 AND b.project_id=$2 AND b.installation_id=$3 AND b.repository_id=$4 AND b.active AND r.active AND i.active AND NOT i.suspended FOR UPDATE OF b,r,i,a`, b.OwnerID, b.ProjectID, b.InstallationID, b.RepositoryID).Scan(&x, &y, &z)
-	if e != nil || x != b.BindingRevision || y != b.RepositoryRevision || z != b.InstallationRevision {
+	// Revalidation never learns ids: an incomplete binding is denied, as the
+	// previous single-join query did (it matched no row).
+	if b.OwnerID == "" || b.ProjectID == "" || b.InstallationID <= 0 || b.RepositoryID <= 0 {
+		return ErrGitHubDenied
+	}
+	live, e := lockCheckoutAuthority(ctx, tx, b.OwnerID, b.ProjectID, b.InstallationID, b.RepositoryID)
+	if e != nil || live.BindingRevision != b.BindingRevision || live.RepositoryRevision != b.RepositoryRevision || live.InstallationRevision != b.InstallationRevision {
 		return ErrGitHubDenied
 	}
 	return nil

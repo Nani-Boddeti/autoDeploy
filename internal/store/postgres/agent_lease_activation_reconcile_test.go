@@ -426,8 +426,7 @@ func TestReconcileActivationPreVerifyGuards(t *testing.T) {
 func TestReconcileActivationRouteMovedWritesNothing(t *testing.T) {
 	a := newActivatedFixture(t, 170, false)
 	a.blockViaTx2Failure(t)
-	// Forced in SQL: AssignRouteHostname can move the head while blocked.
-	a.mustExec(t, `UPDATE route_heads SET hostname='moved.example.com', route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`, a.envID)
+	a.forceRouteMovedWhileFlagged(t)
 	a.assertAgentRefused(t, a.agentCall(ActivationOutcomeActivated), ErrAgentLeaseActivationRouteMoved)
 }
 

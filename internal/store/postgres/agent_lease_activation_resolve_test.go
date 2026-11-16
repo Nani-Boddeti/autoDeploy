@@ -403,11 +403,8 @@ func TestResolveActivationRefusals(t *testing.T) {
 	t.Run("activated with the route moved", func(t *testing.T) {
 		a := newActivatedFixture(t, 152, false)
 		a.blockViaTx2Failure(t)
-		// Forced in SQL: AssignRouteHostname can move the head while blocked
-		// (only while no release is active, hence no predecessor here).
-		if _, err := a.pool.Exec(context.Background(), `UPDATE route_heads SET hostname='moved.example.com', route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`, a.envID); err != nil {
-			t.Fatal(err)
-		}
+		// No predecessor: a hostname change is only legal with no active release.
+		a.forceRouteMovedWhileFlagged(t)
 		a.assertRefused(t, ActivationOutcomeActivated, ErrAgentLeaseActivationRouteMoved)
 		// not_activated is still available and leaves the moved head alone.
 		if err := a.resolve(ActivationOutcomeNotActivated); err != nil {
@@ -492,6 +489,24 @@ func (a activatedFixture) mustExec(t *testing.T, sql string, args ...any) {
 	t.Helper()
 	if _, err := a.pool.Exec(context.Background(), sql, args...); err != nil {
 		t.Fatalf("%s: %v", sql, err)
+	}
+}
+
+// forceRouteMovedWhileFlagged moves the blocked head's hostname. Neither
+// AssignRouteHostname (16h) nor the route_heads trigger (000027) allows a
+// hostname change while reconciliation_required is set, so the state is forced
+// with three individually legal writes: clear the flag, move with revision+1,
+// set the flag again. The defensive route-moved checks stay covered.
+func (a activatedFixture) forceRouteMovedWhileFlagged(t *testing.T) {
+	t.Helper()
+	for _, q := range []string{
+		`UPDATE route_heads SET reconciliation_required=false, updated_at=clock_timestamp() WHERE environment_id=$1 AND reconciliation_required`,
+		`UPDATE route_heads SET hostname='moved.example.com', route_revision=route_revision+1, updated_at=clock_timestamp() WHERE environment_id=$1`,
+		`UPDATE route_heads SET reconciliation_required=true, updated_at=clock_timestamp() WHERE environment_id=$1 AND NOT reconciliation_required`,
+	} {
+		if tag, err := a.pool.Exec(context.Background(), q, a.envID); err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("%s: rows=%d err=%v", q, tag.RowsAffected(), err)
+		}
 	}
 }
 

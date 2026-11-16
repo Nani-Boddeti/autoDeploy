@@ -827,6 +827,9 @@ run on a real host.
   (environment, commit SHA); replay check by nonce; in-flight check; then intent, deployment, deployment event,
   agent job and job event. Session-before-registration ordering was rejected because it deadlocks with
   installation disable and repository binding.
+- Checkout paths (reserve, mint, activate, start, revalidate) take registration, installation, repository, then
+  binding `FOR UPDATE` as separate statements, and the checkout reservation row last, matching installation
+  disable and reconcile. A checkout never locks a reservation before the authority chain.
 - Idempotency: the nonce is generated per form render. The same nonce with the same payload returns the existing
   deployment. The same nonce with a different payload is a conflict. A new nonce allows a deliberate redeploy.
 - In flight = a queued or in-progress deployment for the same owner, environment and commit

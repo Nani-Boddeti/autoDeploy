@@ -237,8 +237,9 @@ Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agen
     runs `Observer.Preflight` (GET `/api/version`) before `authorize`; 401/403/other 4xx ->
     `permanent_configuration`, 408/425/429/5xx/dial/timeout -> transient, all with no traffic change. Verify now
     fails fast on 401/403 after the switch. Real Traefik `/api/version` behaviour unverified until the host run.
-14. The `validate_route_head_update` trigger does not enforce the 16h hostname refusal on a flagged route head
-    (application-level only); add it as defence in depth.
+14. ~~The `validate_route_head_update` trigger does not enforce the 16h hostname refusal on a flagged route head~~
+    done in step 21E: migration 000027 refuses a hostname change when the stored row is flagged
+    `reconciliation_required` (OLD-only, mirrors the app check); no production write is affected.
 15. ~~Admin `AssignRouteHostname` on a flagged route head~~ closed by 16h (typed `ErrRouteHeadReconciliationRequired`).
 
 ## Known follow-ups
