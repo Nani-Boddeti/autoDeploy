@@ -31,6 +31,11 @@ const (
 // no activation caused declared activated / not_activated. Non-retryable.
 var ErrAgentLeaseOutcomeMismatch = errors.New("agent lease declared outcome does not match the kind of block")
 
+// ErrActivationResolveStale reports a resolve request aimed at an attempt other
+// than the one the slot now names as pending (a stale operator form after a
+// newer attempt blocked the environment). Nothing is written.
+var ErrActivationResolveStale = errors.New("activation resolve form is for a different attempt than the one pending")
+
 func validActivationOutcome(outcome string) bool {
 	switch outcome {
 	case ActivationOutcomeActivated, ActivationOutcomeNotActivated, ActivationOutcomeNoActivation:
@@ -116,11 +121,11 @@ type resolvedActivationOperation struct {
 //
 // Idempotency: once resolved the slot no longer names the attempt, so a
 // repeat is answered by confirmResolvedOutcome.
-func (r *AgentLeaseRepository) ResolveActivation(ctx context.Context, principal auth.Principal, environmentID, outcome, reason string) error {
+func (r *AgentLeaseRepository) ResolveActivation(ctx context.Context, principal auth.Principal, environmentID string, expectedAttemptID int64, outcome, reason string) error {
 	if r == nil || r.pool == nil || principal.Validate() != nil || !github.ValidOpaqueID(environmentID) {
 		return ErrServerAuthorizationDenied
 	}
-	if !validActivationOutcome(outcome) {
+	if !validActivationOutcome(outcome) || expectedAttemptID <= 0 {
 		return ErrAgentLeaseInvalidInput
 	}
 	// The audit table has no outcome column (and a CHECK on the action), so the
@@ -147,7 +152,7 @@ func (r *AgentLeaseRepository) ResolveActivation(ctx context.Context, principal 
 		return fmt.Errorf("lock environment slot for activation resolution: %w", err)
 	}
 	if pendingAttemptID == nil {
-		if err = confirmResolvedOutcome(ctx, tx, principal, environmentID, outcome); err != nil {
+		if err = confirmResolvedOutcome(ctx, tx, principal, environmentID, expectedAttemptID, outcome); err != nil {
 			return err
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -166,6 +171,13 @@ func (r *AgentLeaseRepository) ResolveActivation(ctx context.Context, principal 
 	}
 	if jobOwnerID != principal.OwnerID {
 		return ErrServerAuthorizationDenied
+	}
+	// The operator's form named an attempt; resolving a different one would
+	// apply an outcome judged for another activation. Refuse after the owner
+	// check (a foreign owner learns nothing about the pending attempt) and
+	// before any further lock; nothing has been written.
+	if attemptID != expectedAttemptID {
+		return ErrActivationResolveStale
 	}
 
 	if err = r.resolveDeclared(ctx, tx, declaredResolution{
@@ -477,9 +489,9 @@ func (r *AgentLeaseRepository) resolveNotActivated(ctx context.Context, tx pgx.T
 // agree with the declared outcome (succeeded<->activated,
 // failed<->not_activated, none<->no_activation); disagreement is an integrity
 // conflict.
-func confirmResolvedOutcome(ctx context.Context, tx pgx.Tx, principal auth.Principal, environmentID, outcome string) error {
+func confirmResolvedOutcome(ctx context.Context, tx pgx.Tx, principal auth.Principal, environmentID string, expectedAttemptID int64, outcome string) error {
 	var attemptID int64
-	if err := tx.QueryRow(ctx, `SELECT a.id FROM agent_job_attempts a JOIN agent_jobs j ON j.id=a.job_id WHERE a.id=(SELECT max(id) FROM agent_job_attempts WHERE environment_id=$1) AND j.owner_id=$2 AND EXISTS (SELECT 1 FROM agent_job_events e WHERE e.attempt_id=a.id AND e.event_type='reconciled')`, environmentID, principal.OwnerID).Scan(&attemptID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT a.id FROM agent_job_attempts a JOIN agent_jobs j ON j.id=a.job_id WHERE a.id=(SELECT max(id) FROM agent_job_attempts WHERE environment_id=$1) AND a.id=$3 AND j.owner_id=$2 AND EXISTS (SELECT 1 FROM agent_job_events e WHERE e.attempt_id=a.id AND e.event_type='reconciled')`, environmentID, principal.OwnerID, expectedAttemptID).Scan(&attemptID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrServerAuthorizationDenied
 		}

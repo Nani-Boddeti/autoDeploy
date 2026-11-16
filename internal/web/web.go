@@ -67,7 +67,7 @@ type ServerAdmin interface {
 	IssueEnrollment(context.Context, auth.Principal, string, [32]byte, int) (time.Time, error)
 	RevokeServer(context.Context, auth.Principal, string, string) error
 	ListReconcilingEnvironments(context.Context, auth.Principal) ([]postgres.ReconcilingEnvironment, error)
-	ResolveActivation(ctx context.Context, principal auth.Principal, environmentID, outcome, reason string) error
+	ResolveActivation(ctx context.Context, principal auth.Principal, environmentID string, expectedAttemptID int64, outcome, reason string) error
 }
 
 // RuntimeConfigAdmin is the narrow surface the runtime-configuration admin
@@ -927,7 +927,7 @@ func (h *Handler) environmentsResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 4 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["outcome"]) != 1 || len(v["reason"]) != 1 {
+	if err != nil || len(v) != 5 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["attempt_id"]) != 1 || len(v["outcome"]) != 1 || len(v["reason"]) != 1 {
 		badRequest(w)
 		return
 	}
@@ -937,11 +937,18 @@ func (h *Handler) environmentsResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	outcome, reason := v.Get("outcome"), v.Get("reason")
+	// The attempt the operator's form was rendered for; the repository refuses
+	// the request if a different attempt is pending now.
+	attemptID, err := strconv.ParseInt(v.Get("attempt_id"), 10, 64)
+	if err != nil || attemptID <= 0 {
+		badRequest(w)
+		return
+	}
 	if !github.ValidOpaqueID(v.Get("environment_id")) || !validResolveOutcome(outcome) || len(reason) > maxResolveReasonBytes || strings.TrimSpace(reason) == "" {
 		badRequest(w)
 		return
 	}
-	if err := h.config.ServerAdmin.ResolveActivation(r.Context(), p, v.Get("environment_id"), outcome, reason); err != nil {
+	if err := h.config.ServerAdmin.ResolveActivation(r.Context(), p, v.Get("environment_id"), attemptID, outcome, reason); err != nil {
 		resolveError(w, err, outcome)
 		return
 	}
@@ -976,6 +983,8 @@ func resolveError(w http.ResponseWriter, err error, outcome string) {
 		plain(w, http.StatusConflict, "the route moved since the activation was authorized, so activated is impossible; declare not_activated\n")
 	case errors.Is(err, postgres.ErrAgentLeaseIntegrityConflict):
 		plain(w, http.StatusConflict, "this environment was already resolved with a different outcome\n")
+	case errors.Is(err, postgres.ErrActivationResolveStale):
+		plain(w, http.StatusConflict, "this form is for a different activation than the one now blocking the environment; reload the servers page and review it\n")
 	case errors.Is(err, postgres.ErrServerAuthorizationDenied), errors.Is(err, postgres.ErrAgentLeaseInvalidInput):
 		badRequest(w)
 	default:

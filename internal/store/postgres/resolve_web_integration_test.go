@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,8 +45,8 @@ func (a resolveServerAdmin) ListReconcilingEnvironments(ctx context.Context, p a
 func (a resolveServerAdmin) ListServers(context.Context, auth.Principal) ([]postgres.ServerSummary, error) {
 	return nil, nil
 }
-func (a resolveServerAdmin) ResolveActivation(ctx context.Context, p auth.Principal, environmentID, outcome, reason string) error {
-	return a.leases.ResolveActivation(ctx, p, environmentID, outcome, reason)
+func (a resolveServerAdmin) ResolveActivation(ctx context.Context, p auth.Principal, environmentID string, expectedAttemptID int64, outcome, reason string) error {
+	return a.leases.ResolveActivation(ctx, p, environmentID, expectedAttemptID, outcome, reason)
 }
 
 type resolveHarness struct {
@@ -101,7 +102,7 @@ func (h resolveHarness) request(method, target string, form url.Values) *httptes
 
 func (h resolveHarness) resolve(outcome string) *httptest.ResponseRecorder {
 	h.t.Helper()
-	return h.request(http.MethodPost, "/environments/resolve", url.Values{"csrf": {h.csrf}, "environment_id": {h.env.EnvironmentID}, "outcome": {outcome}, "reason": {"operator checked the host"}})
+	return h.request(http.MethodPost, "/environments/resolve", url.Values{"csrf": {h.csrf}, "environment_id": {h.env.EnvironmentID}, "attempt_id": {strconv.FormatInt(h.env.AttemptID, 10)}, "outcome": {outcome}, "reason": {"operator checked the host"}})
 }
 
 func (h resolveHarness) listed() bool {
@@ -294,5 +295,31 @@ func TestResolveFormEndToEndRouteMoved(t *testing.T) {
 	}
 	if rr = h.resolve("not_activated"); rr.Code != http.StatusSeeOther || h.listed() {
 		t.Fatalf("not_activated after a moved route = %d, listed=%v", rr.Code, h.listed())
+	}
+}
+
+// 21G: a form rendered for another attempt is refused with the reload message
+// and writes nothing; a form without attempt_id is a 400; the rendered page
+// carries the hidden attempt_id of the blocked attempt.
+func TestResolveFormAttemptAnchor(t *testing.T) {
+	h := newResolveHarness(t, postgres.NewActivationBlockForTest(t, 190, true))
+	page := h.request(http.MethodGet, "/servers", nil).Body.String()
+	if want := `name="attempt_id" value="` + strconv.FormatInt(h.env.AttemptID, 10) + `"`; !strings.Contains(page, want) {
+		t.Fatalf("servers page lacks %s", want)
+	}
+	events, audits := h.count(eventsQuery), h.count(auditQuery)
+	stale := h.request(http.MethodPost, "/environments/resolve", url.Values{"csrf": {h.csrf}, "environment_id": {h.env.EnvironmentID}, "attempt_id": {strconv.FormatInt(h.env.AttemptID+1, 10)}, "outcome": {"not_activated"}, "reason": {"stale form"}})
+	if stale.Code != http.StatusConflict || stale.Body.String() != "this form is for a different activation than the one now blocking the environment; reload the servers page and review it\n" {
+		t.Fatalf("stale form = %d %q", stale.Code, stale.Body.String())
+	}
+	missing := h.request(http.MethodPost, "/environments/resolve", url.Values{"csrf": {h.csrf}, "environment_id": {h.env.EnvironmentID}, "outcome": {"not_activated"}, "reason": {"old form"}})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("form without attempt_id = %d", missing.Code)
+	}
+	if h.count(eventsQuery) != events || h.count(auditQuery) != audits || !h.listed() {
+		t.Fatal("a refused form wrote state or unblocked the environment")
+	}
+	if rr := h.resolve("not_activated"); rr.Code != http.StatusSeeOther {
+		t.Fatalf("form with the real attempt_id = %d %q", rr.Code, rr.Body.String())
 	}
 }

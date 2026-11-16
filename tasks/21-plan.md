@@ -141,6 +141,39 @@ resolution paths write route_heads).
 (GenuinelyRaces|Races|ConcurrentAssign|TestAssignRouteHostnameRefused|ResolveActivation|ReconcileActivation).
 Review: light. Estimate 1-1.5h.
 
+## 21G design (2026-11-16, APPROVED: D1 keep latest + require equality, D2 409 reload message)
+**Hazard (21F):** the operator resolve form posts (environment_id, outcome, reason) only. ResolveActivation locks the
+slot and resolves WHATEVER attempt is pending. A stale form for attempt A (lost response, back/refresh) submitted
+after a newer attempt B blocked resolves B with A's outcome (e.g. "activated" when the host never switched).
+The replay path (nothing pending) is already safe: confirmResolvedOutcome is anchored to the environment's latest
+attempt by design (TestResolveActivationReplayIsAnchoredToLatestAttempt: a duplicate for A after B was claimed is
+Denied; an old resolution never reports success for a call that did nothing). Keep that.
+**Change:**
+1. Form (templates/servers.html): hidden `attempt_id` = the row's AttemptID (already rendered in the table; fed by
+   ListReconcilingEnvironments a.id = the pending attempt). No query/view change.
+2. Handler environmentsResolve: exactly 5 fields; attempt_id parsed int64 > 0, else badRequest. An old open form
+   without attempt_id -> 400 (reload).
+3. Store ResolveActivation(ctx, principal, environmentID, expectedAttemptID, outcome, reason): expectedAttemptID <= 0
+   -> ErrAgentLeaseInvalidInput up front. Pending path: right after the slot lock, pending != expected -> new
+   `ErrActivationResolveStale`, before any other lock, nothing written (code convention: refusals write nothing).
+   Replay path: keep latest-attempt anchoring AND require latest == expected (D1); mismatch -> ErrServerAuthorizationDenied
+   as today.
+4. web resolveError: ErrActivationResolveStale -> 409 "this form is for a different activation than the one now
+   blocking the environment; reload the servers page and review it".
+5. Signature ripple: web interface + cmd/controlplane adapter + 2 test fakes; ~30 test call sites (fixture helper
+   a.resolve passes a.attemptID; harness h.resolve posts attempt_id; BlockedEnvironmentForTest gains AttemptID).
+   Agent ReconcileActivation unchanged (already attempt-anchored).
+**Decisions:** D1 replay: keep latest anchoring + require equality (recommended: zero behaviour change, existing
+replay tests keep their assertions) vs anchor replay to the expected attempt (duplicate for an older resolved attempt
+would then return success; rewrites TestResolveActivationReplayIsAnchoredToLatestAttempt). D2: 409 + reload message.
+**Tests (fail before, pass after):** store: resolve A, claim B, block B (plain-block expire path), replay with A's id
+-> ErrActivationResolveStale, slot still pending on B, resolveState/audit/events unchanged; positive control with B's
+id succeeds. expected <= 0 -> invalid input. Web end-to-end: stale form 409 + nothing written; form missing attempt_id
+-> 400; rendered servers page contains the hidden attempt_id. Existing resolve/reconcile/replay suites unchanged in
+assertions (only call sites pass the id).
+**Bar:** gofmt, build, vet x2, make check, race unit, fresh PG18 sweep; race x20 on ResolveActivation|ReconcileActivation|
+ResolveForm. Review: yes (resolution path). Estimate 1.5-2h.
+
 ## Out of scope here — each needs its own plan + owner call
 Health TCP/container policies; observability (metrics, structured logs audit, backup/DR docs; readiness already
 exists); Hetzner packaging; UI gaps (variables, domains); server-side claim idempotency, register dedupe.
@@ -195,3 +228,17 @@ Per step: gofmt, build, vet both tag sets, `go test -race ./...`; steps with SQL
   PASS WITH NOTES -> confirmed all 4 production route_heads UPDATEs unaffected, allowed cases assert 1 row, OLD-only
   edge pinned. Bar: gofmt, build, vet x2, make check, race unit; fresh PG18 sweep; migrations 77 PASS; route/
   activation/resolution race x20 (2070s). Gate 14 closed in status doc. NEXT: 21F gate 4 analysis, then acer session.
+- 21F DONE 2026-11-16 (analysis, verified by orchestrator): gate 4 SAFE (slot FOR UPDATE in both paths
+  activation_resolution.go:143/:560, under-lock re-check in resolveDeclared, typed replay/conflict, 000021 closed-op
+  trigger, cross-path race test both orders x 4 outcome pairs). Found: operator ResolveActivation takes only
+  (environment, outcome); replay anchored to latest attempt -> stale resubmit can resolve a newer blocked activation.
+  Owner: fix now as 21G.
+- 21G DONE 2026-11-16 (commit pending owner OK): resolve form carries hidden attempt_id; handler requires exactly 5
+  fields, attempt_id int64 > 0 (parsed after session/CSRF); ResolveActivation(expectedAttemptID): <= 0 invalid input;
+  pending path: owner check, THEN pending != expected -> ErrActivationResolveStale (409 reload), nothing written;
+  replay path: latest-attempt anchoring kept AND latest == expected. Orchestrator moved the stale check after the owner
+  check (design placed it before: foreign owner could learn another owner's environment has a blocked activation);
+  test failed with the old order. Stale-form test failed on old code. Only existing test touched beyond the id
+  argument: foreign slot flag now names the corrupt attempt (still asserts CorruptState, no writes). Review PASS WITH
+  NOTES. Deliberate: a stale form when nothing is pending gets the generic 400 (replay refusals reveal nothing); a
+  double-click straddling a new claim gets 400 (safe). ParseInt accepts "+5"/"007" (numeric compare, harmless).

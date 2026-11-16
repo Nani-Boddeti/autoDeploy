@@ -19,6 +19,7 @@ type BlockedEnvironmentForTest struct {
 	Leases        *AgentLeaseRepository
 	Principal     auth.Principal
 	EnvironmentID string
+	AttemptID     int64
 }
 
 // NewActivationBlockForTest blocks an environment through the real Activate
@@ -29,7 +30,7 @@ func NewActivationBlockForTest(t *testing.T, seed byte, withPredecessor bool) Bl
 	t.Helper()
 	a := newActivatedFixture(t, seed, withPredecessor)
 	a.blockViaSweeperDiversion(t)
-	return BlockedEnvironmentForTest{Pool: a.pool, Leases: a.repo, Principal: a.principal, EnvironmentID: a.envID}
+	return BlockedEnvironmentForTest{Pool: a.pool, Leases: a.repo, Principal: a.principal, EnvironmentID: a.envID, AttemptID: a.attemptID}
 }
 
 // NewPlainBlockForTest blocks an environment through an ordinary expiry close
@@ -37,7 +38,7 @@ func NewActivationBlockForTest(t *testing.T, seed byte, withPredecessor bool) Bl
 func NewPlainBlockForTest(t *testing.T, seed byte) BlockedEnvironmentForTest {
 	t.Helper()
 	a := plainBlock(t, seed)
-	return BlockedEnvironmentForTest{Pool: a.pool, Leases: a.repo, Principal: a.principal, EnvironmentID: a.envID}
+	return BlockedEnvironmentForTest{Pool: a.pool, Leases: a.repo, Principal: a.principal, EnvironmentID: a.envID, AttemptID: a.attemptID}
 }
 
 // CancelFixtureForTest is a queued deployment/job for owner A plus a second

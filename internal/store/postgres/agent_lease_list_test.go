@@ -56,7 +56,7 @@ func TestAgentLeaseListReconcilingEnvironmentsOwnerScoped(t *testing.T) {
 	}
 
 	// Resolving the reconciliation removes it from the list.
-	if err = repo.ResolveActivation(ctx, f.principal, f.envID, ActivationOutcomeNoActivation, "operator break-glass: verified clean"); err != nil {
+	if err = repo.ResolveActivation(ctx, f.principal, f.envID, attemptID, ActivationOutcomeNoActivation, "operator break-glass: verified clean"); err != nil {
 		t.Fatal(err)
 	}
 	cleared, err := repo.ListReconcilingEnvironments(ctx, f.principal)
@@ -79,7 +79,7 @@ func TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves(t *testing
 	d := f.withCredential(t, 250)
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 	ctx := context.Background()
-	f.leaseJob(t, 1, 1)
+	attemptID := f.leaseJob(t, 1, 1)
 	time.Sleep(1100 * time.Millisecond)
 	if _, err := repo.ExpireBatch(ctx, 10); err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves(t *testing
 	if leases, err := repo.Claim(ctx, f.serverID, d, 5); err != nil || len(leases) != 0 {
 		t.Fatalf("claim while flagged: leases=%+v err=%v, want none", leases, err)
 	}
-	if err := repo.ResolveActivation(ctx, f.principal, f.envID, ActivationOutcomeNoActivation, "operator break-glass: verified clean"); err != nil {
+	if err := repo.ResolveActivation(ctx, f.principal, f.envID, attemptID, ActivationOutcomeNoActivation, "operator break-glass: verified clean"); err != nil {
 		t.Fatal(err)
 	}
 	leases, err := repo.Claim(ctx, f.serverID, d, 5)

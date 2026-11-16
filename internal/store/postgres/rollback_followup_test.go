@@ -151,7 +151,7 @@ func TestRollbackOperatorDeclaredActivated(t *testing.T) {
 	w := newRollbackWorld(t, 153)
 	ctx := context.Background()
 	res, attemptID, depID := w.blockedRollback(t)
-	if err := w.lease.ResolveActivation(ctx, w.principal, w.envID, ActivationOutcomeActivated, resolveReason); err != nil {
+	if err := w.lease.ResolveActivation(ctx, w.principal, w.envID, attemptID, ActivationOutcomeActivated, resolveReason); err != nil {
 		t.Fatalf("ResolveActivation: %v", err)
 	}
 	if active, a, b := w.activeAndStates(t); active != w.relA || a != "active" || b != "retained" {
@@ -172,8 +172,8 @@ func TestRollbackOperatorDeclaredActivated(t *testing.T) {
 func TestRollbackOperatorDeclaredNotActivatedChangesNothingElse(t *testing.T) {
 	w := newRollbackWorld(t, 154)
 	ctx := context.Background()
-	res, _, depID := w.blockedRollback(t)
-	if err := w.lease.ResolveActivation(ctx, w.principal, w.envID, ActivationOutcomeNotActivated, resolveReason); err != nil {
+	res, blockedAttemptID, depID := w.blockedRollback(t)
+	if err := w.lease.ResolveActivation(ctx, w.principal, w.envID, blockedAttemptID, ActivationOutcomeNotActivated, resolveReason); err != nil {
 		t.Fatalf("ResolveActivation: %v", err)
 	}
 	if active, a, b := w.activeAndStates(t); active != w.relB || a != "retained" || b != "active" {

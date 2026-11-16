@@ -372,8 +372,8 @@ func (a serverAdmin) RevokeServer(ctx context.Context, p auth.Principal, serverI
 func (a serverAdmin) ListReconcilingEnvironments(ctx context.Context, p auth.Principal) ([]postgres.ReconcilingEnvironment, error) {
 	return a.leases.ListReconcilingEnvironments(ctx, p)
 }
-func (a serverAdmin) ResolveActivation(ctx context.Context, p auth.Principal, environmentID, outcome, reason string) error {
-	return a.leases.ResolveActivation(ctx, p, environmentID, outcome, reason)
+func (a serverAdmin) ResolveActivation(ctx context.Context, p auth.Principal, environmentID string, expectedAttemptID int64, outcome, reason string) error {
+	return a.leases.ResolveActivation(ctx, p, environmentID, expectedAttemptID, outcome, reason)
 }
 
 // serverAuthenticator adapts (*postgres.ServerRepository).Authenticate, which

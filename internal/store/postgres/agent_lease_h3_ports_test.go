@@ -88,7 +88,7 @@ func TestResolveActivationNoActivationIsOwnerScopedAndAuditedOnce(t *testing.T) 
 	a := plainBlock(t, 244)
 	stranger := secondOwnerPrincipal(t, a.pool, NewAuthRepository(a.pool), 245)
 	before := a.resolveState(t)
-	if err := a.repo.ResolveActivation(ctx, stranger, a.envID, ActivationOutcomeNoActivation, "cross-owner break-glass attempt"); !errors.Is(err, ErrServerAuthorizationDenied) {
+	if err := a.repo.ResolveActivation(ctx, stranger, a.envID, a.attemptID, ActivationOutcomeNoActivation, "cross-owner break-glass attempt"); !errors.Is(err, ErrServerAuthorizationDenied) {
 		t.Fatalf("cross-owner err=%v", err)
 	}
 	if after := a.resolveState(t); !reflect.DeepEqual(before, after) {
@@ -100,7 +100,7 @@ func TestResolveActivationNoActivationIsOwnerScopedAndAuditedOnce(t *testing.T) 
 
 	fenceBefore, _, _, _ := a.slotRow(t)
 	eventsBefore := a.jobEvents(t)
-	if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, ActivationOutcomeNoActivation, "operator break-glass: agent unreachable"); err != nil {
+	if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, ActivationOutcomeNoActivation, "operator break-glass: agent unreachable"); err != nil {
 		t.Fatal(err)
 	}
 	if fence, current, rec, flagged := a.slotRow(t); fence != fenceBefore || current != nil || rec != nil || flagged {

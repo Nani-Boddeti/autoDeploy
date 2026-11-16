@@ -45,6 +45,7 @@ type serverAdminStub struct {
 	resolveErr     error
 	resolveEnv     string
 	resolveOutcome string
+	resolveAttempt int64
 	resolveReason  string
 	resolveCalls   int
 }
@@ -80,9 +81,9 @@ func (s *serverAdminStub) RevokeServer(_ context.Context, _ auth.Principal, serv
 func (s *serverAdminStub) ListReconcilingEnvironments(context.Context, auth.Principal) ([]postgres.ReconcilingEnvironment, error) {
 	return s.environments, s.envListErr
 }
-func (s *serverAdminStub) ResolveActivation(_ context.Context, _ auth.Principal, environmentID, outcome, reason string) error {
+func (s *serverAdminStub) ResolveActivation(_ context.Context, _ auth.Principal, environmentID string, expectedAttemptID int64, outcome, reason string) error {
 	s.resolveCalls++
-	s.resolveEnv, s.resolveOutcome, s.resolveReason = environmentID, outcome, reason
+	s.resolveEnv, s.resolveAttempt, s.resolveOutcome, s.resolveReason = environmentID, expectedAttemptID, outcome, reason
 	return s.resolveErr
 }
 
@@ -145,7 +146,7 @@ func TestServersRoutesRequireSessionAndCorrectMethod(t *testing.T) {
 		{http.MethodPost, "/servers/register", url.Values{"csrf": {"x"}, "name": {"host-1"}}},
 		{http.MethodPost, "/servers/enrollment", url.Values{"csrf": {"x"}, "server_id": {"server_a"}}},
 		{http.MethodPost, "/servers/revoke", url.Values{"csrf": {"x"}, "server_id": {"server_a"}, "reason": {"r"}, "confirm": {"revoke"}}},
-		{http.MethodPost, "/environments/resolve", url.Values{"csrf": {"x"}, "environment_id": {"environment_a"}, "outcome": {"no_activation"}, "reason": {"r"}}},
+		{http.MethodPost, "/environments/resolve", url.Values{"csrf": {"x"}, "environment_id": {"environment_a"}, "attempt_id": {"42"}, "outcome": {"no_activation"}, "reason": {"r"}}},
 	}
 	for _, tc := range cases {
 		// No session cookie at all -> redirected to /login, never mutated.
@@ -365,7 +366,7 @@ func TestServersRevokeRequiresConfirmationAndReason(t *testing.T) {
 
 // resolveForm is a well-formed resolve body; tests override single keys.
 func resolveForm(csrf string, override map[string][]string) url.Values {
-	v := url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "outcome": {postgres.ActivationOutcomeNoActivation}, "reason": {"agent lost, manually verified clean"}}
+	v := url.Values{"csrf": {csrf}, "environment_id": {"environment_a"}, "attempt_id": {"42"}, "outcome": {postgres.ActivationOutcomeNoActivation}, "reason": {"agent lost, manually verified clean"}}
 	for k, val := range override {
 		if val == nil {
 			delete(v, k)
@@ -423,6 +424,36 @@ func TestEnvironmentsResolveRefusesMalformedBodiesWithoutRepositoryCall(t *testi
 				t.Fatalf("%s = %d calls=%d, want 400 and no repository call", name, rr.Code, admin.resolveCalls)
 			}
 		})
+	}
+}
+
+// 21G: the form names the attempt it was rendered for. A missing, repeated,
+// non-numeric, zero or negative attempt_id is a 400 with no repository call;
+// a valid one is forwarded parsed.
+func TestEnvironmentsResolveAttemptID(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	csrf := serversCSRF(t, h, p)
+	for name, id := range map[string][]string{
+		"missing": nil, "empty": {""}, "non-numeric": {"abc"}, "zero": {"0"}, "negative": {"-3"},
+		"fractional": {"1.5"}, "padded": {" 7"}, "overflow": {"99999999999999999999"}, "duplicate": {"7", "7"},
+	} {
+		rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"attempt_id": id}))
+		if rr.Code != http.StatusBadRequest || admin.resolveCalls != 0 {
+			t.Fatalf("%s attempt_id = %d calls=%d, want 400 and no repository call", name, rr.Code, admin.resolveCalls)
+		}
+	}
+	rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"attempt_id": {"7"}}))
+	if rr.Code != http.StatusSeeOther || admin.resolveCalls != 1 || admin.resolveAttempt != 7 {
+		t.Fatalf("valid attempt_id = %d calls=%d forwarded=%d", rr.Code, admin.resolveCalls, admin.resolveAttempt)
+	}
+}
+
+func TestEnvironmentsResolveStaleRefusalIs409(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	admin.resolveErr = postgres.ErrActivationResolveStale
+	rr := postResolve(h, p, resolveForm(serversCSRF(t, h, p), nil))
+	if rr.Code != http.StatusConflict || rr.Body.String() != "this form is for a different activation than the one now blocking the environment; reload the servers page and review it\n" {
+		t.Fatalf("stale = %d %q", rr.Code, rr.Body.String())
 	}
 }
 

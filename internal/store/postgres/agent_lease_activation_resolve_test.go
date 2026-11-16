@@ -103,7 +103,7 @@ func (a activatedFixture) resolveState(t *testing.T) resolveState {
 }
 
 func (a activatedFixture) resolve(outcome string) error {
-	return a.repo.ResolveActivation(context.Background(), a.principal, a.envID, outcome, resolveReason)
+	return a.repo.ResolveActivation(context.Background(), a.principal, a.envID, a.attemptID, outcome, resolveReason)
 }
 
 // assertRefused calls ResolveActivation and requires wantErr and no write.
@@ -294,14 +294,14 @@ func TestResolveActivationOutcomeValidation(t *testing.T) {
 	// not after the prefix is refused, nothing written.
 	long := strings.Repeat("r", 512-len("outcome=activated; ")+1)
 	before := a.resolveState(t)
-	if err := a.repo.ResolveActivation(context.Background(), a.principal, a.envID, ActivationOutcomeActivated, long); !errors.Is(err, ErrServerAuthorizationDenied) {
+	if err := a.repo.ResolveActivation(context.Background(), a.principal, a.envID, a.attemptID, ActivationOutcomeActivated, long); !errors.Is(err, ErrServerAuthorizationDenied) {
 		t.Fatalf("over-long combined reason err=%v", err)
 	}
 	if after := a.resolveState(t); !reflect.DeepEqual(before, after) {
 		t.Fatal("over-long reason wrote state")
 	}
 	exact := strings.Repeat("r", 512-len("outcome=not_activated; "))
-	if err := a.repo.ResolveActivation(context.Background(), a.principal, a.envID, ActivationOutcomeNotActivated, exact); err != nil {
+	if err := a.repo.ResolveActivation(context.Background(), a.principal, a.envID, a.attemptID, ActivationOutcomeNotActivated, exact); err != nil {
 		t.Fatalf("exactly 512-byte combined reason err=%v", err)
 	}
 }
@@ -330,7 +330,7 @@ func plainBlock(t *testing.T, seed byte) activatedFixture {
 func TestResolveActivationNoActivationClearsPlainBlock(t *testing.T) {
 	b := plainBlock(t, 131)
 	fenceBefore, _, _, _ := b.slotRow(t)
-	if err := b.repo.ResolveActivation(context.Background(), b.principal, b.envID, ActivationOutcomeNoActivation, "operator break-glass"); err != nil {
+	if err := b.repo.ResolveActivation(context.Background(), b.principal, b.envID, b.attemptID, ActivationOutcomeNoActivation, "operator break-glass"); err != nil {
 		t.Fatalf("ResolveActivation(no_activation) on a plain block: %v", err)
 	}
 	fence, current, rec, flagged := b.slotRow(t)
@@ -372,7 +372,7 @@ func TestResolveActivationRefusals(t *testing.T) {
 		other := secondOwnerPrincipal(t, a.pool, NewAuthRepository(a.pool), 147)
 		before := a.resolveState(t)
 		for _, outcome := range []string{ActivationOutcomeActivated, ActivationOutcomeNotActivated, ActivationOutcomeNoActivation} {
-			if err := a.repo.ResolveActivation(context.Background(), other, a.envID, outcome, resolveReason); !errors.Is(err, ErrServerAuthorizationDenied) {
+			if err := a.repo.ResolveActivation(context.Background(), other, a.envID, a.attemptID, outcome, resolveReason); !errors.Is(err, ErrServerAuthorizationDenied) {
 				t.Fatalf("foreign owner %s err=%v, want denied", outcome, err)
 			}
 		}
@@ -383,7 +383,7 @@ func TestResolveActivationRefusals(t *testing.T) {
 	t.Run("unknown environment", func(t *testing.T) {
 		a := newActivatedFixture(t, 148, true)
 		a.blockViaTx2Failure(t)
-		if err := a.repo.ResolveActivation(context.Background(), a.principal, "no-such-env", ActivationOutcomeActivated, resolveReason); !errors.Is(err, ErrServerAuthorizationDenied) {
+		if err := a.repo.ResolveActivation(context.Background(), a.principal, "no-such-env", a.attemptID, ActivationOutcomeActivated, resolveReason); !errors.Is(err, ErrServerAuthorizationDenied) {
 			t.Fatalf("err=%v", err)
 		}
 	})
@@ -396,8 +396,16 @@ func TestResolveActivationRefusals(t *testing.T) {
 		if _, err := a.pool.Exec(context.Background(), `UPDATE environment_slots SET reconciliation_attempt_id=$2, updated_at=clock_timestamp() WHERE environment_id=$1`, a.envID, other); err != nil {
 			t.Fatal(err)
 		}
+		// The form names the attempt the slot now points at (the corrupt one),
+		// so the corruption check, not the stale-form check, is what refuses.
 		for _, outcome := range []string{ActivationOutcomeActivated, ActivationOutcomeNotActivated, ActivationOutcomeNoActivation} {
-			a.assertRefused(t, outcome, ErrAgentLeaseCorruptState)
+			before := a.resolveState(t)
+			if err := a.resolveFor(other, outcome); !errors.Is(err, ErrAgentLeaseCorruptState) {
+				t.Fatalf("ResolveActivation(%q) err=%v, want %v", outcome, err, ErrAgentLeaseCorruptState)
+			}
+			if after := a.resolveState(t); !reflect.DeepEqual(before, after) {
+				t.Fatalf("refused ResolveActivation(%q) wrote state", outcome)
+			}
 		}
 	})
 	t.Run("activated with the route moved", func(t *testing.T) {
@@ -605,7 +613,7 @@ func TestResolveActivationIdempotentRepeat(t *testing.T) {
 			}
 			// A foreign owner learns nothing from a repeat.
 			stranger := secondOwnerPrincipal(t, a.pool, NewAuthRepository(a.pool), seed+1)
-			if err := a.repo.ResolveActivation(context.Background(), stranger, a.envID, outcome, resolveReason); !errors.Is(err, ErrServerAuthorizationDenied) {
+			if err := a.repo.ResolveActivation(context.Background(), stranger, a.envID, a.attemptID, outcome, resolveReason); !errors.Is(err, ErrServerAuthorizationDenied) {
 				t.Fatalf("foreign repeat err=%v", err)
 			}
 		})
@@ -613,15 +621,15 @@ func TestResolveActivationIdempotentRepeat(t *testing.T) {
 	t.Run("no_activation", func(t *testing.T) {
 		a := plainBlock(t, 60)
 		ctx := context.Background()
-		if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, ActivationOutcomeNoActivation, resolveReason); err != nil {
+		if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, ActivationOutcomeNoActivation, resolveReason); err != nil {
 			t.Fatal(err)
 		}
 		before := a.resolveState(t)
-		if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, ActivationOutcomeNoActivation, resolveReason); err != nil {
+		if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, ActivationOutcomeNoActivation, resolveReason); err != nil {
 			t.Fatalf("repeat err=%v", err)
 		}
 		for _, other := range []string{ActivationOutcomeActivated, ActivationOutcomeNotActivated} {
-			if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, other, resolveReason); !errors.Is(err, ErrAgentLeaseIntegrityConflict) {
+			if err := a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, other, resolveReason); !errors.Is(err, ErrAgentLeaseIntegrityConflict) {
 				t.Fatalf("repeat with %s err=%v, want integrity conflict", other, err)
 			}
 		}
@@ -798,7 +806,7 @@ func TestResolveActivationTwoResolutionsRace(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					errs[i] = a.repo.ResolveActivation(ctx, who, a.envID, outcome, resolveReason)
+					errs[i] = a.repo.ResolveActivation(ctx, who, a.envID, a.attemptID, outcome, resolveReason)
 				}()
 			}
 			start(0, a.principal, tc.first)
@@ -841,7 +849,7 @@ func TestResolveActivationRacesLateReport(t *testing.T) {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						resolveErr = a.repo.ResolveActivation(ctx, a.principal, a.envID, outcome, resolveReason)
+						resolveErr = a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, outcome, resolveReason)
 					}()
 				}
 				startReport := func() {
@@ -919,7 +927,7 @@ func TestResolveActivationRacesExpireOne(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resolveErr = a.repo.ResolveActivation(ctx, a.principal, a.envID, ActivationOutcomeNotActivated, resolveReason)
+			resolveErr = a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, ActivationOutcomeNotActivated, resolveReason)
 		}()
 		waitForLockWaiters(t, ctx, a.pool, "FROM environment_slots%FOR UPDATE", 1)
 		unpark.Do(func() { close(proceed) })
@@ -960,7 +968,7 @@ func TestResolveActivationRacesExpireOne(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resolveErr = resolver.ResolveActivation(ctx, a.principal, a.envID, ActivationOutcomeActivated, resolveReason)
+			resolveErr = resolver.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, ActivationOutcomeActivated, resolveReason)
 		}()
 		<-reached
 		closed, err := a.repo.expireOne(ctx, a.attemptID)

@@ -545,7 +545,7 @@ func TestReconcileActivationRacesOperatorResolution(t *testing.T) {
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
-						operatorErr = a.repo.ResolveActivation(ctx, a.principal, a.envID, operatorOutcome, resolveReason)
+						operatorErr = a.repo.ResolveActivation(ctx, a.principal, a.envID, a.attemptID, operatorOutcome, resolveReason)
 					}()
 				}
 				if agentFirst {

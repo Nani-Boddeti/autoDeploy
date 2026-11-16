@@ -214,8 +214,13 @@ Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agen
 2. ~~10d's persistent result-report retry~~ done in 10d-4 (`d99970a`); still unproven against a real control-plane outage.
 3. Traefik API authentication: code half done in 16f (`2edaa98`, optional credentials file, basic auth to loopback
    only); still open: Traefik's JSON shapes, reload timing and the authenticated API observed against a real Traefik.
-4. Both resolution paths (operator `ResolveActivation`, agent `ReconcileActivation`) can resolve an activation;
-   that is safe only while no activate operations exist, i.e. while the gate is false. Re-check before flipping.
+4. ~~Both resolution paths (operator `ResolveActivation`, agent `ReconcileActivation`) can resolve an activation~~
+   re-checked in step 21F: safe with activate operations present. Both lock the environment slot FOR UPDATE and
+   re-check op state, open attempt and slot attempt under it in the shared `resolveDeclared`; the loser replays
+   (same outcome nil, different outcome `ErrAgentLeaseIntegrityConflict`, nothing written); 000021 trigger refuses
+   rewriting a closed operation. Covered by TestReconcileActivationRacesOperatorResolution (both orders, all four
+   outcome pairs, real lock contention). Adjacent hazard found: the operator form is not anchored to an attempt
+   (stale resubmit could resolve a newer blocked activation) -> step 21G.
 5. ~~Fence `Store.path`: `ValidOpaqueID` allows 128 bytes and `encodeName` can expand x3, exceeding the 255-byte
    file-name limit for long environment ids~~ done in 16a (`fd9b8a1`): the fence store refuses them.
 6. ~~The agent-local `ReconciliationRequired` flag set on a stale renewal is never cleared~~ done in 16b
