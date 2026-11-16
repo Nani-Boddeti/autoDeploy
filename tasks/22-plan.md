@@ -15,7 +15,11 @@ failing test first -> full bar -> independent review -> owner sees diff -> commi
 ## Phase 2: mac-side code closing outcomes
 - 22-1 TCP and container health policies with bounded retries (only HTTP exists) -> Health policies outcome. ~1 day.
 - 22-2 Build: exercise secret mounts, resource/time limits, build-output redaction, build cleanup -> Build. ~1-1.5d.
-- 22-3 Live log streaming on the deployment page -> UI. ~0.5-1 day.
+- 22-3 UI outcome (owner 2026-11-16): (a) show the failure reason (e.g. container_unhealthy, deadline_exceeded +
+  last probe) on the deployment page next to the failure class, not only under Logs; (b) overall UI rework to a more
+  productive theme with fewer nested clicks (dashboard-style overview: environments, current release, last deploy
+  and its reason, deploy/rollback/resolve actions inline); (c) live log streaming. Design first with the
+  impeccable skill and pastel palette (CLAUDE.md), owner approves mock/design before code. ~2-3 days.
 
 ## Phase 3: observability
 - 22-4 Metrics endpoint, structured-log audit, liveness next to /readyz, PostgreSQL + secrets backup/DR docs. ~1 day.
@@ -109,3 +113,13 @@ policies before installing an older build (gate 12 class, document in status doc
   22-1a race x20 (skip 7 pre-existing fixed-id tests) clean. Low follow-ups: skipped-job crowding; cosmetic
   trailing "; " in LastProbe when HTTP errors first. NEXT: commit, then acer validation (tcp port 80 + tuned
   deadline pass; failing HEALTHCHECK image fast fail with blue/green).
+- ACER 2026-11-16 (build 1818b54, install-app.sh applied 000028; helpers byte-identical; previous build kept as
+  ~/autodeploy-stage/bin-gated.prev-e0f2319): attempt 21 STS with tuned policy (deadline 90, tcp 80) passed and
+  switched. Attempt 22 blue/green with tcp port 81: gate 20:10:10 -> 20:11:40 (exactly the tuned 90s) failed
+  deadline_exceeded/permanent_configuration, last_probe="status=200; tcp error: dial tcp 172.29.0.129:81: connect:
+  connection refused" -> TCP check per round and tuned deadline PROVEN; candidate stopped, no activation, site 200.
+  Pending: image HEALTHCHECK unhealthy/starting on a real host (needs a Dockerfile HEALTHCHECK in the demo repo).
+- ACER 2026-11-16 attempt 23 (blue/green, demo Dockerfile HEALTHCHECK exit 1): gate 20:16:26 -> 20:16:30 failed
+  container_unhealthy/permanent_configuration with last_probe="status=200; tcp ok" -> image HEALTHCHECK PROVEN.
+  Health-policies outcome ticked (12/18, weighted ~84%). Owner asked: failure reason on the deployment page + overall
+  productive UI rework with fewer nested clicks -> folded into 22-3.

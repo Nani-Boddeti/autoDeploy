@@ -151,7 +151,9 @@ State transitions must be validated in the domain layer and committed transactio
       restart policy, and immutable release labels. (Proven on the acer: network, CPU, memory, restart
       policy, labels. Environment-variable injection has no explicit acer evidence: check in the next acer
       session.)
-- [ ] Implement HTTP/TCP/container health policies with bounded retries.
+- [x] Implement HTTP/TCP/container health policies with bounded retries.
+      (step 22-1, 1818b54; acer 2026-11-16: tuned policy attempt 21, TCP check + tuned 90s deadline attempt 22,
+      image HEALTHCHECK unhealthy -> container_unhealthy in 4s attempt 23; tasks/22-plan.md)
 - [ ] Implement Traefik route generation, automatic HTTPS integration, and atomic active-release
       switching.
 - [x] Implement blue/green activation, stop-then-start mode, release retention, and rollback.

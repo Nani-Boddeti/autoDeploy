@@ -269,8 +269,12 @@
   20E retention (rt-13 removed, newest two retained kept), env-var injection, STS failure path (attempt 19: predecessor
   restarted, route untouched, environment blocked by design, resolved not_activated via the 21G form), STS success (20).
   Not yet proven: failed release rt-19 removal after 24h (check ~2026-11-17 16:00+), crash recovery, ACME, gate 3.
-- Progress: 11/18 outcomes (~61%; release strategies ticked 2026-11-16), weighted ~81% (14.55/18 by per-outcome partial
-  credit, see status doc). Hard gates 13/15 closed (open: 3 real Traefik observation, 12 drain before downgrade).
+- Progress: 12/18 outcomes (~67%; release strategies + health policies ticked 2026-11-16), weighted ~84% (15.05/18,
+  see status doc). Hard gates 13/15 closed (open: 3 real Traefik observation, 12 drain before downgrade).
+- Step 22 roadmap: tasks/22-plan.md. 22-1 health policies (1818b54, migration 000028) proven on the acer (attempts
+  21-23). Next per roadmap: 24h rt-19 check, crash recovery, 22-2 build outcome, 22-3 UI outcome (failure reason on the
+  deployment page + overall productive UI with fewer nested clicks + live logs; design with impeccable skill, pastel,
+  owner approves design first).
 - Step 21 mac side complete (tasks/21-plan.md): 21A docs; 21B failed-candidate cleanup (05bf9de, 514741f); 21C
   route-page Releases table (94dd2ca); 21D checkout lock order + 21E migration 000027 flagged-head hostname guard
   (77e4435); 21F gate 4 closed + 21G operator resolve form anchored to its attempt (e0f2319).
