@@ -78,6 +78,20 @@ func ClassifyFailure(err error) queue.FailureClass {
 		// A bad Dockerfile (or any other buildx failure): an
 		// application-configuration problem, per the plan text verbatim.
 		return queue.FailureClassPermanentConfiguration
+	case errors.Is(err, ErrBuildTimeout):
+		// The build ran past the agent's own time limit: too slow for its
+		// limit, and an unchanged retry would hit the same wall.
+		return queue.FailureClassPermanentConfiguration
+	case errors.Is(err, ErrBuildInterrupted):
+		// The agent's own context went away mid-build (job cancel, lost
+		// lease, shutdown); same reasoning as the health gate's
+		// context_cancelled: nothing about the application failed.
+		return queue.FailureClassTransient
+	case errors.Is(err, ErrBuilderUnavailable):
+		// The dedicated builder is infrastructure, not the repository: a
+		// lost or unrecreatable builder clears on a later attempt. (The
+		// startup probe fails closed on it independently of classification.)
+		return queue.FailureClassTransient
 	case errors.Is(err, ErrBuildxUnavailable):
 		// Missing/broken buildx on this host is this host's own
 		// environment being misconfigured, not the repository's.

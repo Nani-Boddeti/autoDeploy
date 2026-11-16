@@ -13,7 +13,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
+	"autodeploy/internal/buildsecret"
 	"autodeploy/internal/crypto"
 )
 
@@ -35,6 +37,18 @@ var (
 	// ErrBuildFailed wraps a non-zero buildx exit or an unusable metadata
 	// result.
 	ErrBuildFailed = errors.New("docker buildx: build failed")
+	// ErrBuildTimeout means the build ran past the agent's own build time
+	// limit (BuildRequest.Timeout) and was killed. The build is too slow
+	// for its limit, so retrying unchanged would hit the same wall:
+	// permanent_configuration. It deliberately does not wrap
+	// context.DeadlineExceeded, so it can never be mistaken for a lost
+	// lease.
+	ErrBuildTimeout = errors.New("docker buildx: build exceeded its time limit")
+	// ErrBuildInterrupted means the caller's context ended mid-build (job
+	// cancel, lease loss, agent shutdown) and the build was killed. Nothing
+	// about the application failed, so this is transient. The wrapped
+	// chain also carries the caller's context error.
+	ErrBuildInterrupted = errors.New("docker buildx: build interrupted")
 	// ErrInvalidBuildRequest is returned for a structurally invalid
 	// BuildRequest: this is checked before any subprocess is started or any
 	// secret is materialized.
@@ -113,10 +127,55 @@ type BuildRequest struct {
 	// Materializer resolves SecretBindings to plaintext. Required whenever
 	// SecretBindings is non-empty.
 	Materializer BuildSecretMaterializer
+	// Literals are the build-scoped literal_nonsecret bindings, delivered as
+	// `--build-arg NAME=value` (ADR 0003 forbids ARG/ENV only for secrets;
+	// literals are non-secret by classification). Names are validated by
+	// resolveBuildLiterals; the values are visible in argv and image history.
+	Literals []BuildLiteral
 	// Stdout and Stderr are the pre-redaction sinks for build output. Build
 	// wraps both in a crypto.RedactingWriter itself; callers must not
 	// redact separately or pass an already-redacting writer.
 	Stdout, Stderr io.Writer
+	// Timeout bounds the buildx subprocess. Zero or negative means
+	// DefaultBuildTimeout, so a build is never unbounded.
+	Timeout time.Duration
+	// BuildxConfigDir is the BUILDX_CONFIG directory holding the dedicated
+	// builder's definition (BuilderConfig.ConfigDir). Empty leaves buildx's
+	// own default; production always sets it.
+	BuildxConfigDir string
+	// Builder carries the dedicated builder's caps so a builder lost after
+	// startup can be recreated once after a failed build (see
+	// checkBuilderAfterFailure). Its ConfigDir defaults to BuildxConfigDir.
+	Builder BuilderConfig
+}
+
+// BuildLiteral is one build-scoped literal_nonsecret binding.
+type BuildLiteral struct {
+	VariableName string
+	Value        string
+}
+
+// ErrInvalidBuildLiteral is returned when a build-scoped literal binding is
+// refused (invalid, reserved or built-in name, duplicate, or a name also used
+// as a build secret). It wraps ErrInvalidBuildRequest, so it classifies as
+// permanent_configuration. Messages name the variable, never its value.
+var ErrInvalidBuildLiteral = fmt.Errorf("%w: build literal", ErrInvalidBuildRequest)
+
+// DefaultBuildTimeout is the build time limit when BuildRequest.Timeout is
+// unset; it matches the agent's --build-timeout default.
+const DefaultBuildTimeout = 30 * time.Minute
+
+// buildWaitDelay bounds how long Wait lingers after the process group is
+// killed, so a descendant that somehow still holds the output pipes cannot
+// hang the build forever.
+const buildWaitDelay = 10 * time.Second
+
+// EffectiveBuildTimeout resolves an unset (<= 0) limit to the default.
+func EffectiveBuildTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultBuildTimeout
+	}
+	return d
 }
 
 // BuildResult is the outcome of one successful build: the built image's
@@ -167,6 +226,64 @@ var reservedSecretEnvVars = map[string]struct{}{
 	"BUILDX_METADATA_PROVENANCE": {},
 }
 
+// Literals deliberately keep the narrower rule (the fixed set above plus
+// BUILDKIT_*/BUILDX_*, no DOCKER_* prefix): they travel as `--build-arg` argv,
+// never in the CLI's environment, so DOCKER_*-named literals are harmless.
+// PATH/HOME/DOCKER_HOST stay refused for literals on purpose, to avoid
+// confusion with the same names as env-borne secrets; that is documented
+// behaviour, not an accident.
+
+// reservedBuildArgNames are BuildKit/Dockerfile predefined build args a
+// literal must not override (case-insensitive): the proxy args and the
+// platform args.
+var reservedBuildArgNames = map[string]struct{}{
+	"HTTP_PROXY": {}, "HTTPS_PROXY": {}, "FTP_PROXY": {}, "NO_PROXY": {}, "ALL_PROXY": {},
+	"TARGETPLATFORM": {}, "TARGETOS": {}, "TARGETARCH": {}, "TARGETVARIANT": {},
+	"BUILDPLATFORM": {}, "BUILDOS": {}, "BUILDARCH": {}, "BUILDVARIANT": {},
+}
+
+// maxBuildLiteralNameLen mirrors the control plane's variable_name CHECK
+// (1..128 and the same pattern as envVarPattern).
+const maxBuildLiteralNameLen = 128
+
+// resolveBuildLiterals validates the build-scoped literals and returns them
+// sorted by name so argv is deterministic. A name that is invalid, duplicated,
+// reserved (reservedSecretEnvVars), a BuildKit/buildx built-in (BUILDKIT_*,
+// BUILDX_*, proxy and platform args) or also a build secret is refused, never
+// dropped: the secret clash is refused rather than guessed.
+func resolveBuildLiterals(literals []BuildLiteral, secrets []BuildSecretBinding) ([]BuildLiteral, error) {
+	if len(literals) == 0 {
+		return nil, nil
+	}
+	secretNames := make(map[string]struct{}, len(secrets))
+	for _, b := range secrets {
+		secretNames[b.VariableName] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(literals))
+	for _, l := range literals {
+		n := l.VariableName
+		if len(n) < 1 || len(n) > maxBuildLiteralNameLen || !envVarPattern.MatchString(n) {
+			return nil, fmt.Errorf("%w: invalid variable name %q", ErrInvalidBuildLiteral, n)
+		}
+		upper := strings.ToUpper(n)
+		_, reserved := reservedSecretEnvVars[n]
+		_, builtIn := reservedBuildArgNames[upper]
+		if reserved || builtIn || strings.HasPrefix(upper, "BUILDKIT_") || strings.HasPrefix(upper, "BUILDX_") {
+			return nil, fmt.Errorf("%w: variable name %q is reserved for docker/buildx/BuildKit", ErrInvalidBuildLiteral, n)
+		}
+		if _, dup := seen[n]; dup {
+			return nil, fmt.Errorf("%w: duplicate variable name %q", ErrInvalidBuildLiteral, n)
+		}
+		seen[n] = struct{}{}
+		if _, clash := secretNames[n]; clash {
+			return nil, fmt.Errorf("%w: variable name %q is bound both as a build secret and a build literal", ErrInvalidBuildLiteral, n)
+		}
+	}
+	out := append([]BuildLiteral(nil), literals...)
+	sort.Slice(out, func(i, j int) bool { return out[i].VariableName < out[j].VariableName })
+	return out, nil
+}
+
 // subprocessEnvAllowlist is the complete set of environment variables the
 // docker/buildx subprocess may inherit from the agent process, before the
 // per-build secret entries (which are never in this list -- see
@@ -213,15 +330,6 @@ func subprocessEnv(secretEnv []string) []string {
 	return append(env, secretEnv...)
 }
 
-// opaqueSecretID returns the opaque BuildKit session secret id for the i-th
-// secret in a build, e.g. "build-secret-0". It is a positional index, never
-// derived from the variable name or any secret content, so the id itself
-// carries no information about what the secret is -- ADR 0003 requires the
-// id to be opaque, and a name-derived id would leak the variable name (and
-// therefore a hint about the secret's purpose) into build logs, argv, and
-// BuildKit's own diagnostics.
-func opaqueSecretID(i int) string { return fmt.Sprintf("build-secret-%d", i) }
-
 // resolvedBuildSecret pairs one binding with its materialized value plus
 // the opaque id and env var name that will carry it into the build.
 type resolvedBuildSecret struct {
@@ -232,8 +340,9 @@ type resolvedBuildSecret struct {
 
 // resolveBuildSecrets validates that the materializer returned exactly one
 // value per requested binding (by variable name, ADR 0003's identity for a
-// binding) and assigns each a positional opaque id, sorted by variable name
-// so argv construction is deterministic and testable.
+// binding) and assigns each its opaque id via buildsecret.ID (index among the
+// build-scoped names sorted by variable name, ADR 0003: never the name itself),
+// so ids and argv order are deterministic whatever order bindings arrive in.
 func resolveBuildSecrets(bindings []BuildSecretBinding, values []BuildSecretValue) ([]resolvedBuildSecret, error) {
 	if len(bindings) == 0 {
 		return nil, nil
@@ -250,13 +359,25 @@ func resolveBuildSecrets(bindings []BuildSecretBinding, values []BuildSecretValu
 	}
 	sorted := append([]BuildSecretBinding(nil), bindings...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].VariableName < sorted[j].VariableName })
+	names := make([]string, len(sorted))
+	for i, b := range sorted {
+		if i > 0 && names[i-1] == b.VariableName {
+			return nil, fmt.Errorf("%w: duplicate secret binding %q", ErrInvalidBuildRequest, b.VariableName)
+		}
+		names[i] = b.VariableName
+	}
 
 	out := make([]resolvedBuildSecret, 0, len(sorted))
-	for i, b := range sorted {
+	for _, b := range sorted {
 		if !envVarPattern.MatchString(b.VariableName) {
 			return nil, fmt.Errorf("%w: invalid secret variable name %q", ErrInvalidBuildRequest, b.VariableName)
 		}
-		if _, reserved := reservedSecretEnvVars[b.VariableName]; reserved {
+		// Secret values are exported into the docker CLI's own environment, so
+		// every BUILDKIT_*/BUILDX_*/DOCKER_* name (any case) is refused, not
+		// only the fixed set: those prefixes are CLI configuration.
+		upper := strings.ToUpper(b.VariableName)
+		_, reserved := reservedSecretEnvVars[b.VariableName]
+		if reserved || strings.HasPrefix(upper, "BUILDKIT_") || strings.HasPrefix(upper, "BUILDX_") || strings.HasPrefix(upper, "DOCKER_") {
 			return nil, fmt.Errorf("%w: secret variable name %q is reserved for the docker/buildx CLI", ErrInvalidBuildRequest, b.VariableName)
 		}
 		value, ok := byName[b.VariableName]
@@ -266,7 +387,8 @@ func resolveBuildSecrets(bindings []BuildSecretBinding, values []BuildSecretValu
 		if len(value) == 0 {
 			return nil, fmt.Errorf("%w: empty materialized value for %q", ErrInvalidBuildRequest, b.VariableName)
 		}
-		out = append(out, resolvedBuildSecret{id: opaqueSecretID(i), envVar: b.VariableName, value: value})
+		id, _ := buildsecret.ID(names, b.VariableName) // b's name is in names by construction
+		out = append(out, resolvedBuildSecret{id: id, envVar: b.VariableName, value: value})
 	}
 	return out, nil
 }
@@ -348,11 +470,12 @@ func resolveDockerfilePath(contextDir, dockerfilePath string) (string, error) {
 //
 // Shape (labels and secrets sorted for determinism):
 //
-//	buildx build --progress=plain --file <path> --provenance=false --sbom=false
+//	buildx build --builder autodeploy-build --progress=plain --file <path> --provenance=false --sbom=false
 //	  --label <k>=<v> [--label <k>=<v> ...]
 //	  --secret id=<opaque>,env=<VAR> [--secret id=<opaque>,env=<VAR> ...]
+//	  --build-arg <NAME>=<literal> [--build-arg ...]   (non-secret literals only, sorted by name)
 //	  --metadata-file <path> --load <contextDir>
-func buildxArgv(dockerfile string, labels map[string]string, secrets []resolvedBuildSecret, metadataFile string) ([]string, []string) {
+func buildxArgv(dockerfile string, labels map[string]string, secrets []resolvedBuildSecret, literals []BuildLiteral, metadataFile string) ([]string, []string) {
 	// --provenance=false --sbom=false: with the containerd image store
 	// (Docker >= 29 default) buildx otherwise exports an OCI index holding an
 	// attestation manifest next to the image, so --metadata-file carries no
@@ -361,7 +484,9 @@ func buildxArgv(dockerfile string, labels map[string]string, secrets []resolvedB
 	// provenance attestation embeds the build's invocation (build args, source
 	// layout) that ADR 0003 requires to stay out of anything persisted with
 	// the image. See ADR 0003 amendments.
-	args := []string{"buildx", "build", "--progress=plain", "--file", dockerfile, "--provenance=false", "--sbom=false"}
+	// --builder: every build runs in the dedicated capped builder (builder.go),
+	// never the default one; the name is a constant, not ambient state.
+	args := []string{"buildx", "build", "--builder", BuilderName, "--progress=plain", "--file", dockerfile, "--provenance=false", "--sbom=false"}
 
 	keys := make([]string, 0, len(labels))
 	for k := range labels {
@@ -376,6 +501,12 @@ func buildxArgv(dockerfile string, labels map[string]string, secrets []resolvedB
 	for _, s := range secrets {
 		args = append(args, "--secret", "id="+s.id+",env="+s.envVar)
 		env = append(env, s.envVar+"="+string(s.value))
+	}
+
+	// Literals are non-secret by classification and already sorted by
+	// resolveBuildLiterals; they travel in argv, never in the subprocess env.
+	for _, l := range literals {
+		args = append(args, "--build-arg", l.VariableName+"="+l.Value)
 	}
 
 	args = append(args, "--metadata-file", metadataFile, "--load", ".")
@@ -405,6 +536,9 @@ func validateBuildRequest(req BuildRequest) error {
 			return fmt.Errorf("%w: duplicate secret binding for %q", ErrInvalidBuildRequest, b.VariableName)
 		}
 		seen[b.VariableName] = struct{}{}
+	}
+	if _, err := resolveBuildLiterals(req.Literals, req.SecretBindings); err != nil {
+		return err
 	}
 	return nil
 }
@@ -453,6 +587,8 @@ const dockerExecutable = "docker"
 // available.
 func probeBuildx(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, dockerExecutable, "buildx", "version")
+	killProcessGroupOnCancel(cmd)
+	cmd.WaitDelay = buildWaitDelay
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -472,6 +608,34 @@ func probeBuildx(ctx context.Context) error {
 // engine_test.go exercises newClient directly. The exported, platform-gated
 // Build wraps this identically to how client_linux.go wraps newClient.
 func build(ctx context.Context, req BuildRequest) (BuildResult, error) {
+	var ran bool
+	res, err := runBuild(ctx, req, &ran)
+	if err != nil && !ran {
+		err = MarkBuildNotStarted(err)
+	}
+	return res, err
+}
+
+// buildNotStartedError marks a build that failed before the buildx subprocess
+// ran (validation, probe, secret materialization, setup).
+type buildNotStartedError struct{ err error }
+
+func (e *buildNotStartedError) Error() string { return e.err.Error() }
+func (e *buildNotStartedError) Unwrap() error { return e.err }
+
+// MarkBuildNotStarted wraps err as a failure that happened before the buildx
+// subprocess ran. Build applies it itself; it is exported so callers' fakes
+// can reproduce that shape.
+func MarkBuildNotStarted(err error) error { return &buildNotStartedError{err} }
+
+// BuildNeverStarted reports whether err came from a Build that failed before
+// the buildx subprocess was started, so there is nothing to clean up after it.
+func BuildNeverStarted(err error) bool {
+	var ns *buildNotStartedError
+	return errors.As(err, &ns)
+}
+
+func runBuild(ctx context.Context, req BuildRequest, ran *bool) (BuildResult, error) {
 	if err := validateBuildRequest(req); err != nil {
 		return BuildResult{}, err
 	}
@@ -479,6 +643,11 @@ func build(ctx context.Context, req BuildRequest) (BuildResult, error) {
 	// must never fall through to a legacy `docker build`, which has no
 	// --secret support.
 	if err := probeBuildx(ctx); err != nil {
+		if ctx.Err() != nil {
+			// The probe was killed by the caller's context, not by a
+			// broken buildx: a cancel/lease loss, not host misconfiguration.
+			return BuildResult{}, fmt.Errorf("%w: %w", ErrBuildInterrupted, ctx.Err())
+		}
 		return BuildResult{}, err
 	}
 	labels, err := BuiltImageLabels(req.Identity)
@@ -525,6 +694,10 @@ func build(ctx context.Context, req BuildRequest) (BuildResult, error) {
 	// the resolved path, and TOCTOU on a re-check is no worse than the
 	// single check would be -- both run immediately before the path is
 	// used, with no attacker-controlled step in between.
+	literals, err := resolveBuildLiterals(req.Literals, req.SecretBindings)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	dockerfile, err := resolveDockerfilePath(req.ContextDir, req.DockerfilePath)
 	if err != nil {
 		return BuildResult{}, err
@@ -537,17 +710,27 @@ func build(ctx context.Context, req BuildRequest) (BuildResult, error) {
 	defer os.RemoveAll(metaDir)
 	metaFile := metaDir + "/metadata.json"
 
-	argv, secretEnv := buildxArgv(dockerfile, labels, resolved, metaFile)
+	argv, secretEnv := buildxArgv(dockerfile, labels, resolved, literals, metaFile)
 	for i := range resolved {
 		clearBytes(resolved[i].value)
 	}
 
-	cmd := exec.CommandContext(ctx, dockerExecutable, argv...)
+	// Only the subprocess is bounded by the limit; the earlier probe and
+	// secret materialization keep the caller's context. A derived context
+	// lets the two causes of death be told apart afterwards by their own
+	// Err(), never by error text.
+	limit := EffectiveBuildTimeout(req.Timeout)
+	buildCtx, cancelBuild := context.WithTimeout(ctx, limit)
+	defer cancelBuild()
+	cmd := exec.CommandContext(buildCtx, dockerExecutable, argv...)
+	killProcessGroupOnCancel(cmd)
+	cmd.WaitDelay = buildWaitDelay
 	cmd.Dir = req.ContextDir
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Env = subprocessEnv(secretEnv)
+	cmd.Env = withBuildxConfig(subprocessEnv(secretEnv), req.BuildxConfigDir)
 
+	*ran = true
 	runErr := cmd.Run()
 	// Wipe the subprocess env strings we built; cmd.Env's backing array is
 	// ours (append onto os.Environ() may or may not reuse it, so this is
@@ -559,6 +742,22 @@ func build(ctx context.Context, req BuildRequest) (BuildResult, error) {
 
 	closeErr := errors.Join(stdout.Close(), stderr.Close())
 	if runErr != nil {
+		switch {
+		case ctx.Err() != nil:
+			// The caller's context ended (checked first: it also ends
+			// buildCtx, and a lost lease must never read as a timeout).
+			return BuildResult{}, fmt.Errorf("%w: %w", ErrBuildInterrupted, ctx.Err())
+		case errors.Is(buildCtx.Err(), context.DeadlineExceeded):
+			return BuildResult{}, fmt.Errorf("%w (%s): %v", ErrBuildTimeout, limit, runErr)
+		}
+		// A non-zero exit is the tenant's unless the builder itself is gone.
+		bcfg := req.Builder
+		if bcfg.ConfigDir == "" {
+			bcfg.ConfigDir = req.BuildxConfigDir
+		}
+		if berr := checkBuilderAfterFailure(ctx, bcfg); berr != nil {
+			return BuildResult{}, berr
+		}
 		return BuildResult{}, fmt.Errorf("%w: %v", ErrBuildFailed, runErr)
 	}
 	if closeErr != nil {

@@ -12,6 +12,11 @@ func Build(context.Context, BuildRequest) (BuildResult, error) {
 }
 
 // ProbeBuildx is unavailable outside Linux; see Build.
-func ProbeBuildx(context.Context) error {
+func ProbeBuildx(context.Context, BuilderConfig) error {
+	return ErrUnsupportedPlatform
+}
+
+// PruneBuildCache is unavailable outside Linux; see Build.
+func PruneBuildCache(context.Context, BuilderConfig, int64) error {
 	return ErrUnsupportedPlatform
 }

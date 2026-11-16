@@ -11,8 +11,19 @@ func Build(ctx context.Context, req BuildRequest) (BuildResult, error) {
 }
 
 // ProbeBuildx is the buildx half of the startup capability probe: it fails
-// closed when the docker CLI or the buildx plugin is missing or unusable,
-// so an incapable host is caught at enrollment rather than mid-deployment.
-func ProbeBuildx(ctx context.Context) error {
-	return probeBuildx(ctx)
+// closed when the docker CLI or the buildx plugin is missing or unusable, or
+// when the dedicated capped builder cannot be ensured and bootstrapped, so an
+// incapable host is caught at startup rather than mid-deployment.
+func ProbeBuildx(ctx context.Context, cfg BuilderConfig) error {
+	if err := probeBuildx(ctx); err != nil {
+		return err
+	}
+	return ensureBuilder(ctx, cfg)
+}
+
+// PruneBuildCache bounds the dedicated builder's cache to keepBytes after a
+// build; see pruneBuildCache. Errors are for logging: they never decide a
+// deployment's outcome.
+func PruneBuildCache(ctx context.Context, cfg BuilderConfig, keepBytes int64) error {
+	return pruneBuildCache(ctx, cfg, keepBytes)
 }

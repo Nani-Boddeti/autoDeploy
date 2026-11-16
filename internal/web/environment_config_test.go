@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/buildsecret"
 	"autodeploy/internal/store/postgres"
 )
 
@@ -454,5 +455,75 @@ func TestEnvironmentConfigRemoveBinding(t *testing.T) {
 	}
 	if admin.removeCalls != 1 || admin.removeVar != "API_TOKEN" {
 		t.Fatalf("removeCalls=%d removeVar=%q", admin.removeCalls, admin.removeVar)
+	}
+}
+
+func TestEnvironmentConfigShowsBuildLiteralHint(t *testing.T) {
+	h, admin, p := runtimeConfigHandler(t)
+	_ = serversCSRF(t, h, p)
+	admin.getFound = true
+	admin.getCfg = postgres.RuntimeConfig{
+		EnvironmentID:        "env-a",
+		RuntimeConfigInput:   postgres.RuntimeConfigInput{ContainerPort: 8080, ContainerScheme: "http", ReleaseStrategy: "stop_then_start", DrainSeconds: 30, CPUMillis: 500, MemoryBytes: 268435456, RestartPolicy: "unless-stopped"},
+		HealthPolicyRevision: 1,
+		Revision:             1,
+	}
+	r := httptest.NewRequest(http.MethodGet, "https://admin.example.test/environments/config?environment_id=env-a", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "v1.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get = %d body=%s", rr.Code, rr.Body.String())
+	}
+	const hint = "Build literals are passed as --build-arg and are visible in the image history; never use them for secrets."
+	if !strings.Contains(rr.Body.String(), hint) {
+		t.Fatalf("build literal hint missing from page: %s", rr.Body.String())
+	}
+}
+
+// The page shows, for build-scoped secret bindings only, the Dockerfile id
+// computed by buildsecret.ID over the live build-scoped secret names; runtime
+// secrets and literals get none.
+func TestEnvironmentConfigShowsBuildSecretDockerfileIDs(t *testing.T) {
+	h, admin, p := runtimeConfigHandler(t)
+	_ = serversCSRF(t, h, p)
+	admin.getFound = true
+	admin.getCfg = postgres.RuntimeConfig{
+		EnvironmentID:        "env-a",
+		RuntimeConfigInput:   postgres.RuntimeConfigInput{ContainerPort: 8080, ContainerScheme: "http", ReleaseStrategy: "stop_then_start", DrainSeconds: 30, CPUMillis: 500, MemoryBytes: 268435456, RestartPolicy: "unless-stopped"},
+		HealthPolicyRevision: 1,
+		Revision:             1,
+	}
+	admin.getBindings = []postgres.RuntimeBinding{
+		{VariableName: "ZED_TOKEN", BindingKind: "secret", DeliveryScope: "build", SecretHeadID: "h1", SecretVersionNumber: 1},
+		{VariableName: "AAA_RUNTIME", BindingKind: "secret", DeliveryScope: "runtime", SecretHeadID: "h2", SecretVersionNumber: 1},
+		{VariableName: "NPM_TOKEN", BindingKind: "secret", DeliveryScope: "build", SecretHeadID: "h3", SecretVersionNumber: 1},
+		{VariableName: "BUILD_LIT", BindingKind: "literal_nonsecret", DeliveryScope: "build", LiteralValue: "x"},
+	}
+	r := httptest.NewRequest(http.MethodGet, "https://admin.example.test/environments/config?environment_id=env-a", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "v1.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"})
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get = %d", rr.Code)
+	}
+	body := rr.Body.String()
+	names := []string{"ZED_TOKEN", "NPM_TOKEN"}
+	for _, n := range names {
+		id, _ := buildsecret.ID(names, n)
+		row := body[strings.Index(body, "<td>"+n+"</td>"):]
+		row = row[:strings.Index(row, "</tr>")]
+		if !strings.Contains(row, "Dockerfile id: "+id) {
+			t.Fatalf("%s row lacks Dockerfile id %s: %s", n, id, row)
+		}
+	}
+	if strings.Count(body, "Dockerfile id: build-secret-") != 2 {
+		t.Fatalf("want exactly 2 Dockerfile ids (runtime secret and literal excluded): %s", body)
+	}
+	if !strings.Contains(body, "NPM_TOKEN</td><td>secret</td><td>build</td><td>secret head h3 (version 1)<br>Dockerfile id: build-secret-0") {
+		t.Fatalf("NPM_TOKEN must be build-secret-0")
+	}
+	if !strings.Contains(body, "can change if build secret bindings are added or removed") {
+		t.Fatal("note missing")
 	}
 }

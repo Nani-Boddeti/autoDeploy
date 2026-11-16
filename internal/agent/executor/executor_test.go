@@ -650,7 +650,7 @@ func TestNewExecutorFailsClosedWhenEngineProbeFails(t *testing.T) {
 
 func TestNewExecutorFailsClosedWhenBuildxProbeFails(t *testing.T) {
 	orig := probeBuildxFunc
-	probeBuildxFunc = func(context.Context) error { return errors.New("buildx missing") }
+	probeBuildxFunc = func(context.Context, docker.BuilderConfig) error { return errors.New("buildx missing") }
 	defer func() { probeBuildxFunc = orig }()
 
 	cfg := Config{
@@ -668,7 +668,7 @@ func TestNewExecutorFailsClosedWhenBuildxProbeFails(t *testing.T) {
 
 func TestNewExecutorSucceedsWhenBothProbesPass(t *testing.T) {
 	orig := probeBuildxFunc
-	probeBuildxFunc = func(context.Context) error { return nil }
+	probeBuildxFunc = func(context.Context, docker.BuilderConfig) error { return nil }
 	defer func() { probeBuildxFunc = orig }()
 
 	cfg := Config{
@@ -698,7 +698,7 @@ func testActivationConfig() *ActivationConfig {
 
 func TestNewExecutorRequiresActivationConfig(t *testing.T) {
 	orig := probeBuildxFunc
-	probeBuildxFunc = func(context.Context) error { return nil }
+	probeBuildxFunc = func(context.Context, docker.BuilderConfig) error { return nil }
 	defer func() { probeBuildxFunc = orig }()
 
 	cfg := Config{

@@ -90,6 +90,16 @@ type Config struct {
 	// logging only); it is additive -- BuildOutput keeps receiving the same
 	// bytes -- and shipping failures never affect an attempt.
 	LogShipper *logship.Factory
+	// BuildTimeout bounds each build (agent flag --build-timeout). Zero
+	// means docker.DefaultBuildTimeout.
+	BuildTimeout time.Duration
+	// Builder is the dedicated capped buildx builder every build runs in;
+	// NewExecutor ensures it at startup and fails closed if it cannot.
+	Builder docker.BuilderConfig
+	// BuildCacheKeep bounds the dedicated builder's cache after every build
+	// (agent flag --build-cache-keep). Zero means
+	// docker.DefaultBuildCacheKeepBytes.
+	BuildCacheKeep int64
 	// Activation configures the post-health-gate traffic switch. It is
 	// REQUIRED: NewExecutor refuses a nil value, because an executor without
 	// activation would report success after the health gate and close the
@@ -112,6 +122,13 @@ type Executor struct {
 	logger       *log.Logger
 	logs         *logship.Factory  // nil: no log shipping.
 	activation   *activationRunner // nil: Execute fails closed.
+	buildTimeout time.Duration     // 0: docker.DefaultBuildTimeout.
+	buildxConfig string            // BUILDX_CONFIG of the dedicated builder.
+	builder      docker.BuilderConfig
+	cacheKeep    int64 // bytes the builder's cache is bounded to after a build.
+	// pruneCache is docker.PruneBuildCache; nil skips cleanup (struct-literal
+	// test executors).
+	pruneCache func(context.Context, docker.BuilderConfig, int64) error
 }
 
 // NewExecutor validates cfg, runs the startup capability probe (Docker
@@ -129,8 +146,15 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 	if _, err := cfg.Docker.Probe(ctx); err != nil {
 		return nil, fmt.Errorf("agent executor: docker engine capability probe failed: %w", err)
 	}
-	if err := probeBuildxFunc(ctx); err != nil {
+	if cfg.Builder.Logf == nil && cfg.Logger != nil {
+		cfg.Builder.Logf = cfg.Logger.Printf
+	}
+	if err := probeBuildxFunc(ctx, cfg.Builder); err != nil {
 		return nil, fmt.Errorf("agent executor: buildx capability probe failed: %w", err)
+	}
+	cacheKeep := cfg.BuildCacheKeep
+	if cacheKeep == 0 {
+		cacheKeep = docker.DefaultBuildCacheKeepBytes
 	}
 	logger := cfg.Logger
 	if logger == nil {
@@ -155,6 +179,11 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 		buildOutput:  buildOutput,
 		logger:       logger,
 		logs:         cfg.LogShipper,
+		buildTimeout: cfg.BuildTimeout,
+		buildxConfig: cfg.Builder.ConfigDir,
+		builder:      cfg.Builder,
+		cacheKeep:    cacheKeep,
+		pruneCache:   docker.PruneBuildCache,
 	}, nil
 }
 
@@ -252,13 +281,33 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 			SourceDigest:     sourceDigest(lease.CommitSHA),
 			BuildOperationID: dockerid.AttemptRuntimeInstanceID(lease.AttemptID),
 		},
-		SecretBindings: docker.BuildScopedBindings(toScopedBindings(lease.SecretBindings)),
-		Materializer:   materializer,
-		Stdout:         teeWriter{local: e.buildOutput, ship: logs.BuildWriter()},
-		Stderr:         teeWriter{local: e.buildOutput, ship: logs.BuildWriter()},
+		SecretBindings:  docker.BuildScopedBindings(toScopedBindings(lease.SecretBindings)),
+		Materializer:    materializer,
+		Literals:        literalBuildArgs(lease.LiteralBindings),
+		Stdout:          teeWriter{local: e.buildOutput, ship: logs.BuildWriter()},
+		Stderr:          teeWriter{local: e.buildOutput, ship: logs.BuildWriter()},
+		Timeout:         e.buildTimeout,
+		BuildxConfigDir: e.buildxConfig,
+		Builder:         e.builder,
 	})
+	// Cleanup runs after every build that actually ran (success, failure,
+	// timeout, cancel) and never changes the outcome. A build that failed
+	// before the subprocess started (validation, probe, builder unavailable)
+	// left nothing to prune.
+	if !docker.BuildNeverStarted(err) {
+		e.cleanBuildCache(ctx, logs)
+	}
 	if err != nil {
 		class := docker.ClassifyFailure(err)
+		if errors.Is(err, docker.ErrBuildTimeout) {
+			// Say the reason on the Logs page, not just the class.
+			logs.Linef(logship.StreamPhase, "build: the build exceeded its time limit of %s and was stopped", docker.EffectiveBuildTimeout(e.buildTimeout))
+		}
+		if errors.Is(err, docker.ErrInvalidBuildLiteral) {
+			// Name the refusal and the variable (never the value); the error
+			// text carries only the name.
+			logs.Linef(logship.StreamPhase, "build: a build-scoped variable binding was refused: %v", err)
+		}
 		logs.Linef(logship.StreamPhase, "build: failed (%s)", class)
 		logs.Diagf(logship.StreamPhase, "build: failed (%s): %v", class, err)
 		return e.outcome(lease, false, class)
@@ -404,6 +453,21 @@ const (
 	candidateStopGrace   = 10 * time.Second
 	candidateStopWait    = 15 * time.Second
 )
+
+// cleanBuildCache bounds the dedicated builder's cache after a build. The
+// context is detached from cancellation so a cancelled or lease-lost job still
+// cleans up; PruneBuildCache bounds itself with its own timeout so it cannot
+// hang the agent. A failure is logged (fixed phase line for the tenant, error
+// text to the agent journal only) and is otherwise ignored.
+func (e *Executor) cleanBuildCache(ctx context.Context, logs *logship.Attempt) {
+	if e.pruneCache == nil {
+		return
+	}
+	if err := e.pruneCache(context.WithoutCancel(ctx), e.builder, e.cacheKeep); err != nil {
+		logs.Linef(logship.StreamPhase, "build: cache cleanup failed (the deployment is not affected)")
+		logs.Diagf(logship.StreamPhase, "build: cache cleanup failed: %v", err)
+	}
+}
 
 // teeWriter copies build output to the existing local writer and, additively,
 // to the shipper. The shipper's writer never blocks or fails, so the local

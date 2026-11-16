@@ -170,6 +170,10 @@ func TestValidateActivationFlagsRejectsInvalidValues(t *testing.T) {
 		"drain grace negative":     func(c *command) { c.drainStopGrace = -time.Second },
 		"drain grace fractional":   func(c *command) { c.drainStopGrace = 1500 * time.Millisecond },
 		"drain grace too long":     func(c *command) { c.drainStopGrace = 301 * time.Second },
+		"build timeout zero":       func(c *command) { c.buildTimeout = 0 },
+		"build timeout negative":   func(c *command) { c.buildTimeout = -time.Minute },
+		"build timeout too short":  func(c *command) { c.buildTimeout = time.Minute - time.Nanosecond },
+		"build timeout too long":   func(c *command) { c.buildTimeout = 2*time.Hour + time.Nanosecond },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -179,6 +183,40 @@ func TestValidateActivationFlagsRejectsInvalidValues(t *testing.T) {
 				t.Fatal("expected an error")
 			}
 		})
+	}
+}
+
+func TestBuildTimeoutFlag(t *testing.T) {
+	c, err := parseArgs(runArgs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.buildTimeout != 30*time.Minute {
+		t.Fatalf("default buildTimeout = %s, want 30m", c.buildTimeout)
+	}
+	c, err = parseArgs(runArgs("--build-timeout", "45m"))
+	if err != nil || c.buildTimeout != 45*time.Minute {
+		t.Fatalf("parsed = %s, %v", c.buildTimeout, err)
+	}
+	if _, err := parseArgs(runArgs("--build-timeout", "soon")); err == nil {
+		t.Fatal("expected an error for an unparsable duration")
+	}
+	if _, err := parseArgs([]string{"enroll", "--base-url", "https://cp.example", "--server-id", "s", "--state-dir", "/var/lib/agent", "--build-timeout", "5m"}); err == nil {
+		t.Fatal("--build-timeout must be rejected for enroll")
+	}
+	for name, d := range map[string]time.Duration{"min": time.Minute, "max": 2 * time.Hour} {
+		t.Run(name, func(t *testing.T) {
+			c := validActivationCommand(t)
+			c.buildTimeout = d
+			if err := validateActivationFlags(c); err != nil {
+				t.Fatalf("%s must be accepted: %v", d, err)
+			}
+		})
+	}
+	c = validActivationCommand(t)
+	c.buildTimeout = 3 * time.Hour
+	if err := validateActivationFlags(c); err == nil || !strings.Contains(err.Error(), "--build-timeout") {
+		t.Fatalf("err = %v, want one naming --build-timeout", err)
 	}
 }
 
@@ -453,6 +491,116 @@ func TestParseArgsCheckoutQuotaLimits(t *testing.T) {
 	} {
 		if _, err := parseArgs(args); err == nil {
 			t.Fatalf("expected an error for args=%v", args)
+		}
+	}
+}
+
+func TestBuildResourceFlags(t *testing.T) {
+	c, err := parseArgs(runArgs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.buildMemory != 2<<30 || c.buildCPUs != 2 {
+		t.Fatalf("defaults = %d bytes, %d cpus; want 2GiB, 2", c.buildMemory, c.buildCPUs)
+	}
+	for in, want := range map[string]int64{"512MiB": 512 << 20, "4GiB": 4 << 30, "1073741824": 1 << 30, "32GiB": 32 << 30} {
+		c, err := parseArgs(runArgs("--build-memory", in))
+		if err != nil || c.buildMemory != want {
+			t.Fatalf("--build-memory %s = %d, %v; want %d", in, c.buildMemory, err, want)
+		}
+	}
+	for _, bad := range []string{"", "0", "-1GiB", "2 GiB", "2GB", "GiB", "lots", "99999999999999GiB"} {
+		if _, err := parseArgs(runArgs("--build-memory", bad)); err == nil {
+			t.Errorf("--build-memory %q must be rejected", bad)
+		}
+	}
+	c, err = parseArgs(runArgs("--build-cpus", "4"))
+	if err != nil || c.buildCPUs != 4 {
+		t.Fatalf("--build-cpus 4 = %d, %v", c.buildCPUs, err)
+	}
+	for _, bad := range []string{"", "0", "-1", "1.5", "many"} {
+		if _, err := parseArgs(runArgs("--build-cpus", bad)); err == nil {
+			t.Errorf("--build-cpus %q must be rejected", bad)
+		}
+	}
+	for _, f := range [][]string{{"--build-memory", "2GiB"}, {"--build-cpus", "2"}} {
+		args := append([]string{"enroll", "--base-url", "https://cp.example", "--server-id", "s", "--state-dir", "/var/lib/agent"}, f...)
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("%s must be rejected for enroll", f[0])
+		}
+	}
+}
+
+func TestValidateActivationFlagsBuildResourceBounds(t *testing.T) {
+	for name, mutate := range map[string]func(*command){
+		"memory below min": func(c *command) { c.buildMemory = 512<<20 - 1 },
+		"memory above max": func(c *command) { c.buildMemory = 32<<30 + 1 },
+		"cpus zero":        func(c *command) { c.buildCPUs = 0 },
+		"cpus above max":   func(c *command) { c.buildCPUs = 33 },
+	} {
+		c := validActivationCommand(t)
+		mutate(&c)
+		if err := validateActivationFlags(c); err == nil || !strings.Contains(err.Error(), "--build-") {
+			t.Errorf("%s: err = %v, want one naming the flag", name, err)
+		}
+	}
+	for name, mutate := range map[string]func(*command){
+		"memory min": func(c *command) { c.buildMemory = 512 << 20 },
+		"memory max": func(c *command) { c.buildMemory = 32 << 30 },
+		"cpus min":   func(c *command) { c.buildCPUs = 1 },
+		"cpus max":   func(c *command) { c.buildCPUs = 32 },
+	} {
+		c := validActivationCommand(t)
+		mutate(&c)
+		if err := validateActivationFlags(c); err != nil {
+			t.Errorf("%s must be accepted: %v", name, err)
+		}
+	}
+}
+
+func TestBuilderConfigFromCommand(t *testing.T) {
+	c := validActivationCommand(t)
+	got := builderConfig(c)
+	if got.ConfigDir != filepath.Join(c.stateDir, "buildx") || got.MemoryBytes != c.buildMemory || got.CPUs != c.buildCPUs {
+		t.Fatalf("builderConfig = %+v", got)
+	}
+}
+
+func TestBuildCacheKeepFlag(t *testing.T) {
+	c, err := parseArgs(runArgs())
+	if err != nil || c.buildCacheKeep != 5<<30 {
+		t.Fatalf("default = %d, %v; want 5GiB", c.buildCacheKeep, err)
+	}
+	for in, want := range map[string]int64{"1GiB": 1 << 30, "20GiB": 20 << 30, "1073741824": 1 << 30} {
+		c, err := parseArgs(runArgs("--build-cache-keep", in))
+		if err != nil || c.buildCacheKeep != want {
+			t.Fatalf("--build-cache-keep %s = %d, %v; want %d", in, c.buildCacheKeep, err, want)
+		}
+	}
+	for _, bad := range []string{"", "0", "-1GiB", "5GB", "lots"} {
+		if _, err := parseArgs(runArgs("--build-cache-keep", bad)); err == nil {
+			t.Errorf("--build-cache-keep %q must be rejected", bad)
+		}
+	}
+	enroll := []string{"enroll", "--base-url", "https://cp.example", "--server-id", "s", "--state-dir", "/var/lib/agent", "--build-cache-keep", "5GiB"}
+	if _, err := parseArgs(enroll); err == nil {
+		t.Error("--build-cache-keep must be rejected for enroll")
+	}
+}
+
+func TestValidateActivationFlagsBuildCacheKeepBounds(t *testing.T) {
+	for name, v := range map[string]int64{"below min": 1<<30 - 1, "above max": 500<<30 + 1} {
+		c := validActivationCommand(t)
+		c.buildCacheKeep = v
+		if err := validateActivationFlags(c); err == nil || !strings.Contains(err.Error(), "--build-cache-keep") {
+			t.Errorf("%s: err = %v, want one naming the flag", name, err)
+		}
+	}
+	for name, v := range map[string]int64{"min": 1 << 30, "max": 500 << 30} {
+		c := validActivationCommand(t)
+		c.buildCacheKeep = v
+		if err := validateActivationFlags(c); err != nil {
+			t.Errorf("%s must be accepted: %v", name, err)
 		}
 	}
 }

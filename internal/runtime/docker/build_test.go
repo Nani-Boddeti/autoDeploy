@@ -209,9 +209,9 @@ func TestResolveBuildSecretsInvalidVariableNameFails(t *testing.T) {
 func TestBuildxArgvNeverContainsSecretValue(t *testing.T) {
 	labels := map[string]string{"io.autodeploy.owner-id": "owner01"}
 	resolved := []resolvedBuildSecret{
-		{id: opaqueSecretID(0), envVar: "AWS_KEY", value: []byte("supersecret-aws-value")},
+		{id: "build-secret-0", envVar: "AWS_KEY", value: []byte("supersecret-aws-value")},
 	}
-	argv, env := buildxArgv("Dockerfile", labels, resolved, "/tmp/meta.json")
+	argv, env := buildxArgv("Dockerfile", labels, resolved, nil, "/tmp/meta.json")
 	for _, a := range argv {
 		if strings.Contains(a, "supersecret-aws-value") {
 			t.Fatalf("secret value leaked into argv: %q", a)
@@ -285,7 +285,7 @@ func TestParseBuildMetadataRejectsMissingImageDigest(t *testing.T) {
 }
 
 func TestBuildxArgvDisablesAttestations(t *testing.T) {
-	argv, _ := buildxArgv("Dockerfile", nil, nil, "/tmp/meta.json")
+	argv, _ := buildxArgv("Dockerfile", nil, nil, nil, "/tmp/meta.json")
 	joined := " " + strings.Join(argv, " ") + " "
 	for _, f := range []string{" --provenance=false ", " --sbom=false ", " --load "} {
 		if !strings.Contains(joined, f) {
@@ -524,6 +524,16 @@ func TestResolveBuildSecretsRejectsReservedEnvVar(t *testing.T) {
 	}
 }
 
+func TestResolveBuildSecretsRejectsCLIEnvPrefixesCaseInsensitively(t *testing.T) {
+	for _, name := range []string{"BUILDKIT_PROGRESS", "buildkit_x", "BUILDX_NO_DEFAULT_ATTESTATIONS", "Buildx_Foo", "DOCKER_API_VERSION", "docker_anything"} {
+		bindings := []BuildSecretBinding{{VariableName: name, SecretVersionID: "v1"}}
+		values := []BuildSecretValue{{VariableName: name, Value: []byte("x")}}
+		if _, err := resolveBuildSecrets(bindings, values); !errors.Is(err, ErrInvalidBuildRequest) {
+			t.Fatalf("variable %q: want ErrInvalidBuildRequest, got %v", name, err)
+		}
+	}
+}
+
 // --- subprocessEnv: the parent process's own environment must not leak in ---
 
 func TestSubprocessEnvDoesNotLeakArbitraryParentVars(t *testing.T) {
@@ -666,5 +676,35 @@ func TestSubprocessEnvPinsBuildxBehaviourSwitches(t *testing.T) {
 	}
 	if !has["BUILDX_GIT_INFO=0"] || !has["BUILDX_METADATA_PROVENANCE=disabled"] || has["BUILDX_GIT_INFO=1"] {
 		t.Fatalf("buildx switches not pinned: %v", env)
+	}
+}
+
+// Secret ids follow buildsecret.ID (index among build-scoped names sorted by
+// variable name), independent of the order bindings arrive in.
+func TestResolveBuildSecretsIDsIndependentOfArrivalOrder(t *testing.T) {
+	values := []BuildSecretValue{{VariableName: "ZED", Value: []byte("z")}, {VariableName: "ALPHA", Value: []byte("a")}, {VariableName: "MID", Value: []byte("m")}}
+	want := map[string]string{"ALPHA": "build-secret-0", "MID": "build-secret-1", "ZED": "build-secret-2"}
+	for _, order := range [][]string{{"ZED", "ALPHA", "MID"}, {"ALPHA", "MID", "ZED"}, {"MID", "ZED", "ALPHA"}} {
+		bindings := make([]BuildSecretBinding, 0, len(order))
+		for _, n := range order {
+			bindings = append(bindings, BuildSecretBinding{VariableName: n, SecretVersionID: "v-" + n})
+		}
+		got, err := resolveBuildSecrets(bindings, values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, r := range got {
+			if r.id != want[r.envVar] {
+				t.Fatalf("order %v: %s got id %s want %s", order, r.envVar, r.id, want[r.envVar])
+			}
+		}
+	}
+}
+
+func TestResolveBuildSecretsRejectsDuplicateBindingNames(t *testing.T) {
+	b := []BuildSecretBinding{{VariableName: "A"}, {VariableName: "A"}}
+	v := []BuildSecretValue{{VariableName: "A", Value: []byte("x")}, {VariableName: "B", Value: []byte("y")}}
+	if _, err := resolveBuildSecrets(b, v); !errors.Is(err, ErrInvalidBuildRequest) {
+		t.Fatalf("want ErrInvalidBuildRequest, got %v", err)
 	}
 }

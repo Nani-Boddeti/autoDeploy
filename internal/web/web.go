@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/buildsecret"
 	"autodeploy/internal/github"
 	"autodeploy/internal/githubapp"
 	"autodeploy/internal/healthgate"
@@ -1170,6 +1171,12 @@ func buildRuntimeConfigView(csrf, environmentID string, cfg postgres.RuntimeConf
 // fails Claim). A literal_nonsecret binding's value is shown as-is: ADR
 // 0003 classifies it as non-secret protected metadata, not a secret.
 func buildBindingRows(bindings []postgres.RuntimeBinding) []bindingRow {
+	var buildSecretNames []string
+	for _, b := range bindings {
+		if b.BindingKind == "secret" && b.DeliveryScope == "build" {
+			buildSecretNames = append(buildSecretNames, b.VariableName)
+		}
+	}
 	rows := make([]bindingRow, 0, len(bindings))
 	for _, b := range bindings {
 		row := bindingRow{VariableName: b.VariableName, Kind: b.BindingKind, Scope: b.DeliveryScope, CreatedAt: formatTimestamp(b.CreatedAt)}
@@ -1178,6 +1185,11 @@ func buildBindingRows(bindings []postgres.RuntimeBinding) []bindingRow {
 				row.Identity = "secret head " + b.SecretHeadID + " (version " + strconv.FormatInt(b.SecretVersionNumber, 10) + ")"
 			} else {
 				row.Identity = "secret head " + b.SecretHeadID + " (no active version)"
+			}
+			if row.Scope == "build" {
+				if id, ok := buildsecret.ID(buildSecretNames, b.VariableName); ok {
+					row.DockerfileID = "Dockerfile id: " + id
+				}
 			}
 		} else {
 			row.Identity = b.LiteralValue
@@ -1991,6 +2003,8 @@ func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expire
 // html/template auto-escapes every field.
 type bindingRow struct {
 	VariableName, Kind, Scope, Identity, CreatedAt string
+	// DockerfileID is set only for build-scoped secret bindings (buildsecret.ID).
+	DockerfileID string
 }
 type runtimeConfigView struct {
 	CSRF, EnvironmentID                                                   string

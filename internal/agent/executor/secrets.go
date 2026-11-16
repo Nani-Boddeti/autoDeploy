@@ -144,17 +144,27 @@ func toScopedBindings(bindings []agentclient.SecretBinding) []docker.ScopedSecre
 // literalRuntimeEnv extracts the runtime-scoped literal_nonsecret bindings
 // from the lease as container env entries directly -- these carry their
 // value on the lease itself (ADR 0003 classification) and need no
-// materialization call. Build-scoped literal bindings are not delivered
-// here or anywhere else in this slice: internal/runtime/docker's Step 5
-// build path has no build-arg/env passthrough (deliberately -- see
-// build.go, "no --build-arg call site in the package"), so a build-scoped
-// literal binding has no delivery mechanism yet. That gap is called out in
-// the Step 6b report rather than silently worked around.
+// materialization call. Build-scoped literals take the other path,
+// literalBuildArgs.
 func literalRuntimeEnv(bindings []agentclient.LiteralBinding) []docker.ContainerEnv {
 	var out []docker.ContainerEnv
 	for _, b := range bindings {
 		if b.DeliveryScope == docker.DeliveryScopeRuntime {
 			out = append(out, docker.ContainerEnv{VariableName: b.VariableName, Value: b.Value})
+		}
+	}
+	return out
+}
+
+// literalBuildArgs extracts the build-scoped literal_nonsecret bindings from
+// the lease for delivery as `--build-arg` (docker.BuildRequest.Literals; name
+// validation and ordering happen in docker.Build). Runtime-scoped literals are
+// excluded.
+func literalBuildArgs(bindings []agentclient.LiteralBinding) []docker.BuildLiteral {
+	var out []docker.BuildLiteral
+	for _, b := range bindings {
+		if b.DeliveryScope == docker.DeliveryScopeBuild {
+			out = append(out, docker.BuildLiteral{VariableName: b.VariableName, Value: b.Value})
 		}
 	}
 	return out

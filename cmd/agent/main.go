@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -86,6 +87,9 @@ const (
 	defaultActivationProbeTimeout = 3 * time.Minute
 	defaultDrainStopGrace         = 30 * time.Second
 	maxDrainStopGrace             = 300 * time.Second
+	defaultBuildTimeout           = 30 * time.Minute
+	minBuildTimeout               = time.Minute
+	maxBuildTimeout               = 2 * time.Hour
 )
 
 func main() {
@@ -145,6 +149,10 @@ type command struct {
 	activationProbeTimeout    time.Duration // > 0
 	activationTimeout         time.Duration // 0 = derived default
 	drainStopGrace            time.Duration // whole seconds, 1..300s (Step 10e-4)
+	buildTimeout              time.Duration // 1m..2h; bounds each build (step 22-2a)
+	buildMemory               int64         // bytes, 512MiB..32GiB; dedicated builder memory cap (22-2b)
+	buildCPUs                 int           // 1..32; dedicated builder CPU cap (22-2b)
+	buildCacheKeep            int64         // bytes, 1GiB..500GiB; build cache bound after each build (22-2c)
 }
 
 func parseArgs(args []string) (command, error) {
@@ -264,6 +272,42 @@ func parseArgs(args []string) (command, error) {
 				return command{}, fmt.Errorf("invalid --drain-stop-grace: %w", err)
 			}
 			c.drainStopGrace = d
+		case "--build-timeout":
+			if c.action != "run" {
+				return command{}, errors.New("--build-timeout is only valid for run")
+			}
+			d, err := time.ParseDuration(value)
+			if err != nil {
+				return command{}, fmt.Errorf("invalid --build-timeout: %w", err)
+			}
+			c.buildTimeout = d
+		case "--build-memory":
+			if c.action != "run" {
+				return command{}, errors.New("--build-memory is only valid for run")
+			}
+			n, err := parseByteSize(value)
+			if err != nil {
+				return command{}, fmt.Errorf("invalid --build-memory: %w", err)
+			}
+			c.buildMemory = n
+		case "--build-cpus":
+			if c.action != "run" {
+				return command{}, errors.New("--build-cpus is only valid for run")
+			}
+			n, err := strconv.Atoi(value)
+			if err != nil || n <= 0 {
+				return command{}, errors.New("invalid --build-cpus")
+			}
+			c.buildCPUs = n
+		case "--build-cache-keep":
+			if c.action != "run" {
+				return command{}, errors.New("--build-cache-keep is only valid for run")
+			}
+			n, err := parseByteSize(value)
+			if err != nil {
+				return command{}, fmt.Errorf("invalid --build-cache-keep: %w", err)
+			}
+			c.buildCacheKeep = n
 		default:
 			return command{}, fmt.Errorf("unknown flag %q", flag)
 		}
@@ -289,6 +333,18 @@ func parseArgs(args []string) (command, error) {
 		}
 		if c.drainStopGrace == 0 {
 			c.drainStopGrace = defaultDrainStopGrace
+		}
+		if c.buildTimeout == 0 {
+			c.buildTimeout = defaultBuildTimeout
+		}
+		if c.buildMemory == 0 {
+			c.buildMemory = docker.DefaultBuildMemory
+		}
+		if c.buildCPUs == 0 {
+			c.buildCPUs = docker.DefaultBuildCPUs
+		}
+		if c.buildCacheKeep == 0 {
+			c.buildCacheKeep = docker.DefaultBuildCacheKeepBytes
 		}
 	}
 	return c, nil
@@ -339,7 +395,46 @@ func validateActivationFlags(c command) error {
 	if c.drainStopGrace < time.Second || c.drainStopGrace > maxDrainStopGrace || c.drainStopGrace%time.Second != 0 {
 		return errors.New("--drain-stop-grace must be whole seconds within 1s..300s")
 	}
+	if c.buildTimeout < minBuildTimeout || c.buildTimeout > maxBuildTimeout {
+		return fmt.Errorf("--build-timeout must be within %s..%s", minBuildTimeout, maxBuildTimeout)
+	}
+	if c.buildMemory < docker.MinBuildMemoryBytes || c.buildMemory > docker.MaxBuildMemoryBytes {
+		return fmt.Errorf("--build-memory must be within %dMiB..%dGiB", docker.MinBuildMemoryBytes>>20, docker.MaxBuildMemoryBytes>>30)
+	}
+	if c.buildCPUs < docker.MinBuildCPUs || c.buildCPUs > docker.MaxBuildCPUs {
+		return fmt.Errorf("--build-cpus must be within %d..%d", docker.MinBuildCPUs, docker.MaxBuildCPUs)
+	}
+	if c.buildCacheKeep < docker.MinBuildCacheKeepBytes || c.buildCacheKeep > docker.MaxBuildCacheKeepBytes {
+		return fmt.Errorf("--build-cache-keep must be within %dGiB..%dGiB", docker.MinBuildCacheKeepBytes>>30, docker.MaxBuildCacheKeepBytes>>30)
+	}
 	return nil
+}
+
+// parseByteSize parses a positive byte count with an optional KiB, MiB or GiB
+// suffix ("2GiB", "512MiB", "1073741824"). Anything else is rejected.
+func parseByteSize(s string) (int64, error) {
+	mult := int64(1)
+	for suffix, m := range map[string]int64{"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30} {
+		if strings.HasSuffix(s, suffix) {
+			s, mult = strings.TrimSuffix(s, suffix), m
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n <= 0 || n > math.MaxInt64/mult {
+		return 0, errors.New("want a positive size such as 2GiB, 512MiB or a byte count")
+	}
+	return n * mult, nil
+}
+
+// builderConfig derives the dedicated builder's configuration: its buildx
+// state lives under the agent's own (agent-owned, 0700) state directory.
+func builderConfig(c command) docker.BuilderConfig {
+	return docker.BuilderConfig{
+		ConfigDir:   filepath.Join(c.stateDir, "buildx"),
+		MemoryBytes: c.buildMemory,
+		CPUs:        c.buildCPUs,
+	}
 }
 
 // activationParts is everything the activation sequence needs from cmd/agent.
@@ -606,6 +701,9 @@ func buildExecutor(ctx context.Context, c command, client *agentclient.Client, l
 		BuildOutput:    logWriter{logger},
 		Logger:         logger,
 		Activation:     &activation,
+		BuildTimeout:   c.buildTimeout,
+		Builder:        builderConfig(c),
+		BuildCacheKeep: c.buildCacheKeep,
 	})
 }
 

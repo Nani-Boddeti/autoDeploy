@@ -12,7 +12,8 @@ failing test first -> full bar -> independent review -> owner sees diff -> commi
 - 22-D owner decision: ADR 0005 STS failure with predecessor restart OK -> finalize failed without operator step
   (agent "definitely not switched" report kind + control-plane branch requiring unchanged route head). ~2-3h if yes.
 
-## Phase 2: mac-side code closing outcomes
+## Phase 2: mac-side code closing outcomes (owner 2026-11-16: finish the application first; UI work 22-3 moves to
+## the very end, after everything else reaches 100%)
 - 22-1 TCP and container health policies with bounded retries (only HTTP exists) -> Health policies outcome. ~1 day.
 - 22-2 Build: exercise secret mounts, resource/time limits, build-output redaction, build cleanup -> Build. ~1-1.5d.
 - 22-3 UI outcome (owner 2026-11-16): (a) show the failure reason (e.g. container_unhealthy, deadline_exceeded +
@@ -84,6 +85,55 @@ claim/lease/execution tests. Review: yes (migration + wire + agent). Estimate ~1
 **Risks:** digest drift (guarded by the golden test); version skew (opt-in + D3); downgrade: reset non-default
 policies before installing an older build (gate 12 class, document in status doc).
 
+## 22-2 design: build outcome (2026-11-16, APPROVED: D1-D5 as recommended)
+Outcome text: "Docker/BuildKit build execution, secret mounts, resource/time limits, labels, log redaction, and
+scoped cleanup." Investigation (orchestrator-verified):
+- EXISTS, fake-docker tested only: buildx argv with --provenance=false --sbom=false, --label io.autodeploy.*,
+  secrets as `--secret id=build-secret-N,env=VAR` (value only in the subprocess env, zeroed after), fail-closed buildx
+  probe, three-layer redaction of build output (build.go RedactingWriter, logship, server sanitizer).
+- MISSING: build time limit (build.go:545 bounded only by the lease ctx); build CPU/memory limits; build-scoped
+  literal bindings (executor/secrets.go:147 "not delivered"); build cache / dangling image cleanup.
+- BUG: any build error -> ErrBuildFailed -> permanent_configuration (classify.go:77), even a kill caused by job
+  cancel or lease loss (should be transient/cancelled).
+- GAP: secret ids are positional (build-secret-N) and shown nowhere, so a Dockerfile author cannot know them, and
+  they may shift when bindings change unless the order is deterministic.
+
+**Change (slices, one subagent each, bar after each):**
+- 22-2a build time limit + classification fix: agent flag --build-timeout (default 30m, bounds 1m..2h, validated at
+  startup) wraps the build in context.WithTimeout; kill the whole process group, cmd.WaitDelay. Our own deadline ->
+  new ErrBuildTimeout -> permanent_configuration (the build is too slow for its limit); parent ctx cancel/lease loss
+  -> transient (or the existing cancelled path), never permanent.
+- 22-2b dedicated builder for limits and scoped cache: the agent ensures (idempotently, at startup, no root) a buildx
+  builder "autodeploy-build" with the docker-container driver and caps from flags --build-memory (default 2GiB) and
+  --build-cpus (default 2), and every build uses --builder autodeploy-build. Fail closed if it cannot be created or
+  probed. Secrets transport unchanged (BuildKit session). Images still --load into dockerd.
+- 22-2c scoped cleanup: after every build (success or failure) prune ONLY that builder's cache to a keep-storage bound
+  (flag --build-cache-keep, default 5GiB): `buildx prune --builder autodeploy-build --max-used-space N --force`
+  (flag present in buildx v0.31.1..v0.39; --keep-storage is a deprecated alias). NO image prune: the built image is
+  itself an untagged image carrying our labels and is the artifact about to be deployed (found in 22-2c), so image
+  removal stays with the 20E/21B cleaners (verified digest only). Never touches other builders. Errors are logged,
+  never fail the deployment.
+- 22-2d build-scoped literal bindings: delivered as `--build-arg NAME=value` (non-secret by classification; ADR 0003
+  forbids ARG only for secrets); names checked against the reserved list; the config page notes that build literals
+  are visible in image history.
+- 22-2e secret id discoverability: build secret ids become deterministic (sorted by variable name, frozen order) and
+  the config page shows "Dockerfile id: build-secret-N" next to each build-scoped secret binding (minimal text, no
+  redesign; UI rework stays 22-3).
+
+**Decisions for owner:** D1 limits via a dedicated capped builder (recommended; also makes cache cleanup scoped) vs
+only documenting a daemon-level cap. D2 build timeout as an agent flag, default 30m (recommended) vs a per-environment
+setting (migration). D3 build literals via --build-arg (recommended) vs refusing build-scoped literals. D4 cache bound
+5GiB per host (flag). D5 deterministic secret ids shown on the config page (recommended) vs letting the id equal the
+variable name (simpler for authors, but ADR 0003 asks for opaque ids).
+**Tests:** fake-docker unit tests for each slice failing first (timeout kill + classification, parent cancel ->
+transient, builder flags + fail-closed, prune argv scoped to the builder/label, --build-arg delivery and reserved
+names, deterministic id order); existing build/redaction tests unchanged.
+**Acer validation (one session, one sudo command per round):** build secret via RUN --mount (passes, value absent from
+`docker history --no-trunc` and `docker save`), build output echoing the secret shows [REDACTED] in the Logs page,
+labels on the image, a `RUN sleep` build hitting a short --build-timeout, a memory-hungry RUN hitting the cap, build
+cache bounded after builds, a build literal reaching the build.
+**Estimate:** ~1.5-2 days + acer session. Review: yes.
+
 ## Progress
 - 2026-11-16: roadmap written; 22-1 investigation started.
 - 2026-11-16: 22-1a DONE (uncommitted): migration 000028 (5 columns both tables, named CHECKs + cross CHECKs,
@@ -123,3 +173,34 @@ policies before installing an older build (gate 12 class, document in status doc
   container_unhealthy/permanent_configuration with last_probe="status=200; tcp ok" -> image HEALTHCHECK PROVEN.
   Health-policies outcome ticked (12/18, weighted ~84%). Owner asked: failure reason on the deployment page + overall
   productive UI rework with fewer nested clicks -> folded into 22-3.
+- 2026-11-16: owner order: 22-2 build next; 22-3 UI last (after 100% of the rest). 22-2 investigation started.
+- 2026-11-16: 22-2b implemented (uncommitted): internal/runtime/docker/builder.go (ensureBuilder: ls json -> match driver+exact
+  driver-opts else rm+create, then inspect --bootstrap; fail closed ErrBuilderUnavailable), BuildkitImage pinned moby/buildkit
+  v0.35.0 @ index digest sha256:aa632b92... (GitHub latest release + `buildx imagetools inspect`), memory-swap=memory (hard cap),
+  cpu-quota=cpus*100000/period 100000, BUILDX_CONFIG=<state-dir>/buildx, --builder autodeploy-build on every build,
+  flags --build-memory (512MiB..32GiB, def 2GiB) --build-cpus (1..32, def 2). ProbeBuildx now takes BuilderConfig. No host kit change.
+- 22-2a DONE (uncommitted): --build-timeout (30m, 1m..2h); build in WithTimeout; process-group SIGKILL + WaitDelay
+  10s (unix); ErrBuildTimeout -> permanent_configuration; parent cancel -> ErrBuildInterrupted -> transient (also for
+  a cancel during probeBuildx, which used to be permanent); timeout reason line in the build log.
+- 22-2b DONE (uncommitted): builder "autodeploy-build" (docker-container driver, moby/buildkit:v0.35.0@sha256:
+  aa632b92...52bb), caps from --build-memory (2GiB, 512MiB..32GiB, memory-swap = memory) and --build-cpus (2, 1..32);
+  BUILDX_CONFIG=<state>/buildx; drift -> rm + create (only that name); fail closed (ErrBuilderUnavailable); every
+  build uses --builder autodeploy-build. Caps verified on the mac via docker inspect. Acer CLI plugin order: /usr/lib
+  (Docker Desktop buildx v0.31.1) shadows /usr/libexec (CE v0.34.0) -> agent likely uses v0.31.1. Follow-up: a builder
+  removed after agent start fails builds until restart (no per-build re-ensure).
+- 22-2c DONE (uncommitted): --build-cache-keep (5GiB, 1GiB..500GiB); after every build (success/failure/timeout/
+  cancel) prune only autodeploy-build to --max-used-space on WithoutCancel ctx with its own 2m timeout; error -> fixed
+  phase line "build: cache cleanup failed (the deployment is not affected)", raw error to the journal only. Design
+  correction: no dangling-image prune (would delete the just-built release image). Verified on the mac (cache 33MB
+  -> 0 with a 10MB cap); acer runs buildx v0.31.1 (flag present in its source).
+- 22-2d DONE (uncommitted): build-scoped literals -> `--build-arg NAME=value` (sorted) via BuildRequest.Literals; refused
+  (ErrInvalidBuildLiteral, wraps ErrInvalidBuildRequest -> permanent_configuration, phase line names the variable, never
+  the value): invalid/duplicate name, reserved list, BUILDKIT_*/BUILDX_*, proxy and platform built-in args
+  (case-insensitive), name also bound as build secret. Runtime literals/secrets unchanged. Config page hint line added.
+- 2026-11-16: 22-2d DONE (build literals -> sorted --build-arg; reserved/built-in names and secret/literal clashes
+  refused). 22-2e DONE (internal/buildsecret.ID: build-secret-N by byte-order name index; shown on the config page;
+  duplicate names refused). Review PASS WITH NOTES -> fix round: builder lost after start -> inspect, re-ensure,
+  ErrBuilderUnavailable (transient, classified); drift recreation reason logged; flaky timeout test fixed (2s, no
+  t.Fatal in goroutine, -race -count=5 stable); BUILDKIT_/BUILDX_/DOCKER_ prefixes refused for build secret names;
+  no cache prune when the build never started; buildx config dir tightened to 0700. Bar: gofmt, build, vet x3 tag
+  sets, make check, race ./..., linux amd64/arm64, windows vet; fresh PG18 sweep clean. NEXT: commit, acer validation.

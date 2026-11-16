@@ -800,7 +800,7 @@ func TestDrainDockerSeamHasNoRemoveOrKill(t *testing.T) {
 
 func TestNewExecutorRejectsNilDrains(t *testing.T) {
 	orig := probeBuildxFunc
-	probeBuildxFunc = func(context.Context) error { return nil }
+	probeBuildxFunc = func(context.Context, docker.BuilderConfig) error { return nil }
 	defer func() { probeBuildxFunc = orig }()
 	act := testActivationConfig()
 	act.Drains = nil
