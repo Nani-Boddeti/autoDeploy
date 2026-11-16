@@ -242,3 +242,21 @@ Per step: gofmt, build, vet both tag sets, `go test -race ./...`; steps with SQL
   argument: foreign slot flag now names the corrupt attempt (still asserts CorruptState, no writes). Review PASS WITH
   NOTES. Deliberate: a stale form when nothing is pending gets the generic 400 (replay refusals reveal nothing); a
   double-click straddling a new claim gets 400 (safe). ParseInt accepts "+5"/"007" (numeric compare, harmless).
+- ACER SESSION 2026-11-16 (build e0f2319 gate-flipped; install-app.sh applied 000027, restarted controlplane+agent;
+  helpers/git byte-identical, not reinstalled; old binaries kept in ~/autodeploy-stage/bin-gated.prev-20261116):
+  - 21B PROVEN: startup + next pass removed 8 failed bring-up releases (cleanups 1-8, 15:42/15:52); containers
+    rt-1..rt-12 gone; no cleanup while the environment was blocked (16:02/16:12 passes idle).
+  - 21C PROVEN: route page Releases table showed active/retained/removed/candidate; removed = failed ones.
+  - 20E PROVEN: after attempt 20 succeeded, 16:22 pass removed cleanups 9-11; rt-13 (oldest retained) gone, newest
+    two retained rt-15/rt-17 kept (stopped).
+  - Env-var injection PROVEN: literal_nonsecret runtime binding AUTODEPLOY_ACER_CHECK=hello present in rt-20 only.
+  - STS failure path (attempt 19, health path /autodeploy-missin -> 404): predecessor stopped, candidate failed gate,
+    candidate stopped, predecessor restarted, route never switched (site served predecessor 200); control plane
+    blocked the environment (reconciliation_required) BY DESIGN (any !succeeded after authorization blocks,
+    agent_lease_repository.go:2586). Owner resolved not_activated via the 21G form (first real use; accepted).
+  - STS success (attempt 20): predecessor rt-15 stopped, gate passed, route switched and verified.
+  - Pending: rt-19 failed-candidate removal after 24h (~2026-11-17 16:00+); crash recovery; gate 3 observation;
+    image removal not observable via `docker images` (app images not listed).
+  - Follow-up for owner decision: ADR 0005 says STS candidate failure with predecessor restart OK should finalize
+    as a definite failure (no operator step); V1 always blocks. Fix = agent reports a "definitely not switched"
+    kind + control-plane branch with route head revision/digest unchanged (own plan).

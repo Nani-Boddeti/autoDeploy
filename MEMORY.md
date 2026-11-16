@@ -261,17 +261,26 @@
 ## Resume Point
 
 ### Current state (2026-11-16) — supersedes older bullets below
-- origin/main = `94dd2ca`, pushed, tree clean. Migrations through 000026. Gates `executorEnabled`/`activationEnabled`
+- origin/main = `e0f2319`, pushed. Migrations through 000027. Gates `executorEnabled`/`activationEnabled`
   still false in committed code; the acer (owner's Ubuntu host) runs a gate-flipped build from
   deploy/host/build-acer-binaries.sh.
-- Proven on the acer (2026-11-13): first real e2e deploy (attempt 13), blue/green + predecessor drain (15),
-  stop-then-start (17), Retry, rollback (18). Not yet proven: 20E retention cleanup (installed 2026-11-14, nothing
-  eligible yet), step 21B failed-candidate cleanup, env-var injection, crash recovery, ACME.
-- Progress: 10/18 outcomes (~56%), weighted ~75-80%. Open outcomes + reasons: docs/IMPLEMENTATION_STATUS.md.
-- Step 21 (tasks/21-plan.md): 21A docs, 21B failed-candidate cleanup (05bf9de control plane, 514741f agent),
-  21C route-page Releases table (94dd2ca) done. Next: 21D ReserveCheckout lock order (investigate + design for
-  owner approval first), 21E flagged-head trigger, 21F two-resolution-paths check, then one batched acer session
-  (start a deliberately failing deploy early: failed-candidate removal needs 24h).
+- Proven on the acer: first real e2e deploy (attempt 13), blue/green + predecessor drain (15), stop-then-start (17),
+  Retry, rollback (18) on 2026-11-13; on 2026-11-16 (build e0f2319): 21B failed-candidate cleanup, 21C releases table,
+  20E retention (rt-13 removed, newest two retained kept), env-var injection, STS failure path (attempt 19: predecessor
+  restarted, route untouched, environment blocked by design, resolved not_activated via the 21G form), STS success (20).
+  Not yet proven: failed release rt-19 removal after 24h (check ~2026-11-17 16:00+), crash recovery, ACME, gate 3.
+- Progress: 11/18 outcomes (~61%; release strategies ticked 2026-11-16), weighted ~81% (14.55/18 by per-outcome partial
+  credit, see status doc). Hard gates 13/15 closed (open: 3 real Traefik observation, 12 drain before downgrade).
+- Step 21 mac side complete (tasks/21-plan.md): 21A docs; 21B failed-candidate cleanup (05bf9de, 514741f); 21C
+  route-page Releases table (94dd2ca); 21D checkout lock order + 21E migration 000027 flagged-head hostname guard
+  (77e4435); 21F gate 4 closed + 21G operator resolve form anchored to its attempt (e0f2319).
+  Acer session 2026-11-16 done (evidence in tasks/21-plan.md). Next: 24h check of rt-19 removal; crash-recovery test
+  (kill agent mid-deploy); gates decision. Owner decision pending: ADR 0005 says STS candidate failure with predecessor
+  restart OK should finalize failed without an operator step; V1 always blocks (needs agent report kind + CP branch).
+- Checkout lock order: registration -> installation -> repository -> binding (separate statements), checkout
+  reservation row last; never lock a reservation before the authority chain.
+- Resolve form: refusals go after the owner check (a foreign owner always gets the generic denial); the replay path
+  stays anchored to the environment's latest attempt and must also match the form's attempt.
 - Failed-candidate rule: production never writes `releases.state='failed'`; failed/cancelled/superseded deployments'
   releases stay candidate/ready and are cleaned via the legal `candidate|ready -> removing` edge. Agents opt in with
   `kinds:["failed_candidate"]`; non-opted-in responses stay byte-identical (agent and server decode strictly).

@@ -154,7 +154,9 @@ State transitions must be validated in the domain layer and committed transactio
 - [ ] Implement HTTP/TCP/container health policies with bounded retries.
 - [ ] Implement Traefik route generation, automatic HTTPS integration, and atomic active-release
       switching.
-- [ ] Implement blue/green activation, stop-then-start mode, release retention, and rollback.
+- [x] Implement blue/green activation, stop-then-start mode, release retention, and rollback.
+      (acer: blue/green attempt 15, stop-then-start 17/19/20, rollback 18, retention + failed-candidate
+      cleanup 2026-11-16 cleanups 1-11; tasks/21-plan.md "ACER SESSION 2026-11-16")
 - [ ] Implement minimal UI for projects, servers, environments, variables, domains, deployments,
       live logs, retry, cancel, and rollback.
 - [ ] Add metrics, structured sanitized logs, readiness/liveness endpoints, retention cleanup,
