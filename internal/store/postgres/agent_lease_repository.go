@@ -17,6 +17,7 @@ import (
 	"autodeploy/internal/auth"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/github"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/dockerid"
 	"autodeploy/internal/runtime/traefik"
@@ -216,7 +217,19 @@ type agentLeaseCandidate struct {
 // qualifies -- including one whose environment has no runtime config, or
 // whose bindings include a secret head with no active version -- is
 // skipped rather than failing the whole call.
+//
+// Claim is the claim of an agent that declared no capability: a job whose
+// frozen health policy is non-default is left queued for it (step 22-1c).
 func (r *AgentLeaseRepository) Claim(ctx context.Context, serverID string, presentedDigest [32]byte, limit int) ([]queue.ClaimedLease, error) {
+	return r.ClaimWithCapabilities(ctx, serverID, presentedDigest, limit, queue.ClaimCapabilities{})
+}
+
+// ClaimWithCapabilities is Claim for an agent that declared caps. With
+// caps.HealthPolicy the agent also receives jobs whose frozen health policy is
+// non-default; without it such a job is skipped before the claim writes
+// anything (see tryClaim), so it stays queued for an agent that can honour it
+// and is never silently run with a weaker check.
+func (r *AgentLeaseRepository) ClaimWithCapabilities(ctx context.Context, serverID string, presentedDigest [32]byte, limit int, caps queue.ClaimCapabilities) ([]queue.ClaimedLease, error) {
 	if limit <= 0 {
 		// No clamp to 1: a non-positive limit asks for nothing, and asking
 		// for nothing must not touch the database at all -- not even to
@@ -313,7 +326,7 @@ func (r *AgentLeaseRepository) Claim(ctx context.Context, serverID string, prese
 		if len(claimed) >= limit {
 			break
 		}
-		lease, ok, err := r.tryClaim(ctx, tx, serverID, c.jobID, c.environmentID, now, leaseExpiresAt)
+		lease, ok, err := r.tryClaim(ctx, tx, serverID, c.jobID, c.environmentID, now, leaseExpiresAt, caps)
 		if err != nil {
 			return nil, err
 		}
@@ -352,7 +365,7 @@ func sortedDistinctEnvironments(candidates []agentLeaseCandidate) []string {
 // a job whose revalidated state no longer matches the discovery snapshot);
 // Claim moves on to its next candidate rather than failing the whole call. A
 // non-nil error is reserved for a genuine database failure.
-func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID string, jobID int64, environmentID string, now, leaseExpiresAt time.Time) (queue.ClaimedLease, bool, error) {
+func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID string, jobID int64, environmentID string, now, leaseExpiresAt time.Time, caps queue.ClaimCapabilities) (queue.ClaimedLease, bool, error) {
 	// Migration 000014 claim-time freeze, ADR 0004 lock hierarchy position
 	// "1b" (see lockEnvironmentRuntimeConfig's doc comment for the full
 	// deadlock argument): SHARE-lock this environment's runtime config
@@ -511,6 +524,32 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		}
 	}
 
+	// Step 22-1c opt-in guard, strictly before the first write below (fence
+	// bump). A non-default frozen health policy is withheld from an agent that
+	// did not declare it can honour it (D3: never silently weaken a check). The
+	// policy that will be frozen is already readable here without writing:
+	// attempt 1 freezes the live row locked above, a rollback's first attempt
+	// copies the target's winning attempt, and a retry copies the previous
+	// attempt. Skipping leaves the job queued/retry_wait, the slot, fence and
+	// deployment untouched, and nothing frozen; the transaction's later
+	// commit releases the locks like every other skip above.
+	if !caps.HealthPolicy {
+		var policy healthgate.Policy
+		switch {
+		case plannedAttemptNumber == 1 && rollbackTargetReleaseID == nil:
+			policy = runtimeConfig.HealthPolicy
+		default:
+			frozen, ferr := loadAttemptExecution(ctx, tx, prevAttemptID)
+			if ferr != nil {
+				return queue.ClaimedLease{}, false, ferr
+			}
+			policy = frozen.HealthPolicy
+		}
+		if !policy.IsDefault() {
+			return queue.ClaimedLease{}, false, nil
+		}
+	}
+
 	// Claim ordering per migration 000013's attempt-insert trigger: bump the
 	// slot fence, then lease the job with attempt_count+1, then insert the
 	// attempt carrying that same fence and the job's now-current
@@ -646,7 +685,8 @@ func (r *AgentLeaseRepository) tryClaim(ctx context.Context, tx pgx.Tx, serverID
 		CPUMillis: frozenConfig.CPUMillis, MemoryBytes: frozenConfig.MemoryBytes,
 		RestartPolicy: frozenConfig.RestartPolicy, DrainSeconds: frozenConfig.DrainSeconds,
 		HealthGatePath: frozenConfig.HealthGatePath, HealthGateHost: frozenConfig.HealthGateHost,
-		ReleaseID: releaseID, RollbackTargetRuntimeInstanceID: rollbackRuntimeInstanceID, SecretBindings: toQueueSecretBindings(frozenBindings),
+		HealthPolicy: frozenConfig.HealthPolicy.WithDefaults(),
+		ReleaseID:    releaseID, RollbackTargetRuntimeInstanceID: rollbackRuntimeInstanceID, SecretBindings: toQueueSecretBindings(frozenBindings),
 		LiteralBindings: toQueueLiteralBindings(frozenLiterals),
 		LeaseExpiresAt:  leaseExpiresAt, AuthorityExpiresAt: leaseExpiresAt,
 	}

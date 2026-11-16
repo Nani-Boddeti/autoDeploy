@@ -1,10 +1,13 @@
 package agenthttp
 
 import (
+	"context"
 	"net/http"
 	"time"
 
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
+	"autodeploy/internal/store/postgres"
 )
 
 // claimLimit is the only value V1 accepts (tasks/todo.md Step 5: "limit
@@ -12,12 +15,74 @@ import (
 // repository call.
 const claimLimit = 1
 
+// maxClaimCapabilities bounds the optional capabilities list of a claim.
+const maxClaimCapabilities = 4
+
+// claimRequest is the wire shape of POST /agent/v1/leases/claim. Capabilities
+// is the agent's opt-in list (step 22-1c; ClaimCleanups' kinds precedent):
+// absent, null or empty is the pre-22-1c request and gets the pre-22-1c
+// response byte for byte; "health_policy" adds the lease's frozen
+// health_policy object and allows non-default-policy jobs to be leased.
 type claimRequest struct {
-	Limit             int  `json:"limit"`
-	ExecutorAvailable bool `json:"executor_available"`
+	Limit             int      `json:"limit"`
+	ExecutorAvailable bool     `json:"executor_available"`
+	Capabilities      []string `json:"capabilities,omitempty"`
 }
 
 func (req claimRequest) valid() bool { return req.Limit == claimLimit }
+
+// parseCapabilities reports the declared capabilities; an unknown name or an
+// oversized list is an invalid request (the decoder is strict everywhere).
+func (req claimRequest) parseCapabilities() (queue.ClaimCapabilities, bool) {
+	var caps queue.ClaimCapabilities
+	if len(req.Capabilities) > maxClaimCapabilities {
+		return caps, false
+	}
+	for _, c := range req.Capabilities {
+		switch c {
+		case healthgate.CapabilityHealthPolicy:
+			caps.HealthPolicy = true
+		default:
+			return caps, false
+		}
+	}
+	return caps, true
+}
+
+// CapabilityClaimer is the optional extension of LeaseClaimer that serves a claim
+// whose agent declared capabilities. (*postgres.AgentLeaseRepository)
+// implements it; a LeaseClaimer without it is served by the plain Claim, which is
+// the non-opted-in path and therefore never yields a non-default policy.
+type CapabilityClaimer interface {
+	ClaimWithCapabilities(ctx context.Context, serverID string, presentedDigest [32]byte, limit int, caps queue.ClaimCapabilities) ([]queue.ClaimedLease, error)
+}
+
+// Production wiring passes the repository, so both interfaces must hold: a
+// missing method would silently drop the health_policy opt-in.
+var (
+	_ LeaseClaimer      = (*postgres.AgentLeaseRepository)(nil)
+	_ CapabilityClaimer = (*postgres.AgentLeaseRepository)(nil)
+)
+
+// healthPolicyView is the wire shape of a frozen healthgate.Policy. tcp_port
+// is an explicit null when no TCP check is configured.
+type healthPolicyView struct {
+	SuccessThreshold int  `json:"success_threshold"`
+	IntervalSeconds  int  `json:"interval_seconds"`
+	TimeoutSeconds   int  `json:"timeout_seconds"`
+	DeadlineSeconds  int  `json:"deadline_seconds"`
+	TCPPort          *int `json:"tcp_port"`
+}
+
+func newHealthPolicyView(p healthgate.Policy) *healthPolicyView {
+	p = p.WithDefaults()
+	v := &healthPolicyView{SuccessThreshold: p.SuccessThreshold, IntervalSeconds: p.IntervalSeconds, TimeoutSeconds: p.TimeoutSeconds, DeadlineSeconds: p.DeadlineSeconds}
+	if p.TCPPort != 0 {
+		port := p.TCPPort
+		v.TCPPort = &port
+	}
+	return v
+}
 
 type claimResponse struct {
 	Leases []leaseView `json:"leases"`
@@ -75,6 +140,9 @@ type leaseView struct {
 	ReleaseID            string               `json:"release_id"`
 	SecretBindings       []secretBindingView  `json:"secret_bindings"`
 	LiteralBindings      []literalBindingView `json:"literal_bindings"`
+	// Set only for a claim that declared the health_policy capability
+	// (step 22-1c); omitted otherwise so every other response is unchanged.
+	HealthPolicy *healthPolicyView `json:"health_policy,omitempty"`
 	// Set only for a rollback lease (step 20D); omitted otherwise.
 	RollbackTargetReleaseID         string `json:"rollback_target_release_id,omitempty"`
 	RollbackTargetRuntimeInstanceID string `json:"rollback_target_runtime_instance_id,omitempty"`
@@ -149,6 +217,11 @@ func (h Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
+	caps, capsOK := req.parseCapabilities()
+	if !capsOK {
+		h.writeError(w, http.StatusBadRequest, "invalid_request")
+		return
+	}
 	if err := h.Authenticator.Authenticate(r.Context(), serverID, digest); err != nil {
 		h.mapError(w, err)
 		return
@@ -157,14 +230,26 @@ func (h Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 		h.writeJSON(w, http.StatusOK, claimResponse{Leases: []leaseView{}})
 		return
 	}
-	leases, err := h.Claimer.Claim(r.Context(), serverID, digest, req.Limit)
+	var (
+		leases []queue.ClaimedLease
+		err    error
+	)
+	if cc, ok := h.Claimer.(CapabilityClaimer); ok && caps.HealthPolicy {
+		leases, err = cc.ClaimWithCapabilities(r.Context(), serverID, digest, req.Limit, caps)
+	} else {
+		leases, err = h.Claimer.Claim(r.Context(), serverID, digest, req.Limit)
+	}
 	if err != nil {
 		h.mapError(w, err)
 		return
 	}
 	views := make([]leaseView, 0, len(leases))
 	for _, l := range leases {
-		views = append(views, newLeaseView(l))
+		v := newLeaseView(l)
+		if caps.HealthPolicy {
+			v.HealthPolicy = newHealthPolicyView(l.HealthPolicy)
+		}
+		views = append(views, v)
 	}
 	h.writeJSON(w, http.StatusOK, claimResponse{Leases: views})
 }

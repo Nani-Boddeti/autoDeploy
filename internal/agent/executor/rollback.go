@@ -71,7 +71,7 @@ func (e *Executor) executeRollback(ctx context.Context, lease agentclient.Lease,
 			logs.Diagf(logship.StreamHealth, "health gate: container network check failed (%s): %v", class, err)
 			return e.outcome(lease, false, class)
 		}
-		gate, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
+		gate, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, lease.HealthPolicy, docker.HealthGateTarget{
 			Host: lease.HealthGateHost, Path: lease.HealthGatePath, Port: lease.ContainerPort, Scheme: lease.ContainerScheme,
 		})
 		if err != nil {

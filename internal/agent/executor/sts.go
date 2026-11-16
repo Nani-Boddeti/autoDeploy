@@ -11,6 +11,7 @@ import (
 	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/agent/state"
 	"autodeploy/internal/deployment"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
 )
@@ -51,8 +52,10 @@ const (
 	// stop + create + start + gate steps. Worst case before the switch:
 	// predecessor stop 90s + candidate create/start (bounded by the Engine
 	// client's own timeouts, budgeted 90s) + health gate 60s (the gate's
-	// fixed overall deadline, healthGateOverallDeadline) = 4 minutes, leaving
-	// the 4 minutes of slack for the switch window check below. Rollback does
+	// default deadline, 60s) = 4 minutes, leaving 4 minutes of slack for the
+	// switch window check below. The gate's deadline is tunable per environment
+	// (step 22-1, up to 600s), so stsWindowExtra widens this by the deadline's
+	// excess over the 60s default; a default policy is unchanged. Rollback does
 	// NOT draw on this window: it runs on detached contexts (candidate stop
 	// 30s + predecessor restart 30s). Additive, so ValidateActivationTimeout
 	// and the blue/green timeout are unchanged.
@@ -63,6 +66,19 @@ const (
 	// serving but the activation reported as a failure.
 	stsSwitchMargin = 30 * time.Second
 )
+
+// stsWindowExtra is the stop-then-start widening of the authorized window for
+// a lease's frozen health policy: stsExtraTimeout plus the gate deadline's
+// excess over the 60s default (never negative). The default policy, an absent
+// one included, yields exactly stsExtraTimeout.
+func stsWindowExtra(p healthgate.Policy) time.Duration {
+	deadline := time.Duration(p.WithDefaults().DeadlineSeconds) * time.Second
+	extra := deadline - healthgate.DefaultDeadlineSeconds*time.Second
+	if extra < 0 {
+		extra = 0
+	}
+	return stsExtraTimeout + extra
+}
 
 // RestartDocker is the Engine capability the stop-then-start release and
 // recovery need: DrainDocker plus start. There is intentionally NO remove or
@@ -258,7 +274,7 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		logs.Linef(logship.StreamHealth, "health gate: container network check failed (%s)", class)
 		return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate network check failed (%s)", class))
 	}
-	gate, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
+	gate, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, lease.HealthPolicy, docker.HealthGateTarget{
 		Host: lease.HealthGateHost, Path: lease.HealthGatePath, Port: lease.ContainerPort, Scheme: lease.ContainerScheme,
 	})
 	switch {

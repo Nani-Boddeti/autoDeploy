@@ -153,8 +153,8 @@ func (f leaseFixture) insertCandidateRelease(t *testing.T, attemptID int64, rele
 		releaseID, deploymentID, f.envID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal')`, attemptID); err != nil {
+	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, attemptID); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -413,8 +413,8 @@ func TestAgentLeaseActivateRefusesCandidateAlreadyActive(t *testing.T) {
 		releaseID, deploymentID, f.envID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal')`, attemptID); err != nil {
+	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, attemptID); err != nil {
 		t.Fatal(err)
 	}
 

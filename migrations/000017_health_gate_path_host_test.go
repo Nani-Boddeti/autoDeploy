@@ -202,22 +202,22 @@ func TestAgentJobAttemptExecutionHealthGateFrozenAndChecked(t *testing.T) {
 	// is rejected outright.
 	mustFail(t, ctx, tx, "expected rejection of missing health_gate_path/host",
 		`INSERT INTO agent_job_attempt_execution
-		 (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision)
-		 VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0)`, f.attemptID)
+		 (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		 VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,3,2,2,60)`, f.attemptID)
 
 	mustFail(t, ctx, tx, "expected rejection of invalid frozen health_gate_path",
 		`INSERT INTO agent_job_attempt_execution
-		 (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-		 VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'//evil','app.internal')`, f.attemptID)
+		 (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		 VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'//evil','app.internal',3,2,2,60)`, f.attemptID)
 
 	mustFail(t, ctx, tx, "expected rejection of invalid frozen health_gate_host",
 		`INSERT INTO agent_job_attempt_execution
-		 (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-		 VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/','user@host')`, f.attemptID)
+		 (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		 VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/','user@host',3,2,2,60)`, f.attemptID)
 
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-	      VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/healthz','app.internal:8443')`, f.attemptID); err != nil {
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+	      VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/healthz','app.internal:8443',3,2,2,60)`, f.attemptID); err != nil {
 		t.Fatalf("insert valid frozen health gate row: %v", err)
 	}
 

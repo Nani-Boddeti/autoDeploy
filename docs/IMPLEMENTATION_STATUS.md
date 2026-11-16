@@ -249,6 +249,10 @@ Hard gates before `activationEnabled` (control plane) or `executorEnabled` (agen
 
 ## Known follow-ups
 
+- Step 22-1 (health policies, migration 000028): before installing any build older than 22-1, reset every
+  environment's health settings to the defaults (3 successes, 2s interval, 2s timeout, 60s deadline, no TCP port);
+  an older agent never receives a job with custom settings (the claim withholds it), so such jobs would wait.
+
 From the server/leases slice:
 
 - Agent-initiated credential rotation protocol: rotation currently requires the agent to already hold its raw credential; there is no agent-initiated rotation path yet (Step 6b).

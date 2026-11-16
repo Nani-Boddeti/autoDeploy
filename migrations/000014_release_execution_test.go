@@ -270,8 +270,8 @@ func TestAgentJobAttemptExecutionInsertOnce(t *testing.T) {
 	f := buildReleaseFixture(t, ctx, tx)
 
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-	      VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID); err != nil {
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+	      VALUES ($1,8080,'http','blue_green',30,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, f.attemptID); err != nil {
 		t.Fatalf("insert execution row: %v", err)
 	}
 
@@ -295,16 +295,16 @@ func TestAgentJobAttemptExecutionDrainSecondsBounds(t *testing.T) {
 
 	mustFail(t, ctx, tx, "expected rejection of drain_seconds=0",
 		`INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-	      VALUES ($1,8080,'http','blue_green',0,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID)
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+	      VALUES ($1,8080,'http','blue_green',0,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, f.attemptID)
 	mustFail(t, ctx, tx, "expected rejection of drain_seconds=301",
 		`INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-	      VALUES ($1,8080,'http','blue_green',301,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID)
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+	      VALUES ($1,8080,'http','blue_green',301,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, f.attemptID)
 
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution
-	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-	      VALUES ($1,8080,'http','blue_green',300,1,500,268435456,'unless-stopped',0,'/','app.internal')`, f.attemptID); err != nil {
+	      (attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+	      VALUES ($1,8080,'http','blue_green',300,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, f.attemptID); err != nil {
 		t.Fatalf("insert execution row with drain_seconds=300: %v", err)
 	}
 	var drain int

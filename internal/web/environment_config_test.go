@@ -93,6 +93,12 @@ func validConfigForm(environmentID, csrf, expectedRevision string) url.Values {
 		"restart_policy":    {"unless-stopped"},
 		"health_gate_path":  {"/healthz"},
 		"health_gate_host":  {"app.internal"},
+
+		"health_success_threshold": {"3"},
+		"health_interval_seconds":  {"2"},
+		"health_timeout_seconds":   {"2"},
+		"health_deadline_seconds":  {"60"},
+		"health_tcp_port":          {""},
 	}
 }
 

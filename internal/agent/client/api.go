@@ -13,6 +13,7 @@ import (
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/github"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/dockerid"
 	"autodeploy/internal/server"
@@ -118,6 +119,11 @@ type Lease struct {
 	// instance of that container. ReleaseID equals RollbackTargetReleaseID.
 	RollbackTargetReleaseID         string
 	RollbackTargetRuntimeInstanceID string
+	// HealthPolicy is the attempt's frozen health policy (step 22-1c). It is
+	// healthgate.DefaultPolicy() when the control plane sent none (an older
+	// control plane, which never leases a non-default policy to us anyway).
+	// The health gate does not read it yet (step 22-1d).
+	HealthPolicy healthgate.Policy
 }
 
 // LiteralBinding is one variable's frozen non-secret value. It carries the
@@ -140,6 +146,42 @@ type literalBindingWire struct {
 	VariableName  string `json:"variable_name"`
 	DeliveryScope string `json:"delivery_scope"`
 	Value         string `json:"value"`
+}
+
+// healthPolicyWire is strict: every field is required (a missing one decodes
+// as nil), tcp_port alone may be null, and unknown fields fail the whole
+// response like everywhere else in this client.
+type healthPolicyWire struct {
+	SuccessThreshold *int `json:"success_threshold"`
+	IntervalSeconds  *int `json:"interval_seconds"`
+	TimeoutSeconds   *int `json:"timeout_seconds"`
+	DeadlineSeconds  *int `json:"deadline_seconds"`
+	TCPPort          *int `json:"tcp_port"`
+}
+
+// parse decodes the lease's policy. required is true when the claim declared
+// the health_policy capability and the server accepted it: then an absent or
+// null policy is a malformed lease (running a tuned job with defaults would
+// silently weaken its check). Only the legacy, capability-less claim falls
+// back to the default policy.
+func (w *healthPolicyWire) parse(required bool) (healthgate.Policy, error) {
+	if w == nil {
+		if required {
+			return healthgate.Policy{}, errors.New("missing health policy")
+		}
+		return healthgate.DefaultPolicy(), nil
+	}
+	if w.SuccessThreshold == nil || w.IntervalSeconds == nil || w.TimeoutSeconds == nil || w.DeadlineSeconds == nil {
+		return healthgate.Policy{}, errors.New("incomplete health policy")
+	}
+	p := healthgate.Policy{SuccessThreshold: *w.SuccessThreshold, IntervalSeconds: *w.IntervalSeconds, TimeoutSeconds: *w.TimeoutSeconds, DeadlineSeconds: *w.DeadlineSeconds}
+	if w.TCPPort != nil {
+		p.TCPPort = *w.TCPPort
+	}
+	if !p.Valid() {
+		return healthgate.Policy{}, errors.New("invalid health policy")
+	}
+	return p, nil
 }
 
 type leaseWire struct {
@@ -172,14 +214,20 @@ type leaseWire struct {
 
 	RollbackTargetReleaseID         string `json:"rollback_target_release_id"`
 	RollbackTargetRuntimeInstanceID string `json:"rollback_target_runtime_instance_id"`
+
+	HealthPolicy *healthPolicyWire `json:"health_policy"`
 }
 
-func (w leaseWire) parse() (Lease, error) {
+func (w leaseWire) parse(policyRequired bool) (Lease, error) {
 	leaseExpires, err := time.Parse(time.RFC3339Nano, w.LeaseExpiresAt)
 	if err != nil {
 		return Lease{}, err
 	}
 	authorityExpires, err := time.Parse(time.RFC3339Nano, w.AuthorityExpiresAt)
+	if err != nil {
+		return Lease{}, err
+	}
+	policy, err := w.HealthPolicy.parse(policyRequired)
 	if err != nil {
 		return Lease{}, err
 	}
@@ -213,17 +261,26 @@ func (w leaseWire) parse() (Lease, error) {
 
 		RollbackTargetReleaseID:         w.RollbackTargetReleaseID,
 		RollbackTargetRuntimeInstanceID: w.RollbackTargetRuntimeInstanceID,
+		HealthPolicy:                    policy,
 	}, nil
 }
 
 // Claim requests at most one lease (internal/agent/http's V1 claimLimit).
 // Callers must never set executorAvailable true unless a real Executor will
 // actually run the returned lease.
+//
+// The request declares the health_policy capability (step 22-1c). A control
+// plane that predates it decodes strictly and answers 400 invalid_request to
+// the unknown field; only then, and only once, the claim is repeated without
+// it (the pre-22-1c request), and every lease then carries the default policy.
+// When the capability was accepted, every lease must carry its policy.
+// A 400 means nothing was claimed, so the repeat cannot lease a second job.
 func (c *Client) Claim(ctx context.Context, executorAvailable bool) ([]Lease, error) {
 	req := struct {
-		Limit             int  `json:"limit"`
-		ExecutorAvailable bool `json:"executor_available"`
-	}{Limit: 1, ExecutorAvailable: executorAvailable}
+		Limit             int      `json:"limit"`
+		ExecutorAvailable bool     `json:"executor_available"`
+		Capabilities      []string `json:"capabilities"`
+	}{Limit: 1, ExecutorAvailable: executorAvailable, Capabilities: []string{healthgate.CapabilityHealthPolicy}}
 	var resp struct {
 		Leases []leaseWire `json:"leases"`
 	}
@@ -234,12 +291,27 @@ func (c *Client) Claim(ctx context.Context, executorAvailable bool) ([]Lease, er
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
-	if err := c.attempt(ctx, pathClaim, payload, &resp, true); err != nil {
+	err = c.attempt(ctx, pathClaim, payload, &resp, true)
+	policyRequired := true
+	var bad errBadRequest
+	if errors.As(err, &bad) {
+		policyRequired = false
+		legacy := struct {
+			Limit             int  `json:"limit"`
+			ExecutorAvailable bool `json:"executor_available"`
+		}{Limit: 1, ExecutorAvailable: executorAvailable}
+		if payload, err = json.Marshal(legacy); err != nil {
+			return nil, fmt.Errorf("encode request: %w", err)
+		}
+		resp.Leases = nil
+		err = c.attempt(ctx, pathClaim, payload, &resp, true)
+	}
+	if err != nil {
 		return nil, err
 	}
 	leases := make([]Lease, 0, len(resp.Leases))
 	for _, w := range resp.Leases {
-		lease, err := w.parse()
+		lease, err := w.parse(policyRequired)
 		if err != nil {
 			return nil, fmt.Errorf("%w: malformed lease in response", ErrTransportFailure)
 		}

@@ -11,6 +11,7 @@ import (
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/agent/state"
 	"autodeploy/internal/deployment"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/runtime/docker"
 	"autodeploy/internal/runtime/dockerid"
 	"autodeploy/internal/runtime/traefik"
@@ -19,9 +20,11 @@ import (
 // stsDocker is a small stateful engine: containers by id with identity labels
 // and a running flag, plus an ordered event log. It implements dockerRuntime.
 type stsDocker struct {
-	ctrs   map[string]*stsCtr
-	events []string
-	hook   func(ev string)
+	gotPolicy healthgate.Policy
+	onGate    func(ctx context.Context)
+	ctrs      map[string]*stsCtr
+	events    []string
+	hook      func(ev string)
 
 	ensureErr error
 	gate      docker.HealthGateResult
@@ -143,8 +146,12 @@ func (d *stsDocker) EnsureReleaseRuntimeContainer(_ context.Context, req docker.
 	return out, nil
 }
 
-func (d *stsDocker) RunHealthGate(context.Context, string, string, int, docker.HealthGateTarget) (docker.HealthGateResult, error) {
+func (d *stsDocker) RunHealthGate(ctx context.Context, _, _ string, _ int, policy healthgate.Policy, _ docker.HealthGateTarget) (docker.HealthGateResult, error) {
 	d.rec("gate")
+	d.gotPolicy = policy
+	if d.onGate != nil {
+		d.onGate(ctx)
+	}
 	return d.gate, d.gateErr
 }
 

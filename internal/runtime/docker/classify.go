@@ -121,7 +121,7 @@ func ClassifyFailure(err error) queue.FailureClass {
 // than guessing that an unexplained gate failure is safe to retry.
 func ClassifyHealthGateResult(result HealthGateResult) queue.FailureClass {
 	switch result.Reason {
-	case HealthGateFailureDeadlineExceeded:
+	case HealthGateFailureDeadlineExceeded, HealthGateFailureContainerUnhealthy:
 		return queue.FailureClassPermanentConfiguration
 	case HealthGateFailureContextCancelled:
 		return queue.FailureClassTransient

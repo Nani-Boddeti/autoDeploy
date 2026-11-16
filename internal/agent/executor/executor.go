@@ -27,6 +27,7 @@ import (
 	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/gitcheckout"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
 	"autodeploy/internal/runtime/dockerid"
@@ -54,7 +55,7 @@ type ControlPlane interface {
 type dockerRuntime interface {
 	Probe(ctx context.Context) (docker.VersionInfo, error)
 	EnsureReleaseRuntimeContainer(ctx context.Context, req docker.RunContainerRequest, networkNameOrID string) (docker.ContainerInspect, error)
-	RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, target docker.HealthGateTarget) (docker.HealthGateResult, error)
+	RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, policy healthgate.Policy, target docker.HealthGateTarget) (docker.HealthGateResult, error)
 	// RestartDocker (inspect, label lookup, stop, wait, start; deliberately no
 	// remove or kill) backs the guarded stop of a candidate that fails before
 	// authorization (stopFailedCandidate) and the stop-then-start release
@@ -341,7 +342,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 			return e.outcome(lease, false, class)
 		}
 
-		gateResult, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, docker.HealthGateTarget{
+		gateResult, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, lease.HealthPolicy, docker.HealthGateTarget{
 			Host:   lease.HealthGateHost,
 			Path:   lease.HealthGatePath,
 			Port:   lease.ContainerPort,

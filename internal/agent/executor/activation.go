@@ -261,7 +261,7 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 	// renewal must not abandon it half-done.
 	timeout := a.timeout
 	if release != nil {
-		timeout += stsExtraTimeout
+		timeout += stsWindowExtra(lease.HealthPolicy)
 	}
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()

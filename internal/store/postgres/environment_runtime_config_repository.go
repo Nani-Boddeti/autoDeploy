@@ -117,6 +117,12 @@ type RuntimeConfigInput struct {
 	// (never retried).
 	HealthGatePath string
 	HealthGateHost string
+	// HealthPolicy is migration 000028's tunable policy (step 22-1a).
+	// Compatibility rule: a numeric field left at 0 means "use ADR 0005's
+	// default" (Create/Update call WithDefaults before validating), so a
+	// caller that never sets it keeps today's 3/2s/2s/60s behavior and can
+	// never store "0 seconds"; TCPPort 0 means no TCP check (NULL).
+	HealthPolicy healthgate.Policy
 }
 
 // valid mirrors migration 000014/000017's environment_runtime_configs CHECK
@@ -131,7 +137,16 @@ func (in RuntimeConfigInput) valid() bool {
 		in.MemoryBytes > 0 && in.MemoryBytes <= 549755813888 &&
 		(in.RestartPolicy == "unless-stopped" || in.RestartPolicy == "on-failure") &&
 		healthgate.ValidPath(in.HealthGatePath) &&
-		healthgate.ValidHost(in.HealthGateHost)
+		healthgate.ValidHost(in.HealthGateHost) &&
+		in.HealthPolicy.Valid()
+}
+
+// tcpPortArg maps the policy's "no TCP check" (0) to SQL NULL.
+func tcpPortArg(port int) any {
+	if port == 0 {
+		return nil
+	}
+	return port
 }
 
 // RuntimeConfig is the full read view of one environment's runtime
@@ -258,13 +273,17 @@ func (r *EnvironmentRuntimeConfigRepository) GetEnvironmentRuntimeConfig(ctx con
 
 func readRuntimeConfig(ctx context.Context, tx pgx.Tx, environmentID string) (RuntimeConfig, bool, error) {
 	var cfg RuntimeConfig
-	err := tx.QueryRow(ctx, `SELECT environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_path, health_gate_host, revision, updated_at FROM environment_runtime_configs WHERE environment_id=$1`, environmentID).
-		Scan(&cfg.EnvironmentID, &cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthPolicyRevision, &cfg.HealthGatePath, &cfg.HealthGateHost, &cfg.Revision, &cfg.UpdatedAt)
+	var tcpPort *int
+	err := tx.QueryRow(ctx, `SELECT environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds, health_tcp_port, revision, updated_at FROM environment_runtime_configs WHERE environment_id=$1`, environmentID).
+		Scan(&cfg.EnvironmentID, &cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthPolicyRevision, &cfg.HealthGatePath, &cfg.HealthGateHost, &cfg.HealthPolicy.SuccessThreshold, &cfg.HealthPolicy.IntervalSeconds, &cfg.HealthPolicy.TimeoutSeconds, &cfg.HealthPolicy.DeadlineSeconds, &tcpPort, &cfg.Revision, &cfg.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RuntimeConfig{}, false, nil
 	}
 	if err != nil {
 		return RuntimeConfig{}, false, fmt.Errorf("read environment runtime config: %w", err)
+	}
+	if tcpPort != nil {
+		cfg.HealthPolicy.TCPPort = *tcpPort
 	}
 	return cfg, true, nil
 }
@@ -300,6 +319,7 @@ func readRuntimeBindings(ctx context.Context, tx pgx.Tx, environmentID string) (
 // that mean to edit an existing config must use
 // UpdateEnvironmentRuntimeConfig instead.
 func (r *EnvironmentRuntimeConfigRepository) CreateEnvironmentRuntimeConfig(ctx context.Context, principal auth.Principal, environmentID string, in RuntimeConfigInput) (RuntimeConfig, error) {
+	in.HealthPolicy = in.HealthPolicy.WithDefaults()
 	if r == nil || r.pool == nil || principal.Validate() != nil || !github.ValidOpaqueID(environmentID) || !in.valid() {
 		return RuntimeConfig{}, ErrServerAuthorizationDenied
 	}
@@ -339,8 +359,9 @@ func (r *EnvironmentRuntimeConfigRepository) CreateEnvironmentRuntimeConfig(ctx 
 	cfg.EnvironmentID = environmentID
 	cfg.RuntimeConfigInput = in
 	cfg.HealthPolicyRevision = 1
-	err = tx.QueryRow(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_path, health_gate_host, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10,0) RETURNING revision, updated_at`,
-		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, in.HealthGatePath, in.HealthGateHost).Scan(&cfg.Revision, &cfg.UpdatedAt)
+	err = tx.QueryRow(ctx, `INSERT INTO environment_runtime_configs(environment_id, container_port, container_scheme, release_strategy, drain_seconds, cpu_millis, memory_bytes, restart_policy, health_policy_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds, health_tcp_port, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10,$11,$12,$13,$14,$15,0) RETURNING revision, updated_at`,
+		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, in.HealthGatePath, in.HealthGateHost,
+		in.HealthPolicy.SuccessThreshold, in.HealthPolicy.IntervalSeconds, in.HealthPolicy.TimeoutSeconds, in.HealthPolicy.DeadlineSeconds, tcpPortArg(in.HealthPolicy.TCPPort)).Scan(&cfg.Revision, &cfg.UpdatedAt)
 	if isUniqueViolation(err) {
 		// The INSERT above already returned a genuine PostgreSQL error,
 		// which poisons the rest of this transaction until rollback -- a
@@ -380,6 +401,7 @@ func (r *EnvironmentRuntimeConfigRepository) CreateEnvironmentRuntimeConfig(ctx 
 // (ErrEnvironmentRuntimeConfigNotFound), so the web layer can tell an
 // operator "this changed underneath you" rather than a generic failure.
 func (r *EnvironmentRuntimeConfigRepository) UpdateEnvironmentRuntimeConfig(ctx context.Context, principal auth.Principal, environmentID string, in RuntimeConfigInput, expectedRevision int64) (RuntimeConfig, error) {
+	in.HealthPolicy = in.HealthPolicy.WithDefaults()
 	if r == nil || r.pool == nil || principal.Validate() != nil || !github.ValidOpaqueID(environmentID) || !in.valid() || expectedRevision < 0 {
 		return RuntimeConfig{}, ErrServerAuthorizationDenied
 	}
@@ -411,8 +433,9 @@ func (r *EnvironmentRuntimeConfigRepository) UpdateEnvironmentRuntimeConfig(ctx 
 	cfg.EnvironmentID = environmentID
 	cfg.RuntimeConfigInput = in
 	cfg.HealthPolicyRevision = 1
-	err = tx.QueryRow(ctx, `UPDATE environment_runtime_configs SET container_port=$2, container_scheme=$3, release_strategy=$4, drain_seconds=$5, cpu_millis=$6, memory_bytes=$7, restart_policy=$8, health_gate_path=$9, health_gate_host=$10, revision=revision+1, updated_at=clock_timestamp() WHERE environment_id=$1 AND revision=$11 RETURNING revision, updated_at`,
-		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, in.HealthGatePath, in.HealthGateHost, expectedRevision).Scan(&cfg.Revision, &cfg.UpdatedAt)
+	err = tx.QueryRow(ctx, `UPDATE environment_runtime_configs SET container_port=$2, container_scheme=$3, release_strategy=$4, drain_seconds=$5, cpu_millis=$6, memory_bytes=$7, restart_policy=$8, health_gate_path=$9, health_gate_host=$10, health_success_threshold=$11, health_interval_seconds=$12, health_timeout_seconds=$13, health_deadline_seconds=$14, health_tcp_port=$15, revision=revision+1, updated_at=clock_timestamp() WHERE environment_id=$1 AND revision=$16 RETURNING revision, updated_at`,
+		environmentID, in.ContainerPort, in.ContainerScheme, in.ReleaseStrategy, in.DrainSeconds, in.CPUMillis, in.MemoryBytes, in.RestartPolicy, in.HealthGatePath, in.HealthGateHost,
+		in.HealthPolicy.SuccessThreshold, in.HealthPolicy.IntervalSeconds, in.HealthPolicy.TimeoutSeconds, in.HealthPolicy.DeadlineSeconds, tcpPortArg(in.HealthPolicy.TCPPort), expectedRevision).Scan(&cfg.Revision, &cfg.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Zero rows affected: either the row does not exist at all, or it
 		// exists but expectedRevision is stale. Distinguish with a second,

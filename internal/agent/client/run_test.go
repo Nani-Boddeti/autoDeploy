@@ -473,7 +473,15 @@ func fixtureLease(t *testing.T, environmentID string, fence int64) *leaseWire {
 		ProjectID: "proj_1", EnvironmentID: environmentID, DeploymentID: "dep_1",
 		RepositoryID: 1, Ref: "refs/heads/main", CommitSHA: strings.Repeat("a", 40),
 		LeaseExpiresAt: expires, AuthorityExpiresAt: expires,
+		HealthPolicy: defaultPolicyWire(),
 	}
+}
+
+// defaultPolicyWire is the policy object a current control plane sends with
+// every lease to an agent that declared the health_policy capability.
+func defaultPolicyWire() *healthPolicyWire {
+	three, two, sixty := 3, 2, 60
+	return &healthPolicyWire{SuccessThreshold: &three, IntervalSeconds: &two, TimeoutSeconds: &two, DeadlineSeconds: &sixty}
 }
 
 func waitForSequenceCount(t *testing.T, fake *fakeControlPlane, n int) {

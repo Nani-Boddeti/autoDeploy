@@ -1033,7 +1033,74 @@ func parseRuntimeConfigForm(v url.Values) (postgres.RuntimeConfigInput, error) {
 	if !validRuntimeConfigFields(port, drain, cpu, scheme, strategy, restart, healthGatePath, healthGateHost, memory) {
 		return postgres.RuntimeConfigInput{}, errors.New("container port must be 1-65535, scheme http/https, strategy blue_green/stop_then_start, drain seconds 1-300, cpu millis 1-256000, memory bytes 1-549755813888, restart policy unless-stopped/on-failure, health gate path must be an absolute path with no whitespace/control characters/#, health gate host must be a valid hostname with an optional :port")
 	}
-	return postgres.RuntimeConfigInput{ContainerPort: port, ContainerScheme: scheme, ReleaseStrategy: strategy, DrainSeconds: drain, CPUMillis: cpu, MemoryBytes: memory, RestartPolicy: restart, HealthGatePath: healthGatePath, HealthGateHost: healthGateHost}, nil
+	policy, err := parseHealthPolicyForm(v)
+	if err != nil {
+		return postgres.RuntimeConfigInput{}, err
+	}
+	return postgres.RuntimeConfigInput{ContainerPort: port, ContainerScheme: scheme, ReleaseStrategy: strategy, DrainSeconds: drain, CPUMillis: cpu, MemoryBytes: memory, RestartPolicy: restart, HealthGatePath: healthGatePath, HealthGateHost: healthGateHost, HealthPolicy: policy}, nil
+}
+
+// healthPolicyFormFields are the five health policy form fields, all required
+// in the (strict) form; health_tcp_port may be empty (no TCP check).
+var healthPolicyFormFields = []string{"health_success_threshold", "health_interval_seconds", "health_timeout_seconds", "health_deadline_seconds", "health_tcp_port"}
+
+var errHealthPolicy = errors.New("health policy must be whole numbers within bounds (successes 1-10, interval 1-30s, timeout 1-30s and no longer than the interval, deadline 10-600s and at least successes x interval, optional TCP port 1-65535)")
+
+// parseFormDigits parses an unsigned decimal; unlike strconv.Atoi it refuses
+// signs, spaces, and anything but ASCII digits.
+func parseFormDigits(s string) (int, bool) {
+	if s == "" || len(s) > 9 {
+		return 0, false
+	}
+	for _, c := range []byte(s) {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	return n, err == nil
+}
+
+// parseHealthPolicyForm parses the five health policy fields and validates
+// them with internal/healthgate (the single source of the bounds and cross
+// rules). No defaults are applied: the rendered form always carries values.
+func parseHealthPolicyForm(v url.Values) (healthgate.Policy, error) {
+	var nums [4]int
+	for i, name := range healthPolicyFormFields[:4] {
+		n, ok := parseFormDigits(v.Get(name))
+		if !ok {
+			return healthgate.Policy{}, errHealthPolicy
+		}
+		nums[i] = n
+	}
+	policy := healthgate.Policy{SuccessThreshold: nums[0], IntervalSeconds: nums[1], TimeoutSeconds: nums[2], DeadlineSeconds: nums[3]}
+	if raw := v.Get("health_tcp_port"); raw != "" {
+		n, ok := parseFormDigits(raw)
+		if !ok || !healthgate.ValidTCPPort(n) {
+			return healthgate.Policy{}, errHealthPolicy
+		}
+		policy.TCPPort = n
+	}
+	if !policy.Valid() {
+		return healthgate.Policy{}, errHealthPolicy
+	}
+	return policy, nil
+}
+
+// healthBoundsView carries healthgate's bounds to the template so the input
+// min/max attributes have one source of truth.
+type healthBoundsView struct {
+	MinThreshold, MaxThreshold, MinInterval, MaxInterval, MinTimeout, MaxTimeout, MinDeadline, MaxDeadline, MinTCPPort, MaxTCPPort int
+}
+
+func newHealthBoundsView() healthBoundsView {
+	return healthBoundsView{
+		MinThreshold: healthgate.MinSuccessThreshold, MaxThreshold: healthgate.MaxSuccessThreshold,
+		MinInterval: healthgate.MinIntervalSeconds, MaxInterval: healthgate.MaxIntervalSeconds,
+		MinTimeout: healthgate.MinTimeoutSeconds, MaxTimeout: healthgate.MaxTimeoutSeconds,
+		MinDeadline: healthgate.MinDeadlineSeconds, MaxDeadline: healthgate.MaxDeadlineSeconds,
+		MinTCPPort: healthgate.MinTCPPort, MaxTCPPort: healthgate.MaxTCPPort,
+	}
 }
 
 // runtimeConfigFormView builds a sticky config view directly from the
@@ -1048,6 +1115,9 @@ func runtimeConfigFormView(csrf, environmentID string, v url.Values) runtimeConf
 		Port: v.Get("container_port"), Scheme: v.Get("container_scheme"), Strategy: v.Get("release_strategy"),
 		Drain: v.Get("drain_seconds"), CPU: v.Get("cpu_millis"), Memory: v.Get("memory_bytes"), Restart: v.Get("restart_policy"),
 		HealthGatePath: v.Get("health_gate_path"), HealthGateHost: v.Get("health_gate_host"),
+		HealthThreshold: v.Get("health_success_threshold"), HealthInterval: v.Get("health_interval_seconds"),
+		HealthTimeout: v.Get("health_timeout_seconds"), HealthDeadline: v.Get("health_deadline_seconds"), HealthTCPPort: v.Get("health_tcp_port"),
+		HealthBounds: newHealthBoundsView(),
 	}
 }
 
@@ -1055,7 +1125,21 @@ func runtimeConfigFormView(csrf, environmentID string, v url.Values) runtimeConf
 // exactly as read back from the repository (the normal GET path, and the
 // fallback view after a rejected mutation once bindings are re-fetched).
 func buildRuntimeConfigView(csrf, environmentID string, cfg postgres.RuntimeConfig, bindings []postgres.RuntimeBinding, found bool) runtimeConfigView {
-	view := runtimeConfigView{CSRF: csrf, EnvironmentID: environmentID, Exists: found, Bindings: buildBindingRows(bindings)}
+	view := runtimeConfigView{CSRF: csrf, EnvironmentID: environmentID, Exists: found, Bindings: buildBindingRows(bindings), HealthBounds: newHealthBoundsView()}
+	// Zero is never a valid stored value, so defaulting only affects views of
+	// rows that predate or omit a policy (and the create form).
+	policy := healthgate.Policy{}
+	if found {
+		policy = cfg.HealthPolicy
+	}
+	policy = policy.WithDefaults()
+	view.HealthThreshold = strconv.Itoa(policy.SuccessThreshold)
+	view.HealthInterval = strconv.Itoa(policy.IntervalSeconds)
+	view.HealthTimeout = strconv.Itoa(policy.TimeoutSeconds)
+	view.HealthDeadline = strconv.Itoa(policy.DeadlineSeconds)
+	if policy.TCPPort != 0 {
+		view.HealthTCPPort = strconv.Itoa(policy.TCPPort)
+	}
 	if found {
 		view.Revision = strconv.FormatInt(cfg.Revision, 10)
 		view.Port = strconv.Itoa(cfg.ContainerPort)
@@ -1171,11 +1255,11 @@ func (h *Handler) environmentConfigPost(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 12 {
+	if err != nil || len(v) != 17 {
 		badRequest(w)
 		return
 	}
-	for _, name := range []string{"environment_id", "csrf", "expected_revision", "container_port", "container_scheme", "release_strategy", "drain_seconds", "cpu_millis", "memory_bytes", "restart_policy", "health_gate_path", "health_gate_host"} {
+	for _, name := range []string{"environment_id", "csrf", "expected_revision", "container_port", "container_scheme", "release_strategy", "drain_seconds", "cpu_millis", "memory_bytes", "restart_policy", "health_gate_path", "health_gate_host", "health_success_threshold", "health_interval_seconds", "health_timeout_seconds", "health_deadline_seconds", "health_tcp_port"} {
 		if len(v[name]) != 1 {
 			badRequest(w)
 			return
@@ -1915,6 +1999,9 @@ type runtimeConfigView struct {
 	Port, Scheme, Strategy, Drain, CPU, Memory, Restart                   string
 	HealthGatePath, HealthGateHost                                        string
 	HealthPolicyRevision, UpdatedAt                                       string
+	HealthThreshold, HealthInterval, HealthTimeout, HealthDeadline        string
+	HealthTCPPort                                                         string
+	HealthBounds                                                          healthBoundsView
 	ConfigError                                                           string
 	Bindings                                                              []bindingRow
 	BindingError                                                          string

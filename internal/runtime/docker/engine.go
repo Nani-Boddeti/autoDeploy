@@ -446,6 +446,12 @@ type ContainerInspect struct {
 		// is not stopped.
 		Restarting bool `json:"Restarting"`
 		Paused     bool `json:"Paused"`
+		// Health is present only when the image defines a HEALTHCHECK. Its
+		// Status ("starting", "healthy", "unhealthy") is read by the health
+		// gate (step 22-1d); nothing else of the health block is needed.
+		Health struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
 	} `json:"State"`
 	NetworkSettings struct {
 		Networks map[string]struct {

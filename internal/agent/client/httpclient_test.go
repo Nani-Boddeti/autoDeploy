@@ -222,7 +222,7 @@ func TestClaimIsNotRetried(t *testing.T) {
 func TestClaimParsesRollbackLeaseFields(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"leases":[{"job_id":1,"attempt_id":2,"attempt_number":1,"fence":3,"project_id":"p","environment_id":"e","deployment_id":"d","repository_id":1,"ref":"refs/heads/main","commit_sha":"abc","lease_expires_at":"2026-11-13T10:00:00Z","authority_expires_at":"2026-11-13T10:00:00Z","release_id":"rel","rollback_target_release_id":"rel","rollback_target_runtime_instance_id":"77","secret_bindings":[],"literal_bindings":[]}]}`))
+		_, _ = w.Write([]byte(`{"leases":[{"job_id":1,"attempt_id":2,"attempt_number":1,"fence":3,"project_id":"p","environment_id":"e","deployment_id":"d","repository_id":1,"ref":"refs/heads/main","commit_sha":"abc","lease_expires_at":"2026-11-13T10:00:00Z","authority_expires_at":"2026-11-13T10:00:00Z","release_id":"rel","rollback_target_release_id":"rel","rollback_target_runtime_instance_id":"77","secret_bindings":[],"literal_bindings":[],"health_policy":{"success_threshold":3,"interval_seconds":2,"timeout_seconds":2,"deadline_seconds":60,"tcp_port":null}}]}`))
 	}))
 	defer srv.Close()
 	leases, err := newTestClient(t, srv, nil).Claim(context.Background(), true)

@@ -89,8 +89,8 @@ func (f leaseFixture) insertHistoricRelease(t *testing.T, releaseID, state, tag 
 		return 0
 	}
 	attemptID := f.insertSucceededActivation(t, releaseID, deploymentID, tag)
-	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-		VALUES ($1,$2,'http',$3,$4,1,250,134217728,'unless-stopped',0,'/health','target.internal')`, attemptID, port, strategy, drain); err != nil {
+	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		VALUES ($1,$2,'http',$3,$4,1,250,134217728,'unless-stopped',0,'/health','target.internal',3,2,2,60)`, attemptID, port, strategy, drain); err != nil {
 		t.Fatal(err)
 	}
 	return attemptID

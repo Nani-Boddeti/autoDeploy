@@ -14,6 +14,7 @@ import (
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/gitcheckout"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
 )
@@ -81,7 +82,8 @@ func (f *fakeCheckout) Checkout(ctx context.Context, attemptID, fence int64) (Ch
 }
 
 type fakeDocker struct {
-	probeErr error
+	probeErr  error
+	gotPolicy healthgate.Policy
 
 	ensureResult docker.ContainerInspect
 	ensureErr    error
@@ -152,7 +154,8 @@ func (f *fakeDocker) EnsureReleaseRuntimeContainer(ctx context.Context, req dock
 	return f.ensureResult, f.ensureErr
 }
 
-func (f *fakeDocker) RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, target docker.HealthGateTarget) (docker.HealthGateResult, error) {
+func (f *fakeDocker) RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, policy healthgate.Policy, target docker.HealthGateTarget) (docker.HealthGateResult, error) {
+	f.gotPolicy = policy
 	f.gateN++
 	f.lastTarget = target
 	f.lastNetID = networkID

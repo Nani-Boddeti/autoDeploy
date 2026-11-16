@@ -278,8 +278,8 @@ func TestOperationsReadDetailAggregate(t *testing.T) {
 	}
 	exec(`INSERT INTO releases(id, deployment_id, environment_id, config_digest, commit_sha, strategy, state)
 		VALUES ('detail-rel','detail-dep',$1,decode(repeat('ab',32),'hex'),'0123456789abcdef0123456789abcdef01234567','stop_then_start','candidate')`, f.envID)
-	exec(`INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host)
-		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal')`, attemptID)
+	exec(`INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
+		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, attemptID)
 	exec(`INSERT INTO release_runtime_instances(release_id, job_id, attempt_id, fence, container_name, observed_state) VALUES ('detail-rel',$1,$2,1,'c-detail','running')`, jobID, attemptID)
 	exec(`UPDATE agent_job_attempts SET state='failed', failure_class='transient', result_operation_id='op', result_digest=decode(repeat('00',32),'hex'), closed_at=clock_timestamp() WHERE id=$1`, attemptID)
 	exec(`UPDATE agent_jobs SET state='retry_wait', available_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, jobID)

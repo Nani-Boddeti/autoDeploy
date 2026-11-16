@@ -27,13 +27,6 @@ import (
 // gate itself and touches no routing state.
 
 const (
-	// healthGateConsecutiveSuccesses, healthGateProbeInterval,
-	// healthGateProbeTimeout, and healthGateOverallDeadline are exactly
-	// ADR 0005's default HTTP policy numbers.
-	healthGateConsecutiveSuccesses = 3
-	healthGateProbeInterval        = 2 * time.Second
-	healthGateProbeTimeout         = 2 * time.Second
-	healthGateOverallDeadline      = 60 * time.Second
 	// healthGateMaxBodyBytes bounds the probe response body this package
 	// will ever read before discarding it. The candidate is an arbitrary
 	// application container, not the trusted Engine API, so this is
@@ -165,6 +158,9 @@ type ContainerStatus struct {
 	State     ContainerState
 	ExitCode  int
 	OOMKilled bool
+	// Health is the image HEALTHCHECK status ("starting", "healthy",
+	// "unhealthy"); empty or "none" when the image defines no healthcheck.
+	Health string
 	// LastProbe describes the final probe attempt ("status=404" or the
 	// transport error, e.g. "dial tcp ...: connection refused") so a gate that
 	// times out is never opaque. Never carries response body content. Empty
@@ -210,10 +206,13 @@ const (
 	HealthGateFailureDeadlineExceeded    HealthGateFailureReason = "deadline_exceeded"
 	HealthGateFailureContextCancelled    HealthGateFailureReason = "context_cancelled"
 	HealthGateFailureContainerNotRunning HealthGateFailureReason = "container_not_running"
+	// HealthGateFailureContainerUnhealthy: the image's own HEALTHCHECK
+	// reported "unhealthy" (ADR 0005: explicit unhealthy is immediate failure).
+	HealthGateFailureContainerUnhealthy HealthGateFailureReason = "container_unhealthy"
 )
 
 // HealthGateResult is RunHealthGate's outcome. Success is only ever true
-// after exactly healthGateConsecutiveSuccesses consecutive successful
+// after the policy's consecutive-success threshold of successful
 // probes with the container observed running throughout.
 type HealthGateResult struct {
 	Success bool
@@ -239,7 +238,7 @@ type HealthGateResult struct {
 // constants and can only ever call this with them; there is no exported way
 // to run the gate with different numbers.
 //
-// ctx's own deadline (set by the caller to healthGateOverallDeadline in
+// ctx's own deadline (set by the caller to the policy deadline in
 // production) is the sole source of the 60s overall deadline: this
 // function does not additionally track elapsed time, so "deadline
 // exceeded" is reported precisely when ctx.Err() says so.
@@ -273,6 +272,10 @@ func runHealthGate(ctx context.Context, probe HealthProbeFunc, state ContainerSt
 			}, nil
 		}
 
+		if st.Health == "unhealthy" {
+			return HealthGateResult{Success: false, Reason: HealthGateFailureContainerUnhealthy}, nil
+		}
+
 		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 		ok, err := probe(probeCtx)
 		cancel()
@@ -292,7 +295,9 @@ func runHealthGate(ctx context.Context, probe HealthProbeFunc, state ContainerSt
 			return HealthGateResult{}, err
 		}
 
-		if ok {
+		// An image HEALTHCHECK still "starting" blocks passing: the round is
+		// probed (so LastProbe stays informative) but cannot count.
+		if ok && st.Health != "starting" {
 			consecutive++
 		} else {
 			consecutive = 0
@@ -325,9 +330,13 @@ func deadlineResult(err error) HealthGateResult {
 // health_policy_revision is asserted equal to 1 up front: V1 only ever
 // pins revision 1 (see migrations 000014/000016), so any other value
 // reaching this call is a caller bug, not a runtime condition to gate on.
-func (c *Client) RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, target HealthGateTarget) (HealthGateResult, error) {
+func (c *Client) RunHealthGate(ctx context.Context, containerID, networkID string, healthPolicyRevision int, policy healthgate.Policy, target HealthGateTarget) (HealthGateResult, error) {
 	if healthPolicyRevision != 1 {
 		return HealthGateResult{}, fmt.Errorf("%w: unsupported health_policy_revision %d", ErrInvalidIdentifier, healthPolicyRevision)
+	}
+	policy = policy.WithDefaults()
+	if !policy.Valid() {
+		return HealthGateResult{}, fmt.Errorf("%w: invalid health policy", ErrInvalidIdentifier)
 	}
 	if err := target.validate(); err != nil {
 		return HealthGateResult{}, err
@@ -338,17 +347,79 @@ func (c *Client) RunHealthGate(ctx context.Context, containerID, networkID strin
 		return HealthGateResult{}, err
 	}
 
+	t := policyTimings(policy)
 	trace := &probeTrace{}
 	probe := newHTTPProbeTraced(ip, target, trace)
+	var tcpTrace *probeTrace
+	if policy.TCPPort != 0 {
+		tcpTrace = &probeTrace{}
+		probe = andProbes(probe, newTCPProbe(ip, policy.TCPPort, tcpTrace))
+	}
 	state := func(ctx context.Context) (ContainerStatus, error) {
 		return c.containerRunningState(ctx, containerID)
 	}
 
-	gateCtx, cancel := context.WithTimeout(ctx, healthGateOverallDeadline)
+	gateCtx, cancel := context.WithTimeout(ctx, t.deadline)
 	defer cancel()
-	res, err := runHealthGate(gateCtx, probe, state, healthGateProbeInterval, healthGateProbeTimeout, healthGateConsecutiveSuccesses)
+	res, err := runHealthGate(gateCtx, probe, state, t.interval, t.probeTimeout, t.threshold)
 	res.LastProbe = trace.get()
+	if tcpTrace != nil {
+		res.LastProbe += "; " + tcpTrace.get()
+	}
 	return res, err
+}
+
+// gateTimings is a policy's numbers as the gate loop consumes them.
+type gateTimings struct {
+	threshold              int
+	interval, probeTimeout time.Duration
+	deadline               time.Duration
+}
+
+// policyTimings converts a frozen policy (zero fields = ADR 0005 defaults)
+// into loop parameters. With the default policy the values equal the
+// healthGate* constants above.
+func policyTimings(p healthgate.Policy) gateTimings {
+	p = p.WithDefaults()
+	return gateTimings{
+		threshold:    p.SuccessThreshold,
+		interval:     time.Duration(p.IntervalSeconds) * time.Second,
+		probeTimeout: time.Duration(p.TimeoutSeconds) * time.Second,
+		deadline:     time.Duration(p.DeadlineSeconds) * time.Second,
+	}
+}
+
+// newTCPProbe dials ip:port once per call (the per-round TCP check of step
+// 22-1d). A refused or timed-out dial is (false, nil) so it resets the
+// streak; the outcome is recorded in trace.
+func newTCPProbe(ip string, port int, trace *probeTrace) HealthProbeFunc {
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
+	return func(ctx context.Context) (bool, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			trace.set("tcp error: " + err.Error())
+			return false, nil
+		}
+		_ = conn.Close()
+		trace.set("tcp ok")
+		return true, nil
+	}
+}
+
+// andProbes runs both probes every round (so each outcome is traced) and
+// counts the round only when both succeed. An error from either aborts.
+func andProbes(a, b HealthProbeFunc) HealthProbeFunc {
+	return func(ctx context.Context) (bool, error) {
+		okA, errA := a(ctx)
+		okB, errB := b(ctx)
+		if errA != nil {
+			return false, errA
+		}
+		if errB != nil {
+			return false, errB
+		}
+		return okA && okB, nil
+	}
 }
 
 // containerNetworkIP resolves the container's IP address on the given
@@ -386,7 +457,7 @@ func (c *Client) containerRunningState(ctx context.Context, containerID string) 
 		return ContainerStatus{}, err
 	}
 	if inspect.State.Running {
-		return ContainerStatus{State: ContainerStateRunning}, nil
+		return ContainerStatus{State: ContainerStateRunning, Health: inspect.State.Health.Status}, nil
 	}
 	return ContainerStatus{
 		State:     ContainerStateNotRunning,

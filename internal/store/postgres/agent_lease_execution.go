@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 
+	"autodeploy/internal/healthgate"
 	"autodeploy/internal/queue"
 
 	"github.com/jackc/pgx/v5"
@@ -49,6 +50,10 @@ type frozenExecutionSnapshot struct {
 	// like the rest of this snapshot.
 	HealthGatePath string
 	HealthGateHost string
+	// HealthPolicy is migration 000028's tunable policy (step 22-1a),
+	// frozen and copied forward with the rest of the snapshot. The zero
+	// value is treated as the default policy by computeConfigDigest.
+	HealthPolicy   healthgate.Policy
 	ConfigRevision int64
 }
 
@@ -97,13 +102,18 @@ type frozenLiteral struct {
 // same check had already passed for it.
 func lockEnvironmentRuntimeConfig(ctx context.Context, tx pgx.Tx, environmentID string) (frozenExecutionSnapshot, bool, error) {
 	var cfg frozenExecutionSnapshot
-	err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, health_gate_path, health_gate_host, revision FROM environment_runtime_configs WHERE environment_id=$1 FOR SHARE`, environmentID).
-		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthGatePath, &cfg.HealthGateHost, &cfg.ConfigRevision)
+	var tcpPort *int
+	err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds, health_tcp_port, revision FROM environment_runtime_configs WHERE environment_id=$1 FOR SHARE`, environmentID).
+		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.HealthGatePath, &cfg.HealthGateHost,
+			&cfg.HealthPolicy.SuccessThreshold, &cfg.HealthPolicy.IntervalSeconds, &cfg.HealthPolicy.TimeoutSeconds, &cfg.HealthPolicy.DeadlineSeconds, &tcpPort, &cfg.ConfigRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return frozenExecutionSnapshot{}, false, nil
 	}
 	if err != nil {
 		return frozenExecutionSnapshot{}, false, fmt.Errorf("lock environment runtime config: %w", err)
+	}
+	if tcpPort != nil {
+		cfg.HealthPolicy.TCPPort = *tcpPort
 	}
 	return cfg, true, nil
 }
@@ -197,8 +207,9 @@ func resolveRuntimeLiteralBindings(ctx context.Context, tx pgx.Tx, environmentID
 // insertAttemptExecution durably freezes cfg as attemptID's
 // agent_job_attempt_execution row (insert-once per migration 000014).
 func insertAttemptExecution(ctx context.Context, tx pgx.Tx, attemptID int64, cfg frozenExecutionSnapshot) error {
-	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		attemptID, cfg.ContainerPort, cfg.ContainerScheme, cfg.ReleaseStrategy, cfg.DrainSeconds, cfg.HealthPolicyRevision, cfg.CPUMillis, cfg.MemoryBytes, cfg.RestartPolicy, cfg.ConfigRevision, cfg.HealthGatePath, cfg.HealthGateHost); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds, health_tcp_port) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		attemptID, cfg.ContainerPort, cfg.ContainerScheme, cfg.ReleaseStrategy, cfg.DrainSeconds, cfg.HealthPolicyRevision, cfg.CPUMillis, cfg.MemoryBytes, cfg.RestartPolicy, cfg.ConfigRevision, cfg.HealthGatePath, cfg.HealthGateHost,
+		cfg.HealthPolicy.SuccessThreshold, cfg.HealthPolicy.IntervalSeconds, cfg.HealthPolicy.TimeoutSeconds, cfg.HealthPolicy.DeadlineSeconds, tcpPortArg(cfg.HealthPolicy.TCPPort)); err != nil {
 		return fmt.Errorf("insert agent job attempt execution: %w", err)
 	}
 	return nil
@@ -299,9 +310,14 @@ func copyTargetAttemptExecution(ctx context.Context, tx pgx.Tx, newAttemptID, ta
 
 func loadAttemptExecution(ctx context.Context, tx pgx.Tx, attemptID int64) (frozenExecutionSnapshot, error) {
 	var cfg frozenExecutionSnapshot
-	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host FROM agent_job_attempt_execution WHERE attempt_id=$1`, attemptID).
-		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision, &cfg.HealthGatePath, &cfg.HealthGateHost); err != nil {
+	var tcpPort *int
+	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds, health_tcp_port FROM agent_job_attempt_execution WHERE attempt_id=$1`, attemptID).
+		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision, &cfg.HealthGatePath, &cfg.HealthGateHost,
+			&cfg.HealthPolicy.SuccessThreshold, &cfg.HealthPolicy.IntervalSeconds, &cfg.HealthPolicy.TimeoutSeconds, &cfg.HealthPolicy.DeadlineSeconds, &tcpPort); err != nil {
 		return frozenExecutionSnapshot{}, fmt.Errorf("load attempt %d execution for copy-forward: %w", attemptID, err)
+	}
+	if tcpPort != nil {
+		cfg.HealthPolicy.TCPPort = *tcpPort
 	}
 	return cfg, nil
 }
@@ -348,7 +364,8 @@ func copyPreviousFrozenSecretVersions(ctx context.Context, tx pgx.Tx, newAttempt
 // rather than inventing a second canonicalization scheme in the same
 // codebase.
 //
-// The leading tag is "3": Slice 10 Step 0 appended HealthGatePath/
+// Step 22-1a's health-policy parts are appended only when non-default; see
+// the comment at the append site. The leading tag is "3": Slice 10 Step 0 appended HealthGatePath/
 // HealthGateHost to this encoding, which changes the shape of what is
 // hashed, so a digest computed by the "2" (or "1") encoding is not
 // comparable to one computed here -- exactly as step 2b's own bump from "1"
@@ -387,6 +404,21 @@ func computeConfigDigest(cfg frozenExecutionSnapshot, bindings []frozenBinding, 
 	parts = append(parts, strconv.Itoa(len(sortedLiterals)))
 	for _, l := range sortedLiterals {
 		parts = append(parts, l.VariableName, l.DeliveryScope, l.LiteralValue)
+	}
+	// Step 22-1a: the tag stays "3". Policy parts are appended ONLY for a
+	// non-default policy, so every digest computed before migration 000028
+	// (all of which carry the default policy) is byte-identical -- real
+	// release rows exist and ensureRelease compares digests. The zero
+	// policy counts as default (WithDefaults). Appended after the literal
+	// section, whose count prefix already makes the tail unambiguous; "hp1"
+	// names the policy encoding so a future change can be told apart.
+	if policy := cfg.HealthPolicy.WithDefaults(); !policy.IsDefault() {
+		parts = append(parts, "hp1",
+			strconv.Itoa(policy.SuccessThreshold),
+			strconv.Itoa(policy.IntervalSeconds),
+			strconv.Itoa(policy.TimeoutSeconds),
+			strconv.Itoa(policy.DeadlineSeconds),
+			strconv.Itoa(policy.TCPPort))
 	}
 	buf := make([]byte, 0, 512)
 	for _, part := range parts {

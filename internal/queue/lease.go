@@ -1,6 +1,10 @@
 package queue
 
-import "time"
+import (
+	"time"
+
+	"autodeploy/internal/healthgate"
+)
 
 // AttemptState mirrors agent_job_attempts.state (migration 000013). Only
 // LeaseSucceeded, LeaseFailed, LeaseExpired, and LeaseCancelled are terminal;
@@ -92,6 +96,17 @@ type ClaimedLease struct {
 	// to ReleaseID) and the runtime instance of its original container.
 	RollbackTargetReleaseID         string
 	RollbackTargetRuntimeInstanceID string
+	// HealthPolicy is the attempt's frozen health policy (step 22-1c). The
+	// wire layer carries it only to an agent that opted in.
+	HealthPolicy healthgate.Policy
+}
+
+// ClaimCapabilities are the optional features a claiming agent declared. The
+// zero value is an agent that declared nothing (every pre-22-1c agent).
+type ClaimCapabilities struct {
+	// HealthPolicy: the agent understands and honours the frozen health
+	// policy. Without it a job whose policy is non-default is never leased.
+	HealthPolicy bool
 }
 
 // RenewalResult is the durable outcome of one successful renewal, including
