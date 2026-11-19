@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -161,7 +160,7 @@ func cleanItem() agentclient.CleanupItem {
 }
 
 func newCleaner(dk *cleanDockerFake, cp *cleanCP) *Cleaner {
-	return &Cleaner{Docker: dk, ControlPlane: cp, Logger: log.New(io.Discard, "", 0)}
+	return &Cleaner{Docker: dk, ControlPlane: cp, Logger: slog.New(slog.DiscardHandler)}
 }
 
 func has(calls []string, prefix string) bool {
@@ -247,7 +246,7 @@ func TestCleanerImageInUseIsKeptAndStillSuccess(t *testing.T) {
 	dk2.imageErr = &docker.EngineError{Class: docker.ErrClassTransient, Op: "image-remove", Err: errors.New("boom")}
 	var logBuf strings.Builder
 	c2 := newCleaner(dk2, cp2)
-	c2.Logger = log.New(&logBuf, "", 0)
+	c2.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
 	c2.Pass(context.Background())
 	if !strings.Contains(logBuf.String(), "removal failed") || !strings.Contains(logBuf.String(), "boom") {
 		t.Fatalf("image failure not logged: %q", logBuf.String())

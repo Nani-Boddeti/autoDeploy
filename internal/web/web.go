@@ -6,13 +6,12 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -120,6 +119,10 @@ type Config struct {
 	CommitResolver        githubapp.CommitResolver
 	Now                   func() time.Time
 	Random                io.Reader
+	// Logger receives process-log lines. Nil discards them: it never
+	// defaults to standard error, so every line goes through the redacting
+	// logger the caller injects.
+	Logger *slog.Logger
 }
 
 type Handler struct {
@@ -158,6 +161,17 @@ func New(repository Repository, config Config) (*Handler, error) {
 		config.Random = rand.Reader
 	}
 	return &Handler{repository: repository, config: config}, nil
+}
+
+// discardLogger is the logger used when none is injected.
+var discardLogger = slog.New(slog.DiscardHandler)
+
+// logger returns the injected process logger, or a discarding one when unset.
+func (h *Handler) logger() *slog.Logger {
+	if h.config.Logger == nil {
+		return discardLogger
+	}
+	return h.config.Logger
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -652,7 +666,7 @@ func (h *Handler) githubCallback(w http.ResponseWriter, r *http.Request) {
 		var stage githubapp.SetupStageError
 		if errors.As(err, &stage) {
 			// Fixed step name only (githubapp.SetupStageError); diagnosable from the journal.
-			fmt.Fprintf(os.Stderr, "github setup callback failed at: %s\n", stage.Stage)
+			h.logger().Error("github setup callback failed", "stage", stage.Stage)
 		}
 		badRequest(w)
 		return
@@ -703,7 +717,7 @@ func (h *Handler) githubCompletePost(w http.ResponseWriter, r *http.Request) {
 	if err = h.config.GitHubSetup.Complete(r.Context(), c.Value, p); err != nil {
 		var stage githubapp.SetupStageError
 		if errors.As(err, &stage) {
-			fmt.Fprintf(os.Stderr, "github setup complete failed at: %s\n", stage.Stage)
+			h.logger().Error("github setup complete failed", "stage", stage.Stage)
 		}
 		badRequest(w)
 		return

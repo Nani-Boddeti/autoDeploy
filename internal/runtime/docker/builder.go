@@ -7,13 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"autodeploy/internal/logging"
 )
 
 const (
@@ -55,17 +57,17 @@ type BuilderConfig struct {
 	ConfigDir   string
 	MemoryBytes int64
 	CPUs        int
-	// Logf receives one agent-journal line whenever the builder is recreated
-	// (and why). Nil falls back to the standard logger. Never given secrets.
-	Logf func(format string, args ...any)
+	// Logger receives one agent-journal record whenever the builder is
+	// recreated (and why). Nil discards; there is no fallback to a
+	// package-level logger. Never given secrets.
+	Logger *slog.Logger
 }
 
-func (c BuilderConfig) logf(format string, args ...any) {
-	if c.Logf != nil {
-		c.Logf(format, args...)
-		return
+func (c BuilderConfig) logger() *slog.Logger {
+	if c.Logger != nil {
+		return c.Logger
 	}
-	log.Printf(format, args...)
+	return slog.New(slog.DiscardHandler)
 }
 
 func (c BuilderConfig) validate() error {
@@ -232,7 +234,7 @@ func ensureBuilder(ctx context.Context, cfg BuilderConfig) error {
 	}
 	if !matches {
 		if exists {
-			cfg.logf("buildx builder %s: recreating: %s", BuilderName, reason)
+			cfg.logger().Info("buildx builder recreating", logging.KeyComponent, "builder", "builder", BuilderName, "reason", reason)
 			if _, err := runBuildx(ctx, cfg, "buildx", "rm", BuilderName); err != nil {
 				return err
 			}
@@ -278,7 +280,7 @@ func checkBuilderAfterFailure(ctx context.Context, cfg BuilderConfig) error {
 	if err != nil {
 		cause = err.Error()
 	}
-	cfg.logf("buildx builder %s: missing or unusable after a failed build (%s); recreating", BuilderName, cause)
+	cfg.logger().Info("buildx builder missing or unusable after a failed build; recreating", logging.KeyComponent, "builder", "builder", BuilderName, "cause", cause)
 	if cfg.validate() != nil {
 		return fmt.Errorf("%w: missing or unusable after a failed build", ErrBuilderUnavailable)
 	}

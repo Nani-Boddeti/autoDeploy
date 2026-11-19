@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -61,7 +61,7 @@ func TestExecuteShipsRedactedLogsAndKeepsLocalOutput(t *testing.T) {
 		return docker.BuildResult{ImageDigest: "sha256:" + ones(64), ConfigDigest: "sha256:" + ones(64)}, nil
 	}
 	sender := &captureSender{}
-	factory, err := logship.NewFactory(logship.Config{Sender: sender, Logger: log.New(io.Discard, "", 0), BatchInterval: 10 * time.Millisecond})
+	factory, err := logship.NewFactory(logship.Config{Sender: sender, Logger: slog.New(slog.DiscardHandler), BatchInterval: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func okBuildResult() docker.BuildResult {
 
 func shippingExecutor(t *testing.T, cp *fakeControlPlane, build func(context.Context, docker.BuildRequest) (docker.BuildResult, error), sender logship.Sender) *Executor {
 	t.Helper()
-	factory, err := logship.NewFactory(logship.Config{Sender: sender, Logger: log.New(io.Discard, "", 0), BatchInterval: 10 * time.Millisecond})
+	factory, err := logship.NewFactory(logship.Config{Sender: sender, Logger: slog.New(slog.DiscardHandler), BatchInterval: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -564,7 +564,7 @@ func TestActivateDirectReportTerminalDeleteFailureIsLogged(t *testing.T) {
 	f.deleteErr = errors.New("read-only filesystem")
 	var buf strings.Builder
 	e := f.executor()
-	e.activation.logger = log.New(&buf, "", 0)
+	e.activation.logger = slog.New(slog.NewTextHandler(&buf, nil))
 	out := e.activate(context.Background(), lease, testImageDigest)
 	if !out.HandedOff || f.kicks != 1 {
 		t.Fatalf("outcome=%+v kicks=%d", out, f.kicks)
@@ -591,7 +591,7 @@ func TestActivateSaveAndDirectReportBothFailLeavesAuthorizedAndLogs(t *testing.T
 	f.reportErr = agentclient.ErrTransportFailure
 	var buf strings.Builder
 	e := f.executor()
-	e.activation.logger = log.New(&buf, "", 0)
+	e.activation.logger = slog.New(slog.NewTextHandler(&buf, nil))
 	out := e.activate(context.Background(), lease, testImageDigest)
 	if !out.HandedOff || len(f.reports) != 5 {
 		t.Fatalf("outcome=%+v reports=%d", out, len(f.reports))

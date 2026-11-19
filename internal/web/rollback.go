@@ -3,11 +3,10 @@ package web
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
-	"os"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/errclass"
 	"autodeploy/internal/store/postgres"
 )
 
@@ -32,7 +31,8 @@ func (h *Handler) offerRollback(w http.ResponseWriter, r *http.Request, p auth.P
 	}
 	eligible, err := h.config.Rollback.RollbackEligible(r.Context(), p, d.Release.ID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "rollback eligibility failed: %v\n", err)
+		// Fixed message and error class only: error text can carry a DSN or SQL detail.
+		h.logger().Error("rollback eligibility failed", "class", errclass.Of(err))
 		plain(w, http.StatusInternalServerError, "the page could not be loaded; retry\n")
 		return false
 	}
@@ -74,13 +74,13 @@ func (h *Handler) deploymentRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := h.config.Rollback.EnqueueRollback(r.Context(), p, releaseID, v.Get("request_nonce"))
 	if err != nil {
-		rollbackFailure(w, err)
+		h.rollbackFailure(w, err)
 		return
 	}
 	redirect(w, detailHref(string(result.DeploymentID)))
 }
 
-func rollbackFailure(w http.ResponseWriter, err error) {
+func (h *Handler) rollbackFailure(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, postgres.ErrRollbackInvalid):
 		badRequest(w)
@@ -97,7 +97,7 @@ func rollbackFailure(w http.ResponseWriter, err error) {
 	case errors.Is(err, postgres.ErrRollbackConflict):
 		plain(w, http.StatusConflict, "this form was already submitted with different values; reload the page\n")
 	default:
-		fmt.Fprintf(os.Stderr, "rollback failed: %v\n", err)
+		h.logger().Error("rollback failed", "class", errclass.Of(err))
 		plain(w, http.StatusInternalServerError, "the rollback could not be queued; retry\n")
 	}
 }

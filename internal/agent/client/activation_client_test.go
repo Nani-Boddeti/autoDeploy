@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,7 +21,7 @@ var serverConflictCodes = []string{
 }
 
 func TestMapStatusConflictCodes(t *testing.T) {
-	c := &Client{logger: log.New(io.Discard, "", 0)}
+	c := &Client{logger: slog.New(slog.DiscardHandler)}
 	for _, code := range serverConflictCodes {
 		err := c.mapStatus(409, []byte(`{"error":"`+code+`"}`))
 		got, ok := ConflictCode(err)

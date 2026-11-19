@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/agent/state"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/runtime/docker"
 	"autodeploy/internal/runtime/traefik"
 )
@@ -89,7 +90,7 @@ type Drainer struct {
 	RouteDir string
 	// Reporter delivers terminal outcomes (required).
 	Reporter DrainReporter
-	Logger   *log.Logger
+	Logger   *slog.Logger
 
 	// StopGrace is the engine stop grace: whole seconds in 1..300; zero uses 30s.
 	StopGrace time.Duration
@@ -134,11 +135,13 @@ func (d *Drainer) mono() time.Time {
 	return time.Now()
 }
 
-func (d *Drainer) logger() *log.Logger {
-	if d.Logger == nil {
-		return log.Default()
+// logger is the drainer's component logger; a nil Logger discards.
+func (d *Drainer) logger() *slog.Logger {
+	base := d.Logger
+	if base == nil {
+		base = slog.New(slog.DiscardHandler)
 	}
-	return d.Logger
+	return base.With(logging.KeyComponent, "drainer")
 }
 
 func (d *Drainer) now() time.Time {
@@ -233,8 +236,8 @@ func (d *Drainer) doSleep(ctx context.Context, wait time.Duration) error {
 	}
 }
 
-// logLimited logs at most once per hour per key.
-func (d *Drainer) logLimited(key, format string, args ...any) {
+// logLimited logs an error record at most once per hour per key.
+func (d *Drainer) logLimited(key, msg string, attrs ...any) {
 	if d.logged == nil {
 		d.logged = map[string]time.Time{}
 	}
@@ -243,7 +246,7 @@ func (d *Drainer) logLimited(key, format string, args ...any) {
 		return
 	}
 	d.logged[key] = now
-	d.logger().Printf(format, args...)
+	d.logger().Error(msg, attrs...)
 }
 
 // pass scans once, processes every due record and returns how long to sleep
@@ -252,11 +255,11 @@ func (d *Drainer) pass(ctx context.Context) time.Duration {
 	poll := d.pollInterval()
 	records, corruptNames, err := d.Store.ScanDrains()
 	if err != nil {
-		d.logLimited("scan", "agent drainer ERROR: cannot scan pending drains; predecessors are NOT stopped until this clears: %v", err)
+		d.logLimited("scan", "agent drainer: cannot scan pending drains; predecessors are NOT stopped until this clears", logging.Err(err))
 		return poll
 	}
 	for _, name := range corruptNames {
-		d.logLimited("corrupt:"+name, "agent drainer ERROR: pending drain entry %q is not a valid record; left untouched (operator action required)", name)
+		d.logLimited("corrupt:"+name, "agent drainer: pending drain entry is not a valid record; left untouched (operator action required)", "entry", name)
 	}
 	wait := poll
 	d.pruneSeen(records)
@@ -268,8 +271,8 @@ func (d *Drainer) pass(ctx context.Context) time.Duration {
 		switch {
 		case !tracked:
 			d.logLimited(fmt.Sprintf("failed:%d", rec.AttemptID),
-				"agent drainer ERROR attempt %d: predecessor release %s (runtime %s) was NOT stopped and will not be retried automatically: %s",
-				rec.AttemptID, rec.PredecessorReleaseID, rec.PredecessorRuntimeInstanceID, rec.FailureSummary)
+				"agent drainer: predecessor release was NOT stopped and will not be retried automatically",
+				logging.KeyAttemptID, rec.AttemptID, logging.KeyReleaseID, rec.PredecessorReleaseID, "runtime_instance_id", rec.PredecessorRuntimeInstanceID, "summary", rec.FailureSummary)
 		case due:
 			d.process(ctx, rec)
 		case remaining < wait:
@@ -394,7 +397,7 @@ func (d *Drainer) process(ctx context.Context, rec state.PendingDrain) {
 		case stepInspect:
 			// Any 404 discharges the obligation; WARN so an unexpected 404
 			// (proxy, odd daemon path) is visible rather than a quiet INFO.
-			d.logger().Printf("agent drainer WARN attempt %d: inspect answered not-found for predecessor %s", rec.AttemptID, name)
+			d.logger().Warn("agent drainer: inspect answered not-found for predecessor", logging.KeyAttemptID, rec.AttemptID, "predecessor", name)
 			d.done(ctx, rec, state.DrainOutcomeGone, "predecessor container is already gone; nothing to stop")
 		case stepStop:
 			d.done(ctx, rec, state.DrainOutcomeGone, "predecessor container vanished before the stop")
@@ -423,7 +426,7 @@ func alreadyStopped(status string) bool {
 // done ends the drain successfully: the outcome is made durable as
 // report_pending and reported; the record is deleted once acknowledged.
 func (d *Drainer) done(ctx context.Context, rec state.PendingDrain, outcome, why string) {
-	d.logger().Printf("agent drainer INFO attempt %d: %s (release %s, runtime %s)", rec.AttemptID, why, rec.PredecessorReleaseID, rec.PredecessorRuntimeInstanceID)
+	d.logger().Info("agent drainer: drain finished", logging.KeyAttemptID, rec.AttemptID, "why", why, logging.KeyReleaseID, rec.PredecessorReleaseID, "runtime_instance_id", rec.PredecessorRuntimeInstanceID)
 	d.terminal(ctx, rec, outcome, why)
 }
 
@@ -447,14 +450,14 @@ func (d *Drainer) failEngine(ctx context.Context, rec state.PendingDrain, op str
 		return
 	}
 	summary = fmt.Sprintf("%s (gave up after %d attempts)", summary, attempts)
-	d.logger().Printf("agent drainer ERROR attempt %d: predecessor release %s is still running; retries exhausted: %s", rec.AttemptID, rec.PredecessorReleaseID, summary)
+	d.logger().Error("agent drainer: predecessor release is still running; retries exhausted", logging.KeyAttemptID, rec.AttemptID, logging.KeyReleaseID, rec.PredecessorReleaseID, "summary", summary)
 	d.fail(ctx, rec, state.DrainOutcomeStopFailed, summary)
 }
 
 // fail ends the drain with a permanent failure outcome (no retry), reported to
 // the control plane and kept locally as evidence.
 func (d *Drainer) fail(ctx context.Context, rec state.PendingDrain, outcome, summary string) {
-	d.logger().Printf("agent drainer ERROR attempt %d: predecessor release %s (runtime %s) NOT stopped: %s", rec.AttemptID, rec.PredecessorReleaseID, rec.PredecessorRuntimeInstanceID, summary)
+	d.logger().Error("agent drainer: predecessor release NOT stopped", logging.KeyAttemptID, rec.AttemptID, logging.KeyReleaseID, rec.PredecessorReleaseID, "runtime_instance_id", rec.PredecessorRuntimeInstanceID, "summary", summary)
 	d.terminal(ctx, rec, outcome, summary)
 }
 
@@ -483,7 +486,7 @@ func (d *Drainer) terminal(ctx context.Context, rec state.PendingDrain, outcome,
 	rec.FailureSummary = ""
 	rec.Retryable = false
 	if err := d.Store.SaveDrain(rec); err != nil {
-		d.logger().Printf("agent drainer ERROR attempt %d: cannot persist the drain outcome %s (will retry the whole step): %v", rec.AttemptID, outcome, err)
+		d.logger().Error("agent drainer: cannot persist the drain outcome (will retry the whole step)", logging.KeyAttemptID, rec.AttemptID, "outcome", outcome, logging.Err(err))
 		return
 	}
 	d.report(ctx, rec)
@@ -498,14 +501,14 @@ func (d *Drainer) report(ctx context.Context, rec state.PendingDrain) {
 			return
 		}
 		if code, isConflict := agentclient.ConflictCode(err); isConflict {
-			d.logger().Printf("agent drainer WARN attempt %d: control plane refused the drain result with a terminal conflict %q; not retrying", rec.AttemptID, code)
+			d.logger().Warn("agent drainer: control plane refused the drain result with a terminal conflict; not retrying", logging.KeyAttemptID, rec.AttemptID, "conflict_code", code)
 		} else {
 			if d.reportFails == nil {
 				d.reportFails, d.reportNext = map[int64]int{}, map[int64]time.Time{}
 			}
 			d.reportFails[rec.AttemptID]++
 			d.reportNext[rec.AttemptID] = d.mono().Add(d.backoff(d.reportFails[rec.AttemptID]))
-			d.logLimited(fmt.Sprintf("report:%d", rec.AttemptID), "agent drainer ERROR attempt %d: drain result %s not delivered yet (kept, will retry): %v", rec.AttemptID, rec.Outcome, err)
+			d.logLimited(fmt.Sprintf("report:%d", rec.AttemptID), "agent drainer: drain result not delivered yet (kept, will retry)", logging.KeyAttemptID, rec.AttemptID, "outcome", rec.Outcome, logging.Err(err))
 			return
 		}
 	}
@@ -519,7 +522,7 @@ func (d *Drainer) report(ctx context.Context, rec state.PendingDrain) {
 func (d *Drainer) acknowledged(rec state.PendingDrain) {
 	if !state.DrainOutcomeIsFailure(rec.Outcome) {
 		if err := d.Store.DeleteDrain(rec.AttemptID); err != nil {
-			d.logger().Printf("agent drainer ERROR attempt %d: drain result delivered but the record could not be deleted (will re-report, idempotent): %v", rec.AttemptID, err)
+			d.logger().Error("agent drainer: drain result delivered but the record could not be deleted (will re-report, idempotent)", logging.KeyAttemptID, rec.AttemptID, logging.Err(err))
 			return
 		}
 		// Forget first-seen times for this attempt so a re-arm (no-tombstone
@@ -536,7 +539,7 @@ func (d *Drainer) acknowledged(rec state.PendingDrain) {
 	rec.ResultSummary = ""
 	rec.Reported = true
 	if err := d.Store.SaveDrain(rec); err != nil {
-		d.logger().Printf("agent drainer ERROR attempt %d: drain result delivered but the evidence record could not be updated (will re-report, idempotent): %v", rec.AttemptID, err)
+		d.logger().Error("agent drainer: drain result delivered but the evidence record could not be updated (will re-report, idempotent)", logging.KeyAttemptID, rec.AttemptID, logging.Err(err))
 	}
 }
 
@@ -545,6 +548,6 @@ func (d *Drainer) save(rec state.PendingDrain, summary string, retryable bool) {
 	rec.FailureSummary = boundSummary(summary)
 	rec.Retryable = retryable
 	if err := d.Store.SaveDrain(rec); err != nil {
-		d.logger().Printf("agent drainer ERROR attempt %d: cannot persist the stop failure (will retry the whole step): %v", rec.AttemptID, err)
+		d.logger().Error("agent drainer: cannot persist the stop failure (will retry the whole step)", logging.KeyAttemptID, rec.AttemptID, logging.Err(err))
 	}
 }

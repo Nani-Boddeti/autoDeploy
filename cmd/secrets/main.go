@@ -1,5 +1,8 @@
 // Command secrets performs terminal-only secret operations: KEK rotation
-// (init-active-kek, rewrap, can-retire) and secret value entry (put, replace).
+// (init-active-kek, rewrap, can-retire), secret value entry (put, replace) and
+// the read-only decrypt canary (verify). verify reads page by page, not from
+// one snapshot: run it with writers stopped (control plane down) for a
+// complete result; under concurrent rewrap/replace it is best-effort.
 package main
 
 import (
@@ -13,7 +16,9 @@ import (
 	"os"
 	"os/signal"
 	"os/user"
+	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"autodeploy/internal/config"
@@ -33,7 +38,7 @@ type command struct {
 	prompt                             func(string) ([]byte, error)
 }
 
-const usageText = "usage: secret put --environment ENV --name VAR --scope runtime|build | secret replace --secret ID [--compromised]"
+const usageText = "usage: secret put --environment ENV --name VAR --scope runtime|build | secret replace --secret ID [--compromised] | secret verify | secret rewrap --from-kek ID [--cursor ID] [--batch-size N] | secret can-retire --kek ID | secret init-active-kek --kek ID"
 
 // userError carries a fixed, value-free message that is safe to show.
 type userError string
@@ -91,6 +96,9 @@ func parseArgs(args []string) (command, error) {
 		}
 		return command{action: "replace", secretID: f["--secret"], compromised: compromised}, nil
 	}
+	if len(args) == 2 && args[1] == "verify" {
+		return command{action: "verify"}, nil
+	}
 	if len(args) == 4 && args[1] == "can-retire" && args[2] == "--kek" && validID(args[3]) {
 		return command{action: "can-retire", oldKEK: args[3]}, nil
 	}
@@ -138,15 +146,26 @@ func main() {
 // errorMessage maps an error to the fixed, value-free text shown to the operator.
 func errorMessage(err error) string {
 	var ue userError
+	var vf verifyFailedError
 	switch {
 	case errors.As(err, &ue):
 		return "secret operation failed: " + ue.Error()
 	case errors.Is(err, errInvalidArguments):
 		return usageText
+	case errors.As(err, &vf):
+		return "secret verify found failures"
+	case errors.Is(err, secret.ErrGenerationMismatch):
+		return "secret operation failed: database generation does not match the key manifest"
 	default:
 		return "secret operation failed"
 	}
 }
+
+// verifyFailedError carries the verify report (counts and fixed-token lines,
+// no values) for a run that found failures; the process still exits non-zero.
+type verifyFailedError string
+
+func (e verifyFailedError) Error() string { return "secret verify found failures" }
 
 // terminalSession is the controlling terminal; ReadSecret shows prompt and
 // reads one line without echo.
@@ -233,15 +252,22 @@ func run(c command, preflight func() (terminalSession, error), exec func(context
 	return runWithOutput(c, preflight, exec, os.Stdout)
 }
 func runWithOutput(c command, preflight func() (terminalSession, error), exec func(context.Context, command) (string, error), output io.Writer) error {
-	t, err := preflight()
-	if err != nil {
-		return err
+	// verify takes no value, so it needs no terminal and may run piped.
+	if c.action != "verify" {
+		t, err := preflight()
+		if err != nil {
+			return err
+		}
+		defer t.Close()
+		c.prompt = t.ReadSecret
 	}
-	defer t.Close()
-	c.prompt = t.ReadSecret
 	result, err := exec(context.Background(), c)
-	if err == nil {
+	var vf verifyFailedError
+	switch {
+	case err == nil:
 		_, _ = fmt.Fprintln(output, result)
+	case errors.As(err, &vf):
+		_, _ = fmt.Fprintln(output, string(vf))
 	}
 	return err
 }
@@ -261,6 +287,8 @@ type secretOperator interface {
 	Initialize(context.Context, string, string) error
 	CanRetire(context.Context, string, secretcrypto.KeyRing) error
 	Rewrap(context.Context, secret.RewrapRequest, secretcrypto.KeyRing) (secret.RewrapResult, error)
+	// Verify decrypts every decryptable version read-only; generation is the manifest's binding.
+	Verify(context.Context, secretcrypto.KeyRing, string) (secret.VerifyResult, error)
 	// EnvironmentScope returns a Scope holding only the environment's derived owner/project/environment ids.
 	EnvironmentScope(context.Context, string) (secret.Scope, error)
 	HeadScope(context.Context, string) (secret.Scope, error)
@@ -278,6 +306,10 @@ func (o postgresSecretOperator) CanRetire(ctx context.Context, id string, ring s
 }
 func (o postgresSecretOperator) Rewrap(ctx context.Context, request secret.RewrapRequest, ring secretcrypto.KeyRing) (secret.RewrapResult, error) {
 	return secret.NewRotator(postgres.NewSecretRepository(o.pool), ring).RewrapBatch(ctx, request)
+}
+
+func (o postgresSecretOperator) Verify(ctx context.Context, ring secretcrypto.KeyRing, generation string) (secret.VerifyResult, error) {
+	return secret.NewVerifier(postgres.NewSecretRepository(o.pool), ring).Verify(ctx, generation)
 }
 
 func (o postgresSecretOperator) EnvironmentScope(ctx context.Context, environmentID string) (secret.Scope, error) {
@@ -462,6 +494,9 @@ func executeWith(ctx context.Context, c command, dependencies secretDependencies
 		}
 		return "active secret key initialized", nil
 	}
+	if c.action == "verify" {
+		return verifySecrets(ctx, operator, ring, generation)
+	}
 	if c.action == "can-retire" {
 		if err := operator.CanRetire(ctx, c.oldKEK, ring); err != nil {
 			return "", err
@@ -473,4 +508,37 @@ func executeWith(ctx context.Context, c command, dependencies secretDependencies
 		return "", err
 	}
 	return fmt.Sprintf("secret rewrap completed selected=%d rewrapped=%d conflicts=%d cursor=%s", result.Selected, result.Rewrapped, result.Conflicts, result.NextCursor), nil
+}
+
+var plainIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
+// safeID prints an id as-is only when it is plain; anything else (newlines,
+// escapes, spaces) is quoted so a stored id cannot forge report lines.
+func safeID(id string) string {
+	if plainIDPattern.MatchString(id) {
+		return id
+	}
+	return strconv.Quote(id)
+}
+
+// verifySecrets formats the canary report. Only counts, version ids, KEK ids
+// and fixed reason tokens are printed.
+func verifySecrets(ctx context.Context, operator secretOperator, ring secretcrypto.KeyRing, generation string) (string, error) {
+	result, err := operator.Verify(ctx, ring, generation)
+	if err != nil {
+		return "", err
+	}
+	report := fmt.Sprintf("secret verify completed checked=%d failed=%d", result.Checked, result.Failed)
+	if result.Failed == 0 {
+		return report, nil
+	}
+	var b strings.Builder
+	b.WriteString(report)
+	for _, f := range result.Failures {
+		fmt.Fprintf(&b, "\nfailed version=%s kek=%s reason=%s", safeID(f.VersionID), safeID(f.KEKID), f.Reason)
+	}
+	if result.Failed > len(result.Failures) {
+		fmt.Fprintf(&b, "\nfailures truncated listed=%d", len(result.Failures))
+	}
+	return "", verifyFailedError(b.String())
 }

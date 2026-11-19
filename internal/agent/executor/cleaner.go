@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"time"
 
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/github"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/runtime/docker"
 )
 
@@ -66,7 +67,7 @@ type CleanupControlPlane interface {
 type Cleaner struct {
 	Docker       CleanupDocker
 	ControlPlane CleanupControlPlane
-	Logger       *log.Logger
+	Logger       *slog.Logger
 	// Interval between passes; zero uses 10 minutes. A pass also runs once at
 	// start (the agent starts the Cleaner after recovery).
 	Interval time.Duration
@@ -83,11 +84,13 @@ func (c *Cleaner) Validate() error {
 	return nil
 }
 
-func (c *Cleaner) logger() *log.Logger {
-	if c.Logger == nil {
-		return log.Default()
+// logger is the cleaner's component logger; a nil Logger discards.
+func (c *Cleaner) logger() *slog.Logger {
+	base := c.Logger
+	if base == nil {
+		base = slog.New(slog.DiscardHandler)
 	}
-	return c.Logger
+	return base.With(logging.KeyComponent, "cleaner")
 }
 
 // Run passes once immediately and then every Interval until ctx ends.
@@ -114,7 +117,7 @@ func (c *Cleaner) Pass(ctx context.Context) {
 	items, err := c.ControlPlane.ClaimCleanups(ctx, cleanupClaimBatch)
 	if err != nil {
 		if ctx.Err() == nil {
-			c.logger().Printf("agent cleaner: claim failed: %v", err)
+			c.logger().Warn("agent cleaner: claim failed", logging.Err(err))
 		}
 		return
 	}
@@ -129,10 +132,10 @@ func (c *Cleaner) Pass(ctx context.Context) {
 			}
 			// Not lost: the server still has the cleanup open and hands it out
 			// again; the next pass redoes the (idempotent) removal and reports.
-			c.logger().Printf("agent cleaner: report for cleanup %d failed (it will be handed out again): %v", item.CleanupID, err)
+			c.logger().Warn("agent cleaner: report failed (it will be handed out again)", logging.KeyCleanupID, item.CleanupID, logging.Err(err))
 			continue
 		}
-		c.logger().Printf("agent cleaner: release %s cleanup %d: %s", item.ReleaseID, item.CleanupID, result)
+		c.logger().Info("agent cleaner: cleanup finished", logging.KeyReleaseID, item.ReleaseID, logging.KeyCleanupID, item.CleanupID, "result", result)
 	}
 }
 
@@ -269,7 +272,7 @@ func (c *Cleaner) removeImage(ctx context.Context, ref string) (kept bool, msg s
 		return true, "; image kept (in use)"
 	default:
 		class := docker.ClassifyFailure(err)
-		c.logger().Printf("agent cleaner: image %s removal failed (%s), image kept: %v", ref, class, err)
+		c.logger().Warn("agent cleaner: image removal failed, image kept", "image", ref, logging.KeyClass, class, logging.Err(err))
 		return true, "; image kept (remove failed: " + string(class) + ")"
 	}
 }

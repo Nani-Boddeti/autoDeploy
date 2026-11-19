@@ -27,14 +27,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"os"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/crypto"
+	"autodeploy/internal/logging"
 )
 
 // DroppedMarkerPrefix starts the system-stream line emitted once per overflow
@@ -86,7 +86,9 @@ type Sender interface {
 // Config configures a Factory. Zero durations/sizes use the defaults.
 type Config struct {
 	Sender Sender
-	Logger *log.Logger
+	// Logger is the agent journal logger (redacting in production). Nil
+	// discards.
+	Logger *slog.Logger
 
 	BufferBytes   int           // queued-chunk memory bound (default 256 KiB)
 	BatchInterval time.Duration // time-based batching and idle partial-line flush (1s)
@@ -99,8 +101,9 @@ type Config struct {
 
 func (c *Config) applyDefaults() {
 	if c.Logger == nil {
-		c.Logger = log.Default()
+		c.Logger = slog.New(slog.DiscardHandler)
 	}
+	c.Logger = c.Logger.With(logging.KeyComponent, "logship")
 	if c.BufferBytes <= 0 {
 		c.BufferBytes = defaultBufferBytes
 	}
@@ -347,7 +350,7 @@ func (a *Attempt) Linef(stream Stream, format string, args ...any) {
 	}
 	// Tee the (already redacted) structural line to the agent journal so an
 	// operator can follow a deployment on the host without the control plane UI.
-	fmt.Fprintf(os.Stderr, "attempt %d [%s] %s", a.attemptID, stream, text)
+	a.cfg.Logger.Info("job log", logging.KeyAttemptID, a.attemptID, "stream", string(stream), "text", strings.TrimSuffix(string(text), "\n"))
 	asm := newAssembler(func(body string) { a.enqueueLocked(stream, body) })
 	asm.write(text)
 	asm.flushFinal()
@@ -380,7 +383,7 @@ func (a *Attempt) Diagf(stream Stream, format string, args ...any) {
 		}
 		text = out.Bytes()
 	}
-	fmt.Fprintf(os.Stderr, "attempt %d [%s] diag: %s", a.attemptID, stream, text)
+	a.cfg.Logger.Info("job diag", logging.KeyAttemptID, a.attemptID, "stream", string(stream), "text", strings.TrimSuffix(string(text), "\n"))
 }
 
 // enqueueLocked assigns (stream, seq) and queues body, or counts a drop when
@@ -635,7 +638,7 @@ func (a *Attempt) stop(err error) {
 	a.queue, a.inflight, a.used = nil, nil, 0
 	if !a.stopLogged {
 		a.stopLogged = true
-		a.cfg.Logger.Printf("agent logship: attempt %d: log shipping stopped: %v", a.attemptID, err)
+		a.cfg.Logger.Warn("agent logship: log shipping stopped", logging.KeyAttemptID, a.attemptID, logging.Err(err))
 	}
 }
 

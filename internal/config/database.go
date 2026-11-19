@@ -49,6 +49,7 @@ const (
 	AgentSweepIntervalEnv               = "AUTODEPLOY_AGENT_SWEEP_INTERVAL"
 	LogRetentionMaxAgeEnv               = "AUTODEPLOY_LOG_RETENTION_MAX_AGE"
 	LogRetentionKeepNewestEnv           = "AUTODEPLOY_LOG_RETENTION_KEEP_NEWEST"
+	MetricsListenAddressEnv             = "AUTODEPLOY_METRICS_LISTEN_ADDRESS"
 )
 
 // defaultAgentSweepInterval matches ADR 0004's V1 sweeper default (Step 4).
@@ -536,4 +537,21 @@ func credentialSettings() (credentialConfig, error) {
 		uid = parsed
 	}
 	return credentialConfig{path: root, uid: uid}, nil
+}
+
+// MetricsListenAddressFromEnvironment returns the Prometheus listener address,
+// or "" when the listener is disabled (unset or empty). The metrics endpoint
+// has no authentication, so the host must be a loopback IP literal: hostnames
+// (including "localhost", which can resolve elsewhere), wildcard and
+// non-loopback addresses, zones, and port 0 are all refused.
+func MetricsListenAddressFromEnvironment() (string, error) {
+	raw := os.Getenv(MetricsListenAddressEnv)
+	if raw == "" {
+		return "", nil
+	}
+	addr, err := netip.ParseAddrPort(raw)
+	if err != nil || addr.Port() == 0 || addr.Addr().Zone() != "" || !addr.Addr().IsLoopback() {
+		return "", ErrInvalidEnvironment
+	}
+	return addr.String(), nil
 }

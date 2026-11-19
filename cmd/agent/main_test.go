@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
-	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 
 	"autodeploy/internal/agent/executor"
 	"autodeploy/internal/agent/state"
+	"autodeploy/internal/server"
 )
 
 func TestParseArgs(t *testing.T) {
@@ -280,7 +283,7 @@ func TestBuildActivationRequiresRouteDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := buildActivation(c, nil, st, log.New(io.Discard, "", 0)); err == nil || !strings.Contains(err.Error(), "--traefik-route-dir") {
+	if _, err := buildActivation(c, nil, st, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "--traefik-route-dir") {
 		t.Fatalf("err = %v, want the missing route dir named", err)
 	}
 }
@@ -297,7 +300,7 @@ func TestBuildActivationAssemblesCompleteConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parts, err := buildActivation(c, nil, st, log.New(io.Discard, "", 0))
+	parts, err := buildActivation(c, nil, st, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +337,7 @@ func TestBuildActivationRejectsMisconfiguredDrainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	newDrainDocker = func(string) (executor.DrainDocker, error) { return nil, nil }
-	if _, err := buildActivation(c, nil, st, log.New(io.Discard, "", 0)); err == nil || !strings.Contains(err.Error(), "drainer") {
+	if _, err := buildActivation(c, nil, st, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "drainer") {
 		t.Fatalf("err = %v, want a drainer configuration error", err)
 	}
 }
@@ -603,4 +606,59 @@ func TestValidateActivationFlagsBuildCacheKeepBounds(t *testing.T) {
 			t.Errorf("%s must be accepted: %v", name, err)
 		}
 	}
+}
+
+// The agent journal logger redacts the credential token (raw and base64) and
+// emits each record as one complete line in a single Write.
+func TestNewAgentLoggerRedactsCredentialToken(t *testing.T) {
+	token, err := server.NewCredentialToken(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out countingWriter
+	logger, err := newAgentLogger(&out, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b64 := base64.StdEncoding.EncodeToString([]byte(token))
+	logger.Error("probe failed", "detail", "raw="+string(token)+" b64="+b64)
+	got := out.buf.String()
+	if strings.Contains(got, string(token)) || strings.Contains(got, b64) {
+		t.Fatalf("credential leaked into the journal: %q", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("no redaction marker: %q", got)
+	}
+	if out.writes != 1 || !strings.HasSuffix(got, "\n") {
+		t.Fatalf("record must arrive complete in one Write: writes=%d got=%q", out.writes, got)
+	}
+}
+
+// buildOutput records pass through the same redacting logger.
+func TestLogWriterRedactsBuildOutputToken(t *testing.T) {
+	token, err := server.NewCredentialToken(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out countingWriter
+	logger, err := newAgentLogger(&out, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (logWriter{logger}).Write([]byte("step 3: " + string(token) + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.buf.String(), string(token)) || !strings.Contains(out.buf.String(), "component=build") {
+		t.Fatalf("build output not redacted or not tagged: %q", out.buf.String())
+	}
+}
+
+type countingWriter struct {
+	buf    bytes.Buffer
+	writes int
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.writes++
+	return c.buf.Write(p)
 }

@@ -288,3 +288,22 @@ func TestAgentConfigLogRetention(t *testing.T) {
 		}
 	}
 }
+
+func TestMetricsListenAddressFromEnvironment(t *testing.T) {
+	valid := map[string]string{"": "", "127.0.0.1:9101": "127.0.0.1:9101", "[::1]:9101": "[::1]:9101", "127.8.9.1:65535": "127.8.9.1:65535",
+		// 4in6 loopback is accepted (netip IsLoopback unmaps it) and String() keeps the 4in6 form.
+		"[::ffff:127.0.0.1]:9101": "[::ffff:127.0.0.1]:9101"}
+	for in, want := range valid {
+		t.Setenv(config.MetricsListenAddressEnv, in)
+		got, err := config.MetricsListenAddressFromEnvironment()
+		if err != nil || got != want {
+			t.Fatalf("%q: got %q err %v, want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"localhost:9101", "0.0.0.0:9101", "[::]:9101", "10.0.0.1:9101", ":9101", "127.0.0.1:0", "127.0.0.1:70000", "garbage", "127.0.0.1", "[::1%lo]:9101", "::ffff:127.0.0.1:9101", " 127.0.0.1:9101", "127.0.0.1:9101\n", "example.test:9101"} {
+		t.Setenv(config.MetricsListenAddressEnv, in)
+		if got, err := config.MetricsListenAddressFromEnvironment(); !errors.Is(err, config.ErrInvalidEnvironment) || got != "" {
+			t.Fatalf("%q: got %q err %v, want ErrInvalidEnvironment", in, got, err)
+		}
+	}
+}

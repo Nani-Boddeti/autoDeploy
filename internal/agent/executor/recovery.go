@@ -1,9 +1,10 @@
 package executor
 
 import (
-	"log"
+	"log/slog"
 
 	"autodeploy/internal/agent/state"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/runtime/traefik"
 )
 
@@ -33,7 +34,7 @@ type RecoveryStore interface {
 // and recovery stops without failing startup; the reporter keeps failing closed
 // and logging. A save error on one record is logged and the rest still run.
 // It returns the number of records converted.
-func RecoverActivations(store RecoveryStore, routeDir string, logger *log.Logger) int {
+func RecoverActivations(store RecoveryStore, routeDir string, logger *slog.Logger) int {
 	return RecoverActivationsRestarting(store, routeDir, logger, nil)
 }
 
@@ -44,21 +45,22 @@ func RecoverActivations(store RecoveryStore, routeDir string, logger *log.Logger
 // (best effort, identity-guarded) before converting the record into a failure
 // whose summary carries the restart result. dk may be nil (no restart; the
 // summary says so).
-func RecoverActivationsRestarting(store RecoveryStore, routeDir string, logger *log.Logger, dk RestartDocker) int {
+func RecoverActivationsRestarting(store RecoveryStore, routeDir string, logger *slog.Logger, dk RestartDocker) int {
 	return recoverActivationsWith(store, routeDir, traefik.ReadDigest, logger, dk)
 }
 
-func recoverActivations(store RecoveryStore, routeDir string, readDigest func(dir, environmentID string) (string, bool, error), logger *log.Logger) int {
+func recoverActivations(store RecoveryStore, routeDir string, readDigest func(dir, environmentID string) (string, bool, error), logger *slog.Logger) int {
 	return recoverActivationsWith(store, routeDir, readDigest, logger, nil)
 }
 
-func recoverActivationsWith(store RecoveryStore, routeDir string, readDigest func(dir, environmentID string) (string, bool, error), logger *log.Logger, dk RestartDocker) int {
+func recoverActivationsWith(store RecoveryStore, routeDir string, readDigest func(dir, environmentID string) (string, bool, error), logger *slog.Logger, dk RestartDocker) int {
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.New(slog.DiscardHandler)
 	}
+	logger = logger.With(logging.KeyComponent, "recovery")
 	records, _, err := store.ScanActivations()
 	if err != nil {
-		logger.Printf("agent activation recovery ERROR: cannot scan pending activations; stranded authorized records are NOT recovered this pass: %v", err)
+		logger.Error("agent activation recovery: cannot scan pending activations; stranded authorized records are NOT recovered this pass", logging.Err(err))
 		return 0
 	}
 	converted := 0
@@ -83,11 +85,11 @@ func recoverActivationsWith(store RecoveryStore, routeDir string, readDigest fun
 		}
 		rec.FailureSummary = buildFailureSummary("recovery", reason, onDisk, routeDigestString(rec.RouteDigest))
 		if serr := store.SaveActivation(rec); serr != nil {
-			logger.Printf("agent activation recovery ERROR attempt %d: cannot convert the authorized record, left untouched (operator action may be required): %v", rec.AttemptID, serr)
+			logger.Error("agent activation recovery: cannot convert the authorized record, left untouched (operator action may be required)", logging.KeyAttemptID, rec.AttemptID, logging.Err(serr))
 			continue
 		}
 		converted++
-		logger.Printf("agent activation recovery attempt %d: authorized record converted to a failure report (on-disk route digest: %s)", rec.AttemptID, onDisk)
+		logger.Info("agent activation recovery: authorized record converted to a failure report", logging.KeyAttemptID, rec.AttemptID, "route_digest_on_disk", onDisk)
 	}
 	return converted
 }
@@ -96,11 +98,11 @@ func recoverActivationsWith(store RecoveryStore, routeDir string, readDigest fun
 // predecessor. Containers are touched only when the on-disk route is known
 // and is not the authorized (candidate) route: otherwise the candidate may be
 // serving and tearing it down would turn an unproven failure into an outage.
-func stoppedPredecessorNote(rec state.PendingActivation, onDisk string, dk RestartDocker, logger *log.Logger) string {
+func stoppedPredecessorNote(rec state.PendingActivation, onDisk string, dk RestartDocker, logger *slog.Logger) string {
 	if onDisk == "unreadable" || onDisk == routeDigestString(rec.RouteDigest) {
 		return "the route may point at the candidate, so the candidate and predecessor were left as found"
 	}
 	note := recoverStoppedPredecessor(dk, rec)
-	logger.Printf("agent activation recovery attempt %d: %s", rec.AttemptID, note)
+	logger.Info("agent activation recovery: stopped predecessor handled", logging.KeyAttemptID, rec.AttemptID, "note", note)
 	return note
 }

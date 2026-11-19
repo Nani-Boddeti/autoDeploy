@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -149,6 +150,21 @@ type Handler struct {
 	TrustedProxyCIDRs         []netip.Prefix
 	Clock                     Clock
 	RequestTimeout            time.Duration
+	// Logger receives process-log lines. Nil discards them: it never
+	// defaults to standard error, so every line goes through the redacting
+	// logger the caller injects.
+	Logger *slog.Logger
+}
+
+// discardLogger is the logger used when none is injected.
+var discardLogger = slog.New(slog.DiscardHandler)
+
+// logger returns the injected process logger, or a discarding one when unset.
+func (h Handler) logger() *slog.Logger {
+	if h.Logger == nil {
+		return discardLogger
+	}
+	return h.Logger
 }
 
 func (h Handler) clock() Clock {

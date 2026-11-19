@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -28,6 +28,7 @@ import (
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/gitcheckout"
 	"autodeploy/internal/healthgate"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
 	"autodeploy/internal/runtime/dockerid"
@@ -84,7 +85,7 @@ type Config struct {
 	// BuildOutput receives buildx's redacted stdout/stderr. Optional; a nil
 	// value discards build output.
 	BuildOutput io.Writer
-	Logger      *log.Logger
+	Logger      *slog.Logger
 	// LogShipper ships each attempt's redacted build output and structural
 	// deploy-step lines to the control plane (step 15g). Optional (nil: local
 	// logging only); it is additive -- BuildOutput keeps receiving the same
@@ -119,7 +120,7 @@ type Executor struct {
 	serverID     string
 	network      string
 	buildOutput  io.Writer
-	logger       *log.Logger
+	logger       *slog.Logger
 	logs         *logship.Factory  // nil: no log shipping.
 	activation   *activationRunner // nil: Execute fails closed.
 	buildTimeout time.Duration     // 0: docker.DefaultBuildTimeout.
@@ -146,8 +147,8 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 	if _, err := cfg.Docker.Probe(ctx); err != nil {
 		return nil, fmt.Errorf("agent executor: docker engine capability probe failed: %w", err)
 	}
-	if cfg.Builder.Logf == nil && cfg.Logger != nil {
-		cfg.Builder.Logf = cfg.Logger.Printf
+	if cfg.Builder.Logger == nil && cfg.Logger != nil {
+		cfg.Builder.Logger = cfg.Logger
 	}
 	if err := probeBuildxFunc(ctx, cfg.Builder); err != nil {
 		return nil, fmt.Errorf("agent executor: buildx capability probe failed: %w", err)
@@ -158,13 +159,13 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 	}
 	logger := cfg.Logger
 	if logger == nil {
-		logger = log.Default()
+		logger = slog.New(slog.DiscardHandler)
 	}
 	buildOutput := cfg.BuildOutput
 	if buildOutput == nil {
 		buildOutput = io.Discard
 	}
-	activation, err := newActivationRunner(*cfg.Activation, logger)
+	activation, err := newActivationRunner(*cfg.Activation, logger.With(logging.KeyComponent, "activation"))
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +178,7 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 		serverID:     cfg.ServerID,
 		network:      cfg.Network,
 		buildOutput:  buildOutput,
-		logger:       logger,
+		logger:       logger.With(logging.KeyComponent, "executor"),
 		logs:         cfg.LogShipper,
 		buildTimeout: cfg.BuildTimeout,
 		buildxConfig: cfg.Builder.ConfigDir,
@@ -216,7 +217,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	}
 
 	if e.activation == nil {
-		e.logger.Print("agent executor: activation is not configured; refusing the lease (fail closed)")
+		e.logger.Error("agent executor: activation is not configured; refusing the lease (fail closed)", logging.KeyAttemptID, lease.AttemptID)
 		return e.outcome(lease, false, queue.FailureClassPermanentConfiguration)
 	}
 
@@ -442,8 +443,8 @@ func (e *Executor) stopFailedCandidate(ctx context.Context, lease agentclient.Le
 		return true
 	default:
 		logs.Linef(logship.StreamPhase, "run: failed candidate could not be stopped")
-		e.logger.Printf("agent executor WARN attempt %d: failed candidate %s was NOT stopped (status=%d step=%q reason=%q): %v",
-			lease.AttemptID, identity.RuntimeInstanceID, res.Status, res.Step, res.Reason, res.Err)
+		e.logger.Warn("agent executor: failed candidate was NOT stopped", logging.KeyAttemptID, lease.AttemptID,
+			"runtime_instance_id", identity.RuntimeInstanceID, "status", res.Status, logging.KeyStage, res.Step, "reason", res.Reason, logging.Err(res.Err))
 		return false
 	}
 }

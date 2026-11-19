@@ -12,6 +12,7 @@ import (
 	"autodeploy/internal/agent/state"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/healthgate"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/docker"
 )
@@ -347,7 +348,7 @@ func (s *stsRelease) rollback(ctx context.Context, rec state.PendingActivation) 
 		logs.Linef(logship.StreamActivation, "release: predecessor restarted")
 	} else {
 		logs.Linef(logship.StreamActivation, "release: predecessor restart failed")
-		s.e.logger.Printf("agent executor ERROR attempt %d: predecessor %s restart failed: %s", s.lease.AttemptID, rec.PredecessorRuntimeInstanceID, res.text())
+		s.e.logger.Error("agent executor: predecessor restart failed", logging.KeyAttemptID, s.lease.AttemptID, "runtime_instance_id", rec.PredecessorRuntimeInstanceID, "result", res.text())
 	}
 	return res.text() + "; " + cand
 }

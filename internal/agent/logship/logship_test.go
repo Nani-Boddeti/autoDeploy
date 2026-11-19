@@ -7,9 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -60,7 +59,7 @@ func (f *fakeSender) chunks(stream Stream) []agentclient.LogChunk {
 
 func testFactory(t *testing.T, s Sender, mod func(*Config)) *Factory {
 	t.Helper()
-	cfg := Config{Sender: s, Logger: log.New(io.Discard, "", 0),
+	cfg := Config{Sender: s, Logger: slog.New(slog.DiscardHandler),
 		BatchInterval: 10 * time.Millisecond, FlushBudget: 500 * time.Millisecond,
 		CallTimeout: time.Second, RetryBase: time.Millisecond, RetryMax: 5 * time.Millisecond}
 	if mod != nil {
@@ -445,7 +444,7 @@ func TestPermanentErrorStopsShipping(t *testing.T) {
 	var logged bytes.Buffer
 	var lmu sync.Mutex
 	before := runtime.NumGoroutine()
-	a := testFactory(t, fs, func(c *Config) { c.Logger = log.New(lockedWriter{&lmu, &logged}, "", 0) }).Start(1, 1)
+	a := testFactory(t, fs, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(lockedWriter{&lmu, &logged}, nil)) }).Start(1, 1)
 	a.Linef(StreamPhase, "phase: a")
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) && len(fs.requests()) == 0 {
@@ -574,27 +573,41 @@ func TestInterleavedControlBytesCannotSplitSecretPastRedactor(t *testing.T) {
 // Diagf writes the journal only: redacted, newline-flattened, never shipped.
 func TestDiagfJournalOnlyAndRedacted(t *testing.T) {
 	fs := &fakeSender{}
-	a := testFactory(t, fs, nil).Start(1, 1)
+	var journal bytes.Buffer
+	var jmu sync.Mutex
+	a := testFactory(t, fs, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(lockedWriter{&jmu, &journal}, nil)) }).Start(1, 1)
 	a.SetSecrets(syntheticSecrets())
 
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	orig := os.Stderr
-	os.Stderr = w
 	a.Diagf(StreamPhase, "run: failed: dial unix /var/run/docker.sock: runtime-secret-BBBB2222\nsecond line")
-	os.Stderr = orig
-	w.Close()
-	journal, _ := io.ReadAll(r)
 	a.Close()
 
-	if !strings.Contains(string(journal), "dial unix /var/run/docker.sock") || strings.Contains(string(journal), "BBBB2222") || strings.Count(string(journal), "\n") != 1 {
-		t.Fatalf("journal line wrong: %q", journal)
+	jmu.Lock()
+	defer jmu.Unlock()
+	if !strings.Contains(journal.String(), "dial unix /var/run/docker.sock") || strings.Contains(journal.String(), "BBBB2222") || strings.Count(journal.String(), "\n") != 1 ||
+		!strings.Contains(journal.String(), `msg="job diag"`) || !strings.Contains(journal.String(), "attempt_id=1") || !strings.Contains(journal.String(), "stream=phase") {
+		t.Fatalf("journal line wrong: %q", journal.String())
 	}
 	if got := collect(fs.chunks(StreamPhase)); strings.Contains(got, "docker.sock") {
 		t.Fatalf("Diagf must not ship: %q", got)
 	}
 	var nilAttempt *Attempt
 	nilAttempt.Diagf(StreamPhase, "x") // nil-safe
+}
+
+// Linef tees the redacted structural line to the injected journal logger.
+func TestLinefTeesToInjectedLogger(t *testing.T) {
+	fs := &fakeSender{}
+	var journal bytes.Buffer
+	var jmu sync.Mutex
+	a := testFactory(t, fs, func(c *Config) { c.Logger = slog.New(slog.NewTextHandler(lockedWriter{&jmu, &journal}, nil)) }).Start(7, 1)
+	a.SetSecrets(syntheticSecrets())
+	a.Linef(StreamPhase, "phase: build runtime-secret-BBBB2222")
+	a.Close()
+	jmu.Lock()
+	defer jmu.Unlock()
+	got := journal.String()
+	if !strings.Contains(got, `msg="job log"`) || !strings.Contains(got, "attempt_id=7") || !strings.Contains(got, "stream=phase") ||
+		!strings.Contains(got, "component=logship") || strings.Contains(got, "BBBB2222") || strings.Count(got, "\n") != 1 {
+		t.Fatalf("journal = %q", got)
+	}
 }

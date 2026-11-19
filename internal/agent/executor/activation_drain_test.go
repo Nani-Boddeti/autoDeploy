@@ -3,7 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -127,13 +127,13 @@ func TestDirectReportNilDrainStoreStillDeletes(t *testing.T) {
 	f, _, e, lease := predFake()
 	e.activation.cfg.Drains = nil
 	var logs strings.Builder
-	e.activation.logger = log.New(&logs, "", 0)
+	e.activation.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	f.saveErrFrom = 2
 	e.activate(context.Background(), lease, testImageDigest)
 	if len(f.deleted) != 1 {
 		t.Fatalf("deleted=%v", f.deleted)
 	}
-	if !strings.Contains(logs.String(), "ERROR attempt 42: a predecessor drain is owed but no drain store") {
+	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "a predecessor drain is owed but no drain store") || !strings.Contains(logs.String(), "attempt_id=42") {
 		t.Fatalf("lost drain not logged: %s", logs.String())
 	}
 }
@@ -171,7 +171,7 @@ func TestDirectReportArmFailureResavesResultReadyRecord(t *testing.T) {
 	arm.err = errors.New("disk full")
 	f.saveErrOn = map[int]error{2: errors.New("busy"), 3: errors.New("busy"), 4: errors.New("busy")}
 	var logs strings.Builder
-	e.activation.logger = log.New(&logs, "", 0)
+	e.activation.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	out := e.activate(context.Background(), lease, testImageDigest)
 	if !out.HandedOff || len(f.deleted) != 0 || len(f.reports) != 1 {
 		t.Fatalf("outcome=%+v deleted=%v reports=%d", out, f.deleted, len(f.reports))
@@ -181,7 +181,7 @@ func TestDirectReportArmFailureResavesResultReadyRecord(t *testing.T) {
 		rec.PredecessorReleaseID != "rel_old" || rec.PredecessorRuntimeInstanceID != "41" || rec.DrainSeconds != 45 {
 		t.Fatalf("record = %+v", rec)
 	}
-	if !strings.Contains(logs.String(), "ERROR attempt 42: the report was acknowledged but the predecessor drain could not be armed; the result record was saved") {
+	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "the report was acknowledged but the predecessor drain could not be armed; the result record was saved") || !strings.Contains(logs.String(), "attempt_id=42") {
 		t.Fatalf("no loud log: %s", logs.String())
 	}
 }
@@ -191,7 +191,7 @@ func TestDirectReportArmFailureAndResaveFailureLogsLostDrain(t *testing.T) {
 	arm.err = errors.New("disk full")
 	f.saveErrFrom = 2
 	var logs strings.Builder
-	e.activation.logger = log.New(&logs, "", 0)
+	e.activation.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	out := e.activate(context.Background(), lease, testImageDigest)
 	if !out.HandedOff || len(f.deleted) != 0 {
 		t.Fatalf("outcome=%+v deleted=%v", out, f.deleted)
@@ -199,7 +199,7 @@ func TestDirectReportArmFailureAndResaveFailureLogsLostDrain(t *testing.T) {
 	if f.last(t).Phase != state.PhaseAuthorized {
 		t.Fatal("authorized record must remain")
 	}
-	if !strings.Contains(logs.String(), "ERROR attempt 42: drain obligation LOST") || !strings.Contains(logs.String(), "rel_old") {
+	if !strings.Contains(logs.String(), "level=ERROR") || !strings.Contains(logs.String(), "drain obligation LOST") || !strings.Contains(logs.String(), "attempt_id=42") || !strings.Contains(logs.String(), "rel_old") {
 		t.Fatalf("lost drain not logged: %s", logs.String())
 	}
 }

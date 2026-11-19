@@ -172,8 +172,8 @@ func TestReporterNilDrainStoreLogsEachLostDrainAndDeletes(t *testing.T) {
 	save(t, a, withPred(readySucceeded(1)), withPred(readySucceeded(2)))
 	h := newHarness(t, a, nil)
 	h.runUntil(t, func() bool { return len(remaining(t, a)) == 0 })
-	for _, id := range []string{"attempt 1:", "attempt 2:"} {
-		if !strings.Contains(h.logText(), "ERROR "+id+" a predecessor drain is owed but no drain store") {
+	for _, id := range []string{"attempt_id=1", "attempt_id=2"} {
+		if countLogs(h.logText(), "level=ERROR", "a predecessor drain is owed but no drain store", id) != 1 {
 			t.Fatalf("lost drain %s not logged: %s", id, h.logText())
 		}
 	}

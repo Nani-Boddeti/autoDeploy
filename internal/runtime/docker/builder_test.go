@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -338,11 +340,11 @@ func TestEnsureBuilderLogsWhyItRecreates(t *testing.T) {
 			fakeBuilderDocker(t, tc.ls, "")
 			var buf bytes.Buffer
 			cfg := testBuilderConfig(t)
-			cfg.Logf = func(format string, args ...any) { fmt.Fprintf(&buf, format+"\n", args...) }
+			cfg.Logger = slog.New(slog.NewTextHandler(&buf, nil))
 			if err := ensureBuilder(context.Background(), cfg); err != nil {
 				t.Fatal(err)
 			}
-			if !strings.Contains(buf.String(), "recreating") || !strings.Contains(buf.String(), tc.want) {
+			if !strings.Contains(unquoted(&buf), "recreating") || !strings.Contains(unquoted(&buf), tc.want) {
 				t.Fatalf("log = %q, want recreating + %q", buf.String(), tc.want)
 			}
 			if strings.Contains(buf.String(), BuildkitImage) && name != "driver" {
@@ -352,16 +354,39 @@ func TestEnsureBuilderLogsWhyItRecreates(t *testing.T) {
 	}
 }
 
+// unquoted undoes slog text-handler value quoting so assertions can match
+// the human text.
+func unquoted(buf *bytes.Buffer) string { return strings.ReplaceAll(buf.String(), `\"`, `"`) }
+
+// A nil Logger discards: nothing reaches the standard logger or slog default.
+func TestEnsureBuilderNilLoggerDiscards(t *testing.T) {
+	fakeBuilderDocker(t, `{"Name":"autodeploy-build","Driver":"docker","Nodes":[{"Name":"x"}]}`+"\n", "")
+	var std, def bytes.Buffer
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	prevDef := slog.Default()
+	log.SetOutput(&std)
+	slog.SetDefault(slog.New(slog.NewTextHandler(&def, nil)))
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags); slog.SetDefault(prevDef) })
+	cfg := testBuilderConfig(t)
+	cfg.Logger = nil
+	if err := ensureBuilder(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if std.Len() != 0 || def.Len() != 0 {
+		t.Fatalf("nil Logger wrote to a process logger: std=%q default=%q", std.String(), def.String())
+	}
+}
+
 func TestEnsureBuilderLogsWhenDriverOptsAbsentFromListing(t *testing.T) {
 	ls := `{"Name":"autodeploy-build","Driver":"docker-container","Nodes":[{"Name":"autodeploy-build0"}]}` + "\n"
 	fakeBuilderDocker(t, ls, "")
 	var buf bytes.Buffer
 	cfg := testBuilderConfig(t)
-	cfg.Logf = func(format string, args ...any) { fmt.Fprintf(&buf, format+"\n", args...) }
+	cfg.Logger = slog.New(slog.NewTextHandler(&buf, nil))
 	if err := ensureBuilder(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(buf.String(), "reports no driver options") {
+	if !strings.Contains(unquoted(&buf), "reports no driver options") {
 		t.Fatalf("log = %q, want the absent-DriverOpts note", buf.String())
 	}
 }

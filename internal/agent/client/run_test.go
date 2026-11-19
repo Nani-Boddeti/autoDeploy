@@ -6,7 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -124,7 +124,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func newTestAgent(t *testing.T, srv *httptest.Server, executor Executor, logger *log.Logger) *Agent {
+func newTestAgent(t *testing.T, srv *httptest.Server, executor Executor, logger *slog.Logger) *Agent {
 	t.Helper()
 	token, err := server.NewCredentialToken(rand.Reader)
 	if err != nil {
@@ -421,7 +421,7 @@ func TestFailClosedOnCorruptFenceState(t *testing.T) {
 
 func TestLogsContainNoTokenOrDigest(t *testing.T) {
 	var buf bytes.Buffer
-	logger := log.New(&buf, "", 0)
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	fake := &fakeControlPlane{
 		leaseToOffer: fixtureLease(t, "env_f", 1),
 		renewStatus:  func(int) int { return http.StatusConflict },

@@ -48,6 +48,10 @@ type LogPurgeOptions struct {
 	Budget     time.Duration
 	// OnError receives no error value (it may carry driver/connection text).
 	OnError func()
+	// OnRun (optional, metrics) is called once per run that did work or
+	// failed, with ok=false on failure. It is not called when another replica
+	// holds the lock or once the parent context is cancelled (shutdown).
+	OnRun func(ok bool)
 }
 
 // LogPurgeScheduler runs PurgeLogChunks at a modest cadence in its own
@@ -156,6 +160,12 @@ func (s *LogPurgeScheduler) runOnce(parent context.Context, now time.Time) {
 		}
 		defer release()
 	}
+	completed := false
+	defer func() {
+		if completed && parent.Err() == nil && s.opts.OnRun != nil {
+			s.opts.OnRun(true)
+		}
+	}()
 	for i := 0; i < s.opts.MaxBatches && ctx.Err() == nil; i++ {
 		n, err := s.purger.PurgeLogChunks(ctx, now, s.opts.Retention, s.opts.BatchSize)
 		if err != nil {
@@ -163,14 +173,22 @@ func (s *LogPurgeScheduler) runOnce(parent context.Context, now time.Time) {
 			return
 		}
 		if n < int64(s.opts.BatchSize) {
+			completed = true
 			return
 		}
 	}
+	completed = true
 }
 
 func (s *LogPurgeScheduler) fail(parent context.Context) {
-	if parent.Err() == nil && s.opts.OnError != nil {
+	if parent.Err() != nil {
+		return
+	}
+	if s.opts.OnError != nil {
 		s.opts.OnError()
+	}
+	if s.opts.OnRun != nil {
+		s.opts.OnRun(false)
 	}
 }
 

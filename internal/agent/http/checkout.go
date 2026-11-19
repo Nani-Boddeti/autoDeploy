@@ -2,12 +2,11 @@ package agenthttp
 
 import (
 	"context"
-	"fmt"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
+	"autodeploy/internal/errclass"
 	"autodeploy/internal/githubapp"
 	"autodeploy/internal/queue"
 )
@@ -269,6 +268,12 @@ type checkoutStartResponse struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+// logCheckoutStartFailure records the failing step and error class only: error
+// text is never logged because it can carry a DSN, token or SQL detail.
+func (h Handler) logCheckoutStartFailure(step string, err error) {
+	h.logger().Error("agent checkout start failed", "stage", step, "class", errclass.Of(err))
+}
+
 // handleCheckoutStart re-authorizes, activates the reservation (which mints
 // the installation token server-side), and only then calls the lease's own
 // Start -- the durable checkout lease is marked running before the response
@@ -308,14 +313,14 @@ func (h Handler) handleCheckoutStart(w http.ResponseWriter, r *http.Request) {
 
 	lease, err := h.CheckoutActivator.Activate(r.Context(), req.ReservationID)
 	if err != nil {
-		// Step and error class only: the token never reaches an error value.
-		fmt.Fprintf(os.Stderr, "agent checkout start failed at activate: %v\n", err)
+		// Step and error class only: error text is never logged.
+		h.logCheckoutStartFailure("activate", err)
 		h.CheckoutRegistry.releaseStart(req.ReservationID)
 		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}
 	if err := lease.Start(r.Context()); err != nil {
-		fmt.Fprintf(os.Stderr, "agent checkout start failed at lease start: %v\n", err)
+		h.logCheckoutStartFailure("lease start", err)
 		// Start failed: the durable lease was never marked running, so the
 		// credential must never be returned. Close what Activate opened so
 		// no minted token is left live with nothing that can use it.
@@ -332,7 +337,7 @@ func (h Handler) handleCheckoutStart(w http.ResponseWriter, r *http.Request) {
 	// remote agent is its own operation and says so.
 	token, err := lease.DeliverToken()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "agent checkout start failed at token delivery: %v\n", err)
+		h.logCheckoutStartFailure("token delivery", err)
 		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable")
 		return
 	}

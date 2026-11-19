@@ -9,7 +9,9 @@
 #                   autodeploy-run admin bootstrap --username administrator
 #                   autodeploy-run admin reset-password --username administrator
 #                   autodeploy-run secrets secret init-active-kek --kek kek-1
-# `admin` and `secrets` need an interactive terminal (they refuse otherwise).
+#                   autodeploy-run secrets secret verify
+# `admin` and `secrets` need an interactive terminal (they refuse otherwise),
+# except `secrets secret verify`, which takes no value and may run piped.
 set -euo pipefail
 
 readonly APP_DIR=/usr/local/lib/autodeploy/app

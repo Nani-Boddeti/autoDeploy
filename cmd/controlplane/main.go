@@ -7,12 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,8 @@ import (
 	secretcrypto "autodeploy/internal/crypto"
 	githubhttp "autodeploy/internal/github/http"
 	"autodeploy/internal/githubapp"
+	"autodeploy/internal/logging"
+	"autodeploy/internal/metrics"
 	"autodeploy/internal/secret"
 	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
@@ -55,11 +58,14 @@ const (
 
 func main() {
 	if err := run(context.Background()); err != nil {
-		logger, closeLogger := controlplaneLogger(os.Stderr, nil)
+		logger := controlplaneLogger(os.Stderr, nil)
 		// Only the source line of the failing startup step is logged: error
 		// text can carry configuration values (e.g. a database URL).
-		logger.Print("control plane unavailable" + failureSite(err))
-		_ = closeLogger.Close()
+		if site := strings.TrimPrefix(failureSite(err), " at "); site != "" {
+			logger.Error("control plane unavailable", logging.KeyStage, site)
+		} else {
+			logger.Error("control plane unavailable")
+		}
 		os.Exit(1)
 	}
 }
@@ -67,24 +73,28 @@ func main() {
 // controlplaneLogger is the sole process-log construction boundary. Callers
 // pass any transient secret values when a future integration can emit related
 // output; failures are deliberately reduced to fixed public messages.
-func controlplaneLogger(dst io.Writer, values [][]byte) (*log.Logger, io.Closer) {
-	redactor, err := secretcrypto.NewRedactingWriter(dst, values)
+func controlplaneLogger(dst io.Writer, values [][]byte) *slog.Logger {
+	logger, err := logging.NewControlPlane(dst, values)
 	if err != nil {
-		return log.New(io.Discard, "", 0), nopCloser{}
+		return slog.New(slog.DiscardHandler)
 	}
-	return log.New(redactor, "", 0), redactor
+	return logger
 }
 
-type nopCloser struct{}
-
-func (nopCloser) Close() error { return nil }
-
 func run(ctx context.Context) error {
+	// One redacting process logger, installed as the default before any
+	// startup step can log, so stray library or std log output is redacted too.
+	processLogger := controlplaneLogger(os.Stderr, nil)
+	slog.SetDefault(processLogger)
 	dsn, err := config.DatabaseURLFromEnvironment()
 	if err != nil {
 		return failAt(err)
 	}
 	webConfig, err := config.WebConfigFromEnvironment()
+	if err != nil {
+		return failAt(err)
+	}
+	metricsAddress, err := config.MetricsListenAddressFromEnvironment()
 	if err != nil {
 		return failAt(err)
 	}
@@ -97,6 +107,8 @@ func run(ctx context.Context) error {
 		return failAt(err)
 	}
 	defer pool.Close()
+	buildInfo, buildInfoOK := debug.ReadBuildInfo()
+	metricSet := newMetricsSet(buildVersion(buildInfo, buildInfoOK), postgres.NewMetricsRepository(pool).MetricsSnapshot, processLogger)
 	repository := postgres.NewAuthRepository(pool)
 	if err = repository.Ping(ctx); err != nil {
 		return failAt(err)
@@ -122,7 +134,9 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return failAt(err)
 	}
-	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, DummyPassword: dummy, ActivationEnabled: activationEnabled}
+	// The web and agent handlers log through processLogger: nothing in them
+	// may write to standard error directly.
+	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, DummyPassword: dummy, ActivationEnabled: activationEnabled, Logger: processLogger}
 	githubConfig, err := config.GitHubAppConfigFromEnvironment()
 	if err != nil {
 		return failAt(err)
@@ -212,6 +226,7 @@ func run(ctx context.Context) error {
 			Canceller:         leaseRepository,
 			Reconciler:        leaseRepository,
 			TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs,
+			Logger:            processLogger,
 		}
 		if handler, ok := agentHandler.(agenthttp.Handler); ok {
 			// Secret materialization is wired only when the secret subsystem
@@ -242,21 +257,21 @@ func run(ctx context.Context) error {
 			}
 			agentHandler = handler
 		}
-		sweepLogger, _ := controlplaneLogger(os.Stderr, nil)
 		logPurger, purgeErr := postgres.NewLogPurgeScheduler(pool, postgres.NewDeploymentLogRepository(pool), postgres.LogPurgeOptions{
 			Retention: postgres.LogRetention{MaxAge: agentConfig.LogRetentionMaxAge, KeepNewestPerEnv: agentConfig.LogRetentionKeepNewest},
-			OnError:   func() { sweepLogger.Print("deployment log purge failed") },
+			OnError:   func() { processLogger.Error("deployment log purge failed", logging.KeyComponent, "log_purge") },
+			OnRun:     metricSet.onPurgeRun,
 		})
 		if purgeErr != nil {
 			return purgeErr
 		}
-		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { sweepLogger.Print("agent lease sweep failed") }).WithLogPurge(logPurger)
+		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { processLogger.Error("agent lease sweep failed", logging.KeyComponent, "lease_sweep") }).WithRunHandler(metricSet.onSweepRun).WithLogPurge(logPurger)
 	}
 	handler, err := web.New(repository, webOptions)
 	if err != nil {
 		return failAt(err)
 	}
-	httpHandler := composeHTTPHandler(handler, webhookHandler, agentHandler)
+	httpHandler := composeHTTPHandler(handler, webhookHandler, agentHandler, metricSet.requests)
 	if enabled {
 		httpHandler = secretReadyHandler(httpHandler, func(requestContext context.Context) error {
 			ring, generation, loadErr := config.KEKRingAndGenerationFromEnvironment()
@@ -266,9 +281,20 @@ func run(ctx context.Context) error {
 			return secretLedgerReady(requestContext, postgres.NewKeyRepository(pool), ring, generation)
 		})
 	}
-	server := newHTTPServer(webConfig.ListenAddress, httpHandler)
+	server := newHTTPServer(webConfig.ListenAddress, httpHandler, processLogger)
+	// The metrics listener (loopback-only, disabled unless configured) binds
+	// before anything serves, so a bind failure fails startup like the main
+	// listener's does.
+	metricsServer, metricsListener, err := startMetricsListener(metricsAddress, newMetricsHandler(metricSet.registry), processLogger)
+	if err != nil {
+		return failAt(err)
+	}
 	errorsChannel := make(chan error, 1)
 	go func() { errorsChannel <- server.ListenAndServe() }()
+	if metricsServer != nil {
+		// A metrics listener failure is logged, never fatal to the control plane.
+		serveMetrics(metricsServer, metricsListener, processLogger)
+	}
 
 	// The sweeper only runs when the agent protocol is enabled; its context
 	// is cancelled alongside the HTTP server's shutdown signal so it never
@@ -312,6 +338,9 @@ func run(ctx context.Context) error {
 	shutdownContext, cancel := newShutdownContext()
 	defer cancel()
 	shutdownErr := server.Shutdown(shutdownContext)
+	if metricsServer != nil {
+		shutdownErr = errors.Join(shutdownErr, metricsServer.Shutdown(shutdownContext))
+	}
 	if sweeperCancel != nil {
 		sweeperCancel()
 		select {
@@ -332,7 +361,14 @@ func run(ctx context.Context) error {
 // this wiring existed. agentHandler is matched by prefix because it serves
 // multiple sub-paths (enroll, heartbeat, jobs/claim, ...); webhookHandler
 // keeps its single exact-path match.
-func composeHTTPHandler(browserHandler, webhookHandler, agentHandler http.Handler) http.Handler {
+//
+// A non-nil requests counter wraps each surface's handler with the
+// status-counting middleware (surface web, agent, webhook); nil leaves the
+// handlers untouched.
+func composeHTTPHandler(browserHandler, webhookHandler, agentHandler http.Handler, requests *metrics.Counter) http.Handler {
+	browserHandler = instrument(surfaceWeb, requests, browserHandler)
+	webhookHandler = instrument(surfaceWebhook, requests, webhookHandler)
+	agentHandler = instrument(surfaceAgent, requests, agentHandler)
 	if webhookHandler == nil && agentHandler == nil {
 		return browserHandler
 	}
@@ -417,9 +453,11 @@ func newShutdownContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), shutdownTimeout)
 }
 
-func newHTTPServer(address string, handler http.Handler) *http.Server {
-	logger, _ := controlplaneLogger(os.Stderr, nil)
-	return &http.Server{Addr: address, Handler: handler, ErrorLog: logger, ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout, MaxHeaderBytes: maxHeaderBytes}
+// newHTTPServer routes net/http's ErrorLog through the process logger's own
+// handler (one core, one mutex) at ERROR level.
+func newHTTPServer(address string, handler http.Handler, logger *slog.Logger) *http.Server {
+	errorLog := slog.NewLogLogger(logger.Handler(), slog.LevelError)
+	return &http.Server{Addr: address, Handler: handler, ErrorLog: errorLog, ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout, MaxHeaderBytes: maxHeaderBytes}
 }
 
 // secretMaterializerFactory builds one request-scoped secret service whose

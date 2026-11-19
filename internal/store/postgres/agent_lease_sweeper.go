@@ -26,6 +26,7 @@ type AgentLeaseSweeper struct {
 	tick    time.Duration
 	batch   int
 	onError func()
+	onRun   func(expired int, ok bool)
 	purge   *LogPurgeScheduler
 	sweepFn func(context.Context) (int, error) // tests only; nil = SweepOnce
 }
@@ -63,6 +64,15 @@ func (s *AgentLeaseSweeper) WithErrorHandler(onError func()) *AgentLeaseSweeper 
 	return s
 }
 
+// WithRunHandler registers an optional per-tick observer (metrics): expired is
+// the number of attempts the tick recovered and ok is false for a failed tick.
+// It is not called once ctx is cancelled. Like WithErrorHandler it carries no
+// error value.
+func (s *AgentLeaseSweeper) WithRunHandler(onRun func(expired int, ok bool)) *AgentLeaseSweeper {
+	s.onRun = onRun
+	return s
+}
+
 // WithLogPurge attaches the deployment-log retention scheduler. It is
 // triggered after each tick's lease duties, never blocks the tick, and its
 // failures never fail a sweep (it reports through its own OnError).
@@ -86,8 +96,12 @@ func (s *AgentLeaseSweeper) Run(ctx context.Context) {
 			if s.sweepFn != nil {
 				sweep = s.sweepFn
 			}
-			if _, err := sweep(ctx); err != nil && ctx.Err() == nil && s.onError != nil {
+			n, err := sweep(ctx)
+			if err != nil && ctx.Err() == nil && s.onError != nil {
 				s.onError()
+			}
+			if ctx.Err() == nil && s.onRun != nil {
+				s.onRun(n, err == nil)
 			}
 			// After the lease/activation duties, regardless of their outcome.
 			s.purge.Trigger(ctx)

@@ -17,7 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math"
 	"os"
 	"os/signal"
@@ -34,8 +34,10 @@ import (
 	"autodeploy/internal/checkoutcontain"
 	"autodeploy/internal/checkoutquota"
 	"autodeploy/internal/gitcheckout"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/runtime/docker"
 	"autodeploy/internal/runtime/traefik"
+	"autodeploy/internal/server"
 )
 
 // agentVersion is reported on every heartbeat. It has no runtime effect in
@@ -503,7 +505,7 @@ var errTraefikCredentialFormat = errors.New("--traefik-api-credentials-file must
 // buildActivation validates the activation flags and assembles the durable
 // stores, Traefik observer, reporter, recovery hook and a complete
 // executor.ActivationConfig. Only reached when executorEnabled is true.
-func buildActivation(c command, client *agentclient.Client, stateStore state.Store, logger *log.Logger) (activationParts, error) {
+func buildActivation(c command, client *agentclient.Client, stateStore state.Store, logger *slog.Logger) (activationParts, error) {
 	if err := validateActivationFlags(c); err != nil {
 		return activationParts{}, err
 	}
@@ -594,7 +596,12 @@ func runAgent(c command, stderr io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("load credential: %w", err)
 	}
-	logger := log.New(stderr, "", log.LstdFlags)
+	logger, err := newAgentLogger(stderr, token)
+	if err != nil {
+		return errors.New("configure agent logger")
+	}
+	// Stray library or std log output goes through the same redacting logger.
+	slog.SetDefault(logger)
 	client, err := agentclient.NewClient(c.baseURL, c.serverID, token, nil, logger)
 	if err != nil {
 		return fmt.Errorf("configure control-plane client: %w", err)
@@ -657,7 +664,7 @@ func runAgent(c command, stderr io.Writer) error {
 // executor.NewExecutor, which runs the fail-closed capability probe
 // (Engine API version compatibility, then buildx) before returning. It is
 // only ever called when executorEnabled is true.
-func buildExecutor(ctx context.Context, c command, client *agentclient.Client, logger *log.Logger, activation executor.ActivationConfig) (agentclient.Executor, error) {
+func buildExecutor(ctx context.Context, c command, client *agentclient.Client, logger *slog.Logger, activation executor.ActivationConfig) (agentclient.Executor, error) {
 	if c.checkoutQuotaSocket == "" || c.checkoutSpawnSocket == "" || c.checkoutAgentGID == 0 || c.environmentNetwork == "" {
 		return nil, errors.New("--checkout-quota-socket, --checkout-spawn-socket, --checkout-agent-gid, and --environment-network are required when the executor is enabled")
 	}
@@ -691,6 +698,10 @@ func buildExecutor(ctx context.Context, c command, client *agentclient.Client, l
 	if err != nil {
 		return nil, fmt.Errorf("configure log shipper: %w", err)
 	}
+	// Builder recreation lines go to the agent journal logger, never the
+	// standard library's default logger.
+	builder := builderConfig(c)
+	builder.Logger = logger
 	return executor.NewExecutor(ctx, executor.Config{
 		LogShipper:     shipper,
 		ControlPlane:   client,
@@ -702,17 +713,29 @@ func buildExecutor(ctx context.Context, c command, client *agentclient.Client, l
 		Logger:         logger,
 		Activation:     &activation,
 		BuildTimeout:   c.buildTimeout,
-		Builder:        builderConfig(c),
+		Builder:        builder,
 		BuildCacheKeep: c.buildCacheKeep,
 	})
 }
 
-// logWriter adapts a *log.Logger to io.Writer for redacted build output,
-// one Print call per Write (log.Logger already serializes concurrent
-// writers, so this needs no locking of its own).
-type logWriter struct{ logger *log.Logger }
+// newAgentLogger builds the agent journal logger: every record is redacted
+// over the agent credential token (raw and base64 forms) and the shared
+// secret-shape patterns before reaching dst, one Write per record. The
+// constructor error never includes the token.
+func newAgentLogger(dst io.Writer, token server.CredentialToken) (*slog.Logger, error) {
+	return logging.NewAgent(dst, [][]byte{[]byte(token)})
+}
+
+// logWriter adapts a *slog.Logger to io.Writer for redacted build output,
+// one record per Write (the logger serializes concurrent writers). Chunks that
+// are only whitespace produce no record.
+type logWriter struct{ logger *slog.Logger }
 
 func (w logWriter) Write(p []byte) (int, error) {
-	w.logger.Print(string(p))
+	text := strings.TrimSuffix(string(p), "\n")
+	if strings.TrimSpace(text) == "" {
+		return len(p), nil
+	}
+	w.logger.Info("build output", logging.KeyComponent, "build", "text", text)
 	return len(p), nil
 }

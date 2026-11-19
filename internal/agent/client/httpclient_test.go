@@ -6,7 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -15,7 +15,7 @@ import (
 	"autodeploy/internal/server"
 )
 
-func newTestClient(t *testing.T, srv *httptest.Server, logger *log.Logger) *Client {
+func newTestClient(t *testing.T, srv *httptest.Server, logger *slog.Logger) *Client {
 	t.Helper()
 	token, err := server.NewCredentialToken(rand.Reader)
 	if err != nil {
@@ -110,7 +110,7 @@ func TestPostDoesNotRetryOn401(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newTestClient(t, srv, log.New(&buf, "", 0))
+	c := newTestClient(t, srv, slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{ReplaceAttr: dropTime})))
 	err := c.post(context.Background(), "/agent/v1/heartbeat", struct{}{}, nil, true)
 	if !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
@@ -118,7 +118,7 @@ func TestPostDoesNotRetryOn401(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("expected exactly one attempt on 401, got %d", calls)
 	}
-	if buf.String() != "agent credential rejected\n" {
+	if buf.String() != "level=WARN msg=\"agent credential rejected\" component=client\n" {
 		t.Fatalf("expected the fixed rejection log line, got %q", buf.String())
 	}
 }

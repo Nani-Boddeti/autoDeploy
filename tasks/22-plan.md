@@ -160,6 +160,96 @@ integration: put then the binding form accepts the printed id and a claim freeze
 **Acer:** owner runs put for a build secret, binds it, then the deferred 22-2 checks (RUN --mount secret, absent from
 `docker history --no-trunc` and `docker save`, [REDACTED] in Logs). Estimate ~0.5 day. Review: yes (secret handling).
 
+## 22-4 design: observability outcome (2026-11-19, APPROVED: D1-D6 as recommended)
+**Outcome text (tasks/todo.md:164):** metrics, structured sanitized logs, readiness/liveness endpoints, retention
+cleanup, backup instructions, disaster-recovery documentation.
+
+**Baseline (investigated 2026-11-19, spot-checked):**
+- Liveness/readiness: control plane already serves unauthenticated GET `/livez` (process) and `/readyz` (DB ping;
+  plus KEK ring reload + ledger/generation check when the secret subsystem is on, cmd/controlplane secretReadyHandler).
+  Agent has no HTTP listener (outbound only); its liveness is visible only as `servers.last_heartbeat_at`.
+- Retention cleanup: exists (deployment log purge scheduler, 20E release retention, 21B failed-candidate cleanup).
+- Metrics: none; go.mod has 4 direct deps (pgx, x/crypto, x/sys, x/term), no prometheus/expvar/OTel.
+- Logs: stdlib `log` text, no levels/fields. Control plane logger goes through crypto.RedactingWriter and logs
+  fixed messages + failure site (error text could carry a DSN). Agent logger `log.New(stderr,...)` has NO redactor;
+  ~53 Printf sites across agent client/executor/reporter/cleaner, docker builder, both mains. Stray direct stderr
+  prints bypass the control-plane logger: internal/web/rollback.go:35,100 and manual_deploy.go:139 (`%v` err),
+  web.go:655,706 (stage only), internal/agent/http/checkout.go:312,318,335 (`%v` err), docker/builder.go:68
+  (`log.Printf`). logship.go:350,383 tee already-redacted lines (fine).
+- Backup/DR: no scripts or docs. ADR 0003 "Backup, restore, and KEK recovery" sets the rules (DB backup holds only
+  ciphertext; KEK ring backed up separately, never colocated; restore installs + validates KEKs before admin traffic
+  or agent jobs, then a non-logging decrypt canary; restore and total-KEK-loss drills before production). MEMORY.md:
+  every restore installs a FRESH active KEK id; an uncertain restored ledger makes the old KEK read-only. cmd/secrets
+  has init-active-kek / rewrap / can-retire / put / replace, but NO decrypt canary.
+
+**Slices (one subagent each, bar after each):**
+- 22-4a stray-print cleanup: inject the control-plane logger into web.Handler and the agent HTTP handler; replace the
+  8 direct stderr prints with logger lines carrying a fixed message + stage + error class (no `%v` of raw errors,
+  matching main.go's failure-site rule); builder.go uses the injected logger. Test: capture logger output on each
+  failure path, assert no DSN/token/secret fixture appears and the stage is present.
+- 22-4b structured logs (D2): both binaries move to log/slog with a key=value text handler (journald-friendly),
+  levels INFO/WARN/ERROR, stable fields `component`, `attempt_id`, `deployment_id`, `release_id`, `cleanup_id`,
+  `failure_class`. Control plane handler writes through the existing RedactingWriter; agent handler gets one too,
+  seeded with the agent credential token and per-attempt secret set where available, plus the logsanitize regex pass.
+  Migrate the ~53 sites mechanically; message text kept so existing journal greps (`grep attempt`) still work.
+- 22-4c metrics (D1, D3, D4): `/metrics` in Prometheus text format 0.0.4, hand-rolled (counters + gauges only, ~150
+  lines + tests, no new dependency), on a SEPARATE listener `AUTODEPLOY_METRICS_LISTEN_ADDRESS`, empty = disabled
+  (default), startup refuses a non-loopback address. Not routed by Traefik, no auth logic needed. Metrics:
+  - process: `autodeploy_build_info{version}`, `autodeploy_up`.
+  - in-process counters: `autodeploy_http_requests_total{surface=web|agent|webhook,code=2xx|3xx|4xx|5xx}`,
+    `autodeploy_lease_sweep_runs_total{result}`, `autodeploy_leases_expired_total`,
+    `autodeploy_log_purge_runs_total{result}`.
+  - DB gauges, one read-only query batch at scrape with a 2s timeout, cached 15s (scrape storms cannot load the DB):
+    `autodeploy_db_up`, `autodeploy_agent_jobs{state}`, `autodeploy_agent_heartbeat_age_seconds{server_id}` (agent
+    liveness), `autodeploy_environments_reconciliation_required`, `autodeploy_release_operations_open`,
+    `autodeploy_webhook_jobs{state}`, `autodeploy_releases{state}`.
+  - Label rule: only bounded enums and server ids; never owner/project/environment names, hostnames, or repo names.
+  Agent-side counters stay in the journal (D3); no agent listener.
+- 22-4d decrypt canary (D5): `secrets secret verify` decrypts every live secret version with the current ring,
+  discards plaintext immediately, prints only `checked=N failed=M` plus failing version ids, exit non-zero on any
+  failure; read-only, no audit write, never prints values or lengths. Required by ADR 0003 restore step.
+- 22-4e backup/DR docs + script (D6): `docs/operations/backup-restore.md` and `deploy/host/backup-db.sh`
+  (`docker exec autodeploy-postgres pg_dump -Fc` to a 0600 file under a root-only dir; encryption/off-host copy left
+  to the operator per ADR 0003). Doc covers: what to back up (DB dump; KEK files + manifest separately; the rest of
+  /etc/autodeploy/controlplane keys; agent credential is reissued, not restored), retention/KEK-retire coupling,
+  restore order (stop agent + control plane -> restore DB -> install KEKs -> fresh active KEK id via init-active-kek
+  -> old KEK kept for decrypt only (no read-only flag exists in code today: the manifest's active id
+  is the only write key, so 22-4e confirms init-active-kek is sufficient or raises it) -> `secrets secret verify` -> /readyz -> start control plane -> start agent), what a restored
+  DB older than the agent's pending activation records does (reconciliation block, operator resolve), total-KEK-loss
+  procedure (secrets unrecoverable: replace every secret value, deployments without secrets keep running), Traefik
+  route files and app containers are reconstructed by the next deploy. Also the gate 12 drain-before-downgrade
+  note (closes gate 12 on paper; Phase 5 keeps the real-host check).
+
+**Decisions for owner:**
+- D1 metrics library: hand-rolled text format, no new dependency (recommended; we need ~10 series) vs
+  prometheus/client_golang (standard, adds a sizeable dependency tree).
+- D2 log format: slog key=value text (recommended; journald + grep friendly) vs slog JSON (better for a log shipper
+  later) vs keep stdlib log and only fix the stray prints (cheapest; "structured" not met).
+- D3 agent metrics: derive agent liveness and job state from the DB on the control plane (recommended; no new agent
+  listener or attack surface) vs a loopback /metrics listener on the agent too.
+- D4 exposure: separate loopback-only listener, disabled by default (recommended) vs `/metrics` on the public
+  listener behind a bearer token file.
+- D5 add `secrets secret verify` now (recommended; ADR 0003 makes it part of every restore) vs document a manual
+  canary.
+- D6 ship a backup script + a restore drill on the acer (recommended; ADR 0003 requires a tested restore before
+  production) vs docs only.
+
+**Tests (fail first):** 22-4a/b log capture per failure path asserting redaction (DSN, bearer, enrollment token,
+secret fixture) and required fields; 22-4c exposition format golden test, counters increment on real handler paths,
+gauge query against PG18 (integration), cache honoured, scrape timeout returns `autodeploy_db_up 0` not a hang,
+non-loopback address refused, listener absent when unset; 22-4d integration: put two secrets -> verify ok; corrupt
+one ciphertext -> verify fails naming that id, output never contains the value; 22-4e shellcheck + a mac drill
+(dump PG18 container, drop DB, restore, verify passes).
+**Acer validation:** enable the metrics listener, `curl 127.0.0.1:<port>/metrics` during a deploy (heartbeat age,
+job states move); `journalctl -u autodeploy-agent` shows key=value lines; full backup -> restore drill per the doc
+on the acer (one owner sudo round per step), `secrets secret verify` passes, a deploy succeeds after restore.
+**Risks:** slog migration touches many agent files (mechanical, but review every redaction seam; journal greps in
+the acer recipe change shape -> update the recipe in memory); restore drill on the acer touches the live DB (take a
+dump first, drill on a scratch database name before the real one); cardinality creep (label rule above, enforced
+by a test listing allowed label names).
+**Estimate:** ~1.5 days mac + one acer session. Review: yes (logging redaction, secret canary, new listener).
+**Outcome effect:** +1 outcome (observability) after acer proof, independent of the build outcome.
+
 ## Progress
 - 2026-11-16: roadmap written; 22-1 investigation started.
 - 2026-11-16: 22-1a DONE (uncommitted): migration 000028 (5 columns both tables, named CHECKs + cross CHECKs,
@@ -251,3 +341,61 @@ integration: put then the binding form accepts the printed id and a claim freeze
   `docker save | grep -c` for the value (expect 0), buildx du under the cap; (4) build timeout and memory-cap checks
   need agent flag overrides (systemd drop-in, owner sudo) -> plan them; (5) crash-recovery test; then tick the build
   outcome (13/18) and move to Phase 3 (observability). UI (22-3) stays last.
+- 2026-11-19: 22-4 design APPROVED (D1-D6 as recommended). 22-4a DONE (uncommitted; owner: commit 22-4a+22-4b
+  together): 8 direct stderr prints in internal/web + internal/agent/http now go through the injected redacting
+  logger as fixed message + stage + errclass token (internal/errclass: context_canceled, deadline_exceeded,
+  postgres_<SQLSTATE>, postgres, other; typed-nil safe); nil logger discards; internal/testutil/srcguard AST guard
+  (os.Stderr/Stdout, log.Print*/Fatal*/Panic*, print/println) in both packages; agent builder Logf wired explicitly.
+  Review PASS WITH NOTES -> fixed (vacuous checkout tests reworked, discard assertions, AST guard, typed-nil).
+  Orchestrator mutation checks: error text re-added -> 3 checkout tests fail; os.Stderr re-added -> guard fails.
+  Limits: lease-start step always class=other (githubapp flattens to ErrCheckoutStale); builder.go:281 logs buildx
+  error text to the agent journal (covered by 22-4b agent redaction).
+- 2026-11-19: 22-4b split: (1) internal/logging + control plane, (2) agent sites. Finding: crypto.RedactingWriter
+  streams and holds back maxPattern-1 bytes while values are loaded -> a long-lived writer under slog would delay
+  each line's tail; design = per-record redaction (format record, fresh writer Write+Close, regex pass, one Write
+  under mutex). 22-4b-1 in progress.
+- 2026-11-19: 22-4b DONE (uncommitted, with 22-4a). internal/logging: slog key=value, no time attr (journald),
+  INFO; per-record redaction = exact values + base64 + slog-escaped forms (derived via slog's own TextHandler) via a
+  fresh RedactingWriter, then internal/logsanitize regex pass (moved out of agenthttp, cap kept there), one Write
+  under a mutex, fixed drop line on failure. Control plane: fixed msg + stage/class attrs, SetDefault at start of
+  run(), ErrorLog shares the process logger. Agent: ~70 sites moved; NewAgent redacts the credential token;
+  logging.Err allowed agent-side only; logship tees + build output through the logger (per-attempt redaction still
+  upstream); log.Default fallbacks removed (nil -> discard). srcguard import-aware (renamed/dot imports, fmt.Print*,
+  log setters, os.NewFile, syscall.Stderr) on 7 packages. Reviews: 22-4b-1 PASS WITH NOTES (HIGH escaped-secret gap
+  fixed, ErrorLog, guard, SetDefault order); final whole-change review PASS WITH NOTES (no critical/high; empty
+  build-output chunks now skipped). Mutation checks: token values nil -> redaction test fails; escaping disabled ->
+  8 subtests fail; Close removed -> holdback tests fail. Windows vet fails at HEAD already (internal/gitcheckout),
+  pre-existing. Acer journal greps change shape (attempt_id=N) -> update acer recipe after install.
+- 2026-11-19: 22-4c DONE (uncommitted). internal/metrics (hand-rolled 0.0.4 exposition, label allow-list, GaugeSet =
+  one collect per WriteText, Cache with 15s success / 5s failure TTL + single in-flight); MetricsSnapshot = one
+  UNION ALL in a READ ONLY tx with SET LOCAL statement_timeout sent as its own statement first (batched, pgx
+  prepares before the SET and a migration lock hung it; test: ACCESS EXCLUSIVE -> postgres_57014 fast); state lists
+  mirrored from CHECKs + integration test vs pg_get_constraintdef; webhook gauge pending-only (partial index);
+  never-heartbeated/revoked servers omitted. AUTODEPLOY_METRICS_LISTEN_ADDRESS loopback IP literal only (4in6 ok),
+  GET/HEAD /metrics only, bind failure fails startup, later Serve failure only logs (optional endpoint never kills
+  the control plane). Review PASS WITH NOTES -> fixed (non-fatal metrics Serve, one snapshot per scrape, failure
+  TTL, panic-path + 4in6 tests). Owner-side decision (orchestrator): no indexes/migration for agent_jobs/releases
+  GROUP BY scans (single-host scale; document limit + alert on db_up in 22-4e). Mutation: loopback check removed ->
+  config table test fails.
+- 2026-11-19: 22-4d DONE (uncommitted). `secrets secret verify`: generation check before any read; pages
+  secret_versions state active|superseded (revoked excluded: materialization refuses it at SQL level; can-retire
+  still counts revoked) by id in READ ONLY txs; real crypto.Decrypt + production cryptoScope; plaintext cleared;
+  no ledger/audit/row writes (integration snapshots identical); output counts + `failed version= kek= reason=`
+  (kek_missing|kek_invalid|unwrap_failed|decrypt_failed|envelope_invalid), unsafe ids %q-quoted, failure list capped
+  at 10000; no TTY preflight for verify only. crypto.Decrypt failures now also match stage markers (stageError, same
+  text; only the verifier branches on them). Run with writers stopped (not one snapshot). Review PASS WITH NOTES ->
+  fixed (kek_invalid, snapshot caveat, cap test, id quoting). Mutation: decrypt errors ignored -> verifier test
+  fails. Follow-up (pre-existing): rewrap has no generation-binding check (only init-active-kek does).
+- 2026-11-19: 22-4e DONE (uncommitted). docs/operations/backup-restore.md (what to back up; KEK set separate per
+  ADR 0003; restore order: stop agent+CP -> rename live DB (record name) -> pg_restore into fresh DB (failure ->
+  drop partial, rename back) -> KEKs+manifest (controlplane-github.env required) -> fresh active KEK + init-active-kek
+  -> `secret verify` failed=0 with writers stopped -> CP + /readyz -> agent; total KEK loss; drill checklist;
+  downgrade rule = gate 12 closed on paper: forward-only migrations, drain before older build), observability.md,
+  deploy/host/backup-db.sh (pg_dump -Fc via docker exec, 0700/0600, temp+mv, TOC check; sha256 recording mandatory).
+  install-app.sh: AUTODEPLOY_METRICS_LISTEN_ADDRESS tunable (was a commented line lost on every regenerate),
+  validated (loopback literal, octets/leading zeros, port<=65535, 8080 refused). Mac drill: dump/restore row counts
+  match (54 tables). Accuracy review PASS WITH NOTES -> fixed. README backups section + IMPLEMENTATION_STATUS refresh
+  (86% weighted, gates 14/15). Unproven until acer drill: restored-DB-older-than-agent-state behaviour, KEK restore
+  steps end to end, `secret put` + rebind guidance for heads without an active version.
+  NEXT: commit 22-4 (all slices) -> acer: install, metrics during a deploy, journal format (update acer recipe greps
+  to attempt_id=N), backup/restore drill on a scratch DB, then tick observability.

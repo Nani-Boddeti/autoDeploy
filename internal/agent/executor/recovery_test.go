@@ -2,7 +2,7 @@ package executor
 
 import (
 	"errors"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +56,7 @@ func TestRecoverActivationsConvertsAuthorizedToFailure(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &recoveryFake{records: []state.PendingActivation{rec}}
-			if n := recoverActivations(f, "/routes", tc.read, log.New(&strings.Builder{}, "", 0)); n != 1 {
+			if n := recoverActivations(f, "/routes", tc.read, slog.New(slog.NewTextHandler(&strings.Builder{}, nil))); n != 1 {
 				t.Fatalf("converted=%d", n)
 			}
 			if len(f.saved) != 1 {
@@ -95,10 +95,10 @@ func TestRecoverActivationsLeavesOtherRecordsUntouched(t *testing.T) {
 func TestRecoverActivationsScanErrorIsLoggedNotFatal(t *testing.T) {
 	var buf strings.Builder
 	f := &recoveryFake{scanErr: errors.New("permission denied")}
-	if n := recoverActivations(f, "/routes", nil, log.New(&buf, "", 0)); n != 0 {
+	if n := recoverActivations(f, "/routes", nil, slog.New(slog.NewTextHandler(&buf, nil))); n != 0 {
 		t.Fatalf("converted=%d", n)
 	}
-	if !strings.Contains(buf.String(), "ERROR") || !strings.Contains(buf.String(), "cannot scan") {
+	if !strings.Contains(buf.String(), "level=ERROR") || !strings.Contains(buf.String(), "cannot scan") {
 		t.Fatalf("scan error not logged loudly: %q", buf.String())
 	}
 }
@@ -110,13 +110,13 @@ func TestRecoverActivationsOneSaveErrorDoesNotStopTheOthers(t *testing.T) {
 		saveErrOn: map[int64]error{2: errors.New("disk full")},
 	}
 	read := func(string, string) (string, bool, error) { return "", false, nil }
-	if n := recoverActivations(f, "/routes", read, log.New(&buf, "", 0)); n != 2 {
+	if n := recoverActivations(f, "/routes", read, slog.New(slog.NewTextHandler(&buf, nil))); n != 2 {
 		t.Fatalf("converted=%d, want 2", n)
 	}
 	if len(f.saved) != 2 || f.saved[0].AttemptID != 1 || f.saved[1].AttemptID != 3 {
 		t.Fatalf("saved = %+v", f.saved)
 	}
-	if !strings.Contains(buf.String(), "attempt 2") || !strings.Contains(buf.String(), "ERROR") {
+	if !strings.Contains(buf.String(), "attempt_id=2") || !strings.Contains(buf.String(), "level=ERROR") {
 		t.Fatalf("save error not logged: %q", buf.String())
 	}
 }
@@ -162,7 +162,7 @@ func TestRecoverActivationsWithDrainFieldsConvertsToFailureAndArmsNothing(t *tes
 	rec.DrainSeconds = 30
 	f := &recoveryFake{records: []state.PendingActivation{rec}}
 	read := func(string, string) (string, bool, error) { return "", false, nil }
-	if n := recoverActivations(f, "/routes", read, log.New(&strings.Builder{}, "", 0)); n != 1 {
+	if n := recoverActivations(f, "/routes", read, slog.New(slog.NewTextHandler(&strings.Builder{}, nil))); n != 1 {
 		t.Fatalf("converted=%d", n)
 	}
 	got := f.saved[0]

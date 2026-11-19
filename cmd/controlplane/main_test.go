@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -26,7 +27,7 @@ func TestActivationEnabledStaysFalse(t *testing.T) {
 }
 
 func TestNewHTTPServerUsesProductionLimits(t *testing.T) {
-	server := newHTTPServer("127.0.0.1:8080", http.NotFoundHandler())
+	server := newHTTPServer("127.0.0.1:8080", http.NotFoundHandler(), controlplaneLogger(io.Discard, nil))
 	if server.Addr != "127.0.0.1:8080" || server.ReadHeaderTimeout != readHeaderTimeout || server.ReadTimeout != readTimeout || server.WriteTimeout != writeTimeout || server.IdleTimeout != idleTimeout || server.MaxHeaderBytes != maxHeaderBytes {
 		t.Fatal("control-plane server limits were not configured")
 	}
@@ -69,7 +70,7 @@ func namedHandler(name string) http.Handler {
 
 func TestComposeHTTPHandlerRoutesAgentAndWebhookBeforeBrowser(t *testing.T) {
 	browser, webhook, agent := namedHandler("browser"), namedHandler("webhook"), namedHandler("agent")
-	composed := composeHTTPHandler(browser, webhook, agent)
+	composed := composeHTTPHandler(browser, webhook, agent, nil)
 
 	cases := []struct {
 		path string
@@ -94,7 +95,7 @@ func TestComposeHTTPHandlerRoutesAgentAndWebhookBeforeBrowser(t *testing.T) {
 
 func TestComposeHTTPHandlerAgentDisabledLeavesBrowserBehaviorUnchanged(t *testing.T) {
 	browser := namedHandler("browser")
-	composed := composeHTTPHandler(browser, nil, nil)
+	composed := composeHTTPHandler(browser, nil, nil, nil)
 	for _, path := range []string{agenthttp.Prefix + "enroll", githubhttp.Path, "/login"} {
 		request := httptest.NewRequest(http.MethodPost, "http://example.test"+path, nil)
 		response := httptest.NewRecorder()
@@ -119,7 +120,7 @@ func TestHTTPServerShutdownWaitsForInflightRequest(t *testing.T) {
 		once.Do(func() { close(started) })
 		<-release
 		w.WriteHeader(http.StatusNoContent)
-	}))
+	}), controlplaneLogger(io.Discard, nil))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if errors.Is(err, syscall.EPERM) {
 		t.Skip("loopback listeners are unavailable in this sandbox")

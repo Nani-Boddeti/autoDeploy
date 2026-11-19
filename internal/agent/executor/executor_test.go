@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -178,7 +178,7 @@ func fakeBuildFunc(result docker.BuildResult, err error, captured *docker.BuildR
 	}
 }
 
-func testLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func testInspect(networkID string) docker.ContainerInspect {
 	inspect := docker.ContainerInspect{ID: "container1"}

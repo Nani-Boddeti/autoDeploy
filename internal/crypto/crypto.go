@@ -24,7 +24,21 @@ var (
 	ErrInvalidEnvelope   = errors.New("invalid secret envelope")
 	ErrUnknownKey        = errors.New("unknown secret encryption key")
 	ErrCryptographicFail = errors.New("secret cryptographic operation failed")
+	// Decrypt failures also match one of these stage markers (errors.Is) so an
+	// operator check can say which step failed. Neither carries data.
+	ErrInvalidKey      = errors.New("secret key malformed")
+	ErrUnwrapFailed    = errors.New("secret key unwrap failed")
+	ErrValueOpenFailed = errors.New("secret value open failed")
 )
+
+// stageError reports ErrCryptographicFail's fixed text while also matching the
+// failing stage; it never carries key, plaintext or ciphertext material.
+type stageError struct{ stage error }
+
+func (e stageError) Error() string { return ErrCryptographicFail.Error() }
+func (e stageError) Is(target error) bool {
+	return target == ErrCryptographicFail || target == e.stage
+}
 
 // Scope contains only immutable identifiers required to reconstruct AAD.
 type Scope struct {
@@ -91,20 +105,20 @@ func Decrypt(provider KeyProvider, scope Scope, envelope Envelope) ([]byte, erro
 	}
 	kek, err := provider.Resolve(envelope.KEKID)
 	if err != nil {
-		return nil, ErrCryptographicFail
+		return nil, stageError{ErrUnknownKey}
 	}
 	defer clear(kek)
 	if len(kek) != 32 {
-		return nil, ErrCryptographicFail
+		return nil, stageError{ErrInvalidKey}
 	}
 	dek, err := open(kek, envelope.WrappedDEK, wrapAAD(envelope.KEKID, scope))
 	if err != nil || len(dek) != 32 {
-		return nil, ErrCryptographicFail
+		return nil, stageError{ErrUnwrapFailed}
 	}
 	defer clear(dek)
 	plaintext, err := open(dek, envelope.Ciphertext, valueAAD(scope))
 	if err != nil || len(plaintext) > MaxPlaintextBytes {
-		return nil, ErrCryptographicFail
+		return nil, stageError{ErrValueOpenFailed}
 	}
 	return plaintext, nil
 }

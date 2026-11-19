@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +14,7 @@ import (
 	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/agent/state"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/queue"
 	"autodeploy/internal/runtime/traefik"
 )
@@ -153,7 +154,7 @@ type activationRunner struct {
 	reportBackoff    time.Duration
 	timeout          time.Duration
 	verifyTimeout    time.Duration
-	logger           *log.Logger
+	logger           *slog.Logger
 }
 
 // ValidateActivationTimeout rejects an explicit overall activation deadline
@@ -170,7 +171,7 @@ func ValidateActivationTimeout(activation, probe, verify time.Duration) error {
 	return nil
 }
 
-func newActivationRunner(cfg ActivationConfig, logger *log.Logger) (*activationRunner, error) {
+func newActivationRunner(cfg ActivationConfig, logger *slog.Logger) (*activationRunner, error) {
 	if cfg.Client == nil || cfg.Observer == nil || cfg.Store == nil || cfg.Revisions == nil || cfg.Drains == nil ||
 		cfg.RouteDir == "" || cfg.ProbeAddress == "" || cfg.ProbeTimeout <= 0 {
 		return nil, errors.New("agent executor: incomplete activation configuration")
@@ -239,7 +240,7 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 			class = queue.FailureClassTransient
 		}
 		logs.Linef(logship.StreamActivation, "activation: traefik api check failed (%s)", class)
-		a.logger.Printf("agent activation attempt %d: traefik api check failed before authorization (%s); route untouched: %v", lease.AttemptID, class, perr)
+		a.logger.Warn("agent activation: traefik api check failed before authorization; route untouched", logging.KeyAttemptID, lease.AttemptID, logging.KeyClass, class, logging.Err(perr))
 		return e.outcome(lease, false, class)
 	}
 	logs.Linef(logship.StreamActivation, "activation: requesting authorization")
@@ -248,12 +249,12 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 	if err != nil {
 		if class, definite := classifyActivateRefusal(err); definite {
 			logs.Linef(logship.StreamActivation, "activation: refused by the control plane (%s)", class)
-			a.logger.Printf("agent activation refused by the control plane (attempt %d): %v", lease.AttemptID, err)
+			a.logger.Warn("agent activation refused by the control plane", logging.KeyAttemptID, lease.AttemptID, logging.Err(err))
 			return e.outcome(lease, false, class)
 		}
 		logs.Linef(logship.StreamActivation, "activation: authorization state unknown; route untouched")
-		a.logger.Printf("agent activation ERROR attempt %d: authorization state UNKNOWN after %d tries; route untouched, sending no completion (the attempt will expire and an operator may need to declare not_activated): %v",
-			lease.AttemptID, a.activateAttempts, err)
+		a.logger.Error("agent activation: authorization state UNKNOWN; route untouched, sending no completion (the attempt will expire and an operator may need to declare not_activated)",
+			logging.KeyAttemptID, lease.AttemptID, "tries", a.activateAttempts, logging.Err(err))
 		return agentclient.Outcome{AuthorizationUnknown: true, OperationID: fmt.Sprintf("op-%d-%d", lease.AttemptID, lease.Fence)}
 	}
 
@@ -284,7 +285,7 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 		DrainSeconds:                 lease.DrainSeconds,
 	}
 	if err := a.cfg.Store.SaveActivation(rec); err != nil {
-		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the authorized record, route untouched: %v", lease.AttemptID, err)
+		a.logger.Error("agent activation: cannot persist the authorized record, route untouched", logging.KeyAttemptID, lease.AttemptID, logging.Err(err))
 		if res, rerr := agentclient.ActivationFailed(boundSummary("host untouched: the agent could not persist the authorized activation record, so the route was not written")); rerr == nil {
 			a.reportDirect(dctx, rec, res)
 		}
@@ -311,7 +312,7 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 	} else {
 		rec.FailureSummary = summary
 		logs.Linef(logship.StreamActivation, "activation: route switch failed; see the activation result")
-		a.logger.Printf("agent activation ERROR attempt %d: %s", lease.AttemptID, summary)
+		a.logger.Error("agent activation: route switch failed", logging.KeyAttemptID, lease.AttemptID, "summary", summary)
 	}
 	if err := a.saveWithRetry(rec); err != nil {
 		// The record is still `authorized`, and the reporter intentionally
@@ -320,7 +321,7 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 		// If that also fails, the `authorized` record stays on disk and
 		// recovery (after this lease returns, or at startup) converts it into
 		// a result_ready failure with on-disk evidence for the reporter.
-		a.logger.Printf("agent activation ERROR attempt %d: cannot persist the result record after retries: %v", lease.AttemptID, err)
+		a.logger.Error("agent activation: cannot persist the result record after retries", logging.KeyAttemptID, lease.AttemptID, logging.Err(err))
 		// A 200 acknowledgement of a success with a predecessor must first
 		// make the drain durable. If arming fails, the real result is saved
 		// once more (below): a result_ready success record hands the drain
@@ -335,11 +336,11 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 		if terminal && acked && !a.armDrainWithRetry(rec) {
 			mayDelete = false
 			if serr := a.saveWithRetry(rec); serr != nil {
-				a.logger.Printf("agent activation ERROR attempt %d: drain obligation LOST: the report was acknowledged but neither the drain nor the result record could be persisted; predecessor release %s must be stopped by an operator: %v",
-					lease.AttemptID, rec.PredecessorReleaseID, serr)
+				a.logger.Error("agent activation: drain obligation LOST: the report was acknowledged but neither the drain nor the result record could be persisted; the predecessor release must be stopped by an operator",
+					logging.KeyAttemptID, lease.AttemptID, logging.KeyReleaseID, rec.PredecessorReleaseID, logging.Err(serr))
 			} else {
-				a.logger.Printf("agent activation ERROR attempt %d: the report was acknowledged but the predecessor drain could not be armed; the result record was saved so the reporter re-reports it and arms the drain (predecessor release %s)",
-					lease.AttemptID, rec.PredecessorReleaseID)
+				a.logger.Error("agent activation: the report was acknowledged but the predecessor drain could not be armed; the result record was saved so the reporter re-reports it and arms the drain",
+					logging.KeyAttemptID, lease.AttemptID, logging.KeyReleaseID, rec.PredecessorReleaseID)
 			}
 		}
 		if mayDelete {
@@ -353,7 +354,7 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 			// reconciliation_required operation -> late_report_recorded
 			// (store/postgres ReportActivationResult; traced in 10d-4 review).
 			if derr := a.cfg.Store.DeleteActivation(rec.AttemptID); derr != nil {
-				a.logger.Printf("agent activation ERROR attempt %d: cannot delete the authorized record after a terminal direct report; recovery will re-report it and the server will answer terminally: %v", lease.AttemptID, derr)
+				a.logger.Error("agent activation: cannot delete the authorized record after a terminal direct report; recovery will re-report it and the server will answer terminally", logging.KeyAttemptID, lease.AttemptID, logging.Err(derr))
 			}
 		}
 	}
@@ -425,7 +426,7 @@ func (a *activationRunner) authorize(ctx context.Context, lease agentclient.Leas
 		}
 		sawUnknown = true
 		lastErr = err
-		a.logger.Printf("agent activation attempt %d: Activate answer unknown (try %d/%d): %v", lease.AttemptID, i+1, a.activateAttempts, err)
+		a.logger.Warn("agent activation: Activate answer unknown", logging.KeyAttemptID, lease.AttemptID, "try", i+1, "tries", a.activateAttempts, logging.Err(err))
 	}
 	return agentclient.ActivateResponse{}, lastErr
 }
@@ -486,7 +487,7 @@ func (a *activationRunner) reportDirect(ctx context.Context, rec state.PendingAc
 			return true, err == nil
 		}
 	}
-	a.logger.Printf("agent activation ERROR attempt %d: direct report did not land (last: %v); the authorized record stays on disk for recovery to convert", rec.AttemptID, err)
+	a.logger.Error("agent activation: direct report did not land; the authorized record stays on disk for recovery to convert", logging.KeyAttemptID, rec.AttemptID, logging.Err(err))
 	return false, false
 }
 
@@ -517,11 +518,11 @@ func (a *activationRunner) armDrain(rec state.PendingActivation) bool {
 		return true
 	}
 	if a.cfg.Drains == nil {
-		a.logger.Printf("agent activation ERROR attempt %d: a predecessor drain is owed but no drain store is configured; the predecessor will not be stopped", rec.AttemptID)
+		a.logger.Error("agent activation: a predecessor drain is owed but no drain store is configured; the predecessor will not be stopped", logging.KeyAttemptID, rec.AttemptID)
 		return true
 	}
 	if err := a.cfg.Drains.ArmDrain(d); err != nil {
-		a.logger.Printf("agent activation ERROR attempt %d: report acknowledged but the predecessor drain could not be armed; the activation record is kept: %v", rec.AttemptID, err)
+		a.logger.Error("agent activation: report acknowledged but the predecessor drain could not be armed; the activation record is kept", logging.KeyAttemptID, rec.AttemptID, logging.Err(err))
 		return false
 	}
 	return true

@@ -3,10 +3,11 @@ package agentclient
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"time"
 
 	"autodeploy/internal/agent/state"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/queue"
 )
 
@@ -75,7 +76,7 @@ type Agent struct {
 	Client   *Client
 	State    state.Store
 	Executor Executor // nil in production this slice.
-	Logger   *log.Logger
+	Logger   *slog.Logger
 	Version  string // agent build version reported on every heartbeat.
 	StateDir string // used only for the best-effort disk-free capability read.
 
@@ -107,11 +108,13 @@ func (a *Agent) renewInterval() time.Duration {
 	return renewInterval
 }
 
-func (a *Agent) logger() *log.Logger {
-	if a.Logger == nil {
-		return log.Default()
+// logger is the agent's component logger; a nil Logger discards.
+func (a *Agent) logger() *slog.Logger {
+	base := a.Logger
+	if base == nil {
+		base = slog.New(slog.DiscardHandler)
 	}
-	return a.Logger
+	return base.With(logging.KeyComponent, "agent")
 }
 
 // Run blocks until ctx is cancelled, heartbeating at the interval the
@@ -128,7 +131,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			defer close(done)
 			if err := a.Reporter.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				a.logger().Printf("agent activation reporter stopped: %v", err)
+				a.logger().Error("agent activation reporter stopped", "subsystem", "reporter", logging.Err(err))
 			}
 		}()
 		defer func() { <-done }()
@@ -139,7 +142,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			defer close(done)
 			if err := a.Drainer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				a.logger().Printf("agent predecessor drainer stopped: %v", err)
+				a.logger().Error("agent predecessor drainer stopped", "subsystem", "drainer", logging.Err(err))
 			}
 		}()
 		defer func() { <-done }()
@@ -149,7 +152,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			defer close(done)
 			if err := a.Cleaner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				a.logger().Printf("agent retention cleaner stopped: %v", err)
+				a.logger().Error("agent retention cleaner stopped", "subsystem", "cleaner", logging.Err(err))
 			}
 		}()
 		defer func() { <-done }()
@@ -182,7 +185,7 @@ func (a *Agent) tick(ctx context.Context) time.Duration {
 		// Client itself; every other failure (network/503/etc.) is
 		// transient and simply retried on the next tick.
 		if !errors.Is(err, ErrUnauthorized) {
-			a.logger().Print("agent heartbeat failed")
+			a.logger().Warn("agent heartbeat failed")
 		}
 		return 0
 	}
@@ -209,7 +212,7 @@ func (a *Agent) claimAndRun(ctx context.Context) {
 	leases, err := a.Client.Claim(ctx, true)
 	if err != nil {
 		if !errors.Is(err, ErrUnauthorized) {
-			a.logger().Print("agent claim failed")
+			a.logger().Warn("agent claim failed")
 		}
 		return
 	}
@@ -241,11 +244,11 @@ func (a *Agent) recoverStranded() {
 func (a *Agent) runLease(ctx context.Context, lease Lease) {
 	stored, existed, err := a.State.Load(lease.EnvironmentID)
 	if err != nil {
-		a.logger().Print("agent fence state unreadable; refusing to act on environment")
+		a.logger().Error("agent fence state unreadable; refusing to act on environment", logging.KeyAttemptID, lease.AttemptID)
 		return
 	}
 	if existed && lease.Fence <= stored.HighestAcceptedFence {
-		a.logger().Print("agent rejecting lease: environment reconciling or fence not advancing")
+		a.logger().Warn("agent rejecting lease: environment reconciling or fence not advancing", logging.KeyAttemptID, lease.AttemptID)
 		return
 	}
 	if existed && stored.ReconciliationRequired {
@@ -253,10 +256,10 @@ func (a *Agent) runLease(ctx context.Context, lease Lease) {
 		// hands out nothing for a flagged slot, so a strictly higher fence
 		// proves an operator resolved it. The Save below writes a Fence with
 		// the flag false, clearing it atomically with the fence advance.
-		a.logger().Print("agent cleared local reconciliation flag: server issued a higher fence")
+		a.logger().Info("agent cleared local reconciliation flag: server issued a higher fence", logging.KeyAttemptID, lease.AttemptID)
 	}
 	if err := a.State.Save(state.Fence{EnvironmentID: lease.EnvironmentID, HighestAcceptedFence: lease.Fence}); err != nil {
-		a.logger().Print("agent failed to persist fence state; refusing to act")
+		a.logger().Error("agent failed to persist fence state; refusing to act", logging.KeyAttemptID, lease.AttemptID)
 		return
 	}
 
@@ -307,10 +310,10 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 	var err error
 	switch {
 	case outcome.HandedOff:
-		a.logger().Print("agent activation handed off to the reporter; sending no completion")
+		a.logger().Info("agent activation handed off to the reporter; sending no completion", logging.KeyAttemptID, lease.AttemptID)
 		return
 	case outcome.AuthorizationUnknown:
-		a.logger().Print("agent activation authorization unknown; sending no completion or cancel acknowledgement, the attempt will expire")
+		a.logger().Warn("agent activation authorization unknown; sending no completion or cancel acknowledgement, the attempt will expire", logging.KeyAttemptID, lease.AttemptID)
 		return
 	case cancelled:
 		err = a.Client.CancelAck(ctx, lease.AttemptID, lease.Fence, outcome.OperationID, outcome.ResultDigest)
@@ -321,14 +324,14 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 	}
 	switch {
 	case cancelled:
-		a.logger().Printf("agent attempt %d finished: cancelled", lease.AttemptID)
+		a.logger().Info("agent attempt finished: cancelled", logging.KeyAttemptID, lease.AttemptID)
 	case outcome.Succeeded:
-		a.logger().Printf("agent attempt %d finished: succeeded", lease.AttemptID)
+		a.logger().Info("agent attempt finished: succeeded", logging.KeyAttemptID, lease.AttemptID)
 	default:
-		a.logger().Printf("agent attempt %d finished: failed (%s)", lease.AttemptID, outcome.FailureClass)
+		a.logger().Info("agent attempt finished: failed", logging.KeyAttemptID, lease.AttemptID, logging.KeyFailureClass, outcome.FailureClass)
 	}
 	if err != nil {
-		a.logger().Print("agent lease outcome report failed")
+		a.logger().Error("agent lease outcome report failed", logging.KeyAttemptID, lease.AttemptID)
 	}
 }
 
@@ -338,12 +341,12 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 func (a *Agent) markReconciliationRequired(environmentID string) {
 	stored, _, err := a.State.Load(environmentID)
 	if err != nil {
-		a.logger().Print("agent could not read fence state to mark reconciliation required")
+		a.logger().Error("agent could not read fence state to mark reconciliation required")
 		return
 	}
 	stored.EnvironmentID = environmentID
 	stored.ReconciliationRequired = true
 	if err := a.State.Save(stored); err != nil {
-		a.logger().Print("agent could not persist reconciliation-required state")
+		a.logger().Error("agent could not persist reconciliation-required state")
 	}
 }

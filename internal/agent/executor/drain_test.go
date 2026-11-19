@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -200,7 +200,7 @@ func newDrainHarness(t *testing.T) *drainHarness {
 func (h *drainHarness) newDrainer() *Drainer {
 	return &Drainer{
 		Store: h.store, Docker: h.docker, RouteDir: "/route-dir", Reporter: h.reporter,
-		Logger:      log.New(h.logs, "", 0),
+		Logger:      slog.New(slog.NewTextHandler(h.logs, nil)),
 		ReadDigest:  func(string, string) (string, bool, error) { return h.digest, h.exists, h.rdErr },
 		Now:         func() time.Time { return h.now },
 		Monotonic:   func() time.Time { return h.mono },
@@ -395,7 +395,7 @@ func TestDrainContainerGoneDeletesRecordWithoutStop(t *testing.T) {
 	if h.docker.count("stop") != 0 || h.docker.count("list") != 0 {
 		t.Fatalf("calls = %v", h.docker.calls)
 	}
-	if !strings.Contains(h.logs.String(), "INFO") {
+	if !strings.Contains(h.logs.String(), "level=INFO") {
 		t.Fatal("no INFO log")
 	}
 }

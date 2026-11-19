@@ -3,13 +3,14 @@ package agentclient
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
 
 	"autodeploy/internal/agent/state"
+	"autodeploy/internal/logging"
 )
 
 // Reporter defaults (tasks/10d-plan.md, 10d-4).
@@ -66,7 +67,7 @@ type drainArmer interface {
 type ActivationReporter struct {
 	Client activationReportClient
 	Store  activationRecordStore
-	Logger *log.Logger
+	Logger *slog.Logger
 	// Drains arms the predecessor drain (10e-3). On a 200 answer to a SUCCESS
 	// report of a record with a predecessor the drain is saved BEFORE the
 	// activation record is deleted; if arming fails the record is kept and the
@@ -120,11 +121,13 @@ func (r *ActivationReporter) Validate() error {
 	return nil
 }
 
-func (r *ActivationReporter) logger() *log.Logger {
-	if r.Logger == nil {
-		return log.Default()
+// logger is the reporter's component logger; a nil Logger discards.
+func (r *ActivationReporter) logger() *slog.Logger {
+	base := r.Logger
+	if base == nil {
+		base = slog.New(slog.DiscardHandler)
 	}
-	return r.Logger
+	return base.With(logging.KeyComponent, "reporter")
 }
 
 func (r *ActivationReporter) clock() time.Time {
@@ -203,7 +206,7 @@ func (r *ActivationReporter) pass(ctx context.Context, tracks map[int64]*reportT
 	recs, corruptNames, err := r.Store.ScanActivations()
 	if err != nil {
 		// Fail closed: never delete or skip on an unreadable directory.
-		r.logger().Printf("activation reporter: cannot scan pending activations; nothing sent or deleted, retrying: %v", err)
+		r.logger().Warn("activation reporter: cannot scan pending activations; nothing sent or deleted, retrying", logging.Err(err))
 		return r.maxBackoff()
 	}
 	r.logCorrupt(corruptNames)
@@ -308,7 +311,7 @@ func (r *ActivationReporter) logCorrupt(names []string) {
 			continue
 		}
 		r.corruptSeen[n] = now
-		r.logger().Printf("activation reporter: ERROR corrupt entry %q in pending activations; left untouched, operator action required", n)
+		r.logger().Error("activation reporter: corrupt entry in pending activations; left untouched, operator action required", "entry", n)
 	}
 	for n := range r.corruptSeen {
 		if !current[n] {
@@ -330,7 +333,7 @@ func buildResult(p state.PendingActivation) (ActivationResult, error) {
 func (r *ActivationReporter) report(ctx context.Context, p state.PendingActivation, tr *reportTrack) (outage bool) {
 	res, err := buildResult(p)
 	if err != nil {
-		r.logger().Printf("activation reporter: ERROR attempt %d: cannot build result from stored record; keeping record: %v", p.AttemptID, err)
+		r.logger().Error("activation reporter: cannot build result from stored record; keeping record", logging.KeyAttemptID, p.AttemptID, logging.Err(err))
 		r.retryFixed(tr)
 		r.warnStale(p, tr)
 		return false
@@ -352,25 +355,25 @@ func (r *ActivationReporter) report(ctx context.Context, p state.PendingActivati
 		// Nothing was recorded server-side (attempt/fence mismatch, missing
 		// operation row, or no longer the leased occupant): keep the evidence.
 		fixed = true
-		r.logger().Printf("activation reporter: ERROR attempt %d: server answered stale_lease with no confirmation the report was recorded; keeping record, retrying slowly", p.AttemptID)
+		r.logger().Error("activation reporter: server answered stale_lease with no confirmation the report was recorded; keeping record, retrying slowly", logging.KeyAttemptID, p.AttemptID)
 	case errors.Is(err, ErrIntegrityConflict):
 		code, _ := ConflictCode(err)
 		if deleteOnConflict(code) {
 			terminal = true
-			r.logger().Printf("activation reporter: attempt %d: server answered conflict %q; report recorded or decided, terminal", p.AttemptID, code)
+			r.logger().Info("activation reporter: server answered conflict; report recorded or decided, terminal", logging.KeyAttemptID, p.AttemptID, "conflict_code", code)
 		} else {
 			fixed = true
 			if code == "" {
 				code = "unknown"
 			}
-			r.logger().Printf("activation reporter: ERROR attempt %d: server answered conflict %q with no confirmation the report was recorded; keeping record, retrying slowly", p.AttemptID, code)
+			r.logger().Error("activation reporter: server answered conflict with no confirmation the report was recorded; keeping record, retrying slowly", logging.KeyAttemptID, p.AttemptID, "conflict_code", code)
 		}
 	case errors.Is(err, ErrInvalidRequest):
 		fixed = true
-		r.logger().Printf("activation reporter: ERROR attempt %d: server rejected the report body; keeping record, retrying slowly", p.AttemptID)
+		r.logger().Error("activation reporter: server rejected the report body; keeping record, retrying slowly", logging.KeyAttemptID, p.AttemptID)
 	case errors.Is(err, ErrUnauthorized):
 		fixed = true
-		r.logger().Printf("activation reporter: attempt %d: agent credential rejected; keeping record, retrying slowly", p.AttemptID)
+		r.logger().Warn("activation reporter: agent credential rejected; keeping record, retrying slowly", logging.KeyAttemptID, p.AttemptID)
 	default:
 		// ErrServiceUnavailable, ErrTransportFailure, anything unknown.
 		outage = callTimedOut || errors.Is(err, ErrServiceUnavailable) || errors.Is(err, ErrTransportFailure)
@@ -385,7 +388,7 @@ func (r *ActivationReporter) report(ctx context.Context, p state.PendingActivati
 	}
 	if terminal {
 		if derr := r.Store.DeleteActivation(p.AttemptID); derr != nil {
-			r.logger().Printf("activation reporter: attempt %d: report answered but record delete failed; will retry: %v", p.AttemptID, derr)
+			r.logger().Warn("activation reporter: report answered but record delete failed; will retry", logging.KeyAttemptID, p.AttemptID, logging.Err(derr))
 			r.retryBackoff(tr)
 			return false
 		}
@@ -413,7 +416,7 @@ func (r *ActivationReporter) armDrain(p state.PendingActivation) bool {
 		return true
 	}
 	if r.Drains == nil {
-		r.logger().Printf("activation reporter: ERROR attempt %d: a predecessor drain is owed but no drain store is configured; the predecessor will not be stopped", p.AttemptID)
+		r.logger().Error("activation reporter: a predecessor drain is owed but no drain store is configured; the predecessor will not be stopped", logging.KeyAttemptID, p.AttemptID)
 		return true
 	}
 	if err := r.Drains.ArmDrain(d); err != nil {
@@ -423,7 +426,7 @@ func (r *ActivationReporter) armDrain(p state.PendingActivation) bool {
 		now := r.clock()
 		if last, ok := r.armErrSeen[p.AttemptID]; !ok || now.Sub(last) >= durOr(r.corruptLogEvery, time.Hour) {
 			r.armErrSeen[p.AttemptID] = now
-			r.logger().Printf("activation reporter: ERROR attempt %d: report acknowledged but the predecessor drain could not be armed; keeping the activation record, retrying (further occurrences logged hourly): %v", p.AttemptID, err)
+			r.logger().Error("activation reporter: report acknowledged but the predecessor drain could not be armed; keeping the activation record, retrying (further occurrences logged hourly)", logging.KeyAttemptID, p.AttemptID, logging.Err(err))
 		}
 		return false
 	}
@@ -438,7 +441,7 @@ func (r *ActivationReporter) warnStale(p state.PendingActivation, tr *reportTrac
 	age := r.clock().Sub(p.CreatedAt)
 	if age >= durOr(r.StaleAfter, defaultReporterStaleAfter) {
 		tr.staleLogged = true
-		r.logger().Printf("activation reporter: WARNING attempt %d: result unreported for %s; traffic was switched and the control plane has not acknowledged it", p.AttemptID, age.Round(time.Second))
+		r.logger().Warn("activation reporter: result unreported; traffic was switched and the control plane has not acknowledged it", logging.KeyAttemptID, p.AttemptID, "age", age.Round(time.Second).String())
 	}
 }
 

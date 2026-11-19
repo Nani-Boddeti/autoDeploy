@@ -13,13 +13,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"time"
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/github"
+	"autodeploy/internal/logging"
 	"autodeploy/internal/server"
 )
 
@@ -148,13 +149,13 @@ type Client struct {
 	baseURL  string // canonical https origin, no trailing slash or path
 	serverID string
 	token    server.CredentialToken
-	logger   *log.Logger
+	logger   *slog.Logger
 }
 
 // NewClient validates baseURL (HTTPS required; see auth.CanonicalHTTPSOrigin)
 // and serverID before any network use. token may be empty when the Client
 // is only used for Enroll.
-func NewClient(baseURL, serverID string, token server.CredentialToken, httpClient *http.Client, logger *log.Logger) (*Client, error) {
+func NewClient(baseURL, serverID string, token server.CredentialToken, httpClient *http.Client, logger *slog.Logger) (*Client, error) {
 	origin, err := auth.CanonicalHTTPSOrigin(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid control-plane base URL: %w", err)
@@ -172,9 +173,9 @@ func NewClient(baseURL, serverID string, token server.CredentialToken, httpClien
 	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	httpClient = &noRedirect
 	if logger == nil {
-		logger = log.New(io.Discard, "", 0)
+		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Client{http: httpClient, baseURL: origin, serverID: serverID, token: token, logger: logger}, nil
+	return &Client{http: httpClient, baseURL: origin, serverID: serverID, token: token, logger: logger.With(logging.KeyComponent, "client")}, nil
 }
 
 // post marshals body, POSTs it to c.baseURL+path, and strictly decodes a
@@ -269,7 +270,7 @@ func (c *Client) mapStatus(status int, body []byte) error {
 	_ = json.Unmarshal(body, &parsed) // best effort; a malformed body still maps purely by status below
 	switch status {
 	case http.StatusUnauthorized:
-		c.logger.Print("agent credential rejected")
+		c.logger.Warn("agent credential rejected")
 		return ErrUnauthorized
 	case http.StatusConflict:
 		if parsed.Error == conflictStaleLease {

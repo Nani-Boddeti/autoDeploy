@@ -57,6 +57,8 @@ type fakeSecretOperator struct {
 	init, retire error
 	result       secret.RewrapResult
 	rewrap       error
+	verifyResult secret.VerifyResult
+	verifyErr    error
 	calls        []string
 	// put/replace support
 	envScope, headScope secret.Scope
@@ -104,6 +106,10 @@ func (f *fakeSecretOperator) CanRetire(context.Context, string, secretcrypto.Key
 func (f *fakeSecretOperator) Rewrap(_ context.Context, _ secret.RewrapRequest, _ secretcrypto.KeyRing) (secret.RewrapResult, error) {
 	f.calls = append(f.calls, "rewrap")
 	return f.result, f.rewrap
+}
+func (f *fakeSecretOperator) Verify(context.Context, secretcrypto.KeyRing, string) (secret.VerifyResult, error) {
+	f.calls = append(f.calls, "verify")
+	return f.verifyResult, f.verifyErr
 }
 func testSecretDeps(t *testing.T, operator *fakeSecretOperator) secretDependencies {
 	t.Helper()

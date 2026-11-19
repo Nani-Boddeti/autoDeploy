@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -126,12 +126,35 @@ func newHarness(t *testing.T, store activationRecordStore, script map[int64][]er
 	t.Helper()
 	h := &harness{client: &fakeReportClient{script: script}, logs: &bytes.Buffer{}, clock: time.Now()}
 	h.rep = &ActivationReporter{
-		Client: h.client, Store: store, Logger: log.New(&lockedWriter{w: h.logs, mu: &h.mu}, "", 0),
+		Client: h.client, Store: store, Logger: slog.New(slog.NewTextHandler(&lockedWriter{w: h.logs, mu: &h.mu}, &slog.HandlerOptions{ReplaceAttr: dropTime})),
 		MinBackoff: 5 * time.Second, MaxBackoff: 60 * time.Second,
 		now:    func() time.Time { h.mu.Lock(); defer h.mu.Unlock(); return h.clock },
 		jitter: func(m time.Duration) time.Duration { return m }, // always the ceiling
 	}
 	return h
+}
+
+// dropTime removes the time attribute so expected lines are deterministic.
+func dropTime(_ []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.TimeKey {
+		return slog.Attr{}
+	}
+	return a
+}
+
+// countLogs counts log lines containing every one of subs.
+func countLogs(text string, subs ...string) int {
+	n := 0
+lines:
+	for _, line := range strings.Split(text, "\n") {
+		for _, s := range subs {
+			if !strings.Contains(line, s) {
+				continue lines
+			}
+		}
+		n++
+	}
+	return n
 }
 
 type lockedWriter struct {
@@ -371,7 +394,9 @@ func TestReporterCorruptFileDoesNotBlockGoodRecords(t *testing.T) {
 	}
 	h := newHarness(t, a, nil)
 	h.rep.corruptLogEvery = time.Hour
-	count := func() int { return strings.Count(h.logText(), `corrupt entry "attempt-2.json"`) }
+	count := func() int {
+		return strings.Count(h.logText(), `corrupt entry in pending activations; left untouched, operator action required" component=reporter entry=attempt-2.json`)
+	}
 	h.runUntil(t, func() bool { return len(h.waits) >= 3 }) // 3 passes, 5s apart
 	if h.client.count(1) != 1 {
 		t.Fatalf("good record calls=%d", h.client.count(1))
@@ -620,7 +645,7 @@ func TestReporterStaleWarningOncePerRecord(t *testing.T) {
 	h.rep.StaleAfter = 5 * time.Minute
 	h.runUntil(t, func() bool { return h.client.total() >= 60 })
 	for _, id := range []int{1, 2} {
-		if n := strings.Count(h.logText(), fmt.Sprintf("WARNING attempt %d:", id)); n != 1 {
+		if n := countLogs(h.logText(), "result unreported", fmt.Sprintf("attempt_id=%d ", id)); n != 1 {
 			t.Fatalf("attempt %d stale warnings = %d\n%s", id, n, h.logText())
 		}
 	}
@@ -631,7 +656,7 @@ func TestReporterNoStaleWarningWhenYoung(t *testing.T) {
 	save(t, a, readyFailed(1))
 	h := newHarness(t, a, map[int64][]error{1: {ErrTransportFailure}})
 	h.runUntil(t, func() bool { return h.client.count(1) >= 3 })
-	if strings.Contains(h.logText(), "WARNING") {
+	if strings.Contains(h.logText(), "result unreported") {
 		t.Fatal("premature stale warning")
 	}
 }
@@ -679,7 +704,7 @@ func TestReporterStaleWarnOnceOnFixedPath(t *testing.T) {
 	if len(remaining(t, a)) != 1 {
 		t.Fatal("operation_mismatch must keep the record")
 	}
-	if n := strings.Count(h.logText(), "WARNING attempt 1:"); n != 1 {
+	if n := countLogs(h.logText(), "result unreported", "attempt_id=1 "); n != 1 {
 		t.Fatalf("warnings=%d", n)
 	}
 }

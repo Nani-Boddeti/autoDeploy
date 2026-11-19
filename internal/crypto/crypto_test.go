@@ -179,3 +179,44 @@ func mustMarshal(t *testing.T, envelope Envelope) []byte {
 	}
 	return encoded
 }
+
+func TestDecryptFailureStagesAreDistinguishable(t *testing.T) {
+	envelope, err := Encrypt(testRing(), &testReservation{}, testScope(), []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown, _ := NewKeyRing("other", map[string][]byte{"other": bytes.Repeat([]byte{9}, 32)})
+	badWrap, badValue := envelope, envelope
+	badWrap.WrappedDEK = append([]byte(nil), envelope.WrappedDEK...)
+	badWrap.WrappedDEK[0] ^= 1
+	badValue.Ciphertext = append([]byte(nil), envelope.Ciphertext...)
+	badValue.Ciphertext[0] ^= 1
+	cases := []struct {
+		name     string
+		provider KeyProvider
+		envelope Envelope
+		stage    error
+	}{{"kek", unknown, envelope, ErrUnknownKey}, {"wrap", testRing(), badWrap, ErrUnwrapFailed}, {"value", testRing(), badValue, ErrValueOpenFailed}}
+	for _, c := range cases {
+		_, err := Decrypt(c.provider, testScope(), c.envelope)
+		if !errors.Is(err, c.stage) || !errors.Is(err, ErrCryptographicFail) || err.Error() != ErrCryptographicFail.Error() {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+	}
+}
+
+type shortKeyProvider struct{}
+
+func (shortKeyProvider) Active() (string, []byte, error) { return "old", make([]byte, 31), nil }
+func (shortKeyProvider) Resolve(string) ([]byte, error)  { return make([]byte, 31), nil }
+
+func TestDecryptMalformedKEKIsInvalidKeyNotUnknown(t *testing.T) {
+	envelope, err := Encrypt(testRing(), &testReservation{}, testScope(), []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Decrypt(shortKeyProvider{}, testScope(), envelope)
+	if !errors.Is(err, ErrInvalidKey) || errors.Is(err, ErrUnknownKey) || !errors.Is(err, ErrCryptographicFail) {
+		t.Fatalf("%v", err)
+	}
+}
