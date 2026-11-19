@@ -39,6 +39,11 @@ func releaseSuffix(t *testing.T) string {
 
 func newActivatedFixture(t *testing.T, seed byte, withPredecessor bool) activatedFixture {
 	t.Helper()
+	return newActivatedFixtureWithStrategy(t, seed, withPredecessor, "stop_then_start")
+}
+
+func newActivatedFixtureWithStrategy(t *testing.T, seed byte, withPredecessor bool, strategy string) activatedFixture {
+	t.Helper()
 	f := newLeaseFixture(t, seed)
 	cred := f.withCredential(t, seed+50)
 	f.insertRouteHead(t, "app.example.com")
@@ -50,7 +55,7 @@ func newActivatedFixture(t *testing.T, seed byte, withPredecessor bool) activate
 	attemptID := f.leaseJob(t, 1, 90)
 	f.advanceDeploymentToHealthChecking(t)
 	candidateID := "candidate-" + releaseSuffix(t)
-	f.insertCandidateRelease(t, attemptID, candidateID)
+	f.insertCandidateReleaseWithStrategy(t, attemptID, candidateID, strategy)
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 	result, err := repo.Activate(context.Background(), f.serverID, cred, attemptID, 1, digest(seed))
 	if err != nil {

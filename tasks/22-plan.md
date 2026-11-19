@@ -498,3 +498,22 @@ server_id without checking the target server exists/is active/same owner — ver
   green, 33 mutations killed, make check green. Review PASS WITH NOTES; lock order verified by hand (no path
   holds servers then bindings except compatible SHARE locks); runbook fixed (stop agent -> rm -> enroll -> start);
   ADR 0001 bearer-token risk note. Unproven until acer: real agent enroll after a restore.
+- 2026-11-20: 22-8 committed 894a48e. 22-D DONE mac-side (committed with this entry). Control plane: claim capability
+  activation_not_switched, lease echo only for opted-in STS non-rollback leases (non-opted bytes golden-pinned);
+  activation-result `outcome:"not_switched"` (only succeeded=false, no observed digest); finalizeNotSwitched
+  (agent_lease_not_switched.go): savepoint -> conditions (expected active set, not rollback/cancel, frozen STS,
+  deployment activating, route head unflagged at expected revision/active, candidate ready, predecessor active) ->
+  blockActivationForReconciliation + resolveNotActivated in one tx (no migration); any doubt/deterministic error ->
+  today's block; transient -> retry; commit failure -> fresh-tx block. Opt-in NOT persisted per attempt (needs a
+  migration); trust note in ADR 0004 (control plane cannot see host routes; agent trusted for host state as for success).
+  Agent: 11-fact proof (echo, not retained, predecessor, stop sent+confirmed, candidate stopped, restart started,
+  pre-stop route digest snapshot, bounded predecessor probe via same RunHealthGate/policy on detached ctx, revision
+  file below authorized, on-disk digest == snapshot); recovered records never claim; record fields omitempty
+  (old bytes pinned); reporter 400 -> durable DowngradeNotSwitched + one plain retry; claim ladder both -> health_policy
+  -> none. Verified: integration sweeps, race x20 (new + existing suites), agent -race x3, make check, linux build;
+  two independent reviews PASS (0 HIGH/MEDIUM); mutations killed both sides; L1/L2 pin tests added.
+  Implementer wrote agent code before tests (mutation runs substitute for fail-first).
+  Known limits: predecessor probe uses the new lease's port/path (mismatch -> plain failure, safe); stop-unknown never
+  eligible; older agent binary cannot read records with the new fields (drain before downgrade).
+  NEXT: acer session (install, rerun attempt-19 STS failure scenario -> deployment failed, env not blocked,
+  predecessor serving; re-enroll drill; plus earlier list), then 22-7 audit, 22-5/22-6 vendor-agnostic VPS, 22-3 UI last.

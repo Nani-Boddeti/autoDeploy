@@ -24,19 +24,19 @@ func claimServer(t *testing.T, bodies *[]string, handle func(n int, body string,
 	}))
 }
 
-func TestClaimSendsHealthPolicyCapability(t *testing.T) {
+func TestClaimSendsBothCapabilities(t *testing.T) {
 	var bodies []string
 	srv := claimServer(t, &bodies, func(_ int, _ string, w http.ResponseWriter) { _, _ = w.Write([]byte(`{"leases":[]}`)) })
 	defer srv.Close()
 	if _, err := newTestClient(t, srv, nil).Claim(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	if len(bodies) != 1 || bodies[0] != `{"limit":1,"executor_available":true,"capabilities":["health_policy"]}` {
+	if len(bodies) != 1 || bodies[0] != `{"limit":1,"executor_available":true,"capabilities":["health_policy","activation_not_switched"]}` {
 		t.Fatalf("bodies = %v", bodies)
 	}
 }
 
-func TestClaimFallsBackOnceWithoutCapabilityAndUsesDefaultPolicy(t *testing.T) {
+func TestClaimFallsBackLadderWithoutCapabilityAndUsesDefaultPolicy(t *testing.T) {
 	var bodies []string
 	srv := claimServer(t, &bodies, func(_ int, body string, w http.ResponseWriter) {
 		if strings.Contains(body, "capabilities") {
@@ -51,8 +51,11 @@ func TestClaimFallsBackOnceWithoutCapabilityAndUsesDefaultPolicy(t *testing.T) {
 	if err != nil || len(leases) != 1 {
 		t.Fatalf("leases=%v err=%v", leases, err)
 	}
-	if len(bodies) != 2 || bodies[1] != `{"limit":1,"executor_available":true}` {
+	if len(bodies) != 3 || bodies[1] != `{"limit":1,"executor_available":true,"capabilities":["health_policy"]}` || bodies[2] != `{"limit":1,"executor_available":true}` {
 		t.Fatalf("bodies = %v", bodies)
+	}
+	if leases[0].ActivationNotSwitched {
+		t.Fatal("legacy fallback must not claim the not_switched echo")
 	}
 	if leases[0].HealthPolicy != healthgate.DefaultPolicy() {
 		t.Fatalf("policy = %+v, want defaults", leases[0].HealthPolicy)
@@ -67,7 +70,7 @@ func TestClaimFallbackDoesNotLoopOrCoverOtherErrors(t *testing.T) {
 	})
 	_, err := newTestClient(t, srv, nil).Claim(context.Background(), true)
 	srv.Close()
-	if !errors.Is(err, ErrInvalidRequest) || len(bodies) != 2 {
+	if !errors.Is(err, ErrInvalidRequest) || len(bodies) != 3 {
 		t.Fatalf("err=%v requests=%d", err, len(bodies))
 	}
 	bodies = nil
@@ -127,5 +130,40 @@ func TestClaimWithCapabilityRefusesLeaseWithoutPolicy(t *testing.T) {
 		if leases, err := claimWithPolicyField(t, field); !errors.Is(err, ErrTransportFailure) {
 			t.Errorf("%s: leases=%+v err=%v, want malformed lease", name, leases, err)
 		}
+	}
+}
+
+// A 22-1c control plane without 22-D rejects the unknown capability: the claim
+// is repeated with health_policy alone, so a tuned policy is still honoured
+// (dropping straight to the legacy request would lose it).
+func TestClaimWithoutNotSwitchedKeepsHealthPolicyCapability(t *testing.T) {
+	var bodies []string
+	srv := claimServer(t, &bodies, func(_ int, body string, w http.ResponseWriter) {
+		if strings.Contains(body, "activation_not_switched") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_request"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"leases":[` + leaseHead + `,"health_policy":{"success_threshold":5,"interval_seconds":4,"timeout_seconds":3,"deadline_seconds":120,"tcp_port":null}}]}`))
+	})
+	defer srv.Close()
+	leases, err := newTestClient(t, srv, nil).Claim(context.Background(), true)
+	if err != nil || len(leases) != 1 || len(bodies) != 2 {
+		t.Fatalf("leases=%v err=%v bodies=%v", leases, err, bodies)
+	}
+	if leases[0].HealthPolicy.DeadlineSeconds != 120 || leases[0].ActivationNotSwitched {
+		t.Fatalf("lease = %+v", leases[0])
+	}
+}
+
+func TestClaimParsesActivationNotSwitchedEcho(t *testing.T) {
+	const policy = `,"health_policy":{"success_threshold":3,"interval_seconds":2,"timeout_seconds":2,"deadline_seconds":60,"tcp_port":null}`
+	leases, err := claimWithPolicyField(t, policy+`,"activation_not_switched":true`)
+	if err != nil || len(leases) != 1 || !leases[0].ActivationNotSwitched {
+		t.Fatalf("leases=%+v err=%v", leases, err)
+	}
+	leases, err = claimWithPolicyField(t, policy)
+	if err != nil || leases[0].ActivationNotSwitched {
+		t.Fatalf("absent echo must be false: %+v err=%v", leases, err)
 	}
 }

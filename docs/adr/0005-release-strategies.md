@@ -679,6 +679,32 @@ reporter, recovery and Traefik observer code. Nothing here has run on a real hos
   next to the candidate.
 - **Unverified.** Fakes only; not run against a real Docker engine or Traefik.
 
+## Amendment 2026-11-19 (slice 22-D): stop-then-start auto-finalize of a not-switched failure
+
+A stop-then-start candidate that fails before any route write (stop predecessor, start candidate, gate fails or
+errors, stop candidate, restart predecessor) used to be reported as a plain failure and blocked the environment for an
+operator, although the host route file never changed and the predecessor is serving again. Procedure step "finalize
+the candidate deployment as failed while the prior release remains active" is now automatic, under strict conditions.
+
+- **Agent precondition (not the server's).** The agent claims `not_switched` only when the failure happened inside
+  `beforeSwitch` (the route was never entered), the predecessor existed and its stop was sent, the candidate is
+  confirmed stopped, the predecessor restart succeeded AND a bounded predecessor health probe passed (ADR 0005's
+  "restart and health-check the prior release"; a Running-only check could hide an outage), the route-revision file is
+  still below the authorized revision and the on-disk route digest equals the pre-stop snapshot. Anything else
+  (switch failures, restart or probe failure, stop mismatch, an already-stopped predecessor, persistence failures,
+  crash-recovered records, rollback or retained jobs) stays a plain failure and blocks. Ambiguity is never
+  auto-resolved.
+- **Control plane (ADR 0004 amendment 2026-11-19).** The report is accepted as a definite failure only if the
+  operation is open, strategy `stop_then_start`, not a rollback job, a predecessor exists and is `active`, the
+  candidate is `ready`, the deployment is `activating` and the route head is unflagged and unchanged; the deployment
+  then fails, the slot is freed and the prior release stays active. If any condition is false the environment blocks
+  exactly as before.
+- **Wire.** Claim capability `activation_not_switched`; the lease echoes it only to claims that opted in;
+  activation-result `"outcome":"not_switched"` is legal only with `succeeded=false`. 200 (finalized, replay, or fell
+  back to the block) and 409 `late_report_recorded` / `route_moved` / `integrity_conflict` are final for the reporter
+  (record deleted); 400 `invalid_request` means the server cannot take the field (the agent strips it and retries once
+  as a plain failure); everything else, transient included, is retried.
+
 ## References
 
 - [Traefik file provider](https://doc.traefik.io/traefik/providers/file/)

@@ -143,6 +143,13 @@ func (f leaseFixture) insertSucceededActivation(t *testing.T, releaseID, deploym
 // Activate's own purposes without pulling in Claim's freeze machinery.
 func (f leaseFixture) insertCandidateRelease(t *testing.T, attemptID int64, releaseID string) {
 	t.Helper()
+	f.insertCandidateReleaseWithStrategy(t, attemptID, releaseID, "stop_then_start")
+}
+
+// insertCandidateReleaseWithStrategy is insertCandidateRelease with the frozen
+// execution row's release_strategy chosen by the caller.
+func (f leaseFixture) insertCandidateReleaseWithStrategy(t *testing.T, attemptID int64, releaseID, strategy string) {
+	t.Helper()
 	ctx := context.Background()
 	var deploymentID string
 	if err := f.pool.QueryRow(ctx, `SELECT deployment_id FROM agent_jobs WHERE id=$1`, f.jobID).Scan(&deploymentID); err != nil {
@@ -154,7 +161,7 @@ func (f leaseFixture) insertCandidateRelease(t *testing.T, attemptID int64, rele
 		t.Fatal(err)
 	}
 	if _, err := f.pool.Exec(ctx, `INSERT INTO agent_job_attempt_execution(attempt_id, container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds)
-		VALUES ($1,8080,'http','stop_then_start',30,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, attemptID); err != nil {
+		VALUES ($1,8080,'http',$2,30,1,500,268435456,'unless-stopped',0,'/','app.internal',3,2,2,60)`, attemptID, strategy); err != nil {
 		t.Fatal(err)
 	}
 }

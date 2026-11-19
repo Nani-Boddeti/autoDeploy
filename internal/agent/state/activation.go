@@ -97,6 +97,23 @@ type PendingActivation struct {
 	// fields, so an older binary treats a record carrying this field as
 	// corrupt; drain such records (let them report) before downgrading.
 	PredecessorStopSent bool
+
+	// PreStopRouteDigest is the on-disk route digest read BEFORE the
+	// predecessor was stopped (stop-then-start auto-finalize, slice 22-D). It
+	// is saved together with PredecessorStopSent, set once (zero -> value, only
+	// while no result is recorded), never changed, and requires
+	// PredecessorStopSent. Zero means no snapshot was taken (not_switched is
+	// then never claimed). Serialised with omitempty, so every record without
+	// it keeps the pre-22-D byte shape (same downgrade caveat as above).
+	PreStopRouteDigest [32]byte
+
+	// NotSwitched is the agent's proof-backed claim that a failed result left
+	// the host exactly as found: the route was never written, the candidate is
+	// stopped, and the predecessor is running and healthy again (ADR 0005, 22-D).
+	// result_ready && !Succeeded only; requires PreStopRouteDigest. Immutable
+	// once result_ready EXCEPT through DowngradeNotSwitched, which only ever
+	// turns it off (the server rejected the field). Omitted when false.
+	NotSwitched bool
 }
 
 // maxDrainSeconds mirrors the server's frozen drain_seconds bound (1-300).
@@ -175,6 +192,12 @@ func (p PendingActivation) validate() error {
 	if p.PredecessorStopSent && !p.HasPredecessor() {
 		return bad("predecessor stop sent requires a predecessor")
 	}
+	if p.PreStopRouteDigest != [32]byte{} && !p.PredecessorStopSent {
+		return bad("pre-stop route digest requires predecessor stop sent")
+	}
+	if p.NotSwitched && (p.Phase != PhaseResultReady || p.Succeeded || p.PreStopRouteDigest == [32]byte{}) {
+		return bad("not-switched outcome requires a failed result and a pre-stop route digest")
+	}
 	switch p.Phase {
 	case PhaseAuthorized:
 		if p.Succeeded || p.ObservedRouteDigest != [32]byte{} || p.FailureSummary != "" {
@@ -237,6 +260,10 @@ type activationWire struct {
 
 	// Absent (omitted when false) outside stop-then-start.
 	PredecessorStopSent bool `json:"predecessor_stop_sent,omitempty"`
+
+	// Slice 22-D; both omitted when unset so older shapes are byte-identical.
+	PreStopRouteDigest string `json:"pre_stop_route_digest,omitempty"`
+	NotSwitched        bool   `json:"not_switched,omitempty"`
 }
 
 func hexDigest(d [32]byte) string { return hex.EncodeToString(d[:]) }
@@ -255,6 +282,10 @@ func parseHexDigest(s string) ([32]byte, bool) {
 }
 
 func (p PendingActivation) marshal() ([]byte, error) {
+	preStop := ""
+	if p.PreStopRouteDigest != [32]byte{} {
+		preStop = hexDigest(p.PreStopRouteDigest)
+	}
 	return json.Marshal(activationWire{
 		AttemptID: p.AttemptID, Fence: p.Fence, EnvironmentID: p.EnvironmentID,
 		OperationID: p.OperationID, RouteDigest: hexDigest(p.RouteDigest),
@@ -268,6 +299,8 @@ func (p PendingActivation) marshal() ([]byte, error) {
 		PredecessorRuntimeInstanceID: p.PredecessorRuntimeInstanceID,
 		DrainSeconds:                 p.DrainSeconds,
 		PredecessorStopSent:          p.PredecessorStopSent,
+		PreStopRouteDigest:           preStop,
+		NotSwitched:                  p.NotSwitched,
 	})
 }
 
@@ -296,6 +329,14 @@ func unmarshalActivation(contents []byte) (PendingActivation, error) {
 	if !ok1 || !ok2 || !ok3 {
 		return PendingActivation{}, errors.New("malformed digest")
 	}
+	var preStop [32]byte
+	if w.PreStopRouteDigest != "" {
+		d, ok := parseHexDigest(w.PreStopRouteDigest)
+		if !ok || d == [32]byte{} {
+			return PendingActivation{}, errors.New("malformed digest")
+		}
+		preStop = d
+	}
 	p := PendingActivation{
 		AttemptID: w.AttemptID, Fence: w.Fence, EnvironmentID: w.EnvironmentID,
 		OperationID: w.OperationID, RouteDigest: route, ImageDigest: image,
@@ -308,6 +349,8 @@ func unmarshalActivation(contents []byte) (PendingActivation, error) {
 		PredecessorRuntimeInstanceID: w.PredecessorRuntimeInstanceID,
 		DrainSeconds:                 w.DrainSeconds,
 		PredecessorStopSent:          w.PredecessorStopSent,
+		PreStopRouteDigest:           preStop,
+		NotSwitched:                  w.NotSwitched,
 	}
 	if err := p.validate(); err != nil {
 		return PendingActivation{}, err
@@ -452,6 +495,12 @@ func (a ActivationStore) SaveActivation(p PendingActivation) error {
 			prev.Phase == PhaseResultReady && prev.PredecessorStopSent != p.PredecessorStopSent {
 			return ErrActivationImmutable
 		}
+		// The pre-stop snapshot is set once (zero -> value) while no result is
+		// recorded, and never changes.
+		if prev.PreStopRouteDigest != [32]byte{} && prev.PreStopRouteDigest != p.PreStopRouteDigest ||
+			prev.Phase == PhaseResultReady && prev.PreStopRouteDigest != p.PreStopRouteDigest {
+			return ErrActivationImmutable
+		}
 		if prev.Phase == PhaseResultReady && p.Phase == PhaseAuthorized {
 			return ErrActivationRegressed
 		}
@@ -459,7 +508,8 @@ func (a ActivationStore) SaveActivation(p PendingActivation) error {
 		// report as a replay only when identical to the first.
 		if prev.Phase == PhaseResultReady && (prev.Succeeded != p.Succeeded ||
 			prev.ObservedRouteDigest != p.ObservedRouteDigest ||
-			prev.FailureSummary != p.FailureSummary) {
+			prev.FailureSummary != p.FailureSummary ||
+			prev.NotSwitched != p.NotSwitched) {
 			return ErrActivationImmutable
 		}
 		p.CreatedAt = prev.CreatedAt
@@ -468,6 +518,39 @@ func (a ActivationStore) SaveActivation(p PendingActivation) error {
 	}
 	p.CreatedAt = p.CreatedAt.UTC()
 	p.UpdatedAt = now
+	contents, err := p.marshal()
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(a.dir, a.path(p.AttemptID), contents)
+}
+
+// DowngradeNotSwitched durably turns the not_switched outcome of a result_ready
+// record off, leaving every other field (the failure summary included)
+// untouched: the record then encodes and reports exactly like a plain failure.
+// The reporter calls it when the control plane rejected the outcome field (an
+// older server), so the downgrade survives an agent restart. It is idempotent:
+// a missing record or one without the outcome is a no-op (nil). It never turns
+// the outcome on.
+func (a ActivationStore) DowngradeNotSwitched(attemptID int64) error {
+	if attemptID <= 0 {
+		return fmt.Errorf("%w: attempt id must be positive", ErrInvalidActivation)
+	}
+	if a.dir == "" {
+		return errUninitialized
+	}
+	mu := lockDir(a.dir)
+	mu.Lock()
+	defer mu.Unlock()
+	p, existed, err := a.readFile(attemptID)
+	if err != nil {
+		return err
+	}
+	if !existed || !p.NotSwitched {
+		return nil
+	}
+	p.NotSwitched = false
+	p.UpdatedAt = a.now().UTC()
 	contents, err := p.marshal()
 	if err != nil {
 		return err

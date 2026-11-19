@@ -22,7 +22,9 @@ const maxClaimCapabilities = 4
 // is the agent's opt-in list (step 22-1c; ClaimCleanups' kinds precedent):
 // absent, null or empty is the pre-22-1c request and gets the pre-22-1c
 // response byte for byte; "health_policy" adds the lease's frozen
-// health_policy object and allows non-default-policy jobs to be leased.
+// health_policy object and allows non-default-policy jobs to be leased;
+// "activation_not_switched" (slice 22-D) adds "activation_not_switched":true to
+// each stop-then-start deployment lease.
 type claimRequest struct {
 	Limit             int      `json:"limit"`
 	ExecutorAvailable bool     `json:"executor_available"`
@@ -42,6 +44,8 @@ func (req claimRequest) parseCapabilities() (queue.ClaimCapabilities, bool) {
 		switch c {
 		case healthgate.CapabilityHealthPolicy:
 			caps.HealthPolicy = true
+		case queue.CapabilityActivationNotSwitched:
+			caps.ActivationNotSwitched = true
 		default:
 			return caps, false
 		}
@@ -143,6 +147,12 @@ type leaseView struct {
 	// Set only for a claim that declared the health_policy capability
 	// (step 22-1c); omitted otherwise so every other response is unchanged.
 	HealthPolicy *healthPolicyView `json:"health_policy,omitempty"`
+	// Set only for a claim that declared the activation_not_switched
+	// capability (slice 22-D), and only on a stop-then-start deployment lease
+	// (not a rollback): the control plane will consider a not_switched
+	// activation-result outcome for it. Omitted otherwise so every other
+	// response is unchanged.
+	ActivationNotSwitched bool `json:"activation_not_switched,omitempty"`
 	// Set only for a rollback lease (step 20D); omitted otherwise.
 	RollbackTargetReleaseID         string `json:"rollback_target_release_id,omitempty"`
 	RollbackTargetRuntimeInstanceID string `json:"rollback_target_runtime_instance_id,omitempty"`
@@ -248,6 +258,9 @@ func (h Handler) handleClaim(w http.ResponseWriter, r *http.Request) {
 		v := newLeaseView(l)
 		if caps.HealthPolicy {
 			v.HealthPolicy = newHealthPolicyView(l.HealthPolicy)
+		}
+		if caps.ActivationNotSwitched && l.ReleaseStrategy == "stop_then_start" && l.RollbackTargetReleaseID == "" {
+			v.ActivationNotSwitched = true
 		}
 		views = append(views, v)
 	}

@@ -294,10 +294,12 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 
 	var observed [32]byte
 	var summary string
+	switchEntered := false
 	if release != nil {
 		summary = release.beforeSwitch(dctx, &rec)
 	}
 	if summary == "" {
+		switchEntered = true
 		var prefix func(context.Context) string
 		if release != nil {
 			prefix = func(c context.Context) string { return release.switchFailurePrefix(c, rec) }
@@ -311,6 +313,9 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 		rec.ObservedRouteDigest = observed
 	} else {
 		rec.FailureSummary = summary
+		// not_switched only from a failure inside beforeSwitch (the route
+		// switch was never entered) whose proofs all held (sts.go).
+		rec.NotSwitched = release != nil && release.notSwitched && !switchEntered
 		logs.Linef(logship.StreamActivation, "activation: route switch failed; see the activation result")
 		a.logger.Error("agent activation: route switch failed", logging.KeyAttemptID, lease.AttemptID, "summary", summary)
 	}
@@ -383,6 +388,10 @@ func (a *activationRunner) saveWithRetry(rec state.PendingActivation) error {
 
 // resultFromRecord builds the report for a result_ready record: success with
 // the on-disk digest, or failure with the summary.
+//
+// It deliberately never carries the not_switched outcome: this path runs only
+// when the result record could not be persisted, and a persist failure keeps
+// the plain failure (the server blocks the environment for an operator).
 func resultFromRecord(rec state.PendingActivation) agentclient.ActivationResult {
 	if rec.Succeeded {
 		return agentclient.ActivationSucceeded(rec.ObservedRouteDigest)

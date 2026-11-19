@@ -32,6 +32,10 @@ type activationReportClient interface {
 type activationRecordStore interface {
 	ScanActivations() (records []state.PendingActivation, corrupt []string, err error)
 	DeleteActivation(attemptID int64) error
+	// DowngradeNotSwitched durably turns a record's not_switched outcome off
+	// (idempotent). The reporter calls it when the control plane rejected the
+	// outcome field, so the stripped (plain failure) shape survives a restart.
+	DowngradeNotSwitched(attemptID int64) error
 }
 
 // drainArmer records the obligation to stop a predecessor release
@@ -107,7 +111,12 @@ type reportTrack struct {
 	failures    int
 	next        time.Time // zero: due now
 	staleLogged bool
-	lastTry     time.Time // zero: never tried; due records go oldest-try first
+	// stripped: the control plane rejected the not_switched outcome during this
+	// process's life; the record is reported as a plain failure even if the
+	// durable downgrade could not be written. In memory only (the durable
+	// downgrade is the restart-proof copy).
+	stripped bool
+	lastTry  time.Time // zero: never tried; due records go oldest-try first
 }
 
 // Validate checks the production requirements: a client, a record store and a
@@ -324,7 +333,18 @@ func buildResult(p state.PendingActivation) (ActivationResult, error) {
 	if p.Succeeded {
 		return ActivationSucceeded(p.ObservedRouteDigest), nil
 	}
+	if p.NotSwitched {
+		return ActivationNotSwitched(p.FailureSummary)
+	}
 	return ActivationFailed(p.FailureSummary)
+}
+
+// isServerBadRequest reports a 400 invalid_request the control plane itself
+// answered (not a local pre-send validation failure, which is also
+// ErrInvalidRequest but says nothing about the server's version).
+func isServerBadRequest(err error) bool {
+	var bad errBadRequest
+	return errors.As(err, &bad)
 }
 
 // report makes one delivery attempt for p and updates tr. Log lines carry the
@@ -339,12 +359,36 @@ func (r *ActivationReporter) report(ctx context.Context, p state.PendingActivati
 		return false
 	}
 	tr.lastTry = r.clock()
-	cctx, cancel := context.WithTimeout(ctx, durOr(r.CallTimeout, defaultReportCallTimeout))
-	err = r.Client.ReportActivationResult(cctx, p.AttemptID, p.Fence, p.OperationID, res)
-	callTimedOut := cctx.Err() != nil && ctx.Err() == nil
-	cancel()
+	if tr.stripped {
+		res = res.withoutOutcome()
+	}
+	send := func(res ActivationResult) (timedOut bool, err error) {
+		cctx, cancel := context.WithTimeout(ctx, durOr(r.CallTimeout, defaultReportCallTimeout))
+		err = r.Client.ReportActivationResult(cctx, p.AttemptID, p.Fence, p.OperationID, res)
+		timedOut = cctx.Err() != nil && ctx.Err() == nil
+		cancel()
+		return timedOut, err
+	}
+	callTimedOut, err := send(res)
 	if ctx.Err() != nil {
 		return false // shutting down; the record stays for the next start
+	}
+	if res.NotSwitched() && isServerBadRequest(err) {
+		// Server downgrade (an older control plane strict-decodes and rejects
+		// the unknown outcome field). Strip it durably FIRST, so a restart
+		// right after cannot send it again, then retry ONCE as a plain
+		// failure. A 400 on that retry is handled below like any other 400:
+		// there is no second strip and no loop. If the durable write fails the
+		// in-memory flag still keeps this process from re-sending the outcome.
+		r.logger().Warn("activation reporter: server rejected the not_switched outcome; reporting as a plain failure", logging.KeyAttemptID, p.AttemptID)
+		tr.stripped = true
+		if derr := r.Store.DowngradeNotSwitched(p.AttemptID); derr != nil {
+			r.logger().Error("activation reporter: cannot persist the outcome downgrade; retrying as a plain failure in memory", logging.KeyAttemptID, p.AttemptID, logging.Err(derr))
+		}
+		callTimedOut, err = send(res.withoutOutcome())
+		if ctx.Err() != nil {
+			return false
+		}
 	}
 
 	terminal, fixed := false, false // fixed: retry at MaxBackoff, not exponential

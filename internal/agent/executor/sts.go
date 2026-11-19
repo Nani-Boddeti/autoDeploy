@@ -182,6 +182,13 @@ type stsRelease struct {
 	// Set when a stop was issued and ended stopped or unknown; not when it was
 	// already stopped, absent or refused.
 	stopSent bool
+	// stopConfirmed: the predecessor stop ended stopped (confirmed), not
+	// unknown, refused or already-down. A not_switched claim requires it.
+	stopConfirmed bool
+	// notSwitched is the decision of the post-stop failure path (failPostStop):
+	// every proof in notSwitchedProof held. activateWith copies it into the
+	// record only when the route switch was never entered.
+	notSwitched bool
 }
 
 func (s *stsRelease) failure(ctx context.Context, rec state.PendingActivation, reason string) string {
@@ -205,6 +212,17 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		if rec.PredecessorRuntimeInstanceID == s.identity.RuntimeInstanceID || rec.PredecessorReleaseID == lease.ReleaseID {
 			logs.Linef(logship.StreamActivation, "release: predecessor equals the candidate; refusing to stop")
 			return s.failure(ctx, *rec, "predecessor identity equals the candidate; nothing stopped or started")
+		}
+		// Slice 22-D: snapshot the on-disk route digest BEFORE the stop, in the
+		// same durable save as the stop intent, only for an opted-in lease (never a
+		// rollback lease: the server does not echo it). A missing or unreadable
+		// route leaves it zero, which makes not_switched unprovable.
+		if lease.ActivationNotSwitched {
+			if onDisk, exists, rerr := a.readDigest(a.cfg.RouteDir, rec.EnvironmentID); rerr == nil && exists {
+				if d, ok := parseRouteDigestString(onDisk); ok {
+					rec.PreStopRouteDigest = d
+				}
+			}
 		}
 		// Durable intent BEFORE the stop. If this save fails nothing was
 		// stopped, so the in-memory flag stays set: a later save may flip
@@ -232,6 +250,7 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		switch res.Status {
 		case stopStopped:
 			s.stopSent = true
+			s.stopConfirmed = true
 			logs.Linef(logship.StreamActivation, "release: predecessor stopped")
 		case stopAlreadyStopped, stopGone:
 			logs.Linef(logship.StreamActivation, "release: predecessor was not running; nothing stopped")
@@ -253,7 +272,7 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		if res.Status != restartStarted {
 			class := e.retainedStartFailure(res, logs)
 			logs.Linef(logship.StreamActivation, "release: retained candidate start failed (%s)", class)
-			return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; retained candidate start failed (%s)", class))
+			return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; retained candidate start failed (%s)", class))
 		}
 	} else {
 		inspect, err = e.docker.EnsureReleaseRuntimeContainer(ctx, docker.RunContainerRequest{
@@ -266,14 +285,14 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		if err != nil {
 			class := docker.ClassifyFailure(err)
 			logs.Linef(logship.StreamActivation, "release: candidate start failed (%s)", class)
-			return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate start failed (%s)", class))
+			return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; candidate start failed (%s)", class))
 		}
 	}
 	networkID, _, err := resolveNetworkAndIP(inspect)
 	if err != nil {
 		class := docker.ClassifyFailure(err)
 		logs.Linef(logship.StreamHealth, "health gate: container network check failed (%s)", class)
-		return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate network check failed (%s)", class))
+		return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; candidate network check failed (%s)", class))
 	}
 	gate, err := e.docker.RunHealthGate(ctx, inspect.ID, networkID, lease.HealthPolicyRevision, lease.HealthPolicy, docker.HealthGateTarget{
 		Host: lease.HealthGateHost, Path: lease.HealthGatePath, Port: lease.ContainerPort, Scheme: lease.ContainerScheme,
@@ -282,10 +301,10 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 	case err != nil:
 		class := docker.ClassifyFailure(err)
 		logs.Linef(logship.StreamHealth, "health gate: error (%s)", class)
-		return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate health gate errored (%s)", class))
+		return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; candidate health gate errored (%s)", class))
 	case !gate.Success:
 		logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s)", gate.Reason)
-		return s.failRolledBack(ctx, *rec, fmt.Sprintf("predecessor stopped; candidate failed health gate: reason=%s last_probe=%q", gate.Reason, gate.LastProbe))
+		return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; candidate failed health gate: reason=%s last_probe=%q", gate.Reason, gate.LastProbe))
 	}
 	logs.Linef(logship.StreamHealth, "health gate: passed")
 	// Do not write the route with too little window left to verify and probe
@@ -295,7 +314,7 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		need := a.cfg.ProbeTimeout + a.verifyTimeout + stsSwitchMargin
 		if left := time.Until(deadline); left < need {
 			logs.Linef(logship.StreamActivation, "release: authorized window too short to switch; rolling back")
-			return s.failRolledBack(ctx, *rec, fmt.Sprintf("authorized window too short to switch the route (%s left, need %s); route not changed", left.Round(time.Second), need))
+			return s.failPostStop(ctx, rec, fmt.Sprintf("authorized window too short to switch the route (%s left, need %s); route not changed", left.Round(time.Second), need))
 		}
 	}
 	return ""
@@ -316,22 +335,39 @@ func (s *stsRelease) switchFailurePrefix(ctx context.Context, rec state.PendingA
 	return s.rollback(ctx, rec) + "; route switch failed before the route changed"
 }
 
+// rollbackResult is what rollback did, for the not_switched decision.
+type rollbackResult struct {
+	text             string
+	candidateStopped bool
+	// restart is meaningful only when restartTried.
+	restart      restartResult
+	restartTried bool
+}
+
 // rollback stops the candidate and, only if that is confirmed, restarts the
 // predecessor when this attempt stopped it. It returns the summary text.
 func (s *stsRelease) rollback(ctx context.Context, rec state.PendingActivation) string {
+	return s.rollbackDetail(ctx, rec).text
+}
+
+func (s *stsRelease) rollbackDetail(ctx context.Context, rec state.PendingActivation) rollbackResult {
 	logs := logship.FromContext(ctx)
 	candidateStopped := s.e.stopFailedCandidate(ctx, s.lease, s.identity, logs)
 	cand := "candidate stopped"
 	if !candidateStopped {
 		cand = "candidate could NOT be stopped"
 	}
+	out := rollbackResult{candidateStopped: candidateStopped}
 	switch {
 	case !rec.HasPredecessor():
-		return "predecessor restart not attempted (no predecessor); " + cand
+		out.text = "predecessor restart not attempted (no predecessor); " + cand
+		return out
 	case !s.stopSent:
-		return "predecessor restart not attempted (not stopped by this attempt); " + cand
+		out.text = "predecessor restart not attempted (not stopped by this attempt); " + cand
+		return out
 	case !candidateStopped:
-		return "predecessor restart not attempted (running both is unsafe; operator action required); " + cand
+		out.text = "predecessor restart not attempted (running both is unsafe; operator action required); " + cand
+		return out
 	}
 	// Detached: an expired authorized window must not make the restart fail
 	// instantly and leave the predecessor down.
@@ -350,7 +386,178 @@ func (s *stsRelease) rollback(ctx context.Context, rec state.PendingActivation) 
 		logs.Linef(logship.StreamActivation, "release: predecessor restart failed")
 		s.e.logger.Error("agent executor: predecessor restart failed", logging.KeyAttemptID, s.lease.AttemptID, "runtime_instance_id", rec.PredecessorRuntimeInstanceID, "result", res.text())
 	}
-	return res.text() + "; " + cand
+	out.text = res.text() + "; " + cand
+	out.restart, out.restartTried = res, true
+	return out
+}
+
+// predecessorProbeSlack is added to the health policy's own deadline to bound
+// the whole predecessor probe (inspect + gate): the gate stops itself at the
+// policy deadline, the slack only covers the surrounding Engine calls.
+const predecessorProbeSlack = 15 * time.Second
+
+// predecessorProbeBound is the hard bound of the predecessor health probe: the
+// environment's frozen health-policy deadline (defaults applied) plus
+// predecessorProbeSlack. It is a variable so a test can shrink it.
+var predecessorProbeBound = func(p healthgate.Policy) time.Duration {
+	return time.Duration(p.WithDefaults().DeadlineSeconds)*time.Second + predecessorProbeSlack
+}
+
+// failPostStop is the failure path after the predecessor stop confirmed (or
+// after any later pre-switch step): it rolls back, then decides whether the
+// failure may be reported as not_switched (notSwitchedProof) and returns the
+// failure summary. The decision lands in s.notSwitched.
+func (s *stsRelease) failPostStop(ctx context.Context, rec *state.PendingActivation, detail string) string {
+	rb := s.rollbackDetail(ctx, *rec)
+	text := rb.text
+	if note, ok := s.notSwitchedProof(ctx, *rec, rb); ok {
+		s.notSwitched = true
+		text += "; " + note
+	} else if note != "" {
+		text += "; " + note
+	}
+	return s.failure(ctx, *rec, text+"; "+detail)
+}
+
+// notSwitchedFacts are the independently established proofs behind a
+// not_switched claim. provable is the single decision point: every fact must
+// hold, any false one means the plain failure (the operator-blocking path).
+type notSwitchedFacts struct {
+	leaseOptedIn     bool // the control plane echoed activation_not_switched
+	notRetained      bool // not a retained (rollback) candidate
+	hasPredecessor   bool
+	stopSent         bool // the stop intent was durably recorded
+	stopConfirmed    bool // the predecessor stop ended stopped, by this attempt
+	candidateStopped bool
+	predecessorUp    bool // restartPredecessor reported it running
+	snapshotTaken    bool // a pre-stop route digest is on the record
+	predecessorProbe bool // the bounded health probe passed
+	revisionBelow    bool // route-revision file < authorized revision
+	routeUnchanged   bool // on-disk digest readable and == the snapshot
+}
+
+// cheap reports whether every fact that needs no I/O holds, so the slow probe
+// only runs for a failure that could still qualify.
+func (f notSwitchedFacts) cheap() bool {
+	return f.leaseOptedIn && f.notRetained && f.hasPredecessor && f.stopSent &&
+		f.stopConfirmed && f.candidateStopped && f.predecessorUp && f.snapshotTaken
+}
+
+func (f notSwitchedFacts) provable() bool {
+	if !f.leaseOptedIn {
+		return false
+	}
+	if !f.notRetained {
+		return false
+	}
+	if !f.hasPredecessor {
+		return false
+	}
+	if !f.stopSent {
+		return false
+	}
+	if !f.stopConfirmed {
+		return false
+	}
+	if !f.candidateStopped {
+		return false
+	}
+	if !f.predecessorUp {
+		return false
+	}
+	if !f.snapshotTaken {
+		return false
+	}
+	if !f.predecessorProbe {
+		return false
+	}
+	if !f.revisionBelow {
+		return false
+	}
+	if !f.routeUnchanged {
+		return false
+	}
+	return true
+}
+
+// notSwitchedProof reports whether this failure provably left the host as
+// found: the switch was never entered (the caller is beforeSwitch), the lease
+// opted in, the predecessor was stopped by this attempt and is running and
+// healthy again, the candidate is stopped, the route-revision file is below the
+// authorized revision and the on-disk route digest equals the pre-stop
+// snapshot. Anything unproven is false (the plain failure, which blocks the
+// environment for an operator). The note, when set, names the probe outcome for
+// the failure summary.
+func (s *stsRelease) notSwitchedProof(ctx context.Context, rec state.PendingActivation, rb rollbackResult) (note string, ok bool) {
+	a, logs := s.e.activation, logship.FromContext(ctx)
+	f := notSwitchedFacts{
+		leaseOptedIn:     s.lease.ActivationNotSwitched,
+		notRetained:      !s.retained,
+		hasPredecessor:   rec.HasPredecessor(),
+		stopSent:         rec.PredecessorStopSent,
+		stopConfirmed:    s.stopConfirmed,
+		candidateStopped: rb.candidateStopped,
+		predecessorUp:    rb.restartTried && rb.restart.Status == restartStarted,
+		snapshotTaken:    rec.PreStopRouteDigest != [32]byte{},
+	}
+	if !f.cheap() {
+		return "", false
+	}
+	// The probe is the one slow step, so it runs after every cheap fact above
+	// and before the disk facts below (the route is re-read after it).
+	f.predecessorProbe, note = s.probePredecessor(ctx, rec)
+	if f.predecessorProbe {
+		stored, err := a.cfg.Revisions.LoadRouteRevision(rec.EnvironmentID)
+		f.revisionBelow = err == nil && stored < rec.RouteRevision
+		onDisk, exists, err := a.readDigest(a.cfg.RouteDir, rec.EnvironmentID)
+		if d, parsed := parseRouteDigestString(onDisk); err == nil && exists && parsed {
+			f.routeUnchanged = d == rec.PreStopRouteDigest
+		}
+	}
+	if !f.provable() {
+		return note, false
+	}
+	logs.Linef(logship.StreamActivation, "release: route unchanged and predecessor healthy; reporting not switched")
+	return note + "; route unchanged", true
+}
+
+// probePredecessor runs the environment's health gate (the same RunHealthGate
+// and frozen policy the candidate went through) against the restarted
+// predecessor. It is bounded by predecessorProbeBound on a detached context
+// (an expired authorized window must not skip the proof). Any error or timeout
+// is "not healthy".
+func (s *stsRelease) probePredecessor(ctx context.Context, rec state.PendingActivation) (healthy bool, note string) {
+	e, lease := s.e, s.lease
+	logs := logship.FromContext(ctx)
+	name, err := docker.ContainerName(rec.PredecessorRuntimeInstanceID)
+	if err != nil {
+		return false, "predecessor health probe not run (invalid runtime instance id)"
+	}
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), predecessorProbeBound(lease.HealthPolicy))
+	defer cancel()
+	inspect, err := e.docker.InspectContainer(pctx, name)
+	if err != nil || !inspect.State.Running {
+		logs.Linef(logship.StreamHealth, "predecessor health probe: not run (inspect failed or not running)")
+		return false, "predecessor health probe not run (inspect failed or not running)"
+	}
+	networkID, _, err := resolveNetworkAndIP(inspect)
+	if err != nil {
+		logs.Linef(logship.StreamHealth, "predecessor health probe: container network check failed")
+		return false, "predecessor health probe not run (network check failed)"
+	}
+	gate, err := e.docker.RunHealthGate(pctx, inspect.ID, networkID, lease.HealthPolicyRevision, lease.HealthPolicy, docker.HealthGateTarget{
+		Host: lease.HealthGateHost, Path: lease.HealthGatePath, Port: lease.ContainerPort, Scheme: lease.ContainerScheme,
+	})
+	switch {
+	case err != nil:
+		logs.Linef(logship.StreamHealth, "predecessor health probe: error (%s)", docker.ClassifyFailure(err))
+		return false, "predecessor health probe errored"
+	case !gate.Success:
+		logs.Linef(logship.StreamHealth, "predecessor health probe: failed (reason=%s)", gate.Reason)
+		return false, fmt.Sprintf("predecessor health probe failed: reason=%s", gate.Reason)
+	}
+	logs.Linef(logship.StreamHealth, "predecessor health probe: passed")
+	return true, "predecessor health probe ok"
 }
 
 // recoverStoppedPredecessor is the recovery counterpart of rollback for a

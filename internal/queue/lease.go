@@ -101,9 +101,22 @@ type ClaimedLease struct {
 	HealthPolicy healthgate.Policy
 }
 
+// Wire values of the stop-then-start auto-finalize (ADR 0005): the claim
+// capability an agent sends, and the optional activation-result outcome.
+const (
+	CapabilityActivationNotSwitched = "activation_not_switched"
+	ActivationOutcomeNotSwitched    = "not_switched"
+)
+
 // ClaimCapabilities are the optional features a claiming agent declared. The
 // zero value is an agent that declared nothing (every pre-22-1c agent).
 type ClaimCapabilities struct {
+	// ActivationNotSwitched: the agent may report an activation failure with
+	// the not_switched outcome (ADR 0005 stop-then-start auto-finalize). It
+	// only gates the lease echo; the control plane re-verifies every
+	// condition when the report arrives.
+	ActivationNotSwitched bool
+
 	// HealthPolicy: the agent understands and honours the frozen health
 	// policy. Without it a job whose policy is non-default is never leased.
 	HealthPolicy bool

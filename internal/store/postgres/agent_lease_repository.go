@@ -2404,15 +2404,25 @@ func isDeterministicActivationFailure(err error) bool {
 // deploy, 42501, ...) stays unclassified and retryable: a 503 can succeed on
 // retry, a terminal 409 tells the agent to stop with nothing recorded.
 func (r *AgentLeaseRepository) ReportActivationResult(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, succeeded bool, observedRouteDigest [32]byte, failureSummary string) error {
+	return r.ReportActivationResultWithOutcome(ctx, serverID, presentedDigest, attemptID, fence, operationID, succeeded, observedRouteDigest, failureSummary, "")
+}
+
+// ReportActivationResultWithOutcome is ReportActivationResult plus the optional
+// outcome (queue.ActivationOutcomeNotSwitched or ""). Any other value is
+// ErrAgentLeaseInvalidInput; not_switched is legal only with succeeded=false.
+func (r *AgentLeaseRepository) ReportActivationResultWithOutcome(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, succeeded bool, observedRouteDigest [32]byte, failureSummary, outcome string) error {
 	var occupantChecked bool
-	err := r.reportActivationResult(ctx, serverID, presentedDigest, attemptID, fence, operationID, succeeded, observedRouteDigest, failureSummary, &occupantChecked)
+	err := r.reportActivationResult(ctx, serverID, presentedDigest, attemptID, fence, operationID, succeeded, observedRouteDigest, failureSummary, outcome, &occupantChecked)
 	if !occupantChecked {
 		return err
 	}
 	return classifyActivationResultError(err)
 }
 
-func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, succeeded bool, observedRouteDigest [32]byte, failureSummary string, occupantChecked *bool) error {
+func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, operationID string, succeeded bool, observedRouteDigest [32]byte, failureSummary, outcome string, occupantChecked *bool) error {
+	if outcome != "" && (outcome != queue.ActivationOutcomeNotSwitched || succeeded) {
+		return ErrAgentLeaseInvalidInput
+	}
 	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 || !validOperationID(operationID) {
 		return ErrAgentLeaseInvalidInput
 	}
@@ -2537,6 +2547,16 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 		// A SUCCESS report is traced (traceDeclaredContradiction): it contradicts
 		// the declaration. A failure report agrees with it and is only answered.
 		if !succeeded {
+			// The one failure report that is acknowledged outright: the
+			// not_switched report that THIS path finalized (slice 22-D), repeated
+			// by an agent whose answer was lost. Both answers are final for the
+			// reporter (200 and 409 integrity_conflict delete the record).
+			if outcome == queue.ActivationOutcomeNotSwitched && op.outcomeSummary == notSwitchedOperationSummary(summary) {
+				if err = tx.Commit(ctx); err != nil {
+					return fmt.Errorf("commit agent lease not_switched replay: %w", err)
+				}
+				return nil
+			}
 			return ErrAgentLeaseIntegrityConflict
 		}
 		return r.traceDeclaredContradiction(ctx, tx, jobID, attemptID)
@@ -2624,6 +2644,27 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 	}
 
 	if !succeeded {
+		if outcome == queue.ActivationOutcomeNotSwitched {
+			disposition, nsErr := r.finalizeNotSwitched(ctx, tx, notSwitchedInput{
+				jobID: jobID, attemptID: attemptID, operationID: op.id, environmentID: environmentID,
+				deploymentID: deploymentID, candidateReleaseID: op.releaseID,
+				expectedRouteRevision: op.expectedRouteRevision, expectedActiveReleaseID: op.expectedActiveReleaseID,
+				summary: summary,
+			})
+			switch disposition {
+			case notSwitchedCommitted:
+				return nil
+			case notSwitchedReturn:
+				return nsErr
+			case notSwitchedBlockFresh:
+				// The transaction is gone or unusable: roll it back FIRST (the
+				// fresh one re-takes the slot lock), then record the same plain
+				// block a commit failure records.
+				_ = tx.Rollback(ctx)
+				return r.recordFailureBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, summary, report, errors.New("not_switched finalize could not be committed"))
+			}
+			// notSwitchedBlockHere: today's block, below, in this transaction.
+		}
 		if err = blockActivationForReconciliation(ctx, tx, r.inject, jobID, attemptID, op.id, environmentID, summary); err != nil {
 			return blockUnrecorded(err)
 		}
@@ -2632,20 +2673,7 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 			if !isDeterministicActivationFailure(err) {
 				return commitErr
 			}
-			outcome, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, summary, report)
-			if freshErr != nil {
-				return fmt.Errorf("%w (after %v)", freshErr, commitErr)
-			}
-			switch outcome {
-			case activationBlockRecorded:
-				return nil
-			case activationBlockNoopSucceeded:
-				return ErrAgentLeaseIntegrityConflict
-			case activationBlockLateRecorded:
-				return ErrAgentLeaseActivationLateReportRecorded
-			default:
-				return ErrAgentLeaseStale
-			}
+			return r.recordFailureBlockInFreshTransaction(ctx, serverID, attemptID, fence, op.id, summary, report, commitErr)
 		}
 		return nil
 	}
@@ -2741,6 +2769,28 @@ func (r *AgentLeaseRepository) reportActivationResult(ctx context.Context, serve
 }
 
 const activationFinalizeSavepoint = "activation_finalize"
+
+// recordFailureBlockInFreshTransaction writes a failure report's block in a new
+// transaction after the original one could not commit (or could not be used)
+// and answers as the original commit would have: nil when the block is
+// recorded, the typed refusals when another writer got there first, a
+// retryable ErrActivationBlockUnrecorded when nothing durable exists.
+func (r *AgentLeaseRepository) recordFailureBlockInFreshTransaction(ctx context.Context, serverID string, attemptID, fence, operationID int64, summary string, report activationReport, cause error) error {
+	outcome, freshErr := r.recordBlockInFreshTransaction(ctx, serverID, attemptID, fence, operationID, summary, report)
+	if freshErr != nil {
+		return fmt.Errorf("%w (after %v)", freshErr, cause)
+	}
+	switch outcome {
+	case activationBlockRecorded:
+		return nil
+	case activationBlockNoopSucceeded:
+		return ErrAgentLeaseIntegrityConflict
+	case activationBlockLateRecorded:
+		return ErrAgentLeaseActivationLateReportRecorded
+	default:
+		return ErrAgentLeaseStale
+	}
+}
 
 // blockAfterFinalizeFailure handles an error raised inside the transaction,
 // after the savepoint, before COMMIT. A known-transient error is returned

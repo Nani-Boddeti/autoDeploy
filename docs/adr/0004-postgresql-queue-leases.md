@@ -953,6 +953,45 @@ run on a real host.
   image is removed once, non-forced, only when the claim has a digest and every removed container verified it; a
   container that vanished mid-stop or an empty digest keeps the image. Unknown kinds are refused untouched.
 
+## Amendments (2026-11-19)
+
+### tx2 may finalize a definite not-switched failure (slice 22-D)
+
+Everything above stays as written EXCEPT one narrow exception in the activation-result transaction (tx2): a failed
+report that carries the optional `"outcome":"not_switched"` (ADR 0005, stop-then-start) is finalized as a definite
+failure, not blocked, when ALL of these hold under the locks tx2 already holds (order unchanged: credential SHARE ->
+slot -> job -> attempt -> operation -> deployment -> route head -> releases ascending): the operation is
+`switch_authorized` and the attempt is the leased occupant at the fence; `expected_active_release_id` is set; the job is
+not a rollback job and has no cancellation requested; the frozen strategy is `stop_then_start`; the deployment is
+`activating`; the route head is unflagged and still at `expected_route_revision` / `expected_active_release_id`; the
+candidate release is `ready` and the predecessor release is `active`. It then runs, in ONE transaction and after a
+savepoint, `blockActivationForReconciliation` followed by the existing operator `not_activated` writes
+(`resolveNotActivated`): deployment `failed`, operation `failed`, attempt closed (`expired`), slot freed and unflagged,
+job `failed`, route head and releases untouched. No migration: migration 000021 still forbids `switch_authorized ->
+failed`, so the block is the legal first step and the resolve follows in the same transaction. Events: the block event,
+then `activation_not_activated` and `failed`.
+Anything else is today's behaviour, never a rejection and never a success: a condition that does not hold, or a
+deterministic error inside the branch (negative definition, `isDeterministicActivationFailure`), rolls back to the
+savepoint and records the plain block (`switch_authorized -> reconciliation_required`, flags, event). A known-transient
+error rolls the whole transaction back and is retried by the agent; a deterministic COMMIT failure records the block in
+a fresh transaction. If neither the finalize nor the block can be written the answer is the retryable
+`ErrActivationBlockUnrecorded`. Authority expiry is still not consulted. Plain failures (no outcome), success reports,
+the sweeper diversion and the operator resolutions are unchanged; a not_switched report that arrives after the
+sweeper's diversion is late evidence like any other report.
+Trust: the control plane cannot see host route state. Only tx2 success moves `route_heads`, so the route-head checks
+above guard against concurrent control-plane changes (e.g. a hostname reassignment), not against a host that did
+switch. That the route was never written, the candidate is stopped and the predecessor is restarted and healthy is the
+agent's claim (ADR 0005 preconditions), trusted exactly as a success report is. The claim opt-in is not persisted per
+attempt; it only controls what the agent is told.
+Replay: the finalized operation's `outcome_summary` is `not_switched: ` plus the sanitized report text (the column
+bound still applies), so a repeat of the same report answers 200; any other report for the failed operation is 409
+`integrity_conflict` as before; both are on the agent reporter's delete list.
+Wire: claim capability `activation_not_switched` (lease echoes `"activation_not_switched":true` only to opted-in claims
+and only for stop-then-start deployment leases); activation-result field `outcome` (only `not_switched`, only with
+`succeeded=false`; otherwise 400 `invalid_request`). The control plane does not persist the opt-in per attempt (that
+would need a migration); it re-verifies every finalize condition when the report arrives, so the opt-in only governs
+what an agent is told, not what the server trusts.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

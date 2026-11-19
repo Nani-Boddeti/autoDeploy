@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -32,6 +33,12 @@ type stsDocker struct {
 	stopErr   map[string]error
 	startErr  map[string]error
 	candID    string
+
+	// predecessor probe (slice 22-D): answers for RunHealthGate calls on the
+	// predecessor container "pred-id"; the zero value means success.
+	predGate      *docker.HealthGateResult
+	predGateErr   error
+	predGateBlock bool // block until the probe context ends (a hung gate)
 }
 
 type stsCtr struct {
@@ -83,7 +90,8 @@ func (d *stsDocker) Probe(context.Context) (docker.VersionInfo, error) {
 func (d *stsDocker) InspectContainer(_ context.Context, id string) (docker.ContainerInspect, error) {
 	c := d.find(id)
 	if c == nil {
-		return docker.ContainerInspect{}, docker.ErrContainerNotFound
+		// The real client's shape: an *EngineError 404 wrapping the sentinel.
+		return docker.ContainerInspect{}, &docker.EngineError{Class: docker.ErrClassConfiguration, Op: "container-inspect", Status: 404, Err: fmt.Errorf("%w: no such container", docker.ErrContainerNotFound)}
 	}
 	out := testInspect("networkabc123")
 	out.ID = c.id
@@ -146,7 +154,18 @@ func (d *stsDocker) EnsureReleaseRuntimeContainer(_ context.Context, req docker.
 	return out, nil
 }
 
-func (d *stsDocker) RunHealthGate(ctx context.Context, _, _ string, _ int, policy healthgate.Policy, _ docker.HealthGateTarget) (docker.HealthGateResult, error) {
+func (d *stsDocker) RunHealthGate(ctx context.Context, containerID, _ string, _ int, policy healthgate.Policy, _ docker.HealthGateTarget) (docker.HealthGateResult, error) {
+	if containerID == "pred-id" {
+		d.rec("probe:pred")
+		if d.predGateBlock {
+			<-ctx.Done()
+			return docker.HealthGateResult{Reason: docker.HealthGateFailureContextCancelled}, nil
+		}
+		if d.predGate != nil {
+			return *d.predGate, d.predGateErr
+		}
+		return docker.HealthGateResult{Success: true}, d.predGateErr
+	}
 	d.rec("gate")
 	d.gotPolicy = policy
 	if d.onGate != nil {

@@ -124,6 +124,11 @@ type Lease struct {
 	// control plane, which never leases a non-default policy to us anyway).
 	// The health gate does not read it yet (step 22-1d).
 	HealthPolicy healthgate.Policy
+	// ActivationNotSwitched is true only when the control plane echoed that it
+	// will consider a not_switched activation outcome for this lease (slice
+	// 22-D: opted-in claim, stop-then-start, not a rollback). False for every
+	// older control plane. The agent sends the outcome only when this is true.
+	ActivationNotSwitched bool
 }
 
 // LiteralBinding is one variable's frozen non-secret value. It carries the
@@ -216,6 +221,8 @@ type leaseWire struct {
 	RollbackTargetRuntimeInstanceID string `json:"rollback_target_runtime_instance_id"`
 
 	HealthPolicy *healthPolicyWire `json:"health_policy"`
+
+	ActivationNotSwitched bool `json:"activation_not_switched"`
 }
 
 func (w leaseWire) parse(policyRequired bool) (Lease, error) {
@@ -262,6 +269,7 @@ func (w leaseWire) parse(policyRequired bool) (Lease, error) {
 		RollbackTargetReleaseID:         w.RollbackTargetReleaseID,
 		RollbackTargetRuntimeInstanceID: w.RollbackTargetRuntimeInstanceID,
 		HealthPolicy:                    policy,
+		ActivationNotSwitched:           w.ActivationNotSwitched,
 	}, nil
 }
 
@@ -269,42 +277,52 @@ func (w leaseWire) parse(policyRequired bool) (Lease, error) {
 // Callers must never set executorAvailable true unless a real Executor will
 // actually run the returned lease.
 //
-// The request declares the health_policy capability (step 22-1c). A control
-// plane that predates it decodes strictly and answers 400 invalid_request to
-// the unknown field; only then, and only once, the claim is repeated without
-// it (the pre-22-1c request), and every lease then carries the default policy.
-// When the capability was accepted, every lease must carry its policy.
-// A 400 means nothing was claimed, so the repeat cannot lease a second job.
+// The request declares the health_policy and activation_not_switched
+// capabilities (steps 22-1c and 22-D). A control plane that predates one decodes
+// strictly and answers 400 invalid_request to the unknown value; the claim is
+// then repeated down a ladder, one rung per 400: both capabilities, then
+// health_policy alone (a 22-1c control plane without 22-D), then none (the
+// pre-22-1c request, every lease carrying the default policy). When the
+// health_policy capability was accepted, every lease must carry its policy.
+// A 400 means nothing was claimed, so a repeat cannot lease a second job.
 func (c *Client) Claim(ctx context.Context, executorAvailable bool) ([]Lease, error) {
-	req := struct {
-		Limit             int      `json:"limit"`
-		ExecutorAvailable bool     `json:"executor_available"`
-		Capabilities      []string `json:"capabilities"`
-	}{Limit: 1, ExecutorAvailable: executorAvailable, Capabilities: []string{healthgate.CapabilityHealthPolicy}}
+	// Claim has no server-side idempotency key: retrying after a lost
+	// response could lease a second job. A single attempt per rung leaves any
+	// orphaned lease to expiry and reconciliation; the next tick claims again.
+	ladder := [][]string{
+		{healthgate.CapabilityHealthPolicy, queue.CapabilityActivationNotSwitched},
+		{healthgate.CapabilityHealthPolicy},
+		nil,
+	}
 	var resp struct {
 		Leases []leaseWire `json:"leases"`
 	}
-	// Claim has no server-side idempotency key: retrying after a lost
-	// response could lease a second job. A single attempt leaves any
-	// orphaned lease to expiry and reconciliation; the next tick claims again.
-	payload, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
-	}
-	err = c.attempt(ctx, pathClaim, payload, &resp, true)
+	var err error
 	policyRequired := true
-	var bad errBadRequest
-	if errors.As(err, &bad) {
-		policyRequired = false
-		legacy := struct {
-			Limit             int  `json:"limit"`
-			ExecutorAvailable bool `json:"executor_available"`
-		}{Limit: 1, ExecutorAvailable: executorAvailable}
-		if payload, err = json.Marshal(legacy); err != nil {
+	for i, caps := range ladder {
+		var payload []byte
+		if caps != nil {
+			payload, err = json.Marshal(struct {
+				Limit             int      `json:"limit"`
+				ExecutorAvailable bool     `json:"executor_available"`
+				Capabilities      []string `json:"capabilities"`
+			}{Limit: 1, ExecutorAvailable: executorAvailable, Capabilities: caps})
+		} else {
+			payload, err = json.Marshal(struct {
+				Limit             int  `json:"limit"`
+				ExecutorAvailable bool `json:"executor_available"`
+			}{Limit: 1, ExecutorAvailable: executorAvailable})
+		}
+		if err != nil {
 			return nil, fmt.Errorf("encode request: %w", err)
 		}
 		resp.Leases = nil
+		policyRequired = caps != nil
 		err = c.attempt(ctx, pathClaim, payload, &resp, true)
+		var bad errBadRequest
+		if !errors.As(err, &bad) || i == len(ladder)-1 {
+			break
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -623,6 +641,9 @@ type ActivationResult struct {
 	succeeded      bool
 	observedDigest [32]byte
 	failureSummary string
+	// notSwitched marks a failure that proved the host was left as found (ADR
+	// 0005 stop-then-start auto-finalize, slice 22-D). Failures only.
+	notSwitched bool
 }
 
 // ActivationSucceeded declares the switch observed with routeDigest.
@@ -637,6 +658,27 @@ func ActivationFailed(summary string) (ActivationResult, error) {
 		return ActivationResult{}, fmt.Errorf("%w: activation failure summary must be 1-%d bytes", ErrInvalidRequest, maxActivationFailureSummaryLen)
 	}
 	return ActivationResult{valid: true, failureSummary: summary}, nil
+}
+
+// ActivationNotSwitched declares a failure with the not_switched outcome: the
+// route was never written and the predecessor is running and healthy again.
+// Same summary bounds as ActivationFailed.
+func ActivationNotSwitched(summary string) (ActivationResult, error) {
+	res, err := ActivationFailed(summary)
+	if err != nil {
+		return ActivationResult{}, err
+	}
+	res.notSwitched = true
+	return res, nil
+}
+
+// NotSwitched reports whether r carries the not_switched outcome.
+func (r ActivationResult) NotSwitched() bool { return r.notSwitched }
+
+// withoutOutcome is r as a plain failure/success (the outcome removed).
+func (r ActivationResult) withoutOutcome() ActivationResult {
+	r.notSwitched = false
+	return r
 }
 
 // ReportActivationResult reports tx2 for operationID. It rejects a zero
@@ -654,7 +696,11 @@ func (c *Client) ReportActivationResult(ctx context.Context, attemptID, fence in
 		Succeeded           bool   `json:"succeeded"`
 		ObservedRouteDigest string `json:"observed_route_digest,omitempty"`
 		FailureSummary      string `json:"failure_summary,omitempty"`
+		Outcome             string `json:"outcome,omitempty"`
 	}{AttemptID: attemptID, Fence: fence, OperationID: operationID, Succeeded: result.succeeded, FailureSummary: result.failureSummary}
+	if result.notSwitched {
+		req.Outcome = queue.ActivationOutcomeNotSwitched
+	}
 	if result.succeeded {
 		req.ObservedRouteDigest = routeDigestPrefix + hex.EncodeToString(result.observedDigest[:])
 	}
