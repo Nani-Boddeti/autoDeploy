@@ -22,7 +22,7 @@ func TestQAStep3CursorResumeRetriesCASConflictsBeforeRetirement(t *testing.T) {
 		rotationVersionWith(t, "b", "old", provider.keys["old"]),
 	}
 	repository.conflict = "a"
-	rotator := NewRotator(repository, provider)
+	rotator := NewRotator(repository, provider, rotationGeneration)
 
 	first, err := rotator.RewrapBatch(context.Background(), RewrapRequest{
 		OldKEKID:  "old",

@@ -79,10 +79,14 @@ func newVerifyEnv(t *testing.T) verifyEnv {
 	return verifyEnv{pool: pool, generation: generation, ring: ring, service: secret.NewService(postgres.NewSecretRepository(pool), ring, nil)}
 }
 
+// worstCaseTerminalActor is the longest actor terminalActor can produce (32-byte
+// operator and 32-byte process user); the audit row must accept it.
+const worstCaseTerminalActor = "terminal:" + "oooooooooooooooooooooooooooooooo" + "(as " + "pppppppppppppppppppppppppppppppp" + ")"
+
 func (e verifyEnv) put(t *testing.T, id, versionID, value string) secret.Scope {
 	t.Helper()
 	s := secret.Scope{OwnerID: "owner", ProjectID: "project", EnvironmentID: "environment", SecretID: id, Purpose: "runtime", DeliveryScope: "runtime"}
-	if _, err := e.service.CreateWithContext(context.Background(), s, versionID, secret.OperationContext{AuditID: "audit-" + versionID, ActorID: "terminal:tester"}, []byte(value)); err != nil {
+	if _, err := e.service.CreateWithContext(context.Background(), s, versionID, secret.OperationContext{AuditID: "audit-" + versionID, ActorID: worstCaseTerminalActor}, []byte(value)); err != nil {
 		t.Fatal(err)
 	}
 	return s
@@ -91,6 +95,12 @@ func (e verifyEnv) put(t *testing.T, id, versionID, value string) secret.Scope {
 // verify runs the real command path (production wiring over a real pool) and
 // returns everything an operator could see.
 func (e verifyEnv) verify(t *testing.T, ring secretcrypto.KeyRing, generation string) (stdout string, err error) {
+	t.Helper()
+	return e.run(t, command{action: "verify"}, ring, generation)
+}
+
+// run executes a command through the real production wiring over a fresh pool.
+func (e verifyEnv) run(t *testing.T, c command, ring secretcrypto.KeyRing, generation string) (stdout string, err error) {
 	t.Helper()
 	deps := secretDependencies{
 		loadDatabase: func() (string, error) { return "unused", nil },
@@ -107,7 +117,12 @@ func (e verifyEnv) verify(t *testing.T, ring secretcrypto.KeyRing, generation st
 		newID: func(p string) (string, error) { return p + "-x", nil },
 	}
 	var out bytes.Buffer
-	err = runWithOutput(command{action: "verify"}, func() (terminalSession, error) { t.Fatal("preflight"); return nil, nil },
+	err = runWithOutput(c, func() (terminalSession, error) {
+		if c.action == "verify" {
+			t.Fatal("verify must not need a terminal")
+		}
+		return fakeTerminal{}, nil
+	},
 		func(ctx context.Context, c command) (string, error) { return executeWith(ctx, c, deps) }, &out)
 	all := out.String()
 	if err != nil {
@@ -202,5 +217,42 @@ func TestVerifyCanaryEndToEnd(t *testing.T) {
 	out, err = e.verify(t, e.ring, "ffffffffffffffffffff")
 	if !errors.Is(err, secret.ErrGenerationMismatch) || out != "" || errors.As(err, &vf) {
 		t.Fatalf("generation: %q %v", out, err)
+	}
+}
+
+func TestRewrapAndCanRetireRefuseGenerationMismatch(t *testing.T) {
+	e := newVerifyEnv(t)
+	e.put(t, "secret-one", "version-one", plainOne)
+	// kek-b is active so kek-a is the old key with one version still on it.
+	rotRing := verifyRing(t, "kek-b", "kek-a", "kek-b")
+	if err := postgres.NewKeyRepository(e.pool).InitializeActiveLedger(context.Background(), "kek-b", e.generation); err != nil {
+		t.Fatal(err)
+	}
+	const wrong = "ffffffffffffffffffff"
+	before := e.counts(t)
+
+	for _, c := range []command{
+		{action: "rewrap", oldKEK: "kek-a", batch: secret.DefaultRewrapBatchSize},
+		{action: "can-retire", oldKEK: "kek-a"},
+	} {
+		out, err := e.run(t, c, rotRing, wrong)
+		if !errors.Is(err, secret.ErrGenerationMismatch) || out != "" || errorMessage(err) != "secret operation failed: database generation does not match the key manifest" {
+			t.Fatalf("%+v: out=%q err=%v msg=%q", c, out, err, errorMessage(err))
+		}
+		if e.counts(t) != before {
+			t.Fatalf("%+v changed rows or the wrap ledger", c)
+		}
+	}
+
+	// Matching generation keeps the existing behaviour.
+	if out, err := e.run(t, command{action: "can-retire", oldKEK: "kek-a"}, rotRing, e.generation); !errors.Is(err, secret.ErrRetirement) || out != "" {
+		t.Fatalf("can-retire matched: %q %v", out, err)
+	}
+	out, err := e.run(t, command{action: "rewrap", oldKEK: "kek-a", batch: secret.DefaultRewrapBatchSize}, rotRing, e.generation)
+	if err != nil || !strings.HasPrefix(out, "secret rewrap completed selected=1 rewrapped=1 conflicts=0") {
+		t.Fatalf("rewrap matched: %q %v", out, err)
+	}
+	if e.counts(t) == before {
+		t.Fatal("matched rewrap changed nothing")
 	}
 }

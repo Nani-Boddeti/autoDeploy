@@ -285,8 +285,8 @@ type secretDependencies struct {
 type secretOperator interface {
 	io.Closer
 	Initialize(context.Context, string, string) error
-	CanRetire(context.Context, string, secretcrypto.KeyRing) error
-	Rewrap(context.Context, secret.RewrapRequest, secretcrypto.KeyRing) (secret.RewrapResult, error)
+	CanRetire(ctx context.Context, kekID string, ring secretcrypto.KeyRing, generation string) error
+	Rewrap(ctx context.Context, request secret.RewrapRequest, ring secretcrypto.KeyRing, generation string) (secret.RewrapResult, error)
 	// Verify decrypts every decryptable version read-only; generation is the manifest's binding.
 	Verify(context.Context, secretcrypto.KeyRing, string) (secret.VerifyResult, error)
 	// EnvironmentScope returns a Scope holding only the environment's derived owner/project/environment ids.
@@ -301,11 +301,11 @@ func (o postgresSecretOperator) Close() error { o.pool.Close(); return nil }
 func (o postgresSecretOperator) Initialize(ctx context.Context, id, generation string) error {
 	return postgres.NewKeyRepository(o.pool).InitializeActiveLedger(ctx, id, generation)
 }
-func (o postgresSecretOperator) CanRetire(ctx context.Context, id string, ring secretcrypto.KeyRing) error {
-	return secret.NewRotator(postgres.NewSecretRepository(o.pool), ring).CanRetire(ctx, id)
+func (o postgresSecretOperator) CanRetire(ctx context.Context, id string, ring secretcrypto.KeyRing, generation string) error {
+	return secret.NewRotator(postgres.NewSecretRepository(o.pool), ring, generation).CanRetire(ctx, id)
 }
-func (o postgresSecretOperator) Rewrap(ctx context.Context, request secret.RewrapRequest, ring secretcrypto.KeyRing) (secret.RewrapResult, error) {
-	return secret.NewRotator(postgres.NewSecretRepository(o.pool), ring).RewrapBatch(ctx, request)
+func (o postgresSecretOperator) Rewrap(ctx context.Context, request secret.RewrapRequest, ring secretcrypto.KeyRing, generation string) (secret.RewrapResult, error) {
+	return secret.NewRotator(postgres.NewSecretRepository(o.pool), ring, generation).RewrapBatch(ctx, request)
 }
 
 func (o postgresSecretOperator) Verify(ctx context.Context, ring secretcrypto.KeyRing, generation string) (secret.VerifyResult, error) {
@@ -342,13 +342,27 @@ func generateID(prefix string) (string, error) {
 	return prefix + "-" + hex.EncodeToString(raw[:]), nil
 }
 
+// operatorPattern is the strict unix-account shape the wrapper also enforces.
+var operatorPattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
 // terminalActor names the invoking unix account for the audit trail. Under
-// autodeploy-run this is the control-plane service account.
+// autodeploy-run the process user is the control-plane service account, so
+// the root-run wrapper passes the human (sudo) operator in AUTODEPLOY_OPERATOR
+// and the actor becomes "terminal:<operator>(as <process user>)"; at most
+// 9+32+4+32+1 = 78 bytes, within the 128-byte secret_audit_events.actor_id
+// limit. The operator is attribution asserted by the wrapper, not
+// authentication: anyone who can run this binary as the control-plane user is
+// already privileged. An absent or malformed value falls back to the process
+// user alone.
 func terminalActor() string {
+	self := "uid-" + strconv.Itoa(os.Getuid())
 	if u, err := user.Current(); err == nil && u.Username != "" {
-		return "terminal:" + u.Username
+		self = u.Username
 	}
-	return "terminal:uid-" + strconv.Itoa(os.Getuid())
+	if op := os.Getenv("AUTODEPLOY_OPERATOR"); operatorPattern.MatchString(op) {
+		return "terminal:" + op + "(as " + self + ")"
+	}
+	return "terminal:" + self
 }
 
 // readConfirmedValue prompts twice and returns the value; the caller clears it.
@@ -498,12 +512,12 @@ func executeWith(ctx context.Context, c command, dependencies secretDependencies
 		return verifySecrets(ctx, operator, ring, generation)
 	}
 	if c.action == "can-retire" {
-		if err := operator.CanRetire(ctx, c.oldKEK, ring); err != nil {
+		if err := operator.CanRetire(ctx, c.oldKEK, ring, generation); err != nil {
 			return "", err
 		}
 		return "secret key can retire", nil
 	}
-	result, err := operator.Rewrap(ctx, secret.RewrapRequest{OldKEKID: c.oldKEK, Cursor: c.cursor, BatchSize: c.batch}, ring)
+	result, err := operator.Rewrap(ctx, secret.RewrapRequest{OldKEKID: c.oldKEK, Cursor: c.cursor, BatchSize: c.batch}, ring, generation)
 	if err != nil {
 		return "", err
 	}

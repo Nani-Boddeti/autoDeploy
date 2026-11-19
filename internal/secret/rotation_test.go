@@ -24,7 +24,11 @@ func (p rotationProvider) Resolve(id string) ([]byte, error) {
 	return append([]byte(nil), key...), nil
 }
 
+const rotationGeneration = "0123456789abcdef"
+
 type rotationRepo struct {
+	generation   string // empty means rotationGeneration
+	calls        int    // list/rewrap/count calls
 	versions     []Version
 	reservations int
 	conflict     string
@@ -33,7 +37,14 @@ type rotationRepo struct {
 }
 
 func (r *rotationRepo) ReserveWrapInvocation(string) error { r.reservations++; return nil }
+func (r *rotationRepo) DatabaseGeneration(context.Context) (string, error) {
+	if r.generation != "" {
+		return r.generation, nil
+	}
+	return rotationGeneration, nil
+}
 func (r *rotationRepo) ListVersionsByKEK(_ context.Context, id, cursor string, n int) ([]Version, error) {
+	r.calls++
 	r.lastLimit = n
 	out := []Version{}
 	for _, v := range r.versions {
@@ -47,6 +58,7 @@ func (r *rotationRepo) ListVersionsByKEK(_ context.Context, id, cursor string, n
 	return out, nil
 }
 func (r *rotationRepo) Rewrap(_ context.Context, _ Scope, id string, revision uint64, e crypto.Envelope) error {
+	r.calls++
 	if id == r.conflict {
 		return errors.New("conflict")
 	}
@@ -60,6 +72,7 @@ func (r *rotationRepo) Rewrap(_ context.Context, _ Scope, id string, revision ui
 	return errors.New("conflict")
 }
 func (r *rotationRepo) CountVersionsByKEK(context.Context, string) (int64, error) {
+	r.calls++
 	return r.count, nil
 }
 func rotationVersion(t *testing.T, id, kek string) Version {
@@ -82,7 +95,7 @@ func TestRotatorBatchesResumeAndBurnsConflictReservations(t *testing.T) {
 	r.versions = []Version{rotationVersionWith(t, "a", "old", p.keys["old"]), rotationVersionWith(t, "b", "new", p.keys["new"]), rotationVersionWith(t, "c", "old", p.keys["old"])}
 	before := append([]byte(nil), r.versions[0].Envelope.Ciphertext...)
 	r.conflict = "a"
-	rot := NewRotator(r, p)
+	rot := NewRotator(r, p, rotationGeneration)
 	got, err := rot.RewrapBatch(context.Background(), RewrapRequest{OldKEKID: "old", BatchSize: 1})
 	if err != nil || got.Selected != 1 || got.Conflicts != 1 || got.NextCursor != "" || r.reservations != 1 {
 		t.Fatalf("first=%+v err=%v reservations=%d", got, err, r.reservations)
@@ -102,7 +115,7 @@ func TestRotatorBatchesResumeAndBurnsConflictReservations(t *testing.T) {
 func TestRotatorUsesDefaultBatchSize(t *testing.T) {
 	p := rotationProvider{active: "new", keys: map[string][]byte{"old": make([]byte, 32), "new": []byte("abcdefghijklmnopqrstuvwxyz123456")}}
 	r := &rotationRepo{}
-	if _, err := NewRotator(r, p).RewrapBatch(context.Background(), RewrapRequest{OldKEKID: "old"}); err != nil {
+	if _, err := NewRotator(r, p, rotationGeneration).RewrapBatch(context.Background(), RewrapRequest{OldKEKID: "old"}); err != nil {
 		t.Fatal(err)
 	}
 	if r.lastLimit != DefaultRewrapBatchSize {
@@ -122,14 +135,32 @@ func rotationVersionWith(t *testing.T, id, kek string, key []byte) Version {
 func TestRotatorRetirementGuard(t *testing.T) {
 	r := &rotationRepo{count: 1}
 	p := rotationProvider{active: "new", keys: map[string][]byte{"new": make([]byte, 32)}}
-	if err := NewRotator(r, p).CanRetire(context.Background(), "old"); !errors.Is(err, ErrRetirement) {
+	if err := NewRotator(r, p, rotationGeneration).CanRetire(context.Background(), "old"); !errors.Is(err, ErrRetirement) {
 		t.Fatalf("retire=%v", err)
 	}
 	r.count = 0
-	if err := NewRotator(r, p).CanRetire(context.Background(), "old"); err != nil {
+	if err := NewRotator(r, p, rotationGeneration).CanRetire(context.Background(), "old"); err != nil {
 		t.Fatal(err)
 	}
-	if err := NewRotator(r, p).CanRetire(context.Background(), "new"); !errors.Is(err, ErrRetirement) {
+	if err := NewRotator(r, p, rotationGeneration).CanRetire(context.Background(), "new"); !errors.Is(err, ErrRetirement) {
 		t.Fatalf("active retire=%v", err)
+	}
+}
+
+func TestRotatorGenerationMismatchRefusesBeforeAnyAccess(t *testing.T) {
+	p := rotationProvider{active: "new", keys: map[string][]byte{"old": make([]byte, 32), "new": []byte("abcdefghijklmnopqrstuvwxyz123456")}}
+	r := &rotationRepo{generation: "ffffffffffffffff", count: 0}
+	r.versions = []Version{rotationVersionWith(t, "a", "old", p.keys["old"])}
+	rot := NewRotator(r, p, rotationGeneration)
+	for _, dry := range []bool{false, true} {
+		if _, err := rot.RewrapBatch(context.Background(), RewrapRequest{OldKEKID: "old", DryRun: dry}); !errors.Is(err, ErrGenerationMismatch) {
+			t.Fatalf("rewrap dry=%v err=%v", dry, err)
+		}
+	}
+	if err := rot.CanRetire(context.Background(), "old"); !errors.Is(err, ErrGenerationMismatch) {
+		t.Fatalf("can-retire err=%v", err)
+	}
+	if r.calls != 0 || r.reservations != 0 || r.versions[0].Envelope.KEKID != "old" {
+		t.Fatalf("repository touched: calls=%d reservations=%d", r.calls, r.reservations)
 	}
 }

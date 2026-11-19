@@ -37,7 +37,9 @@ file; refused when stdin is not a terminal). The environment must already be kno
     sudo /usr/local/lib/autodeploy/autodeploy-run secrets secret put --environment uat --name NPM_TOKEN --scope build
 
 `--scope` is `build` (build-time `RUN --mount=type=secret`) or `runtime` (container environment). The
-command prints `secret head id: <id>` and `version: 1` (never the value). Paste the id into the
+command prints `secret head id: <id>` and `version: 1` (never the value). The audit actor records the
+sudo operator, e.g. `terminal:alice(as autodeploy-controlplane)` (names outside `^[a-z_][a-z0-9_-]{0,31}$`,
+such as `john.doe`, are recorded as `unknown`; this is attribution, not authentication). Paste the id into the
 environment's "Add binding" form on the Servers page: kind secret, the same variable name and the same
 scope. `--name` is only validated, not stored: the variable name is set in the binding form, and both
 must match what the Dockerfile or app expects. To rotate:

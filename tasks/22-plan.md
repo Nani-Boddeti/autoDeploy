@@ -26,12 +26,14 @@ failing test first -> full bar -> independent review -> owner sees diff -> commi
 - 22-4 Metrics endpoint, structured-log audit, liveness next to /readyz, PostgreSQL + secrets backup/DR docs. ~1 day.
 
 ## Phase 4: needs a public host
-- 22-5 Hetzner packaging (adapt deploy/host kit) -> Packaging.
-- 22-6 ACME automatic HTTPS on Hetzner -> Traefik.
+(owner 2026-11-19: vendor-agnostic. Target = any VPS from any provider (generic Ubuntu LTS host with a public
+IPv4/IPv6 and a DNS name), never a provider-specific API, image, or tool. Hetzner is just one possible test host.)
+- 22-5 VPS packaging: adapt the deploy/host kit for a generic public VPS (no provider assumptions) -> Packaging.
+- 22-6 ACME automatic HTTPS on a public VPS (HTTP-01/TLS-ALPN-01, no provider DNS plugin required) -> Traefik.
 
 ## Phase 5: final validation and launch
 - 22-7 Full-codebase security/reliability audit (full-codebase-audit-and-remediate skill), failure-recovery and
-  end-to-end on Hetzner, gate 12 (drain-before-downgrade doc), then flip executorEnabled/activationEnabled.
+  end-to-end on a public VPS, gate 12 (drain-before-downgrade doc), then flip executorEnabled/activationEnabled.
 
 Expected: after Phase 2 -> 14/18 (~90% weighted); Phase 3 -> 15/18; Phases 4-5 -> 18/18.
 
@@ -399,3 +401,13 @@ by a test listing allowed label names).
   steps end to end, `secret put` + rebind guidance for heads without an active version.
   NEXT: commit 22-4 (all slices) -> acer: install, metrics during a deploy, journal format (update acer recipe greps
   to attempt_id=N), backup/restore drill on a scratch DB, then tick observability.
+- 2026-11-19: owner: 22-5/22-6 are vendor-agnostic (any provider's public VPS; no provider APIs/images/DNS
+  plugins); README/status wording updated, ADR 0001 left as historical context.
+- 2026-11-19: small fixes DONE (uncommitted): (1) Rotator.RewrapBatch/CanRetire refuse ErrGenerationMismatch before
+  any repository access (manifest generation vs secret_database_generation; same fixed CLI text as verify);
+  (2) enable-github.sh --kek-id (default kek-1 byte-identical; validKeyID rule; refuses before App key/webhook/KEK/
+  manifest writes if an existing manifest's active id differs; whitespace-tolerant id read; warns on orphan KEK
+  file); runbook total-KEK-loss uses it with prerequisites; (3) audit actor `terminal:<operator>(as <user>)` from
+  autodeploy-run AUTODEPLOY_OPERATOR (SUDO_USER -> logname -> root, strict regex else unknown; set after env-file
+  vars so it can't be overridden). Review PASS WITH NOTES -> fixed. Mutation-style: generation compare disabled ->
+  integration rewrap succeeded (test fails).

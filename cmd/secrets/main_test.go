@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	secretcrypto "autodeploy/internal/crypto"
@@ -99,11 +101,11 @@ func (f *fakeSecretOperator) Initialize(context.Context, string, string) error {
 	f.calls = append(f.calls, "init")
 	return f.init
 }
-func (f *fakeSecretOperator) CanRetire(context.Context, string, secretcrypto.KeyRing) error {
+func (f *fakeSecretOperator) CanRetire(context.Context, string, secretcrypto.KeyRing, string) error {
 	f.calls = append(f.calls, "retire")
 	return f.retire
 }
-func (f *fakeSecretOperator) Rewrap(_ context.Context, _ secret.RewrapRequest, _ secretcrypto.KeyRing) (secret.RewrapResult, error) {
+func (f *fakeSecretOperator) Rewrap(_ context.Context, _ secret.RewrapRequest, _ secretcrypto.KeyRing, _ string) (secret.RewrapResult, error) {
 	f.calls = append(f.calls, "rewrap")
 	return f.result, f.rewrap
 }
@@ -140,4 +142,38 @@ func TestExecuteWithSanitizesOperationErrorsAndFormatsResults(t *testing.T) {
 	if got, err = executeWith(context.Background(), command{action: "can-retire", oldKEK: "fresh"}, deps); err == nil || got != "" {
 		t.Fatalf("retire=%q %v", got, err)
 	}
+}
+
+func TestTerminalActorAttributesOperator(t *testing.T) {
+	self := terminalActorBase(t)
+	t.Setenv("AUTODEPLOY_OPERATOR", "alice")
+	if got, want := terminalActor(), "terminal:alice(as "+self+")"; got != want {
+		t.Fatalf("actor = %q, want %q", got, want)
+	}
+	long := strings.Repeat("a", 32)
+	t.Setenv("AUTODEPLOY_OPERATOR", long)
+	if got := terminalActor(); len(got) > 128 || !strings.HasPrefix(got, "terminal:"+long+"(as ") {
+		t.Fatalf("32-char operator not attributed within 128 bytes: %q", got)
+	}
+}
+
+func TestTerminalActorIgnoresInvalidOperator(t *testing.T) {
+	self := terminalActorBase(t)
+	for _, bad := range []string{"bob;rm", "", "a b", strings.Repeat("a", 33), "Root", "1abc", "al\nice"} {
+		t.Setenv("AUTODEPLOY_OPERATOR", bad)
+		if got := terminalActor(); got != "terminal:"+self {
+			t.Errorf("operator %q: actor = %q, want fallback", bad, got)
+		}
+	}
+	os.Unsetenv("AUTODEPLOY_OPERATOR")
+	if got := terminalActor(); got != "terminal:"+self {
+		t.Errorf("absent operator: actor = %q", got)
+	}
+}
+
+func terminalActorBase(t *testing.T) string {
+	t.Helper()
+	t.Setenv("AUTODEPLOY_OPERATOR", "")
+	got := terminalActor()
+	return strings.TrimPrefix(got, "terminal:")
 }

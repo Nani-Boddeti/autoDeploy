@@ -39,4 +39,11 @@ if [[ -r $GITHUB_ENV_FILE ]]; then
   done <"$GITHUB_ENV_FILE"
 fi
 
-exec runuser -u "$RUN_USER" -- env -i "PATH=/usr/bin:/bin" "TERM=${TERM:-dumb}" "${vars[@]}" "$APP_DIR/$tool" "$@"
+# Who is at the keyboard: the sudo caller, else the login name, else root. Attribution for the
+# audit trail only (the tool re-validates it); it is not authentication.
+operator=${SUDO_USER:-}
+[[ -n $operator && $operator != root ]] || operator=$(logname 2>/dev/null || true)
+[[ -n $operator ]] || operator=root
+[[ "$operator" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || operator=unknown
+
+exec runuser -u "$RUN_USER" -- env -i "PATH=/usr/bin:/bin" "TERM=${TERM:-dumb}" "${vars[@]}" "AUTODEPLOY_OPERATOR=$operator" "$APP_DIR/$tool" "$@"

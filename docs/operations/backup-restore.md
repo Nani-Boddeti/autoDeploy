@@ -185,6 +185,9 @@ Prerequisites: the dump (decrypted, sha256 matches the recorded value), the set 
    A failed run can leave `$CP/secret-*.XXXXXX` temp files behind; delete them (`ls $CP`), otherwise the
    `secret-*` glob sweeps them into the KEK backup set.
 
+   `enable-github.sh --kek-id` does not do this step: it refuses when a manifest with another active id
+   exists, because adding a fresh id next to `retiring` keys is only supported by hand, as below.
+
    Then write the manifest (non-secret JSON; same ownership/mode and temp-file-and-rename way). Format
    from `internal/crypto/manifest.go` and `enable-github.sh`; exactly one `active` key, every older key
    `retiring`, absolute paths, no unknown fields. Example with old `kek-1`:
@@ -295,10 +298,16 @@ blocks new secret materialisation and deployment work that needs secrets.
    (section 3 step 2).
 2. Create a new KEK file and a manifest with a single `active` key (the format in section 3 step 5, without
    the retiring entries), for an id that is not in `secret_wrap_invocations`. The generation id is
-   `SELECT id FROM secret_database_generation WHERE singleton`. `deploy/host/enable-github.sh` is the
-   reference for file mode, owner and the first-time flow; it hard-codes `kek-1`, so for a recovery use
-   the manual steps and a new id.
-3. `autodeploy-run secrets secret init-active-kek --kek <new-id>`.
+   `SELECT id FROM secret_database_generation WHERE singleton`. If the old manifest is gone (remove the
+   stale one first, together with any `secret-*` files that no longer exist elsewhere), run
+   `enable-github.sh --kek-id <new-id>` with the usual App arguments, including `--private-key` with
+   the same App key file (see its header). Prerequisites: `autodeploy-postgres` running, migrations
+   applied, and an interactive terminal (it runs `init-active-kek`). It restarts the control plane at
+   the end, so step 4 below is then only the `/readyz` check. It creates `secret-<new-id>`, the single-key manifest and, in
+   step 3, the ledger row. It refuses, changing nothing, if a manifest with a different active id still
+   exists, and never overwrites an existing KEK file; in that case use the manual steps above.
+3. `enable-github.sh` already ran `init-active-kek` for the new id. With the manual steps, run
+   `autodeploy-run secrets secret init-active-kek --kek <new-id>`.
 4. Start the control plane; `/readyz` must answer `ok`.
 5. `autodeploy-run secrets secret verify` will list every old version as `reason=kek_missing`. That is
    expected; the new KEK covers only values written from now on. Re-enter every secret:

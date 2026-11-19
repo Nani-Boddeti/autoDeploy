@@ -5,7 +5,7 @@
 #
 # Usage (as root):
 #   enable-github.sh --app-id N --client-id ID --slug SLUG --owner-id N \
-#       --owner-type User|Organization --private-key FILE [--replace-key] [--bindir DIR]
+#       --owner-type User|Organization --private-key FILE [--replace-key] [--bindir DIR] [--kek-id ID]
 #
 #   --private-key FILE  the .pem downloaded from the App settings, copied to the host. It is
 #                       copied (never printed) to the control plane's credential directory.
@@ -14,16 +14,25 @@
 #                       change on a host installed before they existed). Not needed once
 #                       install-app.sh has been re-run with a BINDIR that contains `secrets`.
 #
+#   --kek-id ID         id of the active KEK to create (default kek-1; the KEK file is secret-ID).
+#                       Same rule as internal/crypto validKeyID: 1-64 of A-Za-z0-9_-. Use it for a
+#                       FIRST-TIME setup or a total-KEK-loss recovery (docs/operations/backup-restore.md
+#                       section 4) where no manifest exists. The script REFUSES, before writing the App
+#                       key, webhook secret, KEK or manifest (only --bindir's install-app.sh runs earlier), if a
+#                       manifest already exists whose active key is not ID (including a restore that must
+#                       add a fresh id next to retiring KEKs): that rotation is the manual procedure in
+#                       backup-restore.md section 3 step 5. An existing KEK file is never overwritten.
+#
 # Every input is non-secret and validated exactly as internal/config/database.go
 # GitHubAppConfigFromEnvironment does (plus a stricter character set, since the slug becomes
 # part of a URL). What it does:
 #   1. installs the App private key  /etc/autodeploy/controlplane/github-app-private-key
 #   2. creates the webhook secret    /etc/autodeploy/controlplane/github-webhook-secret-1
 #      (32 random bytes, hex text so the owner can paste it into the App's webhook settings)
-#   3. creates the KEK               /etc/autodeploy/controlplane/secret-kek-1 (32 random bytes)
+#   3. creates the KEK               /etc/autodeploy/controlplane/secret-<ID> (32 random bytes)
 #      and its manifest              /etc/autodeploy/controlplane/kek-manifest.json (non-secret
 #      JSON bound to the database generation read from PostgreSQL)
-#   4. initialises the key ledger once: `autodeploy-run secrets secret init-active-kek --kek kek-1`
+#   4. initialises the key ledger once: `autodeploy-run secrets secret init-active-kek --kek <ID>`
 #      (cmd/secrets needs an interactive terminal; a ledger that already exists is detected and
 #      left alone)
 #   5. writes /etc/autodeploy/controlplane-github.env (root 0644, paths and ids only), which the
@@ -45,8 +54,6 @@ readonly RUN="$LIB_DIR/autodeploy-run"
 readonly GITHUB_ENV="$ETC_DIR/controlplane-github.env"
 readonly KEY_DST="$CP_DIR/github-app-private-key"
 readonly WEBHOOK_FILE="$CP_DIR/github-webhook-secret-1"
-readonly KEK_ID=kek-1
-readonly KEK_FILE="$CP_DIR/secret-$KEK_ID"
 readonly MANIFEST="$CP_DIR/kek-manifest.json"
 readonly PG_CONTAINER=autodeploy-postgres
 # Always the system Engine, never a per-user Docker Desktop context.
@@ -56,16 +63,17 @@ unset DOCKER_CONTEXT
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'enable-github: error: %s\n' "$*" >&2; exit 1; }
 
-app_id="" client_id="" slug="" owner_id="" owner_type="" key_src="" replace_key=0 bindir=""
+app_id="" client_id="" slug="" owner_id="" owner_type="" key_src="" replace_key=0 bindir="" kek_id=kek-1
 while (($#)); do
   case "$1" in
     --replace-key) replace_key=1; shift ;;
-    --app-id | --client-id | --slug | --owner-id | --owner-type | --private-key | --bindir)
+    --app-id | --client-id | --slug | --owner-id | --owner-type | --private-key | --bindir | --kek-id)
       (($# >= 2)) || die "$1 needs a value"
       case "$1" in
         --app-id) app_id="$2" ;; --client-id) client_id="$2" ;; --slug) slug="$2" ;;
         --owner-id) owner_id="$2" ;; --owner-type) owner_type="$2" ;;
         --private-key) key_src="$2" ;; --bindir) bindir="$2" ;;
+        --kek-id) kek_id="$2" ;;
         *) die "unreachable" ;;
       esac
       shift 2 ;;
@@ -73,6 +81,10 @@ while (($#)); do
   esac
 done
 
+# Same rule as internal/crypto validKeyID (1-64 of A-Za-z0-9_-): no '/', '.', whitespace or newline.
+[[ $kek_id =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "--kek-id must be 1-64 characters of A-Za-z0-9_-"
+readonly KEK_ID="$kek_id"
+readonly KEK_FILE="$CP_DIR/secret-$KEK_ID"
 [[ $EUID -eq 0 ]] || die "must run as root"
 # ---- 1. validate inputs (mirrors internal/config/database.go) -------------------------
 [[ $app_id =~ ^[1-9][0-9]{0,17}$ ]] || die "--app-id must be a positive integer"
@@ -105,6 +117,14 @@ systemctl is-active --quiet autodeploy-postgres.service || die "autodeploy-postg
 psql_cp() { /usr/bin/docker exec "$PG_CONTAINER" psql -U autodeploy -d autodeploy -X -tA -v ON_ERROR_STOP=1 -c "$1"; }
 psql_cp "SELECT 1 FROM secret_database_generation" >/dev/null 2>&1 \
   || die "database has no secret tables: run '$RUN migrate' first"
+
+# An existing manifest whose active key is not KEK_ID: refuse before anything is written.
+if [[ -e $MANIFEST ]]; then
+  # Whitespace-tolerant: the manifest may be compact (this script) or pretty-printed (by hand).
+  existing_active="$(grep -oE '"active_key_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$MANIFEST" | head -n 1 | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/' || true)"
+  [[ -n $existing_active ]] || die "$MANIFEST exists but its active_key_id could not be read; nothing was changed"
+  [[ $existing_active == "$KEK_ID" ]] || die "$MANIFEST already exists with active KEK id '$existing_active', not '$KEK_ID'; nothing was changed. Adding a fresh id to an existing manifest is manual: see docs/operations/backup-restore.md section 3 step 5"
+fi
 
 write_file() { # dst owner group mode (content on stdin; 0600 temp file renamed into place)
   local tmp
@@ -144,6 +164,7 @@ generation="$(psql_cp "SELECT id FROM secret_database_generation WHERE singleton
 [[ $generation =~ ^[A-Za-z0-9]{16,128}$ ]] || die "unexpected database generation id"
 if [[ -e $KEK_FILE ]]; then
   log "KEK exists; keeping it"
+  [[ -e $MANIFEST ]] || log "WARNING: $KEK_FILE exists without a manifest (left over from an aborted run?); it becomes the active KEK. Remove it first if it is not the intended key."
 else
   [[ ! -e $MANIFEST ]] || die "$MANIFEST exists without $KEK_FILE; refusing to continue"
   log "creating the KEK (32 random bytes)"

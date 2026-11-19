@@ -21,6 +21,7 @@ var (
 // secret callers cannot enumerate encrypted envelopes.
 type RotationRepository interface {
 	crypto.WrapInvocationReserver
+	DatabaseGeneration(context.Context) (string, error)
 	ListVersionsByKEK(context.Context, string, string, int) ([]Version, error)
 	Rewrap(context.Context, Scope, string, uint64, crypto.Envelope) error
 	CountVersionsByKEK(context.Context, string) (int64, error)
@@ -39,15 +40,23 @@ type RewrapResult struct {
 type Rotator struct {
 	repository RotationRepository
 	provider   crypto.KeyProvider
+	// generation is the key manifest's database generation binding.
+	generation string
 }
 
-func NewRotator(repository RotationRepository, provider crypto.KeyProvider) *Rotator {
-	return &Rotator{repository: repository, provider: provider}
+// NewRotator binds the rotator to the manifest's database generation. Every
+// operation refuses with ErrGenerationMismatch, before any other repository
+// access, when the connected database carries a different generation.
+func NewRotator(repository RotationRepository, provider crypto.KeyProvider, generation string) *Rotator {
+	return &Rotator{repository: repository, provider: provider, generation: generation}
 }
 
 func (r *Rotator) RewrapBatch(ctx context.Context, request RewrapRequest) (RewrapResult, error) {
 	if r == nil || r.repository == nil || r.provider == nil || !validRotationID(request.OldKEKID) || (request.Cursor != "" && !validID(request.Cursor)) {
 		return RewrapResult{}, ErrRotationInput
+	}
+	if err := r.checkGeneration(ctx); err != nil {
+		return RewrapResult{}, err
 	}
 	if request.BatchSize == 0 {
 		request.BatchSize = DefaultRewrapBatchSize
@@ -94,6 +103,9 @@ func (r *Rotator) CanRetire(ctx context.Context, kekID string) error {
 	if r == nil || r.repository == nil || r.provider == nil || !validRotationID(kekID) {
 		return ErrRotationInput
 	}
+	if err := r.checkGeneration(ctx); err != nil {
+		return err
+	}
 	active, key, err := r.provider.Active()
 	clear(key)
 	if err != nil || !validRotationID(active) {
@@ -108,6 +120,22 @@ func (r *Rotator) CanRetire(ctx context.Context, kekID string) error {
 	}
 	if n != 0 {
 		return ErrRetirement
+	}
+	return nil
+}
+
+// checkGeneration binds every rotation operation to the database the key
+// manifest was issued for, reusing the read-only generation lookup of Verify.
+func (r *Rotator) checkGeneration(ctx context.Context) error {
+	if !validID(r.generation) {
+		return ErrRotationInput
+	}
+	generation, err := r.repository.DatabaseGeneration(ctx)
+	if err != nil {
+		return ErrCorrupt
+	}
+	if generation != r.generation {
+		return ErrGenerationMismatch
 	}
 	return nil
 }

@@ -1,6 +1,6 @@
 # AutoDeploy
 
-AutoDeploy is a self-hosted control plane and outbound deployment-agent platform for deploying private GitHub Dockerfile applications to Hetzner. It uses Go, PostgreSQL, Docker/BuildKit, and Traefik; it does not give its public control plane a Docker socket or broad SSH access.
+AutoDeploy is a self-hosted control plane and outbound deployment-agent platform for deploying private GitHub Dockerfile applications to any Linux VPS, independent of the hosting provider. It uses Go, PostgreSQL, Docker/BuildKit, and Traefik; it does not give its public control plane a Docker socket or broad SSH access.
 
 Implementation is active. The authoritative continuation brief is [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). The working plan is [tasks/todo.md](tasks/todo.md); accepted architecture decisions are in [docs/adr](docs/adr).
 
