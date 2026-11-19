@@ -44,6 +44,18 @@ func freshGitHubRepository(t *testing.T) (*GitHubRepository, *AuthRepository, au
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Bindings must target an existing, active server of the owner; the
+	// ids below are the ones the binding fixtures in this package use.
+	// Other fixtures insert the same ids, so clear before and after.
+	if _, err := pool.Exec(ctx, `TRUNCATE servers CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.Exec(context.Background(), `TRUNCATE servers CASCADE`) }) //nolint:errcheck
+	for _, id := range []string{"server", "server / opaque"} {
+		if _, err := pool.Exec(ctx, `INSERT INTO servers(id,owner_id,name,protocol_version,status) VALUES($1,$2,$1,1,'active')`, id, p.OwnerID); err != nil {
+			t.Fatal(err)
+		}
+	}
 	githubRepo := NewGitHubRepository(pool)
 	if err := githubRepo.EnsureAppRegistration(ctx, githubapp.AppIdentity{AppID: 7, ClientID: "client", Slug: "app"}, githubapp.Owner{AccountID: 9, Type: "User"}); err != nil {
 		t.Fatal(err)

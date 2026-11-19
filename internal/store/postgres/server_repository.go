@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"time"
 	"unicode/utf8"
@@ -161,7 +162,7 @@ func (r *ServerRepository) RegisterServer(ctx context.Context, principal auth.Pr
 	}
 
 	var expiresAt time.Time
-	err = tx.QueryRow(ctx, `INSERT INTO server_enrollment_tokens(server_id,digest,issued_at,expires_at) VALUES($1,$2,clock_timestamp(),clock_timestamp()+make_interval(secs=>$3)) RETURNING expires_at`, in.ServerID, in.EnrollmentDigest[:], in.EnrollmentTTLSeconds).Scan(&expiresAt)
+	err = tx.QueryRow(ctx, `INSERT INTO server_enrollment_tokens(server_id,digest,issued_at,expires_at,purpose) VALUES($1,$2,clock_timestamp(),clock_timestamp()+make_interval(secs=>$3),'enroll') RETURNING expires_at`, in.ServerID, in.EnrollmentDigest[:], in.EnrollmentTTLSeconds).Scan(&expiresAt)
 	if err != nil {
 		return server.Server{}, time.Time{}, fmt.Errorf("insert server enrollment token: %w", err)
 	}
@@ -212,14 +213,14 @@ func (r *ServerRepository) IssueEnrollment(ctx context.Context, principal auth.P
 		return time.Time{}, err
 	}
 	var consumedAt *time.Time
-	if err = tx.QueryRow(ctx, `SELECT consumed_at FROM server_enrollment_tokens WHERE server_id=$1 FOR UPDATE`, serverID).Scan(&consumedAt); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT consumed_at FROM server_enrollment_tokens WHERE server_id=$1 AND purpose='enroll' FOR UPDATE`, serverID).Scan(&consumedAt); err != nil {
 		return time.Time{}, ErrServerAuthorizationDenied
 	}
 	if consumedAt != nil {
 		return time.Time{}, ErrServerAuthorizationDenied
 	}
 	var expiresAt time.Time
-	if err = tx.QueryRow(ctx, `UPDATE server_enrollment_tokens SET digest=$2,issued_at=clock_timestamp(),expires_at=clock_timestamp()+make_interval(secs=>$3) WHERE server_id=$1 AND consumed_at IS NULL RETURNING expires_at`, serverID, digest[:], ttlSeconds).Scan(&expiresAt); err != nil {
+	if err = tx.QueryRow(ctx, `UPDATE server_enrollment_tokens SET digest=$2,issued_at=clock_timestamp(),expires_at=clock_timestamp()+make_interval(secs=>$3) WHERE server_id=$1 AND purpose='enroll' AND consumed_at IS NULL RETURNING expires_at`, serverID, digest[:], ttlSeconds).Scan(&expiresAt); err != nil {
 		return time.Time{}, ErrServerAuthorizationDenied
 	}
 	if err = r.inject("enrollment_reissue"); err != nil {
@@ -230,6 +231,68 @@ func (r *ServerRepository) IssueEnrollment(ctx context.Context, principal auth.P
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return time.Time{}, fmt.Errorf("commit server enrollment reissue: %w", err)
+	}
+	return expiresAt, nil
+}
+
+// IssueReenrollment mints a single-use re-enrollment token for an active,
+// already-enrolled server, e.g. after a restore left the agent holding a
+// credential the database does not know. Consuming it (Enroll) revokes the
+// live credential and installs the next version. The owner-scoped active
+// server check runs before every other refusal, so a caller can never learn
+// whether another owner's server exists or has enrolled. It refuses with
+// ErrReenrollmentPending while an unexpired token is outstanding (never
+// replacing a live token behind the operator's back); an expired unconsumed
+// token is replaced in place so an abandoned token cannot block re-enrollment
+// forever. Only the digest is stored; the reason is audited.
+func (r *ServerRepository) IssueReenrollment(ctx context.Context, principal auth.Principal, serverID string, digest [32]byte, ttlSeconds int, reason string) (time.Time, error) {
+	if r == nil || r.pool == nil || principal.Validate() != nil || !github.ValidOpaqueID(serverID) || ttlSeconds <= 0 || ttlSeconds > 3600 || reason == "" || !validReason(reason) {
+		return time.Time{}, ErrServerAuthorizationDenied
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("begin server reenrollment issue: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
+		return time.Time{}, err
+	}
+	actor := administratorActor(principal)
+	// Owner scope and active status first: nothing below may leak existence.
+	if err = lockActiveServer(ctx, tx, serverID, principal.OwnerID); err != nil {
+		return time.Time{}, err
+	}
+	var enrolled bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM server_enrollment_tokens WHERE server_id=$1 AND purpose='enroll' AND consumed_at IS NOT NULL)`, serverID).Scan(&enrolled); err != nil {
+		return time.Time{}, fmt.Errorf("check server enrollment: %w", err)
+	}
+	if !enrolled {
+		return time.Time{}, ErrServerNotEnrolled
+	}
+	var pendingID int64
+	var expired bool
+	err = tx.QueryRow(ctx, `SELECT id, expires_at <= clock_timestamp() FROM server_enrollment_tokens WHERE server_id=$1 AND consumed_at IS NULL FOR UPDATE`, serverID).Scan(&pendingID, &expired)
+	var expiresAt time.Time
+	switch {
+	case err == nil && !expired:
+		return time.Time{}, ErrReenrollmentPending
+	case err == nil:
+		err = tx.QueryRow(ctx, `UPDATE server_enrollment_tokens SET digest=$2,issued_at=clock_timestamp(),expires_at=clock_timestamp()+make_interval(secs=>$3) WHERE id=$1 AND consumed_at IS NULL AND purpose='reenroll' RETURNING expires_at`, pendingID, digest[:], ttlSeconds).Scan(&expiresAt)
+	case errors.Is(err, pgx.ErrNoRows):
+		err = tx.QueryRow(ctx, `INSERT INTO server_enrollment_tokens(server_id,digest,issued_at,expires_at,purpose) VALUES($1,$2,clock_timestamp(),clock_timestamp()+make_interval(secs=>$3),'reenroll') RETURNING expires_at`, serverID, digest[:], ttlSeconds).Scan(&expiresAt)
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("store re-enrollment token: %w", err)
+	}
+	if err = r.inject("reenrollment_token"); err != nil {
+		return time.Time{}, err
+	}
+	if err = insertServerAuditEvent(ctx, tx, actor, "reenrollment_issued", &serverID, nil, "success", reason); err != nil {
+		return time.Time{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return time.Time{}, fmt.Errorf("commit server reenrollment issue: %w", err)
 	}
 	return expiresAt, nil
 }
@@ -267,12 +330,17 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 		foundServer = false
 	}
 
+	// At most one unconsumed token exists per server (partial unique index),
+	// so this selects the only token Enroll could ever consume; a server
+	// whose tokens are all consumed finds none and is refused like any other
+	// unknown token.
 	var storedDigest []byte
 	var expiresAt time.Time
-	var consumedAt *time.Time
+	var tokenID int64
+	var purpose string
 	foundToken := false
 	if foundServer {
-		if err = tx.QueryRow(ctx, `SELECT digest,expires_at,consumed_at FROM server_enrollment_tokens WHERE server_id=$1 FOR UPDATE`, serverID).Scan(&storedDigest, &expiresAt, &consumedAt); err == nil {
+		if err = tx.QueryRow(ctx, `SELECT id,digest,expires_at,purpose FROM server_enrollment_tokens WHERE server_id=$1 AND consumed_at IS NULL FOR UPDATE`, serverID).Scan(&tokenID, &storedDigest, &expiresAt, &purpose); err == nil {
 			foundToken = true
 		}
 	}
@@ -287,7 +355,7 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 		stored = dummyCredentialDigest
 	}
 	match := server.ConstantTimeEqualDigest(stored, enrollmentDigest)
-	if !foundServer || !foundToken || consumedAt != nil || !now.Before(expiresAt) || !match {
+	if !foundServer || !foundToken || !now.Before(expiresAt) || !match {
 		// No audit row and no commit here: an unauthenticated caller who
 		// merely knows (or guesses) a server ID can call Enroll an unbounded
 		// number of times, and every prior version of this branch wrote one
@@ -301,15 +369,26 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 		return 0, ErrServerAuthorizationDenied
 	}
 
-	if _, err = tx.Exec(ctx, `UPDATE server_enrollment_tokens SET consumed_at=$2 WHERE server_id=$1 AND consumed_at IS NULL`, serverID, now); err != nil {
+	tag, err := tx.Exec(ctx, `UPDATE server_enrollment_tokens SET consumed_at=$2 WHERE id=$1 AND consumed_at IS NULL`, tokenID, now)
+	if err != nil {
 		return 0, fmt.Errorf("consume server enrollment token: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return 0, ErrServerAuthorizationDenied
 	}
 	if err = r.inject("enrollment_consume"); err != nil {
 		return 0, err
 	}
 
-	const version = 1
-	if _, err = tx.Exec(ctx, `INSERT INTO server_credentials(server_id,version,digest,status) VALUES($1,$2,$3,'active')`, serverID, version, credentialDigest[:]); err != nil {
+	version := 1
+	if purpose == "reenroll" {
+		// Re-enrollment replaces the live credential: same revoke-then-insert
+		// step as RotateCredential, in this transaction, under the server
+		// lock taken above (owner -> server -> credential).
+		if version, err = r.replaceActiveCredential(ctx, tx, serverID, credentialDigest, false); err != nil {
+			return 0, err
+		}
+	} else if _, err = tx.Exec(ctx, `INSERT INTO server_credentials(server_id,version,digest,status) VALUES($1,$2,$3,'active')`, serverID, version, credentialDigest[:]); err != nil {
 		if isUniqueViolation(err) {
 			return 0, ErrServerAuthorizationDenied
 		}
@@ -321,6 +400,11 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 
 	if err = insertServerAuditEvent(ctx, tx, actor, "enrolled", &serverID, intPtr(version), "success", ""); err != nil {
 		return 0, err
+	}
+	if purpose == "reenroll" {
+		if err = insertServerAuditEvent(ctx, tx, actor, "credential_rotated", &serverID, intPtr(version), "success", ""); err != nil {
+			return 0, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit server enroll: %w", err)
@@ -349,18 +433,47 @@ func (r *ServerRepository) RotateCredential(ctx context.Context, principal auth.
 	if err = lockActiveServer(ctx, tx, serverID, principal.OwnerID); err != nil {
 		return 0, err
 	}
-	var activeID int64
-	var activeVersion int
-	if err = tx.QueryRow(ctx, `SELECT id,version FROM server_credentials WHERE server_id=$1 AND status='active' FOR UPDATE`, serverID).Scan(&activeID, &activeVersion); err != nil {
-		return 0, ErrServerAuthorizationDenied
+	newVersion, err := r.replaceActiveCredential(ctx, tx, serverID, newDigest, true)
+	if err != nil {
+		return 0, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE server_credentials SET status='revoked',revoked_at=clock_timestamp() WHERE id=$1`, activeID); err != nil {
-		return 0, fmt.Errorf("revoke server credential: %w", err)
+	if err = insertServerAuditEvent(ctx, tx, actor, "credential_rotated", &serverID, intPtr(newVersion), "success", ""); err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit server credential rotate: %w", err)
+	}
+	return newVersion, nil
+}
+
+// replaceActiveCredential revokes the server's active credential (if any) and
+// inserts the next version as the new active one, MAX(version)+1, in the
+// caller's transaction. The caller must already hold the servers row FOR
+// UPDATE; this takes the credential row lock after it (ADR 0004 lock order
+// owner -> server -> credential). requireActive makes a missing active
+// credential a refusal (rotation); re-enrollment passes false because the
+// whole point is recovering a server whose credential record is unusable.
+func (r *ServerRepository) replaceActiveCredential(ctx context.Context, tx pgx.Tx, serverID string, newDigest [32]byte, requireActive bool) (int, error) {
+	var activeID int64
+	err := tx.QueryRow(ctx, `SELECT id FROM server_credentials WHERE server_id=$1 AND status='active' FOR UPDATE`, serverID).Scan(&activeID)
+	switch {
+	case err == nil:
+		if _, err = tx.Exec(ctx, `UPDATE server_credentials SET status='revoked',revoked_at=clock_timestamp() WHERE id=$1`, activeID); err != nil {
+			return 0, fmt.Errorf("revoke server credential: %w", err)
+		}
+	case errors.Is(err, pgx.ErrNoRows) && !requireActive:
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, ErrServerAuthorizationDenied
+	default:
+		return 0, fmt.Errorf("lock active server credential: %w", err)
 	}
 	if err = r.inject("credential_revoke"); err != nil {
 		return 0, err
 	}
-	newVersion := activeVersion + 1
+	var newVersion int
+	if err = tx.QueryRow(ctx, `SELECT COALESCE(MAX(version),0)+1 FROM server_credentials WHERE server_id=$1`, serverID).Scan(&newVersion); err != nil {
+		return 0, fmt.Errorf("next server credential version: %w", err)
+	}
 	if _, err = tx.Exec(ctx, `INSERT INTO server_credentials(server_id,version,digest,status) VALUES($1,$2,$3,'active')`, serverID, newVersion, newDigest[:]); err != nil {
 		if isUniqueViolation(err) {
 			return 0, ErrServerAuthorizationDenied
@@ -369,12 +482,6 @@ func (r *ServerRepository) RotateCredential(ctx context.Context, principal auth.
 	}
 	if err = r.inject("credential_rotate_insert"); err != nil {
 		return 0, err
-	}
-	if err = insertServerAuditEvent(ctx, tx, actor, "credential_rotated", &serverID, intPtr(newVersion), "success", ""); err != nil {
-		return 0, err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("commit server credential rotate: %w", err)
 	}
 	return newVersion, nil
 }
@@ -484,7 +591,7 @@ func (r *ServerRepository) ListServers(ctx context.Context, principal auth.Princ
 	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
 		return nil, fmt.Errorf("list servers canonical time: %w", err)
 	}
-	rows, err := tx.Query(ctx, `SELECT s.id,s.name,s.status,s.created_at,s.last_heartbeat_at,sc.version,et.consumed_at,et.expires_at FROM servers s LEFT JOIN server_credentials sc ON sc.server_id=s.id AND sc.status='active' LEFT JOIN server_enrollment_tokens et ON et.server_id=s.id WHERE s.owner_id=$1 ORDER BY s.created_at DESC, s.id`, principal.OwnerID)
+	rows, err := tx.Query(ctx, `SELECT s.id,s.name,s.status,s.created_at,s.last_heartbeat_at,sc.version,et.consumed_at,et.expires_at FROM servers s LEFT JOIN server_credentials sc ON sc.server_id=s.id AND sc.status='active' LEFT JOIN LATERAL (SELECT t.consumed_at,t.expires_at FROM server_enrollment_tokens t WHERE t.server_id=s.id ORDER BY t.issued_at DESC, t.id DESC LIMIT 1) et ON true WHERE s.owner_id=$1 ORDER BY s.created_at DESC, s.id`, principal.OwnerID)
 	if err != nil {
 		return nil, fmt.Errorf("query servers: %w", err)
 	}

@@ -37,6 +37,15 @@ type serverAdminStub struct {
 	issueExpiry   time.Time
 	issueCalls    int
 
+	reenrollErr    error
+	reenrollServer string
+	reenrollDigest [32]byte
+	reenrollTTL    int
+	reenrollReason string
+	reenrollExpiry time.Time
+	reenrollCalls  int
+	reenrollOwner  string
+
 	revokeErr    error
 	revokeServer string
 	revokeReason string
@@ -72,6 +81,15 @@ func (s *serverAdminStub) IssueEnrollment(_ context.Context, _ auth.Principal, s
 		return time.Time{}, s.issueErr
 	}
 	return s.issueExpiry, nil
+}
+func (s *serverAdminStub) IssueReenrollment(_ context.Context, principal auth.Principal, serverID string, digest [32]byte, ttlSeconds int, reason string) (time.Time, error) {
+	s.reenrollCalls++
+	s.reenrollOwner = principal.OwnerID
+	s.reenrollServer, s.reenrollDigest, s.reenrollTTL, s.reenrollReason = serverID, digest, ttlSeconds, reason
+	if s.reenrollErr != nil {
+		return time.Time{}, s.reenrollErr
+	}
+	return s.reenrollExpiry, nil
 }
 func (s *serverAdminStub) RevokeServer(_ context.Context, _ auth.Principal, serverID, reason string) error {
 	s.revokeCalls++
@@ -127,7 +145,7 @@ func serversCSRF(t *testing.T, h *Handler, p auth.Principal) string {
 // and /environments route 404s instead of panicking on a nil interface call.
 func TestServersDisabledWithoutAdmin(t *testing.T) {
 	h := testHandler(t, &repositoryStub{})
-	for _, target := range []string{"/servers", "/servers/register", "/servers/enrollment", "/servers/revoke", "/environments/resolve"} {
+	for _, target := range []string{"/servers", "/servers/register", "/servers/enrollment", "/servers/reenroll", "/servers/revoke", "/environments/resolve"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "https://admin.example.test"+target, nil))
 		if rr.Code != http.StatusNotFound {
@@ -145,6 +163,7 @@ func TestServersRoutesRequireSessionAndCorrectMethod(t *testing.T) {
 		{http.MethodGet, "/servers", nil},
 		{http.MethodPost, "/servers/register", url.Values{"csrf": {"x"}, "name": {"host-1"}}},
 		{http.MethodPost, "/servers/enrollment", url.Values{"csrf": {"x"}, "server_id": {"server_a"}}},
+		{http.MethodPost, "/servers/reenroll", url.Values{"csrf": {"x"}, "server_id": {"server_a"}, "reason": {"r"}, "confirm": {"reenroll"}}},
 		{http.MethodPost, "/servers/revoke", url.Values{"csrf": {"x"}, "server_id": {"server_a"}, "reason": {"r"}, "confirm": {"revoke"}}},
 		{http.MethodPost, "/environments/resolve", url.Values{"csrf": {"x"}, "environment_id": {"environment_a"}, "attempt_id": {"42"}, "outcome": {"no_activation"}, "reason": {"r"}}},
 	}
@@ -182,7 +201,7 @@ func TestServersRoutesRequireSessionAndCorrectMethod(t *testing.T) {
 			t.Fatalf("%s wrong method = %d", tc.target, wrr.Code)
 		}
 	}
-	if admin.registerCalls != 0 || admin.issueCalls != 0 || admin.revokeCalls != 0 || admin.resolveCalls != 0 {
+	if admin.registerCalls != 0 || admin.issueCalls != 0 || admin.reenrollCalls != 0 || admin.revokeCalls != 0 || admin.resolveCalls != 0 {
 		t.Fatal("unauthenticated/wrong-method requests reached the repository")
 	}
 	_ = p
@@ -663,5 +682,80 @@ func TestLandingPageLinksToServers(t *testing.T) {
 	h.ServeHTTP(rr, r)
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `href="/servers"`) {
 		t.Fatal("landing page is missing a link to /servers")
+	}
+}
+
+func reenrollForm(csrf string, override map[string][]string) url.Values {
+	v := url.Values{"csrf": {csrf}, "server_id": {"server_abc"}, "reason": {"restored from backup"}, "confirm": {"reenroll"}}
+	for k, val := range override {
+		if val == nil {
+			delete(v, k)
+		} else {
+			v[k] = val
+		}
+	}
+	return v
+}
+
+func TestServersReenrollRequiresCSRFConfirmationAndReason(t *testing.T) {
+	h, admin, p := serversHandler(t)
+	csrf := serversCSRF(t, h, p)
+	post := func(form url.Values) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, serversRequest(http.MethodPost, "/servers/reenroll", form, p, h))
+		return rr
+	}
+
+	for name, form := range map[string]url.Values{
+		"missing confirm":   reenrollForm(csrf, map[string][]string{"confirm": nil}),
+		"wrong confirm":     reenrollForm(csrf, map[string][]string{"confirm": {"revoke"}}),
+		"missing reason":    reenrollForm(csrf, map[string][]string{"reason": nil}),
+		"empty reason":      reenrollForm(csrf, map[string][]string{"reason": {""}}),
+		"missing server_id": reenrollForm(csrf, map[string][]string{"server_id": nil}),
+		"bad server_id":     reenrollForm(csrf, map[string][]string{"server_id": {"bad\x00id"}}),
+		"extra field":       reenrollForm(csrf, map[string][]string{"extra": {"1"}}),
+		"duplicate reason":  reenrollForm(csrf, map[string][]string{"reason": {"a", "b"}}),
+	} {
+		if rr := post(form); rr.Code != http.StatusBadRequest || admin.reenrollCalls != 0 {
+			t.Fatalf("%s = %d calls=%d", name, rr.Code, admin.reenrollCalls)
+		}
+	}
+	// Bad / missing CSRF redirects to login and never reaches the store.
+	if rr := post(reenrollForm("forged", nil)); rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/login" || admin.reenrollCalls != 0 {
+		t.Fatalf("forged csrf = %d %q calls=%d", rr.Code, rr.Header().Get("Location"), admin.reenrollCalls)
+	}
+	// Missing provenance (no Origin) is rejected before anything else.
+	noOrigin := serversRequest(http.MethodPost, "/servers/reenroll", reenrollForm(csrf, nil), p, h)
+	noOrigin.Header.Del("Origin")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, noOrigin)
+	if rr.Code != http.StatusBadRequest || admin.reenrollCalls != 0 {
+		t.Fatalf("no origin = %d calls=%d", rr.Code, admin.reenrollCalls)
+	}
+
+	// Fully confirmed: token shown exactly once, no redirect, no caching,
+	// the repository receives server, reason, TTL and a real digest.
+	admin.reenrollExpiry = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	rr = post(reenrollForm(csrf, nil))
+	if rr.Code != http.StatusOK || rr.Header().Get("Location") != "" || rr.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("reenroll = %d location=%q cache=%q", rr.Code, rr.Header().Get("Location"), rr.Header().Get("Cache-Control"))
+	}
+	body := rr.Body.String()
+	first := strings.Index(body, "enr.v1.")
+	if first < 0 || strings.Contains(body[first+1:], "enr.v1.") {
+		t.Fatal("token not displayed exactly once")
+	}
+	if admin.reenrollCalls != 1 || admin.reenrollServer != "server_abc" || admin.reenrollReason != "restored from backup" || admin.reenrollTTL != enrollmentTTLSeconds || admin.reenrollOwner != p.OwnerID || admin.reenrollDigest == ([32]byte{}) {
+		t.Fatalf("repository call = %+v", admin)
+	}
+
+	// Any repository refusal (foreign owner, revoked, never enrolled, pending)
+	// renders the same generic page and shows no token.
+	for _, e := range []error{postgres.ErrServerAuthorizationDenied, postgres.ErrServerNotEnrolled, postgres.ErrReenrollmentPending} {
+		admin.reenrollErr = e
+		rr = post(reenrollForm(csrf, nil))
+		if rr.Code != http.StatusBadRequest || strings.Contains(rr.Body.String(), "enr.v1.") {
+			t.Fatalf("refusal %v = %d", e, rr.Code)
+		}
 	}
 }

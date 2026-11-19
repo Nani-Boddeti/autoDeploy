@@ -65,6 +65,7 @@ type ServerAdmin interface {
 	ListServers(context.Context, auth.Principal) ([]postgres.ServerSummary, error)
 	RegisterServer(context.Context, auth.Principal, postgres.RegisterServerInput) (server.Server, time.Time, error)
 	IssueEnrollment(context.Context, auth.Principal, string, [32]byte, int) (time.Time, error)
+	IssueReenrollment(context.Context, auth.Principal, string, [32]byte, int, string) (time.Time, error)
 	RevokeServer(context.Context, auth.Principal, string, string) error
 	ListReconcilingEnvironments(context.Context, auth.Principal) ([]postgres.ReconcilingEnvironment, error)
 	ResolveActivation(ctx context.Context, principal auth.Principal, environmentID string, expectedAttemptID int64, outcome, reason string) error
@@ -316,6 +317,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.serversEnrollment(w, r)
+	case "/servers/reenroll":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.serversReenroll(w, r)
 	case "/servers/revoke":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)
@@ -887,6 +898,45 @@ func (h *Handler) serversEnrollment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	expiresAt, err := h.config.ServerAdmin.IssueEnrollment(r.Context(), p, serverID, digest, enrollmentTTLSeconds)
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	renderEnrollmentToken(w, serverID, token, expiresAt)
+}
+
+// serversReenroll issues a single-use re-enrollment token for an already
+// enrolled server (e.g. after a restore left its agent with a credential the
+// database does not know). Like revoke it needs CSRF, provenance, a reason and
+// an explicit confirm=reenroll, because consuming the token replaces the
+// server's live credential. The token is displayed once, exactly as for
+// enrollment.
+func (h *Handler) serversReenroll(w http.ResponseWriter, r *http.Request) {
+	if h.provenance(r) != nil {
+		badRequest(w)
+		return
+	}
+	v, err := parseURLForm(r)
+	if err != nil || len(v) != 4 || len(v["csrf"]) != 1 || len(v["server_id"]) != 1 || len(v["reason"]) != 1 || len(v["confirm"]) != 1 {
+		badRequest(w)
+		return
+	}
+	_, p, ok := h.session(r.Context(), r)
+	if !ok || !auth.ValidateSessionCSRF(h.config.CSRFKeys, v.Get("csrf"), p.SessionID, h.config.PublicOrigin) {
+		redirect(w, "/login")
+		return
+	}
+	serverID := v.Get("server_id")
+	if v.Get("confirm") != "reenroll" || v.Get("reason") == "" || !github.ValidOpaqueID(serverID) {
+		badRequest(w)
+		return
+	}
+	token, digest, err := h.newEnrollmentToken()
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	expiresAt, err := h.config.ServerAdmin.IssueReenrollment(r.Context(), p, serverID, digest, enrollmentTTLSeconds, v.Get("reason"))
 	if err != nil {
 		badRequest(w)
 		return
@@ -2004,11 +2054,11 @@ func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expire
 // so the agent, not the control plane, generates its own credential and
 // sends only its digest at enrollment (internal/agent/http Enroll); a
 // control-plane "rotate" can no longer hand back a usable credential.
-// Revoke-and-re-enroll is not a substitute either, since IssueEnrollment is
-// blocked once a server's enrollment token has been consumed (schema
-// 000012). Rotation is deferred to a follow-up agent-initiated rotation
-// protocol; this slice ships register, reissue-before-enrollment, and
-// revoke only.
+// Re-enrolling an already-enrolled server goes through /servers/reenroll
+// (migration 000029): an administrator-issued, single-use re-enrollment
+// token the agent presents to `agent enroll`, which then installs a new
+// credential. IssueEnrollment stays blocked once a server's first
+// enrollment token has been consumed (schema 000012).
 
 // runtimeConfigView and bindingRow are pre-formatted the same way
 // serverRow/reconcilingRow are: every field is already rendered to text

@@ -252,6 +252,83 @@ by a test listing allowed label names).
 **Estimate:** ~1.5 days mac + one acer session. Review: yes (logging redaction, secret canary, new listener).
 **Outcome effect:** +1 outcome (observability) after acer proof, independent of the build outcome.
 
+## 22-D design: ADR 0005 stop-then-start auto-finalize (2026-11-19, owner chose auto-finalize; APPROVED 2026-11-19: D1 A, D2 probe, D3 exclude rollback)
+**Today:** STS candidate failure before any route write (agent beforeSwitch: stop predecessor -> start candidate ->
+gate fails -> stop candidate -> restart predecessor) is reported as plain `succeeded=false` + free text; tx2
+(agent_lease_repository.go ~2626) calls blockActivationForReconciliation unconditionally -> environment blocked until
+an operator resolves not_activated (acer attempt 19). ADR 0005 :274-278 wants: stop candidate, restart AND
+health-check prior release, finalize failed while prior stays active; ambiguity is never auto-resolved (:226, :248).
+Gaps found: (1) the agent never health-checks the restarted predecessor (only re-inspects Running); (2) trigger
+000021 forbids switch_authorized -> failed ("tx2 never reports a definite failure"); (3) strict decoding both sides.
+**Change:**
+- Agent (sts.go/activation.go/state): a `not_switched` outcome ONLY when all hold: failure inside beforeSwitch
+  (switchRoute never entered), predecessor existed and stop was sent, candidate confirmed stopped, predecessor
+  restart ok AND a bounded predecessor health probe passes (reuse the env health policy; new), route-revision file
+  below the authorized revision, on-disk route digest readable and equal to a pre-stop snapshot recorded in the
+  pending record. Everything else (switch failures, restart/probe failure, stop mismatch, already-stopped/gone
+  predecessor, persist failures, crash-recovered records, rollback/retained jobs) keeps today's plain failure ->
+  block. New omitempty record field, immutable once result_ready.
+- Wire: capability opt-in at claim (health_policy precedent, claim.go), server echoes support only to opted-in
+  claims (non-opted-in bytes pinned by golden test); agent sends `outcome:"not_switched"` only when the lease said
+  supported; reporter strips the field and retries once as a plain failure on 400 invalid_request (server
+  downgrade). Activation-result decoder accepts the new field.
+- Control plane (branch at the !succeeded site, after occupantChecked): ALL must hold under existing locks/order:
+  op switch_authorized; occupant/fence/not cancelled; expected_active_release_id non-nil; frozen strategy
+  stop_then_start; not a rollback job; deployment activating; route_heads FOR UPDATE: revision ==
+  expected_route_revision, active_release_id == expected_active_release_id, not flagged; predecessor release active.
+  Then, in ONE transaction (option A, no migration): blockActivationForReconciliation then the resolveNotActivated
+  writes (deployment failed, op failed, attempt closed, slot freed + unflagged, job failed, head/releases untouched,
+  events). Any failed condition or deterministic error in the branch -> today's block (never reject, never success);
+  transient -> rollback + agent retry; savepoint like the success path; commit failure -> existing fresh-tx block.
+  Replay of not_switched on a failed op answered like the success replay (check reporter delete rules).
+- Docs: ADR 0005 (predecessor health probe, auto-finalize conditions), ADR 0004 amendment (tx2 may finalize a
+  definite not-switched failure; otherwise unchanged).
+**Decisions for owner:** D1 option A (block+resolve in one tx, no migration; reuses tested resolveNotActivated;
+noisier events) (recommended) vs B (migration 000029 allowing switch_authorized -> failed + new event). D2 require
+a bounded predecessor health probe before claiming not_switched (recommended; ADR 0005 step 2; otherwise
+auto-finalize could hide an outage) vs Running-only. D3 rollback/retained STS jobs excluded in V1 (recommended).
+**Tests:** agent outcome matrix (positive: gate fail/start fail/gate error + restart ok + probe ok; negative: each
+exclusion), record round-trip + old-record byte pin, reporter 400 fallback; http strict shapes + claim golden;
+store post-state matrix, negative matrix (each -> block), replay, races (Complete, sweeper, cancel, ResolveActivation)
+at -race -count=20, atomicity via inject hooks, lock order, new Activate possible afterwards; acer: rerun the
+attempt-19 scenario -> deployment failed, environment not blocked, predecessor serving.
+**Estimate:** ~1.5-2 days + reviews (revised up from 2-3h: wire opt-in, predecessor probe, concurrency suite).
+
+## 22-8 design: re-enroll an existing server after a restore (2026-11-19, APPROVED: D1 (a) token, D2 leave open + fencing, D3 no --replace)
+**Gap (found in 22-4e):** nothing lets an already-enrolled server get a new credential. server_enrollment_tokens
+has PK server_id and a frozen consumed row (000012:82-110: "an already enrolled server can never receive a fresh
+enrollment token"); IssueEnrollment refuses consumed servers (server_repository.go:222); Enroll inserts credential
+version 1 only (:289); RotateCredential (:334) has no caller (agent generates its own credential; ADR 0001 :141-146
+says operator rotation is impossible and revoke-then-re-enroll is no substitute). After a restore where the agent
+holds a credential the DB doesn't know, the agent logs "agent credential rejected" every heartbeat forever and the
+only path is revoke + new server + rebind every environment (orphans queued jobs on the old id, strands open
+release_cleanups, forces reconciliation on every environment with an open attempt).
+**Change (option a):**
+- Migration 000029: server_enrollment_tokens gets a surrogate id PK + `purpose` ('enroll'|'reenroll'); a partial
+  unique index keeps at most one UNCONSUMED token per server; consumed rows stay immutable; existing rows migrate as
+  purpose='enroll'. Audit action `reenrollment_issued` added to the server_audit_events CHECK. Append-only/no-delete
+  triggers kept.
+- Store: `IssueReenrollment(ctx, principal, serverID, reason)` (active server only, owner-scoped, single-use token,
+  same TTL cap as enrollment, digest only, audit with reason). `Enroll` consumes either purpose: for 'reenroll' it
+  revokes the active credential and inserts MAX(version)+1 in the same transaction (reuses RotateCredential logic),
+  audits `enrolled` + `credential_rotated` (actor agent). Lock order per ADR 0004 (owner -> server -> credential).
+- Web: POST /servers/reenroll (session + CSRF + reason + confirm=reenroll, mirroring /servers/revoke), token shown
+  once via the existing renderEnrollmentToken. No UI redesign (22-3 stays last).
+- Agent: unchanged; operator removes the stale credential file then runs `agent enroll` with the new token (the
+  os.Link create-if-absent refusal stays).
+- Docs: ADR 0001 amendment (re-enrollment token), backup-restore.md re-enroll steps, deploy/host/README.md.
+**Decisions for owner:** D1 option (a) re-enrollment token (recommended) vs (b) revoke + new server + rebind (no
+code, heavy, loses continuity). D2 open attempts on re-enroll: leave open, fence-checked (recommended; ADR 0004
+:583 already keeps attempts across credential changes; the restored DB is the authority) vs revoke them
+(forces reconciliation). D3 no `agent enroll --replace` now (recommended; manual file removal is documented) vs add it.
+**Tests (fail first):** migration on a DB with existing consumed tokens (rows preserved, constraints hold);
+issue refused for revoked/foreign-owner servers and while an unconsumed token exists; reenroll consume -> old
+credential rejected, new version N+1 authenticates, heartbeat works; token single-use + expiry; concurrent consume
+(one wins); audit rows; web route CSRF/confirm/reason; enroll purpose='enroll' behaviour unchanged.
+**Side finding (separate, small):** upsertBinding (github_repository.go:484) repoints github_project_bindings.
+server_id without checking the target server exists/is active/same owner — verify and add a guard.
+**Estimate:** ~0.5-1 day + review (security-relevant: credentials, migration).
+
 ## Progress
 - 2026-11-16: roadmap written; 22-1 investigation started.
 - 2026-11-16: 22-1a DONE (uncommitted): migration 000028 (5 columns both tables, named CHECKs + cross CHECKs,
@@ -411,3 +488,13 @@ by a test listing allowed label names).
   autodeploy-run AUTODEPLOY_OPERATOR (SUDO_USER -> logname -> root, strict regex else unknown; set after env-file
   vars so it can't be overridden). Review PASS WITH NOTES -> fixed. Mutation-style: generation compare disabled ->
   integration rewrap succeeded (test fails).
+- 2026-11-19: 22-D + 22-8 designs APPROVED (22-8 D2: leave attempts open, fencing). 22-8 DONE mac-side (uncommitted):
+  migration 000029 (surrogate id, purpose enroll|reenroll, one-unconsumed + one-enroll partial unique indexes,
+  reenroll insert trigger: active + already enrolled + born unconsumed; audit action reenrollment_issued);
+  IssueReenrollment (owner/active first, refuses live pending token, replaces expired), Enroll consumes either
+  purpose (reenroll: revoke active + MAX+1 via shared replaceActiveCredential, audits enrolled+credential_rotated);
+  POST /servers/reenroll (CSRF, provenance, reason, confirm=reenroll, token shown once); BindRepository target
+  server guard (exists, active, same owner; FOR SHARE after binding upsert). Integration sweep green, race x20
+  green, 33 mutations killed, make check green. Review PASS WITH NOTES; lock order verified by hand (no path
+  holds servers then bindings except compatible SHARE locks); runbook fixed (stop agent -> rm -> enroll -> start);
+  ADR 0001 bearer-token risk note. Unproven until acer: real agent enroll after a restore.

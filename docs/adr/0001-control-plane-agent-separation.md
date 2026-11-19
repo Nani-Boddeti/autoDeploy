@@ -145,6 +145,37 @@ versioning" from Deferred decisions above:
   agent generates a new credential and submits its digest while authenticated); this slice ships
   register, enrollment-token reissue, and revoke only.
 
+## Amendment (2026-11-19): re-enrollment token
+
+Restoring a database can leave an agent holding a credential the database does not know. The
+amendment above made that unrecoverable for an enrolled server, so the only path was to register a
+new server and rebind every environment. Re-enrollment closes the gap without changing who generates
+credentials:
+
+- An administrator can issue a **re-enrollment token** (`purpose = 'reenroll'`) for an **active,
+  already-enrolled** server of their own owner, with a mandatory reason, through the session- and
+  CSRF-protected web admin (`POST /servers/reenroll`, explicit confirmation). It is single-use,
+  digest-only, capped to the same 15-minute TTL as enrollment, and audited as `reenrollment_issued`.
+  At most one unconsumed token exists per server; a live one is never silently replaced (an expired
+  one is).
+- The agent redeems it through the unchanged enroll endpoint after the operator removes the stale
+  credential file. In one transaction the control plane consumes the token, revokes the active
+  credential and installs the next version; the audit trail records `enrolled` and
+  `credential_rotated` with the agent as actor. The old credential stops authenticating immediately.
+- Enrollment tokens (`purpose = 'enroll'`) are unchanged: a server that already consumed one still
+  cannot be issued another, and a revoked server cannot be re-enrolled. Consumed tokens stay
+  immutable and are never deleted.
+- Agent attempts open at re-enrollment are left open. ADR 0004 already keeps attempts open across a
+  credential change (they bind to the server, and every request re-checks the currently active
+  credential; only revocation closes them), and fences keep a stale holder from mutating state. The
+  restored database stays the authority and any disagreement surfaces through the existing
+  reconciliation path.
+- There is no `agent enroll --replace`: removing the credential file stays a deliberate operator step.
+- Risk accepted: until it is redeemed or expires, a re-enrollment token is a bearer capability to
+  replace the server's credential. It is shown once, single-use, short-lived and audited, and redeeming
+  it kills the credential the real agent holds, so a stolen token used by someone else shows up as the
+  real agent's next request being rejected (401).
+
 ## Validation criteria
 
 - The control-plane process can run without Docker or SSH credentials.

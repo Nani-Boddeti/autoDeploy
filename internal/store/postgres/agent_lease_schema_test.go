@@ -32,7 +32,7 @@ func newLeaseFixture(t *testing.T, seed byte) leaseFixture {
 	githubRepo, _, principal := webhookAuthority(t, "agent-lease-"+t.Name(), seed, seed+1)
 	resetWebhookJobs(t, githubRepo.pool)
 	ctx := context.Background()
-	if _, err := githubRepo.pool.Exec(ctx, `INSERT INTO servers(id, owner_id, name, protocol_version, status) VALUES ('server', $1, 'server', 1, 'active')`, principal.OwnerID); err != nil {
+	if _, err := githubRepo.pool.Exec(ctx, `INSERT INTO servers(id, owner_id, name, protocol_version, status) VALUES ('server', $1, 'server', 1, 'active') ON CONFLICT (id) DO NOTHING`, principal.OwnerID); err != nil {
 		t.Fatal(err)
 	}
 	repo := NewWebhookJobRepository(githubRepo.pool, NewDeploymentRepository(githubRepo.pool))

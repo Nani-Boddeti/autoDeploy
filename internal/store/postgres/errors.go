@@ -64,4 +64,16 @@ var (
 	// enrollment, rotation, revocation, or authentication without exposing
 	// which specific check failed.
 	ErrServerAuthorizationDenied = errors.New("server authorization denied")
+	// ErrBindingServerUnavailable reports a repository binding whose target
+	// server does not exist, is revoked, or belongs to another owner. The three
+	// cases are deliberately indistinguishable.
+	ErrBindingServerUnavailable = errors.New("binding target server is unavailable")
+	// ErrServerNotEnrolled reports a re-enrollment request for a server that
+	// has never consumed its first enrollment token (use IssueEnrollment). It
+	// is returned only after the owner-scoped active-server check passed, so
+	// it never discloses another owner's server.
+	ErrServerNotEnrolled = errors.New("server has not enrolled yet")
+	// ErrReenrollmentPending reports a re-enrollment request while an unexpired,
+	// unconsumed re-enrollment token already exists for the server.
+	ErrReenrollmentPending = errors.New("a re-enrollment token is already pending for this server")
 )

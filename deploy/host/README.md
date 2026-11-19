@@ -73,6 +73,10 @@ in this backup: back them up separately, never next to the only database backup 
 Encryption of the dump and the off-host copy are the operator's job. Full procedure:
 docs/operations/backup-restore.md.
 
+If a restore leaves the agent's credential unknown to the database, re-enroll the same server id (UI
+"Re-enroll agent" for an enrolled server, then stop the agent, remove the stale credential file, run
+`agent enroll` with the token and start the agent): backup-restore.md section 3, step 10.
+
 Metrics, health endpoints and log format: docs/operations/observability.md. The optional
 `install-app.sh` tunable `AUTODEPLOY_METRICS_LISTEN_ADDRESS` (loopback IP literal plus port, for
 example `127.0.0.1:9101`; pass it on every run) enables the metrics listener.

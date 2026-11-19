@@ -484,6 +484,23 @@ func (r *GitHubRepository) BindRepository(ctx context.Context, principal auth.Pr
 	if _, err = tx.Exec(ctx, `INSERT INTO github_project_bindings(owner_id,project_id,repository_id,installation_id,deploy_ref,environment_id,server_id,active) VALUES($1,$2,$3,$4,$5,$6,$7,true) ON CONFLICT(owner_id,project_id) DO UPDATE SET repository_id=EXCLUDED.repository_id,installation_id=EXCLUDED.installation_id,deploy_ref=EXCLUDED.deploy_ref,environment_id=EXCLUDED.environment_id,server_id=EXCLUDED.server_id,active=true,authorization_revision=github_project_bindings.authorization_revision+1,updated_at=clock_timestamp()`, principal.OwnerID, input.ProjectID, input.RepositoryID, installID, input.Ref, input.EnvironmentID, input.ServerID); err != nil {
 		return fmt.Errorf("upsert binding: %w", err)
 	}
+	// The target server must exist, be active and belong to this owner: the
+	// binding's server_id has no foreign key (it also holds legacy NULLs), so
+	// without this check a bind or re-bind could point deployments at a
+	// missing, revoked or another owner's server. Taken after the binding row
+	// (ADR 0004 hierarchy: owner, project binding, ..., server) and FOR SHARE
+	// so a concurrent revocation cannot slip between check and commit; any
+	// refusal rolls the whole upsert back.
+	var serverStatus string
+	if err = tx.QueryRow(ctx, `SELECT status FROM servers WHERE id=$1 AND owner_id=$2 FOR SHARE`, input.ServerID, principal.OwnerID).Scan(&serverStatus); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrBindingServerUnavailable
+		}
+		return fmt.Errorf("check binding server: %w", err)
+	}
+	if serverStatus != "active" {
+		return ErrBindingServerUnavailable
+	}
 	if _, err = tx.Exec(ctx, `INSERT INTO github_audit_events(id,owner_id,actor_user_id,action,result,installation_id,repository_id,project_id) VALUES($1,$2,$3,'repository_bound','success',$4,$5,$6)`, audit, principal.OwnerID, principal.UserID, installID, input.RepositoryID, input.ProjectID); err != nil {
 		return fmt.Errorf("audit binding: %w", err)
 	}

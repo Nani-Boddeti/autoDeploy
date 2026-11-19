@@ -402,6 +402,9 @@ func (a serverAdmin) RegisterServer(ctx context.Context, p auth.Principal, in po
 func (a serverAdmin) IssueEnrollment(ctx context.Context, p auth.Principal, serverID string, digest [32]byte, ttlSeconds int) (time.Time, error) {
 	return a.servers.IssueEnrollment(ctx, p, serverID, digest, ttlSeconds)
 }
+func (a serverAdmin) IssueReenrollment(ctx context.Context, p auth.Principal, serverID string, digest [32]byte, ttlSeconds int, reason string) (time.Time, error) {
+	return a.servers.IssueReenrollment(ctx, p, serverID, digest, ttlSeconds, reason)
+}
 func (a serverAdmin) RevokeServer(ctx context.Context, p auth.Principal, serverID, reason string) error {
 	return a.servers.RevokeServer(ctx, p, serverID, reason)
 }

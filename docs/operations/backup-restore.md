@@ -49,7 +49,7 @@ stored secret.
 **Set D (not restored from backup):**
 
 - **Agent credential** (`/var/lib/autodeploy/agent/credential`): never restore it from a file backup.
-  If the restored database does not recognise it, re-enroll (section 3, step 10).
+  If the restored database does not recognise it, re-enroll the same server id (section 3, step 10).
 - **Traefik dynamic route files** (`/var/lib/autodeploy/traefik/dynamic`) and **application containers**:
   rebuilt by the next deploy of each environment. Until then, what is still on the host keeps running.
 - **Agent state directory** (fence state, pending activation/drain records): host-local runtime state,
@@ -256,14 +256,34 @@ Prerequisites: the dump (decrypted, sha256 matches the recorded value), the set 
 
     The unit has `ConditionPathExists=/var/lib/autodeploy/agent/credential`, so it will not start if the
     credential file is absent. If the agent cannot authenticate because the restored database does not
-    contain its credential (the server was registered or enrolled after the backup), re-enroll: in the UI
-    register the server or reissue its enrollment token, then, as in `install-app.sh`, remove the stale
-    `credential` file (`agent enroll` never overwrites it) and run `agent enroll` with the new token typed at
-    a hidden prompt (`install-app.sh` prints the exact command). The UI **refuses** a fresh token for a
-    server that is already enrolled in the restored database (migration `000012`: a consumed token cannot be
-    reissued); if the restored database says "enrolled" but the credential differs from the agent's, the
-    repository has no supported re-enrollment for that server id. **Operator decision**: register a new
-    server and move its environments, or restore a newer backup.
+    contain its credential, re-enroll the same server id (this keeps its environments, bindings and
+    history; no new server is needed):
+
+    - **Server registered or never enrolled in the restored database**: in the UI reissue its enrollment
+      token (Servers page, "Reissue enrollment token").
+    - **Server already enrolled in the restored database** (the usual case when the agent's credential is
+      newer than the backup): in the UI use "Re-enroll agent" on the Servers page, give a reason, tick the
+      confirmation and submit. The token is shown once, is single-use and expires in 15 minutes. The
+      server must be active, and a still-valid token blocks a second one until it is used or expires.
+      This is audited (`reenrollment_issued`, with your reason).
+
+    Then, on the host, stop the agent (a running agent keeps using the credential it loaded), remove
+    the stale credential file (`agent enroll` never overwrites it), run `agent enroll` with the token
+    typed at a hidden prompt (the same command `install-app.sh` prints at first install, step 4), and
+    start the agent again:
+
+        sudo systemctl stop autodeploy-agent
+        sudo rm /var/lib/autodeploy/agent/credential
+        # agent enroll as printed by install-app.sh (token at a hidden prompt, piped on stdin)
+        sudo systemctl start autodeploy-agent
+
+    Redeeming a re-enrollment token revokes the credential the database held and installs a new one
+    (version N+1) in one transaction; the old credential is rejected from that moment. Verify with
+    `systemctl status autodeploy-agent` and the heartbeat in the UI (Servers page, "Last heartbeat"
+    advances, "Active credential" shows the new version). Open attempts are left as they are: the
+    agent's fence checks keep them safe, and anything inconsistent surfaces as **reconciliation
+    required** (see below). Only if the server was **revoked** in the restored database is there no
+    re-enrollment: register a new server and move its environments, or restore a newer backup.
 
 ### Restoring an older database than the host's local state
 

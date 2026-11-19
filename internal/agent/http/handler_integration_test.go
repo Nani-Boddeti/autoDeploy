@@ -164,7 +164,7 @@ func (f agentHTTPFixture) issueEnrollment(t *testing.T) server.EnrollmentToken {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(context.Background(), `INSERT INTO server_enrollment_tokens(server_id,digest,issued_at,expires_at) VALUES ($1,$2,clock_timestamp(),clock_timestamp()+interval '15 minutes') ON CONFLICT (server_id) DO UPDATE SET digest=EXCLUDED.digest,issued_at=EXCLUDED.issued_at,expires_at=EXCLUDED.expires_at,consumed_at=NULL`, f.serverID, d[:]); err != nil {
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO server_enrollment_tokens(server_id,digest,issued_at,expires_at,purpose) VALUES ($1,$2,clock_timestamp(),clock_timestamp()+interval '15 minutes','enroll') ON CONFLICT (server_id) WHERE purpose='enroll' DO UPDATE SET digest=EXCLUDED.digest,issued_at=EXCLUDED.issued_at,expires_at=EXCLUDED.expires_at,consumed_at=NULL`, f.serverID, d[:]); err != nil {
 		t.Fatal(err)
 	}
 	return tok
@@ -404,5 +404,74 @@ func withTLS(h Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.TLS = &tls.ConnectionState{}
 		h.ServeHTTP(w, r)
+	}
+}
+
+// TestAgentHTTPReenrollReplacesCredential proves the restore path over real
+// HTTP: an enrolled agent holds credential A; an administrator-issued
+// re-enrollment token (inserted directly here, issuance is covered by the
+// store tests) lets the agent enroll with credential B; afterwards A is
+// rejected with 401 and B authenticates (version 2) and heartbeats.
+func TestAgentHTTPReenrollReplacesCredential(t *testing.T) {
+	f := newAgentHTTPFixture(t)
+	srv := httptest.NewServer(withTLS(newTestHandler(f.pool)))
+	defer srv.Close()
+
+	mint := func() (server.CredentialToken, [32]byte) {
+		tok, err := server.NewCredentialToken(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := server.CredentialTokenDigest(tok)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok, d
+	}
+	heartbeat := func(tok server.CredentialToken) int {
+		resp, _ := postJSON(t, srv, pathHeartbeat, tok, f.serverID, heartbeatRequest{ProtocolVersion: 1, AgentVersion: "v1", OS: "linux", Arch: "amd64", CPUCount: 4, MemoryBytes: 1 << 30, DiskFreeBytes: 1 << 30})
+		return resp.StatusCode
+	}
+
+	credA, digestA := mint()
+	enrollment := f.issueEnrollment(t)
+	resp, body := postJSON(t, srv, pathEnroll, "", "", enrollRequest{ServerID: f.serverID, EnrollmentToken: string(enrollment), CredentialDigest: hexOf(digestA)})
+	if resp.StatusCode != http.StatusOK || body["credential_version"] != float64(1) {
+		t.Fatalf("enroll: status=%d body=%v", resp.StatusCode, body)
+	}
+	if got := heartbeat(credA); got != http.StatusOK {
+		t.Fatalf("heartbeat A: %d", got)
+	}
+
+	reenroll, err := server.NewEnrollmentToken(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd, err := server.EnrollmentTokenDigest(reenroll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO server_enrollment_tokens(server_id,digest,issued_at,expires_at,purpose) VALUES ($1,$2,clock_timestamp(),clock_timestamp()+interval '15 minutes','reenroll')`, f.serverID, rd[:]); err != nil {
+		t.Fatal(err)
+	}
+	credB, digestB := mint()
+	resp, body = postJSON(t, srv, pathEnroll, "", "", enrollRequest{ServerID: f.serverID, EnrollmentToken: string(reenroll), CredentialDigest: hexOf(digestB)})
+	if resp.StatusCode != http.StatusOK || body["credential_version"] != float64(2) {
+		t.Fatalf("reenroll: status=%d body=%v", resp.StatusCode, body)
+	}
+	if got := heartbeat(credA); got != http.StatusUnauthorized {
+		t.Fatalf("old credential after re-enroll: %d, want 401", got)
+	}
+	if got := heartbeat(credB); got != http.StatusOK {
+		t.Fatalf("heartbeat B: %d", got)
+	}
+	// Single use over HTTP too.
+	_, digestC := mint()
+	resp, _ = postJSON(t, srv, pathEnroll, "", "", enrollRequest{ServerID: f.serverID, EnrollmentToken: string(reenroll), CredentialDigest: hexOf(digestC)})
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("re-enrollment token accepted twice")
+	}
+	if got := heartbeat(credB); got != http.StatusOK {
+		t.Fatalf("credential B lost after replayed token: %d", got)
 	}
 }
