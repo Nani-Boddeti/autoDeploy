@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AutoDeploy host kit, step 18a-2: read-only verification of the application stack
-# (PostgreSQL, Traefik, private CA, control plane, agent). Changes nothing, prints no
+# (PostgreSQL, Traefik, private CA or ACME, control plane, agent). Changes nothing, prints no
 # secret. Prints PASS/FAIL/SKIP per check and exits non-zero if any check FAILs.
 #
 # Run it after the services are started. Checks that need root are marked [root] and
@@ -50,6 +50,28 @@ BIND="$(cfg "$HOST_ENV" AUTODEPLOY_TRAEFIK_BIND)"
 CP_HOST="$(cfg "$HOST_ENV" AUTODEPLOY_CONTROLPLANE_HOST)"
 CP_PORT="$(cfg "$HOST_ENV" AUTODEPLOY_CONTROLPLANE_PORT)"
 AGID="$(cfg "$HOST_ENV" AUTODEPLOY_AGENT_GID)"
+# TLS mode (host.env AUTODEPLOY_TLS_MODE): lan (default when absent) = private CA; public = ACME.
+TLS_MODE="$(cfg "$HOST_ENV" AUTODEPLOY_TLS_MODE)"
+TLS_MODE="${TLS_MODE:-lan}"
+ACME_CHALLENGE="$(cfg "$HOST_ENV" AUTODEPLOY_ACME_CHALLENGE)"
+ACME_STAGING="$(cfg "$HOST_ENV" AUTODEPLOY_ACME_STAGING)"
+ACME_EMAIL="$(cfg "$HOST_ENV" AUTODEPLOY_ACME_EMAIL)"
+readonly ACME_DIR=/var/lib/autodeploy/traefik/acme
+readonly ACME_PROD_URL=https://acme-v02.api.letsencrypt.org/directory
+readonly ACME_STAGING_URL=https://acme-staging-v02.api.letsencrypt.org/directory
+# Minimum free space under /var/lib/autodeploy: the 30G sparse checkout image
+# (install-checkout.sh CHECKOUT_IMAGE_SIZE default) plus ~10G for Docker images, PostgreSQL, logs.
+MIN_FREE_GB="${AUTODEPLOY_MIN_FREE_GB:-40}"
+# Subnet collision helper (nc_*, check_subnet_collision); optional so a copied-out script still runs.
+NETCHECK="$(dirname -- "${BASH_SOURCE[0]}")/netcheck.sh"
+# shellcheck source=netcheck.sh
+[[ -r $NETCHECK ]] && . "$NETCHECK"
+if [[ $TLS_MODE != lan && $TLS_MODE != public ]]; then
+  bad "host.env AUTODEPLOY_TLS_MODE is lan or public (found: $TLS_MODE)"
+  printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
+  exit 1
+fi
+printf 'TLS mode: %s\n' "$TLS_MODE"
 
 # ---- units ------------------------------------------------------------------------
 for u in autodeploy-postgres autodeploy-traefik autodeploy-controlplane; do
@@ -81,8 +103,22 @@ only_on() { # port addr...: every listener on port is exactly one of the addrs, 
 }
 check "5432 listens only on 127.0.0.1 (PostgreSQL)" only_on 5432 127.0.0.1
 check "8080 listens only on 127.0.0.1 (Traefik management API)" only_on 8080 127.0.0.1
-check "80 listens only on $BIND (Traefik; nothing else, e.g. apache2, on :80)" only_on 80 "$BIND"
-check "443 listens only on $BIND (Traefik)" only_on 443 "$BIND"
+if [[ $TLS_MODE == public ]]; then
+  # Docker publishes an all-interfaces bind on both IPv4 and IPv6 ([::]); ss may also print *.
+  # Not root: an all-interfaces listener ('*' or '[::]') cannot be attributed to Traefik (ss hides other
+  # users' owners), so a host web server would look identical. Do not PASS it; the root-only
+  # only_docker_on check below is the real proof.
+  for p in 80 443; do
+    if ! is_root && listeners "$p" | grep -qxE '\*|\[::\]'; then
+      wrn "$p listens on all interfaces (* or [::]) and the owner is unknown: run as root to verify it is Traefik, not a host web server"
+    else
+      check "$p listens only on $BIND/[::] (Traefik; nothing else, e.g. apache2, on :$p)" only_on "$p" "$BIND" '[::]' '*'
+    fi
+  done
+else
+  check "80 listens only on $BIND (Traefik; nothing else, e.g. apache2, on :80)" only_on 80 "$BIND"
+  check "443 listens only on $BIND (Traefik)" only_on 443 "$BIND"
+fi
 check "control plane listens only on $GATEWAY:$CP_PORT (Docker bridge gateway)" only_on "$CP_PORT" "$GATEWAY"
 
 # Who owns the listeners. Docker-published ports are held by docker-proxy (or the
@@ -107,8 +143,22 @@ if docker_ok; then
   }
   check "container autodeploy-postgres publishes 5432 on 127.0.0.1:5432 only" published autodeploy-postgres 5432/tcp 127.0.0.1:5432
   check "container autodeploy-traefik publishes 8080 on 127.0.0.1:8080 only" published autodeploy-traefik 8080/tcp 127.0.0.1:8080
-  check "container autodeploy-traefik publishes 443 on $BIND:443" published autodeploy-traefik 443/tcp "$BIND:443"
-  check "container autodeploy-traefik publishes 80 on $BIND:80" published autodeploy-traefik 80/tcp "$BIND:80"
+  if [[ $TLS_MODE == public ]]; then
+    published_pub() { # container port: the IPv4 bind is present and any other line is the IPv6 twin ([::]:port)
+      local out l found=0
+      out="$(docker port "$1" "$2" 2>/dev/null)" || return 1
+      while read -r l; do
+        [[ -n $l ]] || continue
+        if [[ $l == "$3" ]]; then found=1; elif [[ $l != "[::]:${3##*:}" ]]; then return 1; fi
+      done <<<"$out"
+      ((found))
+    }
+    check "container autodeploy-traefik publishes 443 on $BIND:443" published_pub autodeploy-traefik 443/tcp "$BIND:443"
+    check "container autodeploy-traefik publishes 80 on $BIND:80" published_pub autodeploy-traefik 80/tcp "$BIND:80"
+  else
+    check "container autodeploy-traefik publishes 443 on $BIND:443" published autodeploy-traefik 443/tcp "$BIND:443"
+    check "container autodeploy-traefik publishes 80 on $BIND:80" published autodeploy-traefik 80/tcp "$BIND:80"
+  fi
   net_ok() {
     [[ "$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}} {{.IPRange}} {{.Gateway}}{{end}}' "$NETWORK" 2>/dev/null)" == "$SUBNET $IP_RANGE $GATEWAY" ]] \
       && [[ "$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$NETWORK" 2>/dev/null)" == "$BRIDGE_NAME" ]]
@@ -205,32 +255,164 @@ else
   skp "Traefik API 200 with credentials; dashboard off [root: the credentials file is agent-owned 0600]"
 fi
 
-# ---- private CA and TLS --------------------------------------------------------------
-CA_CRT=$ETC_DIR/ca/ca.crt
-SRV_CRT=$ETC_DIR/tls/server.crt
-tls_verifies() { # connect to Traefik on 127.0.0.1:443 with SNI; verify against system roots and the hostname
-  local out
-  out="$(openssl s_client -connect "127.0.0.1:443" -servername "$CP_HOST" -verify_return_error -verify_hostname "$CP_HOST" </dev/null 2>&1)" || return 1
-  grep -q 'Verification: OK' <<<"$out"
-}
-check "Traefik serves a certificate for $CP_HOST that the SYSTEM trust store verifies (SNI, hostname, openssl -verify_return_error)" tls_verifies
-check "server certificate verifies against the system trust store (openssl verify -CApath /etc/ssl/certs)" openssl verify -CApath /etc/ssl/certs "$SRV_CRT"
-check "CA certificate is installed in /usr/local/share/ca-certificates" cmp -s "$CA_CRT" /usr/local/share/ca-certificates/autodeploy-private-ca.crt
-cert_not_expiring() { openssl x509 -in "$SRV_CRT" -noout -checkend $((14 * 86400)); }
-check "server certificate is valid for at least 14 more days" cert_not_expiring
+# ---- TLS: private CA (lan) or ACME (public) -------------------------------------------
 hosts_ok() { grep -Eq "^127\.0\.0\.1[[:space:]]+$CP_HOST([[:space:]]|\$)" /etc/hosts; }
 check "/etc/hosts maps $CP_HOST to 127.0.0.1 (agent -> control plane URL, browsers)" hosts_ok
-cp_via_traefik() { # control plane answers through Traefik over verified TLS
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$CP_HOST:443:127.0.0.1" "https://$CP_HOST/")" || return 1
-  [[ "$code" =~ ^[23][0-9][0-9]$ ]]
-}
-check "control plane answers 2xx/3xx at https://$CP_HOST/ through Traefik (system CA, no -k)" cp_via_traefik
-if is_root; then
-  ca_key_ok() { [[ "$(stat -c '%u:%g:%a' "$ETC_DIR/ca/ca.key")" == 0:0:600 && "$(stat -c '%a' "$ETC_DIR/ca")" == 700 ]]; }
-  check "CA key is root:root 0600 in a 0700 directory, outside any container mount [root]" ca_key_ok
+if [[ $TLS_MODE == lan ]]; then
+  CA_CRT=$ETC_DIR/ca/ca.crt
+  SRV_CRT=$ETC_DIR/tls/server.crt
+  tls_verifies() { # connect to Traefik on 127.0.0.1:443 with SNI; verify against system roots and the hostname
+    local out
+    out="$(openssl s_client -connect "127.0.0.1:443" -servername "$CP_HOST" -verify_return_error -verify_hostname "$CP_HOST" </dev/null 2>&1)" || return 1
+    grep -q 'Verification: OK' <<<"$out"
+  }
+  check "Traefik serves a certificate for $CP_HOST that the SYSTEM trust store verifies (SNI, hostname, openssl -verify_return_error)" tls_verifies
+  check "server certificate verifies against the system trust store (openssl verify -CApath /etc/ssl/certs)" openssl verify -CApath /etc/ssl/certs "$SRV_CRT"
+  check "CA certificate is installed in /usr/local/share/ca-certificates" cmp -s "$CA_CRT" /usr/local/share/ca-certificates/autodeploy-private-ca.crt
+  cert_not_expiring() { openssl x509 -in "$SRV_CRT" -noout -checkend $((14 * 86400)); }
+  check "server certificate is valid for at least 14 more days" cert_not_expiring
+  cp_via_traefik() { # control plane answers through Traefik over verified TLS
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$CP_HOST:443:127.0.0.1" "https://$CP_HOST/")" || return 1
+    [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+  }
+  check "control plane answers 2xx/3xx at https://$CP_HOST/ through Traefik (system CA, no -k)" cp_via_traefik
+  if is_root; then
+    ca_key_ok() { [[ "$(stat -c '%u:%g:%a' "$ETC_DIR/ca/ca.key")" == 0:0:600 && "$(stat -c '%a' "$ETC_DIR/ca")" == 700 ]]; }
+    check "CA key is root:root 0600 in a 0700 directory, outside any container mount [root]" ca_key_ok
+  else
+    skp "CA key permissions [root]"
+  fi
+
 else
-  skp "CA key permissions [root]"
+  # public mode: no private CA, no tls/server.*; Traefik gets its certificate from ACME.
+  if [[ $ACME_STAGING == 1 ]]; then ACME_URL=$ACME_STAGING_URL; else ACME_URL=$ACME_PROD_URL; fi
+  case "$ACME_CHALLENGE" in
+    http | tls-alpn) ok "ACME challenge is $ACME_CHALLENGE (host.env)" ;;
+    '') wrn "AUTODEPLOY_ACME_CHALLENGE is not set in host.env (install default is http)" ;;
+    *) bad "AUTODEPLOY_ACME_CHALLENGE is http or tls-alpn (found: $ACME_CHALLENGE)" ;;
+  esac
+  [[ $ACME_STAGING == 1 ]] && wrn "ACME staging is ON ($ACME_STAGING_URL): issued certificates are NOT trusted by browsers or the agent probe"
+  [[ -n $ACME_EMAIL ]] || wrn "AUTODEPLOY_ACME_EMAIL is not set: Let's Encrypt cannot send expiry or revocation notices"
+
+  # CP host DNS == this host's public address. The address comes from the routing table
+  # (the source address the kernel picks), never from an external what-is-my-ip service.
+  route_src() { # family(-4|-6) target -> source address
+    ip "$1" route get "$2" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}'
+  }
+  is_private_v4() { # RFC1918, CGNAT 100.64/10, link-local
+    local r
+    command -v nc_overlap >/dev/null || return 1
+    for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16; do
+      nc_overlap "$1/32" "$r" && return 0
+    done
+    return 1
+  }
+  # getent would only echo the /etc/hosts line below, so ask DNS directly.
+  resolve_public() { # name -> A/AAAA addresses
+    if command -v dig >/dev/null; then
+      { dig +short +time=3 +tries=1 A "$1"; dig +short +time=3 +tries=1 AAAA "$1"; } 2>/dev/null | grep -E '^[0-9a-fA-F:.]+$'
+    elif command -v host >/dev/null; then
+      host -W 3 "$1" 2>/dev/null | awk '/has address|has IPv6 address/ {print $NF}'
+    else
+      return 2
+    fi
+  }
+  SRC4="$(route_src -4 1.1.1.1)"
+  SRC6="$(route_src -6 2606:4700:4700::1111)"
+  RESOLVED="$(resolve_public "$CP_HOST")"
+  rc=$?
+  if ((rc == 2)); then
+    wrn "cannot verify public DNS for $CP_HOST: neither dig nor host is installed (apt install dnsutils)"
+  elif [[ -z $RESOLVED ]]; then
+    bad "$CP_HOST has no public A/AAAA record (DNS must point at this host for ACME)"
+  else
+    # Every resolved A must be this host's IPv4 source address and every AAAA its IPv6 one
+    # (a single foreign record breaks HTTP-01/TLS-ALPN for the clients that pick it).
+    RES_SHOW="$(tr '\n' ' ' <<<"$RESOLVED" | sed 's/ $//')"
+    has_a=0; mism=""
+    while read -r r; do
+      [[ -n $r ]] || continue
+      if [[ $r == *:* ]]; then
+        [[ -z $SRC6 || $r == "$SRC6" ]] || mism+=" $r"
+      else
+        has_a=1
+        [[ -z $SRC4 || $r == "$SRC4" ]] || mism+=" $r"
+      fi
+    done <<<"$RESOLVED"
+    if ((!has_a)); then
+      bad "$CP_HOST has no public A record ($RES_SHOW): IPv4 clients and ACME cannot reach this host"
+    elif [[ -z $SRC4 && -z $SRC6 ]]; then
+      wrn "no default route found: cannot compare DNS for $CP_HOST ($RES_SHOW) with this host's address"
+    elif [[ -n $SRC4 ]] && is_private_v4 "$SRC4"; then
+      wrn "this host is behind NAT (source address $SRC4 is private/CGNAT): DNS for $CP_HOST ($RES_SHOW) must be the provider's public IP; cannot verify from here"
+    elif [[ -n $mism ]]; then
+      bad "DNS for $CP_HOST ($RES_SHOW) has record(s) that are not this host's address (${SRC4:-none} ${SRC6:-}):$mism"
+    else
+      ok "every DNS record for $CP_HOST is this host's public address ($RES_SHOW)"
+    fi
+  fi
+
+  # Ports 80/443: Traefik's published container ports, nothing else.
+  only_docker_on() { # port: no listener is owned by anything but docker-proxy/dockerd
+    local out
+    out="$(ss -ltnpH "sport = :$1" 2>/dev/null)" || return 1
+    ! grep -v -E 'users:\(\("(docker-proxy|dockerd)"' <<<"$out" | grep -q .
+  }
+  if is_root; then
+    for p in 80 443; do
+      check "nothing but the Traefik container holds port $p (no host web server) [root]" only_docker_on "$p"
+    done
+  else
+    skp "nothing but the Traefik container holds ports 80/443 [root]"
+  fi
+
+  acme_reachable() { curl -sS --max-time 10 -f -o /dev/null "$ACME_URL"; }
+  check "outbound HTTPS to the ACME directory $ACME_URL" acme_reachable
+
+  ACME_JSON=$ACME_DIR/acme.json
+  if is_root; then
+    check "$ACME_DIR is a root:root 0700 directory [root]" bash -c "[[ -d $ACME_DIR && ! -L $ACME_DIR && \$(stat -c '%U:%G:%a' $ACME_DIR) == root:root:700 ]]"
+    check "$ACME_JSON is a regular file (not a symlink), root:root 0600 [root]" bash -c "[[ -f $ACME_JSON && ! -L $ACME_JSON && \$(stat -c '%U:%G:%a' $ACME_JSON) == root:root:600 ]]"
+  else
+    skp "acme.json and its directory: regular file, no symlink, 0600/0700 [root]"
+  fi
+
+  # Issued certificate. Traefik serves its self-signed default cert until the first issuance.
+  acme_has_certs() { is_root && [[ -s $ACME_JSON ]] && grep -q '"certificate"' "$ACME_JSON"; }
+  ISSUER="$(openssl s_client -connect 127.0.0.1:443 -servername "$CP_HOST" </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null)"
+  if [[ -z $ISSUER ]]; then
+    bad "Traefik serves a certificate for $CP_HOST on 127.0.0.1:443 (openssl s_client got none)"
+  elif [[ $ISSUER == *"TRAEFIK DEFAULT CERT"* ]]; then
+    if ! is_root; then
+      wrn "Traefik still serves its default certificate for $CP_HOST (run with sudo to tell a fresh acme.json from a failed issuance)"
+    elif acme_has_certs; then
+      bad "Traefik serves its default certificate although $ACME_JSON holds certificates (issuance/renewal for $CP_HOST failing; see docker logs autodeploy-traefik)"
+    else
+      wrn "Traefik serves its default certificate for $CP_HOST: $ACME_JSON is empty/new, issuance has not completed yet (check DNS, ports 80/443, docker logs autodeploy-traefik)"
+    fi
+  elif [[ $ISSUER == *[Ss][Tt][Aa][Gg][Ii][Nn][Gg]* || $ISSUER == *"Fake LE"* ]]; then
+    wrn "staging cert: Traefik serves a Let's Encrypt STAGING certificate for $CP_HOST (${ISSUER#issuer=}); switch off AUTODEPLOY_ACME_STAGING for production"
+  else
+    pub_tls_verify() { # chain to the system CA bundle + hostname match
+      local out
+      out="$(openssl s_client -connect 127.0.0.1:443 -servername "$CP_HOST" -verify_return_error -verify_hostname "$CP_HOST" </dev/null 2>&1)" || return 1
+      grep -q 'Verify return code: 0 (ok)' <<<"$out"
+    }
+    check "certificate for $CP_HOST verifies (system CA bundle, hostname match; issuer ${ISSUER#issuer=})" pub_tls_verify
+  fi
+  if [[ -n $ISSUER && $ISSUER != *"TRAEFIK DEFAULT CERT"* ]]; then
+    if [[ $ISSUER == *[Ss][Tt][Aa][Gg][Ii][Nn][Gg]* || $ISSUER == *"Fake LE"* ]]; then
+      wrn "skipped: control plane through Traefik over verified TLS (staging certificate is not trusted)"
+    else
+      pub_cp_via_traefik() {
+        local code
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$CP_HOST:443:127.0.0.1" "https://$CP_HOST/")" || return 1
+        [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+      }
+      check "control plane answers 2xx/3xx at https://$CP_HOST/ through Traefik (system CA, no -k)" pub_cp_via_traefik
+    fi
+  fi
 fi
 
 # ---- credential files and directories -----------------------------------------------
@@ -259,11 +441,13 @@ fi
 check "route directory is root:$AGENT_USER 1770 (sticky; internal/runtime/traefik checkDirectoryPolicy)" stat_is "$ROUTE_DIR" "root:$AGENT_USER:1770"
 route_files_ok() {
   local f
-  for f in autodeploy-api.yml autodeploy-tls.yml autodeploy-controlplane.yml; do
+  local files="autodeploy-api.yml autodeploy-controlplane.yml"
+  [[ $TLS_MODE == lan ]] && files="autodeploy-api.yml autodeploy-tls.yml autodeploy-controlplane.yml"
+  for f in $files; do
     [[ "$(stat -c '%U:%a' "$ROUTE_DIR/$f" 2>/dev/null)" == root:644 ]] || return 1
   done
 }
-check "installer route files (api, tls, controlplane) are root-owned 0644 in the route directory" route_files_ok
+check "installer route files (api, controlplane; tls in lan mode) are root-owned 0644 in the route directory" route_files_ok
 bins_ok() {
   local b
   for b in controlplane agent migrate admin secrets; do
@@ -281,6 +465,38 @@ check "control plane identity is distinct, non-root, with no supplementary group
 for u in autodeploy-postgres autodeploy-traefik autodeploy-controlplane autodeploy-agent; do
   check "$u.service is enabled" systemctl is-enabled --quiet "$u.service"
 done
+
+# ---- host prerequisites and network layout (both modes) -------------------------------
+check "/dev/loop-control exists (checkout XFS image needs loop devices)" test -e /dev/loop-control
+if docker_ok; then
+  check "docker buildx is installed (image builds)" docker buildx version
+else
+  skp "docker buildx present (this user cannot reach /var/run/docker.sock; run with sudo)"
+fi
+free_gb() { # path -> free GiB on its filesystem (walks up to an existing parent)
+  local d="$1"
+  while [[ ! -d $d ]]; do d="$(dirname -- "$d")"; done
+  df -Pk "$d" | awk 'NR == 2 {print int($4 / 1048576)}'
+}
+FREE_GB="$(free_gb /var/lib/autodeploy)"
+if [[ -n $FREE_GB ]] && ((FREE_GB >= MIN_FREE_GB)); then
+  ok "free disk under /var/lib/autodeploy is ${FREE_GB}G (>= ${MIN_FREE_GB}G: 30G checkout image + images/database)"
+else
+  wrn "free disk under /var/lib/autodeploy is ${FREE_GB:-unknown}G, below the ${MIN_FREE_GB}G minimum (30G sparse checkout image + images/database)"
+fi
+if ! declare -F check_subnet_collision >/dev/null; then
+  skp "subnet collision check (netcheck.sh not found next to this script)"
+elif ! docker_ok; then
+  skp "subnet collision check (this user cannot reach /var/run/docker.sock; run with sudo)"
+elif docker network inspect "$NETWORK" >/dev/null 2>&1; then
+  skp "subnet collision check ($NETWORK already exists; its layout is verified above)"
+else
+  if msg="$(check_subnet_collision "$SUBNET" "$NETWORK" 2>&1)"; then
+    ok "subnet $SUBNET overlaps no host route or Docker network"
+  else
+    wrn "$msg"
+  fi
+fi
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 if ((skip > 0)); then printf 'note: %d check(s) skipped; re-run with sudo for full coverage\n' "$skip"; fi
