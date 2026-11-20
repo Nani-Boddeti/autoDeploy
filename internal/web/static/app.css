@@ -333,6 +333,26 @@ ol.logs, .logs {
 .logs li.marker pre { font-style: italic; }
 .log-nav { display: flex; flex-wrap: wrap; gap: var(--space-md); margin: var(--space-md) 0; }
 
+/* Live tail (22-3k): the status bar is created by logs.js and sticks to the bottom of the log.
+   State is always printed as text; tone only reinforces it. No motion, so reduced-motion needs no override. */
+.log-live { position: relative; }
+.live-bar {
+  position: sticky;
+  bottom: var(--space-md);
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  width: fit-content;
+  margin-top: var(--space-md);
+  padding: var(--space-xs) var(--space-sm);
+  background: var(--surface);
+  border: 1px solid var(--line2);
+  border-radius: var(--radius);
+}
+.live-bar [hidden] { display: none; }
+
 /* Overview and Environments: attention list, setup checklist, environment board. */
 .attention { margin-bottom: var(--space-lg); }
 .attention h2, .checklist h2 { margin-top: 0; }

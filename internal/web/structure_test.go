@@ -258,6 +258,7 @@ var exemptRoutes = map[string]string{
 	"/github/bindings":                "POST only",
 	"/github/installations/reconcile": "POST only",
 	"/deployments/cancel":             "POST only",
+	"/deployments/logs/stream":        "SSE feed for the logs page (22-3k), not a page",
 	"/deployments/manual":             "POST only",
 	"/deployments/rollback":           "POST only",
 	"/servers/register":               "POST only (its result is the enrollment flow page)",

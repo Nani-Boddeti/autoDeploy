@@ -74,6 +74,9 @@ type deploymentLogsView struct {
 	StartHref  string
 	FollowHref string
 	Refresh    bool
+	// StreamURL is the SSE feed the page upgrades to when JavaScript runs; set
+	// exactly when Refresh is (explicit id, last page, non-terminal job).
+	StreamURL string
 	// Picker is the newest deployments as <select> options (nil when unavailable);
 	// Empty carries the zero-deployments state.
 	Picker []deploymentOption
@@ -142,7 +145,8 @@ func (h *Handler) renderLogsEmpty(w http.ResponseWriter, r *http.Request, p auth
 
 // deploymentLogs renders one page of a deployment's log chunks.
 //
-// Tail refresh rule: meta-refresh (3 s) only when the job is non-terminal AND
+// Tail refresh rule: meta-refresh (3 s, inside <noscript>; JavaScript browsers
+// stream instead, see logs_stream.go) only when the job is non-terminal AND
 // this is the last page (Next == nil). A bare meta-refresh reloads the current
 // URL, so the page keeps its own `after` (not Next) and rows that commit late
 // inside this window still appear.
@@ -241,6 +245,13 @@ func (h *Handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 			live := !terminalJobStates[d.Job.State]
 			if hasID {
 				view.Refresh = live
+				if live {
+					cursor := after
+					if n := len(page.Items); n > 0 {
+						cursor = page.Items[n-1].ID
+					}
+					view.StreamURL = "/deployments/logs/stream?id=" + url.QueryEscape(id) + "&after=" + strconv.FormatInt(cursor, 10)
+				}
 			} else if live {
 				// No-id mode resolves to the newest deployment on every load, so
 				// an auto-refresh could jump to a newer one; offer an explicit

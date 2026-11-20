@@ -1,7 +1,7 @@
 {{define "headtop"}}<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="/static/app.css">{{end}}
 {{define "head"}}{{template "headtop"}}<title>{{.}}</title></head><body>{{end}}
 {{define "headrefresh"}}{{template "headtop"}}<meta http-equiv="refresh" content="5"><title>{{.}}</title></head><body>{{end}}
-{{define "headrefreshfast"}}{{template "headtop"}}<meta http-equiv="refresh" content="3"><title>{{.}}</title></head><body>{{end}}
+{{define "headlive"}}{{template "headtop"}}<noscript><meta http-equiv="refresh" content="3"></noscript><script src="/static/logs.js" defer></script><title>{{.}}</title></head><body>{{end}}
 {{define "nav"}}<div class="shell"><aside class="sidebar"><a class="brand" href="/">AutoDeploy</a><nav aria-label="Primary">{{range .Groups}}<div class="nav-group"><p class="nav-heading">{{.Label}}</p><ul>{{range .Items}}<li><a href="{{.Href}}"{{if .Current}} aria-current="page"{{end}}>{{.Label}}{{if .Badge}} <span class="badge" role="img" aria-label="{{.Badge}} blocked">{{.Badge}}</span>{{end}}</a></li>{{end}}</ul></div>{{end}}</nav>{{if .CSRF}}<div class="sidebar-foot"><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="btn ghost">Sign out</button></form></div>{{end}}</aside>{{end}}
 {{define "foot"}}</div></body></html>{{end}}
 {{define "execnotice"}}<p class="notice" role="note">Traffic activation is disabled on this control plane.</p>{{end}}

@@ -13,7 +13,10 @@ import (
 	"autodeploy/internal/store/postgres"
 )
 
-const wantCSP = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'"
+const wantCSP = "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'; script-src 'self'; connect-src 'self'"
+
+// logsScriptTag is the single script tag the CSP-bound pages may carry.
+const logsScriptTag = `<script src="/static/logs.js" defer></script>`
 
 func TestContentSecurityPolicyIsExact(t *testing.T) {
 	h, _, _ := serversHandler(t)
@@ -113,6 +116,14 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		lower := strings.ToLower(body)
 		if !strings.Contains(body, `<link rel="stylesheet" href="/static/app.css">`) {
 			t.Errorf("%s does not link the stylesheet", name)
+		}
+		// The one allowed script tag is the same-origin live-logs enhancement,
+		// and only on the explicit-id logs page.
+		if name == "/deployments/logs?id=dep-1" {
+			if !strings.Contains(lower, logsScriptTag) {
+				t.Errorf("%s lacks the live-logs script tag", name)
+			}
+			lower = strings.Replace(lower, logsScriptTag, "", 1)
 		}
 		for _, banned := range []string{"style=", "<style", "<script", "javascript:", "onclick=", "<link rel=\"stylesheet\" href=\"http"} {
 			if strings.Contains(lower, banned) {

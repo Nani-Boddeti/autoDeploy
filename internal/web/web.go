@@ -132,6 +132,16 @@ type Config struct {
 type Handler struct {
 	repository Repository
 	config     Config
+
+	// Live-log streaming state (logs_stream.go). The timing fields are
+	// unexported test seams; zero means the production value.
+	streams             streamLimiter
+	streamTick          time.Duration
+	streamHeartbeat     time.Duration
+	streamMaxDuration   time.Duration
+	streamTerminalCheck time.Duration
+	streamMaxPerSession int
+	streamMaxTotal      int
 }
 
 func New(repository Repository, config Config) (*Handler, error) {
@@ -188,7 +198,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveStatic(w, r, asset)
 		return
 	}
-	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" {
+	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" && r.URL.Path != "/deployments/logs/stream" {
 		http.NotFound(w, r)
 		return
 	}
@@ -292,6 +302,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.deploymentLogs(w, r)
+	case "/deployments/logs/stream":
+		// The stream re-reads the job state to know when to stop, so it needs
+		// both readers.
+		if h.config.DeploymentLogReader == nil || h.config.OperationsReader == nil {
+			http.NotFound(w, r)
+			return
+		}
+		h.deploymentLogStream(w, r)
 	case "/deployments/cancel":
 		if h.config.OperationsReader == nil || h.config.DeploymentCanceller == nil {
 			http.NotFound(w, r)
@@ -2044,7 +2062,7 @@ func (h *Handler) newID() (string, error) {
 }
 func (h *Handler) securityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'; script-src 'self'; connect-src 'self'")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")

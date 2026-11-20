@@ -8,7 +8,7 @@ import (
 )
 
 // TestDumpPagesForReview writes every parity page as static HTML plus the
-// stylesheet so the pages can be screenshotted from a plain file server. It is
+// stylesheet and live-logs script so the pages can be screenshotted from a plain file server. It is
 // skipped unless AUTODEPLOY_UI_DUMP_DIR is set and touches nothing else.
 func TestDumpPagesForReview(t *testing.T) {
 	dir := os.Getenv("AUTODEPLOY_UI_DUMP_DIR")
@@ -19,6 +19,9 @@ func TestDumpPagesForReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "static", "app.css"), appCSS, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "static", "logs.js"), logsJS, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range parityEntries() {

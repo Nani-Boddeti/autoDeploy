@@ -19,6 +19,9 @@ var templateFS embed.FS
 //go:embed static/app.css
 var appCSS []byte
 
+//go:embed static/logs.js
+var logsJS []byte
+
 func parsePage(name string) *template.Template {
 	return template.Must(template.New(name).ParseFS(templateFS, "templates/layout.html", "templates/"+name+".html")).Lookup(name + ".html")
 }
@@ -44,6 +47,7 @@ type staticAsset struct {
 // directory serving: any other /static/ path is a 404.
 var staticAssets = map[string]staticAsset{
 	"/static/app.css": {contentType: "text/css; charset=utf-8", body: appCSS},
+	"/static/logs.js": {contentType: "text/javascript; charset=utf-8", body: logsJS},
 }
 
 // serveStatic serves one allowlisted embedded asset. It needs no session (the
