@@ -654,6 +654,8 @@ func TestLandingPageLinksToServers(t *testing.T) {
 	principal := auth.Principal{UserID: "user-1", OwnerID: "owner-1", Role: auth.RoleOwner, AuthRevision: 1, SessionID: "session-1"}
 	repo := &repositoryStub{principal: principal}
 	h := testHandler(t, repo)
+	// /servers 404s without ServerAdmin, so the link only exists when it is configured.
+	h.config.ServerAdmin = &serverAdminStub{}
 	r := httptest.NewRequest(http.MethodGet, "https://admin.example.test/", nil)
 	r.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "v1.AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"})
 	rr := httptest.NewRecorder()

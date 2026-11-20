@@ -208,7 +208,7 @@ func TestDeploymentsFiltersCursorAndOlderLink(t *testing.T) {
 	}
 	// no Next -> no older link; empty state
 	stub.list = postgres.DeploymentList{}
-	if b := opsGet(h, p, http.MethodGet, "/deployments").Body.String(); strings.Contains(b, "Older deployments") || !strings.Contains(b, "No deployments to show") {
+	if b := opsGet(h, p, http.MethodGet, "/deployments").Body.String(); strings.Contains(b, "Older deployments") || !strings.Contains(b, "No deployments yet") || !strings.Contains(b, `class="checklist"`) {
 		t.Fatalf("empty page = %s", b)
 	}
 }

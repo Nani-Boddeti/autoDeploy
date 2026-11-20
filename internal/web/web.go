@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -870,7 +871,7 @@ func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	view := serversView{Nav: h.navForCount("servers", p, len(environments)), CSRF: csrf, ReconcilingText: reconcilingText(len(environments))}
+	view := serversView{Nav: h.navForCount("servers", p, len(environments)), CSRF: csrf, ReconcilingText: reconcilingText(len(environments)), EnrollHint: enrollCommand(h.config.PublicOrigin, "<SERVER_ID>")}
 	for _, s := range summaries {
 		view.Servers = append(view.Servers, serverRow{ID: s.ID, Name: s.Name, Status: string(s.Status), CreatedAt: formatTimestamp(s.CreatedAt), LastHeartbeatAt: formatTimestamp(s.LastHeartbeatAt), ActiveCredentialVersion: formatCredentialVersion(s.ActiveCredentialVersion), Enrollment: string(s.Enrollment)})
 	}
@@ -2127,6 +2128,8 @@ type serversView struct {
 	// ReconcilingText is the attention banner ("2 environments need
 	// reconciliation"); empty when nothing is blocked.
 	ReconcilingText string
+	// EnrollHint is the host enrollment command shown when no server exists yet.
+	EnrollHint string
 }
 
 // reconcilingText is the banner sentence for n blocked environments, "" for none.
@@ -2173,7 +2176,36 @@ func formatCredentialVersion(version int) string {
 // log. Cache-Control: no-store is already set process-wide by
 // securityHeaders above.
 func (h *Handler) renderEnrollmentToken(w http.ResponseWriter, r *http.Request, p auth.Principal, serverID, token string, expiresAt time.Time) {
-	renderOperations(w, enrollmentTokenTemplate, enrollmentView{Nav: h.navFor(r.Context(), "servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt)})
+	minutes := 0
+	if left := expiresAt.Sub(h.config.Now()); left > 0 {
+		minutes = int((left + time.Minute - 1) / time.Minute)
+	}
+	renderOperations(w, enrollmentTokenTemplate, enrollmentView{Nav: h.navFor(r.Context(), "servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt), ValidMinutes: minutes, Command: enrollCommand(h.config.PublicOrigin, serverID)})
+}
+
+var (
+	enrollOriginPattern   = regexp.MustCompile(`^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$`)
+	enrollServerIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+)
+
+// enrollCommand is the host-side command that redeems an enrollment token. It
+// mirrors the "agent enroll" step install-app.sh prints (deploy/host/install-app.sh,
+// "Next, as root"): the token is typed at a hidden prompt and piped on stdin, never
+// placed in argv or the environment, so the command carries no token. The agent
+// user, binary and state directory are the installer's fixed layout.
+func enrollCommand(origin, serverID string) string {
+	// Both values land in a shell command the operator pastes as root, so a value
+	// that is not plainly a host or an id is replaced by its placeholder.
+	if !enrollOriginPattern.MatchString(origin) {
+		origin = "https://<CP_HOST>"
+	}
+	if !enrollServerIDPattern.MatchString(serverID) {
+		serverID = "<SERVER_ID>"
+	}
+	return "read -rs -p 'enrollment token: ' T; echo\n" +
+		"printf '%s\\n' \"$T\" | sudo -u autodeploy-agent /usr/local/lib/autodeploy/app/agent enroll \\\n" +
+		"  --base-url " + origin + " --server-id " + serverID + " --state-dir /var/lib/autodeploy/agent\n" +
+		"unset T"
 }
 
 // serversTemplate lists registered servers with a registration form, a

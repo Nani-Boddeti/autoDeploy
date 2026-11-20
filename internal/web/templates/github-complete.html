@@ -1,1 +1,3 @@
-{{template "head" "Confirm GitHub App"}}{{template "nav" .Nav}}<main><h1>Confirm GitHub App installation</h1><form method="post" action="/github/setup/complete"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Confirm</button></form></main>{{template "foot"}}
+{{template "head" "Confirm GitHub App"}}{{template "nav" .Nav}}<main><h1>Confirm GitHub App installation</h1>
+<ol class="steps" aria-label="GitHub setup progress"><li class="done">Install App</li><li aria-current="step"><strong>Confirm</strong></li><li>Bind repository</li></ol>
+<form method="post" action="/github/setup/complete"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Confirm</button></form></main>{{template "foot"}}

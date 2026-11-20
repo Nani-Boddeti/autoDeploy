@@ -28,6 +28,8 @@ type reconciliationView struct {
 	HasServers         bool
 	ServersFailed      bool
 	ServerRows         []overviewServer
+	// Checklist is shown instead of a text-only empty paragraph.
+	Checklist *checklistView
 }
 
 // reconciliationPage renders the environments blocked on reconciliation with
@@ -67,6 +69,9 @@ func (h *Handler) reconciliationPage(w http.ResponseWriter, r *http.Request) {
 			view.ServersFailed = listErr != nil
 			view.ServerRows = h.overviewServers(servers)
 		}
+	}
+	if len(blocked) == 0 && ((view.HasEnvironments && !view.EnvironmentsFailed && len(view.Environments) == 0) || (view.HasServers && !view.ServersFailed && len(view.ServerRows) == 0)) {
+		view.Checklist = h.setupChecklist(r.Context(), p, false)
 	}
 	renderOperations(w, reconciliationTemplate, view)
 }

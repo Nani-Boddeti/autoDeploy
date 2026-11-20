@@ -569,6 +569,28 @@ func emptyDumpPages() map[string]func(t *testing.T) string {
 			h, _, _, _, p := fcHandler(t, manyOwned(14))
 			return pageGet(t, h, p, "/environments/config")
 		},
+		// 22-3j: remaining empty states and flow pages.
+		"projects-empty": func(t *testing.T) string {
+			h, _, p := operationsHandler(t)
+			return pageGet(t, h, p, "/projects")
+		},
+		"deployments-empty": func(t *testing.T) string {
+			h, _, p := operationsHandler(t)
+			return pageGet(t, h, p, "/deployments")
+		},
+		"deployments-filtered-empty": func(t *testing.T) string {
+			h, _, p := operationsHandler(t)
+			return pageGet(t, h, p, "/deployments?project_id=nope")
+		},
+		"servers-empty": func(t *testing.T) string {
+			h, _, p := serversHandler(t)
+			return pageGet(t, h, p, "/servers")
+		},
+		"enrollment-token-issued": func(t *testing.T) string {
+			return enrollmentPage(t, "srv_demo", "tok-demo-0123456789abcdef", time.Date(2026, 8, 10, 0, 15, 0, 0, time.UTC))
+		},
+		"github-continue-steps": func(t *testing.T) string { return parityGitHubContinue(t) },
+		"github-complete-steps": func(t *testing.T) string { return parityGitHubComplete(t) },
 		"reconciliation-empty-servers": func(t *testing.T) string {
 			h, admin, p := serversHandler(t)
 			admin.servers = []postgres.ServerSummary{okServer()}

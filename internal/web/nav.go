@@ -46,6 +46,47 @@ var navItems = []navDef{
 	{Key: "reconciliation", Label: "Reconciliation", Href: "/reconciliation", Group: "Infrastructure", enabled: hasServers},
 }
 
+// routeKind classifies a page route for the structure guards.
+type routeKind string
+
+const (
+	// routeNav is a page listed in the sidebar (every navItems entry).
+	routeNav routeKind = "nav"
+	// routeDetail is a page reached from a list row, never a nav item.
+	routeDetail routeKind = "detail"
+	// routeFlow is a page that exists only inside a multi-step flow.
+	routeFlow routeKind = "flow"
+)
+
+// navRoute is one page route. Method is the HTTP method that renders the page
+// (the enrollment token page is the result of a POST).
+type navRoute struct {
+	Path   string
+	Method string
+	Kind   routeKind
+}
+
+// navRoutes is the single source list of every page route. Add a new page here
+// as well as to the router; structure_test.go fails when a nav-kind route is
+// missing from the sidebar, a page route is missing from this list, or a page
+// renders text only. Keep it next to navItems.
+var navRoutes = []navRoute{
+	{"/", "GET", routeNav},
+	{"/environments", "GET", routeNav},
+	{"/deployments", "GET", routeNav},
+	{"/deployments/logs", "GET", routeNav},
+	{"/environments/config", "GET", routeNav},
+	{"/environments/route", "GET", routeNav},
+	{"/projects", "GET", routeNav},
+	{"/github", "GET", routeNav},
+	{"/servers", "GET", routeNav},
+	{"/reconciliation", "GET", routeNav},
+	{"/deployments/detail", "GET", routeDetail},
+	{"/servers/enrollment", "POST", routeFlow},
+	{"/github/setup/callback", "GET", routeFlow},
+	{"/github/setup/complete", "GET", routeFlow},
+}
+
 type navItem struct {
 	Key, Label, Href, Group string
 	Current                 bool
@@ -72,6 +113,10 @@ type navView struct {
 type enrollmentView struct {
 	Nav                        navView
 	ServerID, Token, ExpiresAt string
+	// ValidMinutes is the whole minutes until expiry (0 hides the sentence).
+	ValidMinutes int
+	// Command is the host-side enrollment command; it never contains the token.
+	Command string
 }
 
 type githubCompleteView struct {

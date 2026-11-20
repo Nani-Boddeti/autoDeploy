@@ -256,6 +256,8 @@ type projectsView struct {
 	Projects   []projectRow
 	CanDeploy  bool
 	CSRF       string
+	// Checklist replaces the list when no project exists.
+	Checklist *checklistView
 }
 
 func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +314,9 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 		}
 		view.Projects = append(view.Projects, row)
 	}
+	if len(view.Projects) == 0 {
+		view.Checklist = h.setupChecklist(r.Context(), p, false)
+	}
 	renderOperations(w, projectsTemplate, view)
 }
 
@@ -349,6 +354,8 @@ type deploymentsView struct {
 	HasFilter     bool
 	// Filter feeds the GET filter form (22-3h).
 	Filter filterFormView
+	// Checklist replaces the list when nothing is filtered and nothing exists.
+	Checklist *checklistView
 }
 
 // filterOption is one <option> of a filter select; the empty ID is "All".
@@ -453,6 +460,9 @@ func (h *Handler) deploymentsList(w http.ResponseWriter, r *http.Request) {
 	if list.Next != nil {
 		view.HasOlder = true
 		view.OlderHref = deploymentsHref(filter, encodeDeploymentCursor(*list.Next))
+	}
+	if len(view.Deployments) == 0 && !view.HasFilter {
+		view.Checklist = h.setupChecklist(r.Context(), p, anyProjectBound(projects))
 	}
 	renderOperations(w, deploymentsTemplate, view)
 }
@@ -721,4 +731,14 @@ func (h *Handler) deploymentCancel(w http.ResponseWriter, r *http.Request) {
 	default:
 		storeFailure(w, err, "the deployment could not be cancelled; retry\n")
 	}
+}
+
+// anyProjectBound reports whether any project has a repository binding.
+func anyProjectBound(projects []postgres.ProjectSummary) bool {
+	for _, pr := range projects {
+		if pr.HasBinding {
+			return true
+		}
+	}
+	return false
 }

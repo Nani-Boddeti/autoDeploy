@@ -234,9 +234,15 @@ type checklistView struct {
 // and at least one environment exists. With zero environments it is the main
 // content (never nil); otherwise it is compact while a step is undone.
 func (h *Handler) newChecklist(githubDone, serverDone, boundDone bool, environments int) *checklistView {
+	// /github is always served; /servers 404s without ServerAdmin, so the step
+	// then shows its state as plain text instead of a dead link.
+	serversHref := ""
+	if h.config.ServerAdmin != nil {
+		serversHref = "/servers"
+	}
 	view := &checklistView{Steps: []checklistStep{
 		{Title: "Connect GitHub", Hint: "Install the GitHub App so repositories can be bound.", Href: "/github", Done: githubDone},
-		{Title: "Register a server", Hint: "Enroll the machine that will run your deployments.", Href: "/servers", Done: serverDone},
+		{Title: "Register a server", Hint: "Enroll the machine that will run your deployments.", Href: serversHref, Done: serverDone},
 		{Title: "Bind a repository", Hint: "Tie a repository branch to an environment and server.", Href: "/github", Done: boundDone},
 	}}
 	allDone := githubDone && serverDone && boundDone
@@ -245,6 +251,16 @@ func (h *Handler) newChecklist(githubDone, serverDone, boundDone bool, environme
 	}
 	view.Compact = environments > 0
 	return view
+}
+
+// setupChecklist builds the checklist for list pages that have nothing to list.
+// Bound repositories are not known here, so that step reads as still to do; it
+// never returns nil (zero environments make the checklist the main content).
+// bound reports whether a repository is already bound; callers that cannot
+// know cheaply pass false (zero projects or environments implies unbound).
+func (h *Handler) setupChecklist(ctx context.Context, p auth.Principal, bound bool) *checklistView {
+	facts := h.loadSetupFacts(ctx, p)
+	return h.newChecklist(facts.repoCount > 0, facts.hasActiveServer(), bound, 0)
 }
 
 // setupFacts are the optional reads behind the checklist and the servers table.

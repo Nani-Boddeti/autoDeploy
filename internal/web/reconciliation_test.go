@@ -77,7 +77,7 @@ func TestReconciliationEmptyWithoutOverviewReaderShowsServers(t *testing.T) {
 func TestReconciliationEmptyWithNoServersStillHasStructure(t *testing.T) {
 	h, _, p := serversHandler(t)
 	page := pageGet(t, h, p, "/reconciliation")
-	contains(t, page, `class="empty"`, hrefAttr("/servers"))
+	contains(t, page, `class="checklist"`, hrefAttr("/servers"))
 }
 
 func TestReconciliationOverviewFailureDegrades(t *testing.T) {
