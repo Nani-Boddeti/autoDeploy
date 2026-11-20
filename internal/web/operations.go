@@ -463,6 +463,9 @@ type statusEventRow struct{ At, From, To, Revision string }
 type jobEventRow struct{ At, Sequence, Type, Attempt string }
 type attemptRow struct {
 	Number, State, Tone, FailureClass, Fence, Strategy, Created, Closed string
+	// Reason and Probe are the health-gate reason label and last probe text of
+	// a failed attempt; empty for every other attempt.
+	Reason, Probe string
 }
 type instanceRow struct{ ID, Attempt, Fence, State, Tone, Created string }
 
@@ -476,6 +479,12 @@ type deploymentDetailView struct {
 	Active       bool
 	Drain        *drainResultView
 	Cleanup      *cleanupView
+	// Failure, FailureProbe and Activation fill the summary failure block, and
+	// only for a failed deployment; HasFailure is true when any of them shows.
+	HasFailure   bool
+	Failure      reasonView
+	FailureProbe string
+	Activation   string
 	JobID        string
 	JobAttempts  string
 	JobCreated   string
@@ -553,6 +562,25 @@ func (h *Handler) offerRetry(w http.ResponseWriter, r *http.Request, p auth.Prin
 	return true
 }
 
+// latestFailedProbe returns the last probe text of the newest failed attempt
+// (highest id), "" when there is none. It never falls back to an older attempt.
+// latestFailedProbe returns the probe of the job's newest attempt (highest
+// attempt number) only when that attempt itself failed, matching the store's
+// rule for the summary failure class and reason; an older failed attempt's
+// probe is never shown as the "last probe".
+func latestFailedProbe(attempts []postgres.AttemptView) string {
+	var newest *postgres.AttemptView
+	for i := range attempts {
+		if newest == nil || attempts[i].AttemptNumber > newest.AttemptNumber {
+			newest = &attempts[i]
+		}
+	}
+	if newest == nil || newest.State != "failed" {
+		return ""
+	}
+	return newest.FailureProbe
+}
+
 func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.operationsPrelude(w, r)
 	if !ok {
@@ -617,12 +645,24 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		}
 		view.JobEvents = append(view.JobEvents, jobEventRow{At: formatTimestamp(e.OccurredAt), Sequence: strconv.Itoa(e.Sequence), Type: e.EventType, Attempt: attempt})
 	}
+	if d.Deployment.Status == "failed" {
+		view.Failure = failedReason(d.Deployment.Status, d.Deployment.FailureClass, d.Deployment.FailureReason)
+		view.FailureProbe, view.Activation = latestFailedProbe(d.Attempts), d.ActivationSummary
+		view.HasFailure = view.Failure.ClassLabel != "" || view.Failure.ReasonLabel != "" || view.FailureProbe != "" || view.Activation != ""
+	}
 	for _, a := range d.Attempts {
 		closed := "open"
 		if a.ClosedAt != nil {
 			closed = formatTimestamp(*a.ClosedAt)
 		}
-		view.Attempts = append(view.Attempts, attemptRow{Number: strconv.Itoa(a.AttemptNumber), State: a.State, Tone: stateTone(a.State), FailureClass: orDash(a.FailureClass), Fence: strconv.FormatInt(a.Fence, 10), Strategy: orDash(a.ReleaseStrategy), Created: formatTimestamp(a.CreatedAt), Closed: closed})
+		row := attemptRow{Number: strconv.Itoa(a.AttemptNumber), State: a.State, Tone: stateTone(a.State), FailureClass: orDash(a.FailureClass), Fence: strconv.FormatInt(a.Fence, 10), Strategy: orDash(a.ReleaseStrategy), Created: formatTimestamp(a.CreatedAt), Closed: closed}
+		if a.State == "failed" {
+			if a.FailureReason != "" {
+				row.Reason = labelOrRaw(failureReasonLabels, a.FailureReason)
+			}
+			row.Probe = a.FailureProbe
+		}
+		view.Attempts = append(view.Attempts, row)
 	}
 	if rel := d.Release; rel != nil {
 		view.HasRelease = true

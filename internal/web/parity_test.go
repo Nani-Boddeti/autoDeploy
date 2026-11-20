@@ -66,7 +66,8 @@ func parityEntries() []parityEntry {
 		{"deployment detail failed", parityDetailFailed, detailFailedFragments()},
 		// State flags are facts (R4) even though they render as pill text.
 		// 22-3i may reword them but must keep a stable marker and flip these pins.
-		{"deployment detail rolled back", parityDetailRolledBack, []string{`rolled back`, `>rolled_back<`, `dep-rb1`}},
+		{"deployment detail rolled back", parityDetailRolledBack, []string{`data-fact="rolled-back"`, `>rolled_back<`, `dep-rb1`}},
+		{"deployment detail failed with reason", parityDetailFailedReason, []string{`class="failure"`, `Temporary failure`, `Image HEALTHCHECK reported unhealthy`, `Last probe:`, `status=200; tcp ok`, `Activation:`, `route switch aborted`, `Health check deadline exceeded`, `dep-fr1`}},
 		{"deployment logs", parityLogs, logsFragments()},
 		{"servers", parityServers, serversFragments()},
 		{"environment config exists", parityConfigExists, configExistsFragments()},
@@ -268,8 +269,8 @@ func parityDetailLeased(t *testing.T) string {
 func detailLeasedFragments() []string {
 	return []string{
 		`http-equiv="refresh"`,
-		// Live-route flag (ReleaseIsActive); see the rolled-back entry note.
-		`live on route`,
+		// Live-route flag (ReleaseIsActive): stable marker, wording may change.
+		`data-fact="live-route"`,
 		// Summary.
 		`dep-par1`, `>proj-par<`, `>env-par<`, `>srv-par<`, `0123456789ab`, `>building<`, ts(pt1), ts(pt2),
 		hrefAttr("/environments/config?environment_id=env-par"), hrefAttr("/environments/route?environment_id=env-par"),
@@ -298,6 +299,19 @@ func parityDetailRolledBack(t *testing.T) string {
 		Job:        postgres.JobView{ID: 33, State: "succeeded", AttemptCount: 1, CreatedAt: pt1, UpdatedAt: pt2},
 	}
 	return pageGet(t, h, p, "/deployments/detail?id=dep-rb1")
+}
+
+// parityDetailFailedReason is a failed deployment with a health-gate reason,
+// the latest failed attempt's probe and an activation summary.
+func parityDetailFailedReason(t *testing.T) string {
+	h, stub, _, p := cancelHandler(t, "dead")
+	stub.detail = postgres.DeploymentDetail{
+		Deployment:        postgres.DeploymentSummary{DeploymentID: "dep-fr1", ProjectID: "proj-par", EnvironmentID: "env-par", ServerID: "srv-par", CommitSHA: paritySHA, Status: "failed", JobID: 34, JobState: "dead", CreatedAt: pt1, UpdatedAt: pt2, FailureClass: "transient", FailureReason: "container_unhealthy"},
+		Job:               postgres.JobView{ID: 34, State: "dead", AttemptCount: 2, CreatedAt: pt1, UpdatedAt: pt2},
+		Attempts:          []postgres.AttemptView{{ID: 90, AttemptNumber: 1, State: "failed", FailureClass: "transient", Fence: 5, FailureReason: "deadline_exceeded", FailureProbe: "status=200; tcp ok", CreatedAt: pt1}},
+		ActivationSummary: "route switch aborted",
+	}
+	return pageGet(t, h, p, "/deployments/detail?id=dep-fr1")
 }
 
 // parityDetailCancelRequested is a leased job whose cancellation is already
