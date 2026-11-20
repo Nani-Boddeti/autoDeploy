@@ -517,3 +517,11 @@ server_id without checking the target server exists/is active/same owner — ver
   eligible; older agent binary cannot read records with the new fields (drain before downgrade).
   NEXT: acer session (install, rerun attempt-19 STS failure scenario -> deployment failed, env not blocked,
   predecessor serving; re-enroll drill; plus earlier list), then 22-7 audit, 22-5/22-6 vendor-agnostic VPS, 22-3 UI last.
+- 2026-11-20: acer unreachable (host down) -> mac-side first (owner). Rewrap generation follow-up already closed (d02edb3,
+  rotation.go:58). 22-7 audit run: 5 parallel audits, no P0/P1; 13 findings + decisions D1-D3 in tasks/22-7-audit.md
+  (key: DB superuser role, container hardening, checkout cleanup no retry, diagnose.sh /var/tmp as root, optional
+  checksum, uninstall destroys KEKs, missing release_operations indexes, no DB timeouts). Awaiting owner approval.
+- 2026-11-20: 22-7 mac-side DONE: 13 audit findings + 2 review rounds fixed (round 1 FAIL: admin migrated as runtime
+  role -> CheckCurrent; round 2 PASS WITH NOTES). Owner: D1 role split, D2 compatible caps + PidsLimit 4096, D3 purge
+  90d job/route events only (webhook deliveries kept: replay protection), HSTS 1 day. Migration 000030. Full bar green.
+  Follow-ups + acer checklist in tasks/22-7-audit.md. RULE-01 (no file deletion without double confirm) adopted.

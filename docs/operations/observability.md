@@ -105,3 +105,7 @@ journalctl -u autodeploy-agent | grep attempt_id=N
 
 (`journalctl -u autodeploy-agent -o cat --since -1h | grep attempt_id=N` for plain lines.) Containers created by an
 attempt carry its id in the `io.autodeploy.attempt-id` label (`internal/runtime/docker/labels.go`).
+
+## Data retention
+
+The control plane purges history older than 90 days once an hour (single runner across replicas, small batches, runs as the runtime database role): events of finished jobs and route events. Webhook deliveries (and their lifecycle repository rows) are never purged: delivery ids are replay protection. Events of unfinished jobs and the `reconciled` / `activation_late_report` job events (read by activation-resolution repeats) are never purged. Audit tables and `release_operations` are kept forever by design. Failures are logged as `event retention purge failed`.
