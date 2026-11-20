@@ -62,6 +62,14 @@ stored secret.
   Either back up `ca.key` with the same care as a KEK (separate location), or accept that a lost CA is
   regenerated with `private-ca.sh --force`, after which every browser and client must trust the new
   `ca.crt` again.
+- **ACME storage** (public mode only, `/var/lib/autodeploy/traefik/acme/acme.json`, 0600 root): holds the
+  Let's Encrypt account key and every issued certificate with its private key. Treat it like a KEK:
+  **Operator decision** on custody, but back it up encrypted, root-only, to a location with narrow access
+  (not next to a readable database dump). It is not needed for correctness: if lost, Traefik registers a new
+  account and re-issues on the next request, but Let's Encrypt rate limits (5 duplicate certificates per week,
+  50 certificates per registered domain per week) make a loss costly when many hostnames must be re-issued
+  at once. Restore: stop `autodeploy-traefik`, place the file as root with mode 0600 (directory 0700), start
+  it; do not edit it. Certificates are renewed automatically while the file persists. LAN mode has no such file.
 - Docker image build cache and the Postgres volume itself: not backed up; the logical dump is the
   supported artifact. (Volume snapshots are **Operator decision** and are not documented here.)
 

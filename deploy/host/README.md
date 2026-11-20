@@ -1,6 +1,18 @@
-# Host kit: enabling GitHub and building for the acer
+# Host kit: enabling GitHub, building binaries, installing
 
-## build-acer-binaries.sh (on the development machine, not root)
+## Public VPS install
+
+Any Ubuntu 24.04 x86_64 VPS with a public IP and DNS: follow docs/operations/vps-install.md (Docker
+prerequisites, `install-app.sh --mode public`, ACME certificates, firewall, backups). Build the binaries
+with `deploy/host/build-host-binaries.sh --gates enabled|disabled OUTDIR GITDIR` (the gate choice is
+mandatory and explicit; it prints the sha256 of `SHA256SUMS` to transfer separately). The acer notes
+below describe the LAN test host (`--mode lan`, the default, private CA).
+
+LAN note: re-running `install-app.sh` on an existing LAN host adds `AUTODEPLOY_TLS_MODE=lan` to host.env (an
+active Traefik restarts once), and lan `preflight-app.sh` gained loop-control, docker buildx, free-disk and
+subnet checks.
+
+## build-acer-binaries.sh (LAN test host; on the development machine, not root)
 
     deploy/host/build-acer-binaries.sh OUTDIR GITDIR
 

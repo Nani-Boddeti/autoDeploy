@@ -525,3 +525,58 @@ server_id without checking the target server exists/is active/same owner — ver
   role -> CheckCurrent; round 2 PASS WITH NOTES). Owner: D1 role split, D2 compatible caps + PidsLimit 4096, D3 purge
   90d job/route events only (webhook deliveries kept: replay protection), HSTS 1 day. Migration 000030. Full bar green.
   Follow-ups + acer checklist in tasks/22-7-audit.md. RULE-01 (no file deletion without double confirm) adopted.
+
+## 22-5 + 22-6 design: generic public VPS + ACME (2026-11-20, APPROVED: D1-D5 as recommended)
+**Baseline (investigated, spot-checked):** kit is LAN-only: CP host default autodeploy.autodeploy.test (install-app.sh:71),
+private-ca.sh wildcard cert via traefik/autodeploy-tls.yml, /etc/hosts 127.0.0.1 block, TRAEFIK_BIND=127.0.0.1, subnet
+172.29.0.0/24 with no host-route collision check, preflight-app.sh CA/hosts/--resolve checks, traefik unit
+AssertPathExists tls/server.*. traefik.yml has NO certificatesResolvers. Renderer ALREADY emits
+tls.certResolver "letsencrypt-production" (render.go:170, defaults.go:25; observer requires it, client.go ErrTLSMismatch);
+LAN works because an undefined resolver falls back to the file cert. CP config (PublicOrigin, trusted proxy) host-agnostic.
+Kit never enables ufw; 5432/8080/metrics/CP port are loopback/bridge-bound. Docker is assumed preinstalled; binaries only
+via build-acer-binaries.sh (gate-flipped). Agent probe uses system roots -> LE staging certs never pass the probe.
+
+**Design:**
+- `--mode lan|public` on install-app.sh / preflight-app.sh / uninstall.sh, persisted AUTODEPLOY_TLS_MODE in host.env.
+  lan = default, generated files byte-identical to today (pinned by a test). In-place lan->public switch unsupported
+  (fresh install documented).
+- public: no private CA / tls file; CP host required (real FQDN, no default); TRAEFIK_BIND default 0.0.0.0;
+  traefik/traefik-public.yml = same entrypoints/providers + certificatesResolvers.letsencrypt-production.acme
+  (storage /etc/traefik/acme/acme.json, challenge per D1, caServer per D2, email per D3). Unit: rw mount
+  /var/lib/autodeploy/traefik/acme (0700 dir, acme.json 0600, NOT under agent-writable dynamic/), tls mount +
+  AssertPathExists mode-conditional. CP router (install-app.sh heredoc) gets certResolver in public mode.
+  No Go change: per-app routes already request the resolver (no golden/digest churn).
+- Keep a managed /etc/hosts line CP_HOST -> 127.0.0.1 in public mode (no CA) so agent->CP never depends on hairpin NAT.
+- Preflight public: DNS A/AAAA of CP host == host public IP (from `ip route get`; no external what-is-my-ip call),
+  nothing else on 80/443, outbound to ACME directory, acme.json 0600, served cert issuer != Traefik default;
+  subnet collision check vs `ip -4 route` + docker networks before network creation (both modes, fail with env var hint).
+- Firewall per D4. acme.json backup note in docs/operations/backup-restore.md (holds ACME account key).
+- Packaging per D5: docs for Docker Engine + buildx + required apt packages (apache2-utils, openssl, curl, xfsprogs),
+  preflight for /dev/loop-control + free disk; generic build script name (new build-host-binaries.sh wrapping existing
+  logic; old script kept); x86_64 + Ubuntu 24.04 stay hard requirements.
+
+**Decisions:** D1 challenge: HTTP-01 default, TLS-ALPN-01 opt-in flag (rec). D2 `--acme-staging` for manual issuance dry
+run only (probe can't trust staging) (rec). D3 ACME email optional + warning (rec). D4 firewall: opt-in
+`--configure-firewall` (ufw 22/80/443, explicit SSH port confirm) (rec) vs docs only. D5 include packaging docs + generic
+build script in 22-5 (rec).
+**Risks:** LE rate limits (5 dup certs/week) -> back up acme.json; first issuance inside 3m probe window; one DNS record
+per app host (no wildcard without DNS-01); HTTP-01 vs entrypoint redirect + undefined-resolver behaviour unverified live;
+Docker ports bypass ufw; provider blocks on :80.
+**Test plan:** Mac: bash -n/shellcheck, lan-mode byte-identical generated files test, traefik-public.yml validated by the
+pinned Traefik image under Docker (`traefik --configFile` startup, no ports), CIDR-collision helper tests, Go suite
+unchanged. VPS (later, any provider): DNS + 80/443 reachability, staging then prod issuance for CP + one app host, redirect
+interplay, acme.json persistence/renewal, ufw+Docker, full deploy e2e (22-7 gate).
+**Slices:** 22-5a mode switch + public config + unit/router + hosts line; 22-5b preflight (DNS, ports, subnet, loop/disk);
+22-5c firewall + packaging docs + build script; 22-6 resolver config/challenge flags/staging + backup doc + validation.
+- 2026-11-20: 22-5 + 22-6 mac-side DONE. install-app.sh --mode lan|public (lan byte-identical + AUTODEPLOY_TLS_MODE=lan);
+  public: FQDN required, Traefik resolver letsencrypt-production (renderer already requested it: no Go change),
+  HTTP-01 default / tls-alpn opt-in, --acme-staging, optional --acme-email, opt-in --configure-firewall (SSH ports =
+  sshd -T U ss U $SSH_CONNECTION; die before any ufw change if session port undetected), acme.json 0700/0600 rw mount,
+  CP /etc/hosts 127.0.0.1 block, refuses lan<->public switch and leftover autodeploy-tls.yml. netcheck.sh subnet
+  collision; preflight public checks (all DNS addrs match, chain+hostname verify, CP via Traefik, ACME reachability,
+  loop/disk/buildx). build-host-binaries.sh --gates enabled|disabled; docs/operations/vps-install.md. Reviews: round 1
+  FAIL (orphan heredoc body aborted install-app.sh step 5 in both modes; bash -n + render-only test missed it ->
+  new script_structure_test executes the installer in a container + heredoc scan), round 2 PASS WITH NOTES, LOWs fixed.
+  Shell tests: netcheck 45, firewall_ssh 19, preflight_public 17, script_structure, lan_mode_identical all green.
+  Unproven until a public VPS: real issuance (staging then prod), HTTP-01 vs entrypoint redirect, renewal, DNS, ufw +
+  Docker, first-issuance vs 3m probe. deploy/host/uninstall.sh.bak0 = stray untracked backup, owner: keep, never commit.
