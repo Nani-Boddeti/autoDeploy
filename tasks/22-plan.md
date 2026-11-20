@@ -606,3 +606,29 @@ environment blocked. Owner: probe with the target the predecessor was deployed w
   invalid/older-server -> fail closed (operator block). Wiring pinned at compile time (cmd/controlplane/wiring_test.go);
   real handler <-> real client contract test. Review PASS WITH NOTES, LOWs fixed. make check, integration sweep, agent
   race x3 green. Acer: rerun section C (health path change on STS) -> expect deployment failed, env NOT blocked.
+- 2026-11-20 acer (4eba3b3 then 4bb1bb5, install-app.sh lan upgrade): PROVEN runtime role split (control plane connects as
+  autodeploy_app; TRUNCATE/DISABLE TRIGGER/session_replication_role/CREATE/COPY PROGRAM refused), restart marker cleared,
+  agent ProtectSystem=strict (deploy + route write + drain OK), empty CapabilityBoundingSet on postgres/traefik (postgres
+  restarted on new unit), metrics on 127.0.0.1:9101, preflight 64/0/1, container hardening on a real deploy (rt-26:
+  no-new-privileges, PidsLimit 4096, 5 caps dropped). 22-D: attempt 27 (4eba3b3) fell back to block (probe used new path)
+  -> 22-D2; attempt 30 (4bb1bb5) STS + wrong path: predecessor probe passed with its own path, not_switched, deployment
+  failed without operator, env not blocked, demo 200. Anomaly: attempt 28 checkout git fetch exit 125 (one-off; 29/30 OK)
+  -> diagnose.sh if it recurs. Installer upgrade output still prints fresh-install next steps (cosmetic follow-up).
+  NEXT acer: re-enroll drill, backup/restore drill on scratch DB, crash-recovery test, 24h retention check.
+- 2026-11-20 acer re-enroll drill (22-8) PROVEN: UI reenrollment_issued -> agent stopped, old credential MOVED aside
+  (credential.pre-reenroll-20261120, owner-approved RULE-01 x2) -> agent enroll -> credential v1 revoked, v2 active in one
+  tx, audit reenrollment_issued + enrolled(2) + credential_rotated(2); heartbeat resumed; attempt 31 blue/green deploy OK
+  with the re-enrolled agent. Old-credential refusal shown via DB revocation (live presentation not exercised).
+  Remaining acer: backup/restore drill (scratch DB), crash-recovery (kill agent mid-deploy), 24h rt retention check.
+- 2026-11-20 acer retention (20E/21B) PROVEN: 11-16 failed candidates (incl. attempt 19) not removed at ~6h, removed at
+  first pass after boot 11-18 (cleanups 14-17); successful releases beyond keep-2 removed (18, 19 at 16:07/16:17, 20 =
+  rt-25 at 16:31:55, 10 min after agent start); today's failed candidates (27, 28, 30) kept <24h. Pending: 24h removal on a
+  continuously running host (rt-27 ~13:12, rt-30 ~16:12 on 11-21) via `ssh -t autodeploy-laptop 'sudo bash
+  ~/autodeploy-stage/retention.sh'`.
+- 2026-11-20 acer crash test K1 (SIGKILL agent during build, attempt 32): systemd restarted agent in 5s; an operator
+  Cancel from the UI arrived at 16:39:00 (only writer of cancel_requested is POST /deployments/cancel); no ack possible
+  (new process has no in-memory lease) -> lease capped 60s -> expired -> closeAttemptOrdinary flags slot
+  reconciliation_required (ADR 0004: expiry/cancel always reconciles, phase-independent). Owner: keep design; follow-ups:
+  (1) narrow the block to attempts that reached a host-mutating phase (ADR amendment + predicate), (2) restarted agent
+  should log attempts it lost / persist a minimal attempt-started record to ack or fail cleanly. Clear via Servers page
+  resolve (attempt 32, no_activation). K2 (kill after activation authorized) still to run.
