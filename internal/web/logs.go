@@ -123,7 +123,7 @@ func (h *Handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := deploymentLogsView{Nav: h.navFor("deployments", p), ExecNotice: !h.config.ActivationEnabled, Title: "Logs for deployment " + id, ID: id, DetailHref: detailHref(id)}
+	view := deploymentLogsView{Nav: h.navFor(r.Context(), "deployments", p), ExecNotice: !h.config.ActivationEnabled, Title: "Logs for deployment " + id, ID: id, DetailHref: detailHref(id)}
 	if after > 0 {
 		view.StartHref = logsHref(id, 0)
 	}

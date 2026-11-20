@@ -265,7 +265,7 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := projectsView{Nav: h.navFor("projects", p), ExecNotice: !h.config.ActivationEnabled}
+	view := projectsView{Nav: h.navFor(r.Context(), "projects", p), ExecNotice: !h.config.ActivationEnabled}
 	if h.manualDeployEnabled() {
 		csrf, csrfErr := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
 		if csrfErr != nil {
@@ -389,7 +389,7 @@ func (h *Handler) deploymentsList(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := deploymentsView{Nav: h.navFor("deployments", p), ExecNotice: !h.config.ActivationEnabled, ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
+	view := deploymentsView{Nav: h.navFor(r.Context(), "deployments", p), ExecNotice: !h.config.ActivationEnabled, ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
 	for _, d := range list.Items {
 		view.Deployments = append(view.Deployments, newDeploymentRow(d))
 	}
@@ -520,7 +520,7 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := deploymentDetailView{
-		Nav:        h.navFor("deployments", p),
+		Nav:        h.navFor(r.Context(), "deployments", p),
 		ExecNotice: !h.config.ActivationEnabled,
 		Title:      "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
 		Refresh: !terminalJobStates[d.Job.State], RefreshEvery: strconv.Itoa(detailRefreshSeconds),

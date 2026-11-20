@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -90,7 +91,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		t.Fatalf("/login = %d", login.Code)
 	}
 	pages["/login"] = login.Body.String()
-	for _, target := range []string{"/", "/environments", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1"} {
+	for _, target := range []string{"/", "/environments", "/servers", "/github", "/reconciliation", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, serversRequest(http.MethodGet, target, nil, p, h))
 		if rr.Code != http.StatusOK {
@@ -99,12 +100,12 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		pages[target] = rr.Body.String()
 	}
 	var buf bytes.Buffer
-	if err := enrollmentTokenTemplate.Execute(&buf, enrollmentView{Nav: h.navFor("servers", p), ServerID: "s", Token: "tok", ExpiresAt: "later"}); err != nil {
+	if err := enrollmentTokenTemplate.Execute(&buf, enrollmentView{Nav: h.navFor(context.Background(), "servers", p), ServerID: "s", Token: "tok", ExpiresAt: "later"}); err != nil {
 		t.Fatal(err)
 	}
 	pages["enrollment"] = buf.String()
 	buf.Reset()
-	if err := githubCompleteTemplate.Execute(&buf, githubCompleteView{Nav: h.navFor("github", p), CSRF: "c"}); err != nil {
+	if err := githubCompleteTemplate.Execute(&buf, githubCompleteView{Nav: h.navFor(context.Background(), "github", p), CSRF: "c"}); err != nil {
 		t.Fatal(err)
 	}
 	pages["github-complete"] = buf.String()
@@ -150,10 +151,12 @@ func TestNavShowsAvailablePages(t *testing.T) {
 		{"/deployments/detail?id=dep-1", "/deployments"},
 		{"/projects", "/projects"},
 		{"/servers", "/servers"},
+		{"/github", "/github"},
+		{"/reconciliation", "/reconciliation"},
 	}
 	for _, pg := range pages {
 		body := navPage(t, h, p, pg.target)
-		for _, href := range []string{"/", "/environments", "/deployments", "/projects", "/#github", "/servers"} {
+		for _, href := range []string{"/", "/environments", "/deployments", "/projects", "/github", "/servers", "/reconciliation"} {
 			if !strings.Contains(body, `href="`+href+`"`) {
 				t.Errorf("%s nav lacks href %q", pg.target, href)
 			}
@@ -170,6 +173,8 @@ func TestNavShowsAvailablePages(t *testing.T) {
 	noServers.config.ServerAdmin = nil
 	if body := navPage(t, noServers, p2, "/projects"); strings.Contains(body, `href="/servers"`) {
 		t.Error("nav shows /servers with ServerAdmin nil")
+	} else if strings.Contains(body, `href="/reconciliation"`) {
+		t.Error("nav shows /reconciliation with ServerAdmin nil")
 	}
 	// An OperationsReader without the overview read omits Environments (its route 404s).
 	noOverview, p4 := navTestHandler(t)

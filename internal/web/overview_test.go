@@ -269,7 +269,7 @@ func TestOverviewWithoutOverviewReaderStillRenders(t *testing.T) {
 	admin.servers = []postgres.ServerSummary{okServer()}
 	h.config.OperationsReader = &operationsStub{}
 	page := pageGet(t, h, p, "/")
-	contains(t, page, `class="checklist"`, "acer", `id="github"`, `action="/github/setup"`)
+	contains(t, page, `class="checklist"`, "acer", hrefAttr("/github"))
 	lacks(t, page, `class="board"`)
 
 	h.config.OperationsReader = nil
@@ -284,7 +284,7 @@ func TestOverviewPrimaryReadFailureDegrades(t *testing.T) {
 	if rr.Code != http.StatusOK || strings.Contains(body, "secret") {
 		t.Fatalf("primary failure = %d", rr.Code)
 	}
-	contains(t, body, "Environments could not be loaded.", `action="/github/setup"`, `class="checklist"`)
+	contains(t, body, "Environments could not be loaded.", hrefAttr("/github"), `class="checklist"`)
 	lacks(t, body, `class="board"`)
 
 	// /environments has nothing else to show: it keeps the operationsFailure response.
@@ -325,7 +325,7 @@ func TestOverviewAttentionItems(t *testing.T) {
 	attention := page[strings.Index(page, `class="attention"`):]
 	attention = attention[:strings.Index(attention, "</section>")]
 	contains(t, attention,
-		"env-blocked", hrefAttr("/servers"),
+		"env-blocked", hrefAttr("/reconciliation"),
 		"stale-box", "gone-box", "revoked",
 		"env-failed", "Configuration problem",
 		"Traffic activation is disabled",
@@ -366,11 +366,6 @@ func TestOverviewRecentDeploymentsAndServers(t *testing.T) {
 	if strings.Count(page, "Temporary failure") != 1 {
 		t.Fatal("failure class shown for a non-failed deployment")
 	}
-}
-
-func TestOverviewKeepsGitHubSection(t *testing.T) {
-	h, _, _, p := overviewHandler(t, fourRows())
-	contains(t, pageGet(t, h, p, "/"), `id="github"`, `action="/github/setup"`, `action="/github/installations/reconcile"`, `name="installation_id"`)
 }
 
 // ---- Environments page ----
@@ -436,7 +431,7 @@ func TestReturnToAllowlist(t *testing.T) {
 		{"rollback", "/deployments/rollback", "/deployments/detail?id=rbd_abc", func(h *Handler, p auth.Principal) url.Values {
 			return rollbackForm(t, h, p)
 		}},
-		{"resolve", "/environments/resolve", "/servers", func(h *Handler, p auth.Principal) url.Values {
+		{"resolve", "/environments/resolve", "/reconciliation", func(h *Handler, p auth.Principal) url.Values {
 			return url.Values{"csrf": {serversCSRF(t, h, p)}, "environment_id": {"env-a"}, "attempt_id": {"5"}, "outcome": {"activated"}, "reason": {"checked by hand"}}
 		}},
 	}
@@ -444,6 +439,7 @@ func TestReturnToAllowlist(t *testing.T) {
 		{"/", "/"},
 		{"/environments", "/environments"},
 		{"/servers", "/servers"},
+		{"/reconciliation", "/reconciliation"},
 		{"//evil.example", ""},
 		{"https://evil.example", ""},
 		{`/\evil`, ""},
@@ -532,7 +528,7 @@ func boardDataFragments() []string {
 }
 
 func overviewBoardFragments() []string {
-	return append(boardDataFragments(), `name="return_to" value="/"`, `action="/logout"`, hrefAttr("/environments"), hrefAttr("/servers"), `srv-1`, `action="/github/setup"`)
+	return append(boardDataFragments(), `name="return_to" value="/"`, `action="/logout"`, hrefAttr("/environments"), hrefAttr("/servers"), `srv-1`)
 }
 
 func environmentsPageFragments() []string {
@@ -550,6 +546,17 @@ func emptyDumpPages() map[string]func(t *testing.T) string {
 	return map[string]func(t *testing.T) string{
 		"overview-empty":     empty("/"),
 		"environments-empty": empty("/environments"),
+		"github-empty": func(t *testing.T) string {
+			h, _, _, p := githubPageHandler(t)
+			h.config.RepositoryLister = nil
+			return pageGet(t, h, p, "/github")
+		},
+		"reconciliation-empty": empty("/reconciliation"),
+		"reconciliation-empty-servers": func(t *testing.T) string {
+			h, admin, p := serversHandler(t)
+			admin.servers = []postgres.ServerSummary{okServer()}
+			return pageGet(t, h, p, "/reconciliation")
+		},
 	}
 }
 

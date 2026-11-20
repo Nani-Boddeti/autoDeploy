@@ -236,6 +236,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.githubReconcile(w, r)
+	case "/github":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.githubPage(w, r)
+	case "/reconciliation":
+		if h.config.ServerAdmin == nil {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.reconciliationPage(w, r)
 	case "/servers":
 		if h.config.ServerAdmin == nil {
 			http.NotFound(w, r)
@@ -607,7 +623,7 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	view := landingView{Nav: h.navFor("home", principal), CSRF: csrf, ShowBind: h.config.GitHubSetup != nil, ExecNotice: !h.config.ActivationEnabled}
+	view := landingView{Nav: h.navFor(r.Context(), "home", principal), CSRF: csrf, ExecNotice: !h.config.ActivationEnabled}
 	// The environment board is the one required read: its failure maps like any operations read.
 	var rows []postgres.EnvironmentOverview
 	if reader, ok := h.overviewReader(); ok {
@@ -629,12 +645,6 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 	}
 	// Everything below is optional: a failed read degrades its own section with a notice.
 	facts := h.loadSetupFacts(r.Context(), principal)
-	if view.ShowBind {
-		view.Repositories = facts.repos
-		for _, srv := range facts.servers {
-			view.Servers = append(view.Servers, landingServer{ID: srv.ID, Name: srv.Name})
-		}
-	}
 	if h.config.ServerAdmin != nil {
 		view.HasServers, view.ServersUnavailable = true, facts.serversFailed
 		view.ServerRows = h.overviewServers(facts.servers)
@@ -652,14 +662,10 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 }
 
 // landingView is the Overview page's data (the type keeps its original name: the
-// parity guard and landing tests build it directly). The binding form posts to
-// /github/bindings; the GitHub section stays here until 22-3g moves it to /github.
+// parity guard builds it directly). The GitHub section moved to /github in 22-3g.
 type landingView struct {
-	Nav          navView
-	CSRF         string
-	ShowBind     bool
-	Repositories []postgres.BindableRepository
-	Servers      []landingServer
+	Nav  navView
+	CSRF string
 
 	ExecNotice         bool
 	Attention          []attentionItem
@@ -674,8 +680,6 @@ type landingView struct {
 	ServerRows         []overviewServer
 	ServersUnavailable bool
 }
-
-type landingServer struct{ ID, Name string }
 
 func (h *Handler) githubSetup(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil || h.provenance(r) != nil {
@@ -736,9 +740,9 @@ func (h *Handler) githubCallback(w http.ResponseWriter, r *http.Request) {
 	// The callback arrives cross-site, so the session cookie is usually absent: nav without sign-out.
 	var nav navView
 	if _, p, ok := h.session(r.Context(), r); ok {
-		nav = h.navFor("github", p)
+		nav = h.navFor(r.Context(), "github", p)
 	} else {
-		nav = h.navFor("github", auth.Principal{})
+		nav = h.navFor(r.Context(), "github", auth.Principal{})
 	}
 	renderOperations(w, githubContinueTemplate, githubContinueView{Nav: nav})
 }
@@ -758,7 +762,7 @@ func (h *Handler) githubCompleteGet(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	renderOperations(w, githubCompleteTemplate, githubCompleteView{Nav: h.navFor("github", p), CSRF: csrf})
+	renderOperations(w, githubCompleteTemplate, githubCompleteView{Nav: h.navFor(r.Context(), "github", p), CSRF: csrf})
 }
 func (h *Handler) githubCompletePost(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil || h.provenance(r) != nil {
@@ -785,7 +789,7 @@ func (h *Handler) githubCompletePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, expiredHandoffCookie())
-	redirect(w, "/")
+	redirect(w, "/github")
 }
 func (h *Handler) githubBind(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil || h.provenance(r) != nil {
@@ -817,7 +821,7 @@ func (h *Handler) githubBind(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	redirect(w, "/")
+	redirect(w, "/github")
 }
 func (h *Handler) githubReconcile(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil || h.provenance(r) != nil {
@@ -839,7 +843,7 @@ func (h *Handler) githubReconcile(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	redirect(w, "/")
+	redirect(w, "/github")
 }
 
 // serversList renders the registered-servers list, the registration form,
@@ -866,12 +870,9 @@ func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	view := serversView{Nav: h.navFor("servers", p), CSRF: csrf, ResolveReasonMax: maxResolveReasonBytes}
+	view := serversView{Nav: h.navForCount("servers", p, len(environments)), CSRF: csrf, ReconcilingText: reconcilingText(len(environments))}
 	for _, s := range summaries {
 		view.Servers = append(view.Servers, serverRow{ID: s.ID, Name: s.Name, Status: string(s.Status), CreatedAt: formatTimestamp(s.CreatedAt), LastHeartbeatAt: formatTimestamp(s.LastHeartbeatAt), ActiveCredentialVersion: formatCredentialVersion(s.ActiveCredentialVersion), Enrollment: string(s.Enrollment)})
-	}
-	for _, e := range environments {
-		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, ConfigHref: newEnvironmentLink(e.EnvironmentID).ConfigHref, RouteHref: newEnvironmentLink(e.EnvironmentID).RouteHref, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since), Activation: activationLabel(e.Activation)})
 	}
 	renderOperations(w, serversTemplate, view)
 }
@@ -916,7 +917,7 @@ func (h *Handler) serversRegister(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnrollmentToken(w, p, registered.ID, token, expiresAt)
+	h.renderEnrollmentToken(w, r, p, registered.ID, token, expiresAt)
 }
 
 // serversEnrollment reissues a fresh enrollment token for an existing,
@@ -952,7 +953,7 @@ func (h *Handler) serversEnrollment(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnrollmentToken(w, p, serverID, token, expiresAt)
+	h.renderEnrollmentToken(w, r, p, serverID, token, expiresAt)
 }
 
 // serversReenroll issues a single-use re-enrollment token for an already
@@ -991,7 +992,7 @@ func (h *Handler) serversReenroll(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnrollmentToken(w, p, serverID, token, expiresAt)
+	h.renderEnrollmentToken(w, r, p, serverID, token, expiresAt)
 }
 
 // serversRevoke revokes a server and its active credential. Revocation
@@ -1072,7 +1073,7 @@ func (h *Handler) environmentsResolve(w http.ResponseWriter, r *http.Request) {
 		resolveError(w, err, outcome)
 		return
 	}
-	redirectAfter(w, returnTo, "/servers")
+	redirectAfter(w, returnTo, "/reconciliation")
 }
 
 func validResolveOutcome(outcome string) bool {
@@ -1318,8 +1319,8 @@ func buildBindingRows(bindings []postgres.RuntimeBinding) []bindingRow {
 	return rows
 }
 
-func (h *Handler) renderEnvironmentConfig(w http.ResponseWriter, p auth.Principal, view runtimeConfigView) {
-	view.Nav = h.navFor("servers", p)
+func (h *Handler) renderEnvironmentConfig(w http.ResponseWriter, r *http.Request, p auth.Principal, view runtimeConfigView) {
+	view.Nav = h.navFor(r.Context(), "servers", p)
 	renderOperations(w, environmentConfigTemplate, view)
 }
 
@@ -1352,7 +1353,7 @@ func (h *Handler) environmentConfigGet(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnvironmentConfig(w, p, buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found))
+	h.renderEnvironmentConfig(w, r, p, buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found))
 }
 
 // renderConfigRejection re-fetches only the bindings table (never the
@@ -1373,7 +1374,7 @@ func (h *Handler) renderConfigRejection(w http.ResponseWriter, r *http.Request, 
 	if found {
 		submitted.Revision = strconv.FormatInt(cfg.Revision, 10)
 	}
-	h.renderEnvironmentConfig(w, p, submitted)
+	h.renderEnvironmentConfig(w, r, p, submitted)
 }
 
 // environmentConfigPost creates (expected_revision empty) or CAS-updates
@@ -1518,7 +1519,7 @@ func (h *Handler) environmentBindingAdd(w http.ResponseWriter, r *http.Request) 
 		default:
 			view.BindingError = "binding rejected: invalid values, or you are not authorized to configure this environment"
 		}
-		h.renderEnvironmentConfig(w, p, view)
+		h.renderEnvironmentConfig(w, r, p, view)
 		return
 	}
 	redirect(w, "/environments/config?environment_id="+url.QueryEscape(environmentID))
@@ -1566,8 +1567,8 @@ func buildRouteHeadView(csrf, environmentID string, head postgres.RouteHead, fou
 	return view
 }
 
-func (h *Handler) renderRouteHead(w http.ResponseWriter, p auth.Principal, view routeHeadView) {
-	view.Nav = h.navFor("servers", p)
+func (h *Handler) renderRouteHead(w http.ResponseWriter, r *http.Request, p auth.Principal, view routeHeadView) {
+	view.Nav = h.navFor(r.Context(), "servers", p)
 	renderOperations(w, routeHeadTemplate, view)
 }
 
@@ -1602,7 +1603,7 @@ func (h *Handler) environmentRouteGet(w http.ResponseWriter, r *http.Request) {
 	}
 	view := buildRouteHeadView(csrf, environmentID, head, found)
 	view.Releases = h.environmentReleaseRows(r.Context(), p, environmentID)
-	h.renderRouteHead(w, p, view)
+	h.renderRouteHead(w, r, p, view)
 }
 
 // renderRouteRejection re-fetches the current route head so a rejected
@@ -1622,7 +1623,7 @@ func (h *Handler) renderRouteRejection(w http.ResponseWriter, r *http.Request, p
 		submitted.ReconciliationRequired = head.ReconciliationRequired
 	}
 	submitted.Releases = h.environmentReleaseRows(r.Context(), p, submitted.EnvironmentID)
-	h.renderRouteHead(w, p, submitted)
+	h.renderRouteHead(w, r, p, submitted)
 }
 
 // environmentRoutePost creates (expected_revision empty) or CAS-assigns
@@ -2081,13 +2082,24 @@ type reconcilingRow struct {
 	EnvironmentID, ConfigHref, RouteHref, AttemptID, JobID, ServerID, Since, Activation string
 }
 type serversView struct {
-	Nav                     navView
-	CSRF                    string
-	Servers                 []serverRow
-	ReconcilingEnvironments []reconcilingRow
-	// ResolveReasonMax is the resolve form's maxlength (UTF-16 units, so only
-	// a hint: environmentsResolve enforces maxResolveReasonBytes in bytes).
-	ResolveReasonMax int
+	Nav     navView
+	CSRF    string
+	Servers []serverRow
+	// ReconcilingText is the attention banner ("2 environments need
+	// reconciliation"); empty when nothing is blocked.
+	ReconcilingText string
+}
+
+// reconcilingText is the banner sentence for n blocked environments, "" for none.
+func reconcilingText(n int) string {
+	switch {
+	case n <= 0:
+		return ""
+	case n == 1:
+		return "1 environment needs reconciliation"
+	default:
+		return strconv.Itoa(n) + " environments need reconciliation"
+	}
 }
 
 // activationLabel renders "" (a block no activation caused) as "none".
@@ -2121,8 +2133,8 @@ func formatCredentialVersion(version int) string {
 // goes only into this response body -- never a redirect Location, never a
 // log. Cache-Control: no-store is already set process-wide by
 // securityHeaders above.
-func (h *Handler) renderEnrollmentToken(w http.ResponseWriter, p auth.Principal, serverID, token string, expiresAt time.Time) {
-	renderOperations(w, enrollmentTokenTemplate, enrollmentView{Nav: h.navFor("servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt)})
+func (h *Handler) renderEnrollmentToken(w http.ResponseWriter, r *http.Request, p auth.Principal, serverID, token string, expiresAt time.Time) {
+	renderOperations(w, enrollmentTokenTemplate, enrollmentView{Nav: h.navFor(r.Context(), "servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt)})
 }
 
 // serversTemplate lists registered servers with a registration form, a

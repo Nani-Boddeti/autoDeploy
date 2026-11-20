@@ -16,7 +16,7 @@ import (
 // board and the Environments page (22-3d). *postgres.OperationsReadRepository
 // satisfies it; like EnvironmentReleaseReader it is discovered on
 // Config.OperationsReader. Without it /environments 404s and the Overview
-// renders only the setup checklist, servers and GitHub sections.
+// renders only the setup checklist, servers and recent deployments.
 type EnvironmentOverviewReader interface {
 	ListEnvironmentOverview(ctx context.Context, principal auth.Principal) ([]postgres.EnvironmentOverview, error)
 }
@@ -40,7 +40,7 @@ var environmentsTemplate = parsePage("environments")
 // returnToAllowlist is the exact set of post-action redirect targets a board
 // form may request. Anything else (other paths, query strings, schemes,
 // protocol-relative or backslash forms) falls back to the handler's default.
-var returnToAllowlist = map[string]bool{"/": true, "/environments": true, "/servers": true}
+var returnToAllowlist = map[string]bool{"/": true, "/environments": true, "/servers": true, "/reconciliation": true}
 
 // takeReturnTo removes the optional return_to field from v (so the strict
 // field-count checks of the POST handlers stay unchanged) and returns it only
@@ -234,9 +234,9 @@ type checklistView struct {
 // content (never nil); otherwise it is compact while a step is undone.
 func (h *Handler) newChecklist(githubDone, serverDone, boundDone bool, environments int) *checklistView {
 	view := &checklistView{Steps: []checklistStep{
-		{Title: "Connect GitHub", Hint: "Install the GitHub App so repositories can be bound.", Href: "/#github", Done: githubDone},
+		{Title: "Connect GitHub", Hint: "Install the GitHub App so repositories can be bound.", Href: "/github", Done: githubDone},
 		{Title: "Register a server", Hint: "Enroll the machine that will run your deployments.", Href: "/servers", Done: serverDone},
-		{Title: "Bind a repository", Hint: "Tie a repository branch to an environment and server.", Href: "/#github", Done: boundDone},
+		{Title: "Bind a repository", Hint: "Tie a repository branch to an environment and server.", Href: "/github", Done: boundDone},
 	}}
 	allDone := githubDone && serverDone && boundDone
 	if allDone && environments > 0 {
@@ -320,14 +320,14 @@ func (h *Handler) overviewServers(servers []postgres.ServerSummary) []overviewSe
 }
 
 // attentionItems collects real problems only: blocked environments, revoked or
-// silent servers and environments whose latest deployment failed. The blocked
-// link targets /servers (where reconciliation lives) until /reconciliation exists.
+// silent servers and environments whose latest deployment failed. Blocked
+// environments link to /reconciliation.
 func (h *Handler) attentionItems(rows []postgres.EnvironmentOverview, servers []postgres.ServerSummary) []attentionItem {
 	now := h.config.Now()
 	var items []attentionItem
 	for _, e := range rows {
 		if e.ReconciliationRequired {
-			items = append(items, attentionItem{Kind: "Blocked", Subject: e.EnvironmentID, Text: "needs reconciliation before it can deploy again.", Href: "/servers", LinkText: "Resolve"})
+			items = append(items, attentionItem{Kind: "Blocked", Subject: e.EnvironmentID, Text: "needs reconciliation before it can deploy again.", Href: "/reconciliation", LinkText: "Resolve"})
 		}
 	}
 	for _, s := range servers {
@@ -386,7 +386,7 @@ func (h *Handler) environmentsList(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusInternalServerError, "the page could not be rendered\n")
 		return
 	}
-	view := environmentsView{Nav: h.navFor("environments", p), ExecNotice: !h.config.ActivationEnabled, Board: board}
+	view := environmentsView{Nav: h.navFor(r.Context(), "environments", p), ExecNotice: !h.config.ActivationEnabled, Board: board}
 	if len(rows) == 0 {
 		facts := h.loadSetupFacts(r.Context(), p)
 		view.Checklist = h.newChecklist(facts.repoCount > 0, facts.hasActiveServer(), anyBound(rows), 0)

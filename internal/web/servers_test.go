@@ -408,7 +408,7 @@ func TestEnvironmentsResolveForwardsEachOutcome(t *testing.T) {
 			h, admin, p := serversHandler(t)
 			csrf := serversCSRF(t, h, p)
 			rr := postResolve(h, p, resolveForm(csrf, map[string][]string{"outcome": {outcome}}))
-			if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/servers" || admin.resolveCalls != 1 {
+			if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/reconciliation" || admin.resolveCalls != 1 {
 				t.Fatalf("resolve = %d location=%q calls=%d", rr.Code, rr.Header().Get("Location"), admin.resolveCalls)
 			}
 			if admin.resolveEnv != "environment_a" || admin.resolveOutcome != outcome || admin.resolveReason != "agent lost, manually verified clean" {
@@ -619,40 +619,18 @@ func TestServersListRendersAndEscapesNamesAndRepositoryDenialIsGeneric(t *testin
 	if !strings.Contains(body, "&lt;script&gt;") {
 		t.Fatal("expected escaped server name in output")
 	}
-	if !strings.Contains(body, "server_abc") || !strings.Contains(body, "environment_a") {
-		t.Fatal("list did not render server/environment identifiers")
+	if !strings.Contains(body, "server_abc") {
+		t.Fatal("list did not render the server identifier")
 	}
 	if !strings.Contains(body, "name=\"csrf\"") {
 		t.Fatal("list forms are missing CSRF tokens")
 	}
-	// The resolve form: a required select whose first option is the empty
-	// "Choose outcome" and nothing is preselected, the three exact values,
-	// the byte-derived maxlength, and the Activation column.
-	if got := strings.Count(body, `action="/environments/resolve"`); got != 2 {
-		t.Fatalf("resolve forms = %d, want one per reconciling environment", got)
+	// The reconciling table and its resolve forms moved to /reconciliation (22-3g).
+	if strings.Contains(body, `action="/environments/resolve"`) || strings.Contains(body, "<th>Activation</th>") {
+		t.Fatal("servers page still renders the reconciling table")
 	}
-	if strings.Contains(body, "mark-reconciled") {
-		t.Fatal("page still references the old mark-reconciled path")
-	}
-	if got := strings.Count(body, `<select name="outcome" required autocomplete="off"><option value="">Choose outcome</option>`); got != 2 {
-		t.Fatalf("required outcome selects with an empty first option = %d, want 2", got)
-	}
-	if strings.Contains(body, "selected") {
-		t.Fatal("an outcome option is preselected")
-	}
-	for _, value := range []string{`value="activated"`, `value="not_activated"`, `value="no_activation"`} {
-		if got := strings.Count(body, "<option "+value+">"); got != 2 {
-			t.Fatalf("option %s appears %d times, want 2", value, got)
-		}
-	}
-	if want := fmt.Sprintf(`<input name="reason" required autocomplete="off" maxlength="%d">`, maxResolveReasonBytes); strings.Count(body, want) != 2 {
-		t.Fatalf("resolve reason input with maxlength %d not rendered for both rows", maxResolveReasonBytes)
-	}
-	if !strings.Contains(body, "<th>Activation</th>") || !strings.Contains(body, "<td>none</td>") || !strings.Contains(body, "<td>reconciliation_required</td>") {
-		t.Fatal("Activation column missing or does not render none / the activation state")
-	}
-	if !strings.Contains(body, ">Resolve</button>") {
-		t.Fatal("resolve button missing")
+	if !strings.Contains(body, "2 environments need reconciliation") || !strings.Contains(body, `href="/reconciliation"`) {
+		t.Fatal("servers page lacks the reconciliation banner")
 	}
 
 	// A repository read failure renders the generic error page, not a

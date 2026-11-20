@@ -178,7 +178,7 @@ func TestGitHubHandoffAndBindingRequireSessionCSRFAndAreOneUse(t *testing.T) {
 	post.AddCookie(&http.Cookie{Name: handoffCookieName, Value: handoff})
 	rr = httptest.NewRecorder()
 	h.ServeHTTP(rr, post)
-	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/" || store.completed != 1 {
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/github" || store.completed != 1 {
 		t.Fatalf("complete=%d count=%d", rr.Code, store.completed)
 	}
 	bind := githubRequest(http.MethodPost, "/github/bindings", url.Values{"csrf": {githubCSRF(t, h, p)}, "project_id": {"project_opaque"}, "repository_id": {"42"}, "ref": {"refs/heads/main"}, "environment_id": {"environment_opaque"}, "server_id": {"server_opaque"}}, p, h)
@@ -200,7 +200,7 @@ func TestGitHubReconcileRequiresSessionCSRF(t *testing.T) {
 	valid := githubRequest(http.MethodPost, "/github/installations/reconcile", url.Values{"csrf": {githubCSRF(t, h, p)}, "installation_id": {"11"}}, p, h)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, valid)
-	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/" {
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/github" {
 		t.Fatalf("reconcile code=%d location=%q", rr.Code, rr.Header().Get("Location"))
 	}
 	invalid := githubRequest(http.MethodPost, "/github/installations/reconcile", url.Values{"installation_id": {"11"}}, p, h)

@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"context"
 	"html"
 	"net/http"
 	"strconv"
@@ -54,6 +55,10 @@ type parityEntry struct {
 func parityEntries() []parityEntry {
 	return []parityEntry{
 		{"landing", parityLanding, landingFragments()},
+		// 22-3g: the GitHub forms moved from the landing entry to /github; the
+		// reconciling rows and resolve forms moved from servers to /reconciliation.
+		{"github", parityGitHub, githubFragments()},
+		{"reconciliation", parityReconciliation, reconciliationFragments()},
 		{"projects", parityProjects, projectsFragments()},
 		{"deployments", parityDeployments, deploymentsFragments()},
 		{"deployment detail leased", parityDetailLeased, detailLeasedFragments()},
@@ -97,7 +102,7 @@ func pageGet(t *testing.T, h *Handler, p auth.Principal, target string) string {
 func parityNav(t *testing.T, active string) navView {
 	t.Helper()
 	h, p := navTestHandler(t)
-	return h.navFor(active, p)
+	return h.navFor(context.Background(), active, p)
 }
 
 func execTemplate(t *testing.T, run func(*bytes.Buffer) error) string {
@@ -130,17 +135,33 @@ const (
 
 func parityLanding(t *testing.T) string {
 	return execTemplate(t, func(b *bytes.Buffer) error {
-		return landingTemplate.Execute(b, landingView{
-			Nav: parityNav(t, "home"), CSRF: "csrf-landing", ShowBind: true,
-			Repositories: []postgres.BindableRepository{{RepositoryID: 201, FullName: "owner/demo", BoundProject: "demo"}, {RepositoryID: 202, FullName: "owner/other"}},
-			Servers:      []landingServer{{ID: "server_1", Name: "acer"}},
-		})
+		return landingTemplate.Execute(b, landingView{Nav: parityNav(t, "home"), CSRF: "csrf-landing"})
 	})
 }
 
 func landingFragments() []string {
 	return []string{
-		// GitHub forms: move to /github in 22-3g.
+		// Overview keeps these; the GitHub forms moved to /github in 22-3g.
+		`action="/logout"`,
+		hrefAttr("/servers"),
+	}
+}
+
+// ---- github ----
+
+func parityGitHub(t *testing.T) string {
+	return execTemplate(t, func(b *bytes.Buffer) error {
+		return githubTemplate.Execute(b, githubView{
+			Nav: parityNav(t, "github"), CSRF: "csrf-github", ShowBind: true,
+			Repositories: []postgres.BindableRepository{{RepositoryID: 201, FullName: "owner/demo", BoundProject: "demo"}, {RepositoryID: 202, FullName: "owner/other"}},
+			Servers:      []githubServer{{ID: "server_1", Name: "acer"}},
+		})
+	})
+}
+
+func githubFragments() []string {
+	return []string{
+		// Moved verbatim from the landing entry (22-3g).
 		`action="/github/setup"`,
 		`action="/github/installations/reconcile"`,
 		`name="installation_id"`,
@@ -150,10 +171,7 @@ func landingFragments() []string {
 		`name="ref"`, `value="refs/heads/main"`,
 		`name="environment_id"`,
 		`name="server_id"`, `value="server_1"`, `acer (server_1)`,
-		`name="csrf" value="csrf-landing"`,
-		// Overview keeps these.
-		`action="/logout"`,
-		hrefAttr("/servers"),
+		`name="csrf" value="csrf-github"`,
 	}
 }
 
@@ -422,15 +440,31 @@ func serversFragments() []string {
 		`name="server_id" value="srv_alpha"`, `name="server_id" value="srv_beta"`,
 		`name="reason"`, `name="confirm" value="reenroll"`, `name="confirm" value="revoke"`,
 		`name="csrf" value="`,
-		// Reconciling environments and the resolve form: move to /reconciliation in 22-3g.
+		// Reconciling rows and resolve forms moved to /reconciliation in 22-3g; the
+		// environment-ID GET form was removed there (owner-approved: the env strip replaces it).
+	}
+}
+
+// ---- reconciliation ----
+
+func parityReconciliation(t *testing.T) string {
+	h, admin, p := serversHandler(t)
+	admin.environments = []postgres.ReconcilingEnvironment{
+		{EnvironmentID: "env-reconcile", AttemptID: 55, JobID: 66, ServerID: "srv_alpha", Since: pt4, Activation: "activated"},
+	}
+	return pageGet(t, h, p, "/reconciliation")
+}
+
+func reconciliationFragments() []string {
+	return []string{
+		// Moved from the servers entry (22-3g).
 		`env-reconcile`, hrefAttr("/environments/config?environment_id=env-reconcile"), hrefAttr("/environments/route?environment_id=env-reconcile"),
 		`>55<`, `>66<`, `>activated<`, ts(pt4),
 		`action="/environments/resolve"`,
 		`name="environment_id" value="env-reconcile"`, `name="attempt_id" value="55"`,
 		`name="outcome"`, `value="activated"`, `value="not_activated"`, `value="no_activation"`,
 		`maxlength="` + strconv.Itoa(maxResolveReasonBytes) + `"`,
-		// removed in 22-3g by owner-approved plan (env strip replaces it)
-		`<form method="get" action="/environments/config">`,
+		`name="return_to" value="/reconciliation"`,
 	}
 }
 

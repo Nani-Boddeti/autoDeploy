@@ -41,14 +41,14 @@ func TestEnvironmentLinksOnOperationsPages(t *testing.T) {
 	}
 }
 
-func TestEnvironmentLinksOnServersAndConfigPages(t *testing.T) {
+func TestEnvironmentLinksOnReconciliationAndConfigPages(t *testing.T) {
 	h, admin, p := serversHandler(t)
 	admin.environments = []postgres.ReconcilingEnvironment{{EnvironmentID: linkEnv, AttemptID: 1, JobID: 2, ServerID: "s"}}
-	rr := opsGet(h, p, http.MethodGet, "/servers")
+	rr := opsGet(h, p, http.MethodGet, "/reconciliation")
 	if rr.Code != http.StatusOK {
-		t.Fatalf("/servers = %d", rr.Code)
+		t.Fatalf("/reconciliation = %d", rr.Code)
 	}
-	wantEnvLinks(t, "/servers", rr.Body.String())
+	wantEnvLinks(t, "/reconciliation", rr.Body.String())
 
 	ch, _, cp := runtimeConfigHandler(t)
 	rr = opsGet(ch, cp, http.MethodGet, "/environments/config?environment_id=env-a")
