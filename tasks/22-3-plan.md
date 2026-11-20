@@ -286,7 +286,7 @@ Standard brief footer (paste into every subagent brief):
   - Latest deployment: `LEFT JOIN LATERAL (agent_jobs j JOIN deployments d ... WHERE j.owner_id=$1 AND j.environment_id=e ORDER BY d.created_at DESC, d.id DESC LIMIT 1)`.
   - Latest failure: a LATERAL on the latest failed attempt of that job, giving `failure_class`.
   - Reason: a LATERAL over `deployment_log_chunks c WHERE c.attempt_id=a.id AND c.stream='health' AND c.body LIKE 'health gate: failed (reason=%' ORDER BY c.id DESC LIMIT 1`.
-  - Rollback target: the newest release with `state='ready'`, `id <> active_release_id`, the same environment, owned by the guard. The POST still re-checks eligibility.
+  - Rollback target: must mirror `evaluateRollback` (rollback_repository.go ~85-151). That means a `retained` target and an `active` source in the same environment, owned by the principal through the release's deployment job. (CORRECTED 2026-11-20 after review: an earlier rev said `ready`. Releases gain `active`/`retained` states in later migrations.)
   - Reconciling attempt: from `environment_slots.reconciliation_attempt_id` (owned only).
 - **Do (2): parse the reason in Go, not SQL.**
   - `parseHealthFailureReason(body string) string` matches `^health gate: failed \(reason=([a-z_]+)( class=[a-z_]+)?\)\n?$` and returns the reason ONLY if it is in the 4-value allowlist. Otherwise it returns "".
@@ -456,7 +456,7 @@ Standard brief footer (paste into every subagent brief):
 ## Order and gates
 1. 22-3a, then owner approval of the mock.
 2. Then 22-3b, 22-3c, 22-3d, (22-3e), 22-3f, 22-3g, 22-3h, 22-3i, 22-3j, 22-3k and 22-3l, one commit each.
-- 22-3d (store) and 22-3e (agent) may run in parallel with 22-3c. Use a separate PG port for 22-3d.
+- 22-3d (store) and 22-3e (agent) ran in parallel. Owner 2026-11-20: from 22-3f on, slices run strictly one at a time.
 
 ## Risks
 - Cross-owner leak in the overview join, because the environment namespace is global. Mitigation: the `AND owned` guard on every non-owner-scoped table, plus a mandatory collision test (22-3d test 3).
@@ -473,3 +473,6 @@ Standard brief footer (paste into every subagent brief):
 - 2026-11-20: owner approved the 22-3a mock ("seems alright"). NEXT: 22-3b parity guard.
 - 2026-11-20: 22-3b done. internal/web/parity_test.go has 16 entries. Owner-side review added pins for the live-route, rolled-back and reconciliation-required flags, which the subagent had classed as prose. Mutation evidence: blanking the digest or drain_seconds fails the test. NEXT: 22-3c shell.
 - 2026-11-20: 22-3c done. Sidebar shell (nav.go; nav lists only pages that exist, later slices add theirs), app.css rewrite, renderOperations migration, static allowlist, env-gated ui_dump_test. Owner-approved adjustments: phone nav wraps instead of a collapsible menu; landing sign-out moved into the sidebar. Review PASS; the side-border guard was tightened to cover logical properties and var(). Screenshots taken with headless Chrome (extension not connected).
+- 2026-11-20: 22-3e committed ec914fb. Last probe is shipped on all 3 failure paths through an owner-chosen shape allowlist (safeProbe); anything else ships as 'probe detail withheld', which closes the rollback path's empty-redaction-set gap. Probes ending 'context canceled' or 'TLS handshake timeout' are also withheld (acceptable).
+- 2026-11-20: 22-3d review FAIL. H1: rollback target used `ready`, but eligibility needs `retained` (plan error, from facts read only up to 000014). H2: ActiveCommit and the rollback target were not release-owner checked. Also M1-M3 (slot guard test, unused probe lateral, failure fields shown after a successful retry). Fixes are back with the implementer. Lesson: facts about state enums must come from the latest migration, not the creating one.
+- 2026-11-20: 22-3d done after 2 reviews. ListEnvironmentOverview: one query; env-level fields gated on environment ownership, release-level fields (ActiveCommit/Since, rollback target) gated on release ownership. Rollback offer mirrors evaluateRollback, tested by construction in both directions with refusal variants. Failure class/reason shown only when the latest attempt failed; probe lateral only on detail. Follow-up: partial index on deployment_log_chunks (attempt_id, id) WHERE stream='health' if needed.

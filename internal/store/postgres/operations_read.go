@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"autodeploy/internal/auth"
@@ -84,6 +85,13 @@ type DeploymentSummary struct {
 	CancelRequested bool
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+	// FailureClass and FailureReason describe the deployment job's latest
+	// failed attempt. FailureClass is the closed failure_class enum ("" when
+	// no attempt failed). FailureReason is one of the allowlisted health-gate
+	// reasons parsed from that attempt's health log line ("" when the line
+	// is missing, purged by retention, or not an allowlisted value).
+	FailureClass  string
+	FailureReason string
 }
 
 // ShortCommit returns the first 12 characters of the commit id.
@@ -173,6 +181,11 @@ type AttemptView struct {
 	ReleaseStrategy string // from agent_job_attempt_execution; "" if the row does not exist
 	CreatedAt       time.Time
 	ClosedAt        *time.Time
+	// FailureReason is the allowlisted health-gate reason of a failed attempt
+	// and FailureProbe its last probe text (at most 200 bytes, already
+	// redacted at log ingest); both "" when absent or not parseable.
+	FailureReason string
+	FailureProbe  string
 }
 
 type ReleaseView struct {
@@ -209,6 +222,48 @@ type DeploymentDetail struct {
 	ReleaseIsActive      bool
 	PredecessorDrain     *DrainResultView // nil until the agent reports one
 	ReleaseCleanup       *ReleaseCleanup  // latest retention cleanup of the release; nil when none (step 20E)
+	// ActivationSummary is the outcome_summary of the release's latest
+	// release_operations row that carries one (sanitized at write, cut to
+	// maxActivationSummaryBytes here); "" when there is none.
+	ActivationSummary string
+}
+
+// maxActivationSummaryBytes bounds DeploymentDetail.ActivationSummary (the
+// column allows 2048; the UI contract is 512).
+const maxActivationSummaryBytes = 512
+
+// healthLikeFailed and healthLikeProbe select the newest health-stream log
+// line of an attempt that may be a failure reason / last-probe line. They are
+// only a coarse index-friendly filter: the line is parsed (and its content
+// allowlisted) in Go by parseHealthFailureReason / parseHealthLastProbe.
+const (
+	healthLikeFailed = `health gate: failed (reason=%`
+	healthLikeProbe  = `health gate: last probe: %`
+)
+
+// attemptHealthLaterals returns LEFT JOIN LATERAL clauses aliased <p>fr (and,
+// when withProbe, <p>fp) exposing the body of the newest matching health chunk
+// of attemptExpr (NULL when none). One round trip, no per-row queries. Only
+// the detail page needs the probe line.
+func attemptHealthLaterals(p, attemptExpr string, withProbe bool) string {
+	r := strings.NewReplacer("{P}", p, "{A}", attemptExpr)
+	out := r.Replace(`
+LEFT JOIN LATERAL (SELECT c.body FROM deployment_log_chunks c WHERE c.attempt_id={A} AND c.stream='health' AND c.body LIKE '` + healthLikeFailed + `' ORDER BY c.id DESC LIMIT 1) {P}fr ON true`)
+	if withProbe {
+		out += r.Replace(`
+LEFT JOIN LATERAL (SELECT c.body FROM deployment_log_chunks c WHERE c.attempt_id={A} AND c.stream='health' AND c.body LIKE '` + healthLikeProbe + `' ORDER BY c.id DESC LIMIT 1) {P}fp ON true`)
+	}
+	return out
+}
+
+// jobFailureLaterals returns LEFT JOIN LATERAL clauses aliased <p>fa (the
+// job's LATEST attempt, only when it is failed: id, failure_class, so a
+// deployment that recovered on retry shows no failure) and <p>fr (the reason
+// line of that attempt).
+func jobFailureLaterals(p, jobExpr string) string {
+	return strings.NewReplacer("{P}", p, "{J}", jobExpr).Replace(`
+LEFT JOIN LATERAL (SELECT x.id, x.failure_class FROM (SELECT fa.id, fa.state, fa.failure_class FROM agent_job_attempts fa WHERE fa.job_id={J} ORDER BY fa.attempt_number DESC LIMIT 1) x WHERE x.state='failed') {P}fa ON true`) +
+		attemptHealthLaterals(p, p+"fa.id", false)
 }
 
 // requireLiveSession mirrors lockAdministratorSession's predicate without
@@ -284,7 +339,8 @@ SELECT l.project_id,
                SELECT j.environment_id AS e FROM agent_jobs j WHERE j.owner_id=$1 AND j.project_id=l.project_id
                UNION SELECT b.environment_id WHERE b.environment_id IS NOT NULL
              ) s ORDER BY e),
-       ld.id, ld.environment_id, ld.server_id, ld.commit_sha, ld.status, ld.job_id, ld.job_state, ld.cancel_requested, ld.created_at, ld.updated_at
+       ld.id, ld.environment_id, ld.server_id, ld.commit_sha, ld.status, ld.job_id, ld.job_state, ld.cancel_requested, ld.created_at, ld.updated_at,
+       ldfa.failure_class, ldfr.body
 FROM limited l
 LEFT JOIN github_project_bindings b ON b.owner_id=$1 AND b.project_id=l.project_id
 LEFT JOIN github_repositories rp ON rp.repository_id=b.repository_id AND rp.owner_id=b.owner_id
@@ -294,7 +350,7 @@ LEFT JOIN LATERAL (
   FROM agent_jobs j JOIN deployments d ON d.id=j.deployment_id
   WHERE j.owner_id=$1 AND j.project_id=l.project_id
   ORDER BY d.created_at DESC, d.id DESC LIMIT 1
-) ld ON true
+) ld ON true`+jobFailureLaterals("ld", "ld.job_id")+`
 ORDER BY l.project_id`, principal.OwnerID, MaxProjectsListed)
 	if err != nil {
 		return nil, fmt.Errorf("list projects: %w", err)
@@ -308,16 +364,18 @@ ORDER BY l.project_id`, principal.OwnerID, MaxProjectsListed)
 			ldJobID                                               *int64
 			ldCancel                                              *bool
 			ldCreated, ldUpdated                                  *time.Time
+			ldClass, ldReasonBody                                 *string
 		)
 		if err = rows.Scan(&p.ProjectID, &p.HasBinding, &p.BindingActive, &p.RepositoryFullName, &p.RepositoryDefaultRef,
 			&p.BindingEnvironmentID, &p.BindingServerID, &p.EnvironmentIDs,
-			&ldID, &ldEnv, &ldServer, &ldCommit, &ldStatus, &ldJobID, &ldJobState, &ldCancel, &ldCreated, &ldUpdated); err != nil {
+			&ldID, &ldEnv, &ldServer, &ldCommit, &ldStatus, &ldJobID, &ldJobState, &ldCancel, &ldCreated, &ldUpdated, &ldClass, &ldReasonBody); err != nil {
 			return nil, fmt.Errorf("scan project: %w", err)
 		}
 		if ldID != nil {
 			p.LatestDeployment = &DeploymentSummary{DeploymentID: *ldID, ProjectID: p.ProjectID, EnvironmentID: *ldEnv, ServerID: *ldServer,
 				CommitSHA: *ldCommit, Status: *ldStatus, JobID: *ldJobID, JobState: *ldJobState, CancelRequested: *ldCancel,
-				CreatedAt: *ldCreated, UpdatedAt: *ldUpdated}
+				CreatedAt: *ldCreated, UpdatedAt: *ldUpdated,
+				FailureClass: derefString(ldClass), FailureReason: parseHealthFailureReason(derefString(ldReasonBody))}
 		}
 		out = append(out, p)
 	}
@@ -358,16 +416,25 @@ func (r *OperationsReadRepository) ListDeployments(ctx context.Context, principa
 		return DeploymentList{}, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// The page is selected and limited first; the failure laterals then run
+	// only for the (at most limit+1) page rows. Ordering, keyset predicate and
+	// limit semantics are unchanged.
 	rows, err := tx.Query(ctx, `
-SELECT d.id, j.project_id, j.environment_id, j.server_id, d.commit_sha, d.status, j.id, j.state,
-       j.cancel_requested_at IS NOT NULL, d.created_at, d.updated_at
+WITH page AS (
+SELECT d.id, j.project_id, j.environment_id, j.server_id, d.commit_sha, d.status, j.id AS job_id, j.state AS job_state,
+       j.cancel_requested_at IS NOT NULL AS cancel_requested, d.created_at, d.updated_at
 FROM agent_jobs j JOIN deployments d ON d.id=j.deployment_id
 WHERE j.owner_id=$1
   AND ($2='' OR j.project_id=$2)
   AND ($3='' OR j.environment_id=$3)
   AND ($4::timestamptz IS NULL OR (d.created_at, d.id) < ($4::timestamptz, $5::text))
 ORDER BY d.created_at DESC, d.id DESC
-LIMIT $6`, principal.OwnerID, filter.ProjectID, filter.EnvironmentID, afterAt, afterID, limit+1)
+LIMIT $6
+)
+SELECT pg.id, pg.project_id, pg.environment_id, pg.server_id, pg.commit_sha, pg.status, pg.job_id, pg.job_state,
+       pg.cancel_requested, pg.created_at, pg.updated_at, pgfa.failure_class, pgfr.body
+FROM page pg`+jobFailureLaterals("pg", "pg.job_id")+`
+ORDER BY pg.created_at DESC, pg.id DESC`, principal.OwnerID, filter.ProjectID, filter.EnvironmentID, afterAt, afterID, limit+1)
 	if err != nil {
 		return DeploymentList{}, fmt.Errorf("list deployments: %w", err)
 	}
@@ -375,10 +442,12 @@ LIMIT $6`, principal.OwnerID, filter.ProjectID, filter.EnvironmentID, afterAt, a
 	list := DeploymentList{Items: []DeploymentSummary{}}
 	for rows.Next() {
 		var d DeploymentSummary
+		var class, reasonBody *string
 		if err = rows.Scan(&d.DeploymentID, &d.ProjectID, &d.EnvironmentID, &d.ServerID, &d.CommitSHA, &d.Status, &d.JobID, &d.JobState,
-			&d.CancelRequested, &d.CreatedAt, &d.UpdatedAt); err != nil {
+			&d.CancelRequested, &d.CreatedAt, &d.UpdatedAt, &class, &reasonBody); err != nil {
 			return DeploymentList{}, fmt.Errorf("scan deployment: %w", err)
 		}
+		d.FailureClass, d.FailureReason = derefString(class), parseHealthFailureReason(derefString(reasonBody))
 		list.Items = append(list.Items, d)
 	}
 	if err = rows.Err(); err != nil {
@@ -412,21 +481,23 @@ func (r *OperationsReadRepository) GetDeploymentDetail(ctx context.Context, prin
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var d DeploymentDetail
+	var headClass, headReasonBody *string
 	err = tx.QueryRow(ctx, `
 SELECT d.id, j.project_id, j.environment_id, j.server_id, d.commit_sha, d.status, j.id, j.state,
        j.cancel_requested_at IS NOT NULL, d.created_at, d.updated_at,
-       j.attempt_count, j.cancel_requested_at, j.created_at, j.updated_at
-FROM agent_jobs j JOIN deployments d ON d.id=j.deployment_id
+       j.attempt_count, j.cancel_requested_at, j.created_at, j.updated_at, jfa.failure_class, jfr.body
+FROM agent_jobs j JOIN deployments d ON d.id=j.deployment_id`+jobFailureLaterals("j", "j.id")+`
 WHERE j.owner_id=$1 AND d.id=$2`, principal.OwnerID, deploymentID).Scan(
 		&d.Deployment.DeploymentID, &d.Deployment.ProjectID, &d.Deployment.EnvironmentID, &d.Deployment.ServerID, &d.Deployment.CommitSHA,
 		&d.Deployment.Status, &d.Deployment.JobID, &d.Deployment.JobState, &d.Deployment.CancelRequested, &d.Deployment.CreatedAt, &d.Deployment.UpdatedAt,
-		&d.Job.AttemptCount, &d.Job.CancelRequestedAt, &d.Job.CreatedAt, &d.Job.UpdatedAt)
+		&d.Job.AttemptCount, &d.Job.CancelRequestedAt, &d.Job.CreatedAt, &d.Job.UpdatedAt, &headClass, &headReasonBody)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return DeploymentDetail{}, ErrOperationsNotFound
 	}
 	if err != nil {
 		return DeploymentDetail{}, fmt.Errorf("read deployment detail: %w", err)
 	}
+	d.Deployment.FailureClass, d.Deployment.FailureReason = derefString(headClass), parseHealthFailureReason(derefString(headReasonBody))
 	d.Job.ID, d.Job.State = d.Deployment.JobID, d.Deployment.JobState
 	d.Job.ServerID, d.Job.EnvironmentID, d.Job.ProjectID = d.Deployment.ServerID, d.Deployment.EnvironmentID, d.Deployment.ProjectID
 
@@ -446,10 +517,16 @@ WHERE j.owner_id=$1 AND d.id=$2`, principal.OwnerID, deploymentID).Scan(
 	}
 	if d.Attempts, err = queryAll(ctx, tx, func(rows pgx.Rows) (AttemptView, error) {
 		var a AttemptView
-		return a, rows.Scan(&a.ID, &a.AttemptNumber, &a.State, &a.FailureClass, &a.Fence, &a.ServerID, &a.ReleaseStrategy, &a.CreatedAt, &a.ClosedAt)
-	}, `SELECT a.id, a.attempt_number, a.state, COALESCE(a.failure_class,''), a.fence, a.server_id, COALESCE(x.release_strategy,''), a.created_at, a.closed_at
-FROM agent_job_attempts a LEFT JOIN agent_job_attempt_execution x ON x.attempt_id=a.id
-WHERE a.job_id=$1 ORDER BY a.attempt_number DESC LIMIT $2`, d.Job.ID, MaxDetailAttempts); err != nil {
+		var reasonBody, probeBody *string
+		if err := rows.Scan(&a.ID, &a.AttemptNumber, &a.State, &a.FailureClass, &a.Fence, &a.ServerID, &a.ReleaseStrategy, &a.CreatedAt, &a.ClosedAt, &reasonBody, &probeBody); err != nil {
+			return a, err
+		}
+		a.FailureReason, a.FailureProbe = parseHealthFailureReason(derefString(reasonBody)), parseHealthLastProbe(derefString(probeBody))
+		return a, nil
+	}, `SELECT a.id, a.attempt_number, a.state, COALESCE(a.failure_class,''), a.fence, a.server_id, COALESCE(x.release_strategy,''), a.created_at, a.closed_at, afr.body, afp.body
+FROM (SELECT * FROM agent_job_attempts WHERE job_id=$1 ORDER BY attempt_number DESC LIMIT $2) a
+LEFT JOIN agent_job_attempt_execution x ON x.attempt_id=a.id`+attemptHealthLaterals("a", "a.id", true)+`
+ORDER BY a.attempt_number DESC`, d.Job.ID, MaxDetailAttempts); err != nil {
 		return DeploymentDetail{}, err
 	}
 
@@ -464,6 +541,15 @@ WHERE a.job_id=$1 ORDER BY a.attempt_number DESC LIMIT $2`, d.Job.ID, MaxDetailA
 		return DeploymentDetail{}, fmt.Errorf("read release: %w", err)
 	}
 	if d.Release != nil {
+		var summary string
+		err = tx.QueryRow(ctx, `SELECT outcome_summary FROM release_operations WHERE release_id=$1 AND outcome_summary <> '' ORDER BY id DESC LIMIT 1`, d.Release.ID).Scan(&summary)
+		switch {
+		case err == nil:
+			d.ActivationSummary = truncateUTF8(summary, maxActivationSummaryBytes)
+		case errors.Is(err, pgx.ErrNoRows):
+		default:
+			return DeploymentDetail{}, fmt.Errorf("read activation summary: %w", err)
+		}
 		if d.RuntimeInstances, err = queryAll(ctx, tx, func(rows pgx.Rows) (RuntimeInstanceView, error) {
 			var i RuntimeInstanceView
 			return i, rows.Scan(&i.ID, &i.AttemptID, &i.Fence, &i.ObservedState, &i.CreatedAt)
