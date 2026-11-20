@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -12,6 +13,8 @@ import (
 	"autodeploy/internal/auth"
 	"autodeploy/internal/deployment"
 	"autodeploy/internal/store/postgres"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type rollbackStoreStub struct {
@@ -231,5 +234,36 @@ func TestRollbackErrorMapping(t *testing.T) {
 		if strings.Contains(rr.Body.String(), "SECRET") || rr.Header().Get("Location") != "" {
 			t.Errorf("%s leaked or redirected", tc.name)
 		}
+	}
+}
+
+func TestStoreTimeoutsRenderRetryable503(t *testing.T) {
+	const secret = "ghs_SECRETTOKEN SELECT pg_advisory_xact_lock"
+	for _, code := range []string{"55P03", "57014"} {
+		wrapped := fmt.Errorf("%s: %w", secret, &pgconn.PgError{Code: code, Message: secret})
+		h, st, _, p := rollbackHandler(t)
+		st.enqueueErr = wrapped
+		rr := cancelPost(h, p, "/deployments/rollback", rollbackForm(t, h, p), nil)
+		if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") == "" || strings.Contains(rr.Body.String(), "SECRET") {
+			t.Errorf("%s enqueue = %d %q retry=%q", code, rr.Code, rr.Body.String(), rr.Header().Get("Retry-After"))
+		}
+		h, st, ops, p := rollbackHandler(t)
+		ops.detail = retainedDetail("healthy")
+		st.eligibleErr = wrapped
+		rr = opsGet(h, p, http.MethodGet, "/deployments/detail?id=dep-1")
+		if rr.Code != http.StatusServiceUnavailable || strings.Contains(rr.Body.String(), "SECRET") {
+			t.Errorf("%s eligibility = %d %q", code, rr.Code, rr.Body.String())
+		}
+		rec := httptest.NewRecorder()
+		operationsFailure(rec, httptest.NewRequest(http.MethodGet, "/", nil), wrapped)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s operationsFailure = %d", code, rec.Code)
+		}
+	}
+	// Other SQLSTATEs keep the generic 500.
+	rec := httptest.NewRecorder()
+	storeFailure(rec, &pgconn.PgError{Code: "40001"}, "x\n")
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("40001 = %d", rec.Code)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/server"
@@ -491,5 +492,86 @@ func TestListServersOneRowPerServerWithReenrollment(t *testing.T) {
 	list, err = repo.ListServers(ctx, principal)
 	if err != nil || len(list) != 1 || list[0].Enrollment != EnrollmentConsumed || list[0].ActiveCredentialVersion != 2 {
 		t.Fatalf("consumed: %+v %v", list, err)
+	}
+}
+
+// holdServerRowLock holds FOR UPDATE on the server row in another tx until
+// the returned release func runs.
+func holdServerRowLock(t *testing.T, pool *pgxpool.Pool, serverID string) (release func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := tx.QueryRow(ctx, `SELECT id FROM servers WHERE id=$1 FOR UPDATE`, serverID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return func() { _ = tx.Rollback(ctx) }
+}
+
+func TestEnrollBogusTokenRejectedWithoutServerLock(t *testing.T) {
+	pool, repo, _, principal := freshServerRepository(t)
+	_, _ = registerTestServer(t, repo, principal, "srv_lock", 1)
+	release := holdServerRowLock(t, pool, "srv_lock")
+	defer release()
+
+	bogus := reenrollEnrollmentDigest(t, 99)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := repo.Enroll(ctx, "srv_lock", bogus, reenrollCredentialDigest(t, 98))
+	if !errors.Is(err, ErrServerAuthorizationDenied) || time.Since(start) > time.Second {
+		t.Fatalf("bogus enroll must be refused promptly without the row lock: err=%v after %v", err, time.Since(start))
+	}
+	// Unknown server too.
+	if _, err := repo.Enroll(ctx, "srv_nope", bogus, reenrollCredentialDigest(t, 98)); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("unknown server: %v", err)
+	}
+	// A VALID token does queue on the lock (proves the lock is really held
+	// and the fast path is what avoided it).
+	short, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel2()
+	if _, err := repo.Enroll(short, "srv_lock", reenrollEnrollmentDigest(t, 1), reenrollCredentialDigest(t, 97)); err == nil || errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("valid enroll should block on the held lock and hit the ctx deadline, got %v", err)
+	}
+}
+
+func TestEnrollValidStillWorksAndRechecksUnderLock(t *testing.T) {
+	pool, repo, _, principal := freshServerRepository(t)
+	ctx := context.Background()
+	_, _ = registerTestServer(t, repo, principal, "srv_race", 1)
+	// Token consumed by someone else between the unlocked fast check and the lock.
+	repo.failAfter = func(stage string) error {
+		if stage == "enroll_fast_pass" {
+			_, err := pool.Exec(ctx, `UPDATE server_enrollment_tokens SET consumed_at=clock_timestamp() WHERE server_id='srv_race'`)
+			return err
+		}
+		return nil
+	}
+	if _, err := repo.Enroll(ctx, "srv_race", reenrollEnrollmentDigest(t, 1), reenrollCredentialDigest(t, 2)); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("token consumed after fast check must be refused under lock: %v", err)
+	}
+	var creds int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM server_credentials WHERE server_id='srv_race'`).Scan(&creds); err != nil || creds != 0 {
+		t.Fatalf("credentials=%d err=%v", creds, err)
+	}
+	// Server revoked between fast check and lock.
+	_, _ = registerTestServer(t, repo, principal, "srv_race2", 3)
+	repo.failAfter = func(stage string) error {
+		if stage == "enroll_fast_pass" {
+			return repo.RevokeServer(ctx, principal, "srv_race2", "revoked mid-enroll")
+		}
+		return nil
+	}
+	if _, err := repo.Enroll(ctx, "srv_race2", reenrollEnrollmentDigest(t, 3), reenrollCredentialDigest(t, 4)); !errors.Is(err, ErrServerAuthorizationDenied) {
+		t.Fatalf("server revoked after fast check must be refused under lock: %v", err)
+	}
+	// Plain valid enroll still works.
+	repo.failAfter = nil
+	_, _ = registerTestServer(t, repo, principal, "srv_ok2", 5)
+	if v, err := repo.Enroll(ctx, "srv_ok2", reenrollEnrollmentDigest(t, 5), reenrollCredentialDigest(t, 6)); err != nil || v != 1 {
+		t.Fatalf("valid enroll: v=%d err=%v", v, err)
 	}
 }

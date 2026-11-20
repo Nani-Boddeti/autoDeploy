@@ -192,6 +192,9 @@ func NewExecutor(ctx context.Context, cfg Config) (*Executor, error) {
 // reporting progress at each phase, and returns promptly once ctx is
 // cancelled -- except after a successful Activate, when the switch runs to a
 // persisted result on its own detached context (see activate).
+// checkoutCloseBudget bounds the post-lease workspace release, retries included.
+const checkoutCloseBudget = 45 * time.Second
+
 func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentclient.Outcome {
 	// Fail closed before any container work at all -- checkout, build, and
 	// run all happen after this point. Migration 000017 makes both
@@ -247,16 +250,21 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	checkoutResult, err := e.checkout.Checkout(ctx, lease.AttemptID, lease.Fence)
 	if err != nil {
 		class := classifyPhaseError(ctx, err)
-		logs.Linef(logship.StreamPhase, "checkout: failed (%s): %v", class, err)
+		logs.Linef(logship.StreamPhase, "checkout: failed (%s)", class)
+		logs.Diagf(logship.StreamPhase, "checkout: failed (%s): %v", class, err)
 		return e.outcome(lease, false, class)
 	}
 	logs.Linef(logship.StreamPhase, "checkout: complete")
 	var closeOnce sync.Once
 	closeCheckout := func() {
 		closeOnce.Do(func() {
-			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			// Detached from the lease ctx; bounds the whole retry schedule
+			// (each Close attempt is itself capped at 5s by gitcheckout).
+			closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), checkoutCloseBudget)
 			defer cancel()
-			_ = checkoutResult.Close(closeCtx)
+			if err := checkoutResult.Close(closeCtx); err != nil {
+				logs.Diagf(logship.StreamPhase, "checkout: workspace release failed, allocation may be stranded: %v", err)
+			}
 		})
 	}
 	defer closeCheckout()

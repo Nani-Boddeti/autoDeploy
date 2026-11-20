@@ -102,3 +102,27 @@ func TestLogPurgeNilOnRunIsSafe(t *testing.T) {
 	s := newTestScheduler(t, &fakePurger{}, nil, LogPurgeOptions{})
 	s.runOnce(context.Background(), time.Now())
 }
+
+// A wedged sweep (blocked statement or row lock) is cut off by the per-sweep
+// timeout, reported through the error handler, and the loop keeps ticking.
+func TestSweeperBoundsEachSweepAndReportsTimeout(t *testing.T) {
+	var calls, errs atomic.Int32
+	sweeper := (&AgentLeaseSweeper{tick: 10 * time.Millisecond}).WithErrorHandler(func() { errs.Add(1) })
+	sweeper.sweepFn = func(ctx context.Context) (int, error) {
+		calls.Add(1)
+		<-ctx.Done() // never finishes on its own
+		return 0, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); sweeper.Run(ctx) }()
+	waitFor(t, func() bool { return calls.Load() >= 2 && errs.Load() >= 2 })
+	cancel()
+	<-done
+}
+
+func TestSweepTimeoutIsMultipleOfTick(t *testing.T) {
+	if got := sweepTimeoutFor(15 * time.Second); got != 45*time.Second {
+		t.Fatalf("got %v", got)
+	}
+}

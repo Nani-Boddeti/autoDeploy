@@ -33,7 +33,7 @@ func (h *Handler) offerRollback(w http.ResponseWriter, r *http.Request, p auth.P
 	if err != nil {
 		// Fixed message and error class only: error text can carry a DSN or SQL detail.
 		h.logger().Error("rollback eligibility failed", "class", errclass.Of(err))
-		plain(w, http.StatusInternalServerError, "the page could not be loaded; retry\n")
+		storeFailure(w, err, "the page could not be loaded; retry\n")
 		return false
 	}
 	if !eligible {
@@ -98,6 +98,6 @@ func (h *Handler) rollbackFailure(w http.ResponseWriter, err error) {
 		plain(w, http.StatusConflict, "this form was already submitted with different values; reload the page\n")
 	default:
 		h.logger().Error("rollback failed", "class", errclass.Of(err))
-		plain(w, http.StatusInternalServerError, "the rollback could not be queued; retry\n")
+		storeFailure(w, err, "the rollback could not be queued; retry\n")
 	}
 }

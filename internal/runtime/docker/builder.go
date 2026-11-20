@@ -123,6 +123,30 @@ func withBuildxConfig(env []string, dir string) []string {
 	return append(out, "BUILDX_CONFIG="+dir)
 }
 
+// maxBuildxOutputBytes caps how much of a buildx subcommand's stdout or
+// stderr is held in memory (F12f). Legitimate `buildx ls/inspect` output is a
+// few KiB; anything beyond the cap is discarded, not an error.
+const maxBuildxOutputBytes = 1 << 20
+
+// cappedBuffer keeps at most max bytes and silently discards the rest while
+// still reporting full writes, so the child never sees a short write or EPIPE.
+type cappedBuffer struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := c.max - c.buf.Len(); room > 0 {
+		if len(p) < room {
+			room = len(p)
+		}
+		c.buf.Write(p[:room])
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+
 // runBuildx runs `docker <args>` in the builder's config dir and returns its
 // stdout; stderr is folded into the error text.
 func runBuildx(ctx context.Context, cfg BuilderConfig, args ...string) (string, error) {
@@ -130,9 +154,10 @@ func runBuildx(ctx context.Context, cfg BuilderConfig, args ...string) (string, 
 	killProcessGroupOnCancel(cmd)
 	cmd.WaitDelay = buildWaitDelay
 	cmd.Env = withBuildxConfig(subprocessEnv(nil), cfg.ConfigDir)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := &cappedBuffer{max: maxBuildxOutputBytes}
+	stderr := &cappedBuffer{max: maxBuildxOutputBytes}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(stderr.String())
 		if len(msg) > 512 {

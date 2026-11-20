@@ -205,7 +205,7 @@ func (l pgAdvisoryLogPurgeLocker) tryLock(ctx context.Context) (func(), bool, er
 	var acquired bool
 	if err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, deploymentLogPurgeAdvisoryLockKey).Scan(&acquired); err != nil || !acquired {
 		if err != nil {
-			_ = conn.Hijack().Close(context.Background())
+			closeHijacked(conn)
 		} else {
 			conn.Release()
 		}
@@ -216,9 +216,17 @@ func (l pgAdvisoryLogPurgeLocker) tryLock(ctx context.Context) (func(), bool, er
 		defer cancel()
 		var unlocked bool
 		if err := conn.QueryRow(unlockCtx, `SELECT pg_advisory_unlock($1)`, deploymentLogPurgeAdvisoryLockKey).Scan(&unlocked); err != nil || !unlocked {
-			_ = conn.Hijack().Close(context.Background())
+			closeHijacked(conn)
 			return
 		}
 		conn.Release()
 	}, true, nil
+}
+
+// closeHijacked destroys the connection (releasing any session advisory lock
+// server-side) without letting a dead socket block the caller indefinitely.
+func closeHijacked(conn *pgxpool.Conn) {
+	ctx, cancel := context.WithTimeout(context.Background(), logPurgeUnlockTimeout)
+	defer cancel()
+	_ = conn.Hijack().Close(ctx)
 }

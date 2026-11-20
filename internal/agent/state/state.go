@@ -85,7 +85,26 @@ func New(dir string) (Store, error) {
 	if err := syncDirAndParent(dir); err != nil {
 		return Store{}, fmt.Errorf("sync agent state directory: %w", err)
 	}
+	sweepStaleTemps(dir)
 	return Store{dir: dir}, nil
+}
+
+// sweepStaleTemps removes leftover writeFileAtomic temp files (a crash between
+// CreateTemp and Rename strands one). Only regular files matching the exact
+// ".fence-*.tmp" pattern are removed; symlinks, directories and everything
+// else are left alone. Best effort: a temp is never a committed record, so a
+// failed removal changes nothing.
+func sweepStaleTemps(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !isAtomicTemp(e.Name()) || !e.Type().IsRegular() {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, e.Name()))
+	}
 }
 
 func (s Store) path(environmentID string) (string, error) {

@@ -310,6 +310,20 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 		return 0, ErrServerAuthorizationDenied
 	}
 	actor := AuditActor{Type: server.ActorAgent, ID: serverID}
+
+	// Lock-free fast reject. An unauthenticated caller who knows (or guesses)
+	// a server ID must not be able to queue on that server's row lock with a
+	// bogus token, so every cheap check runs here on a plain read first. The
+	// result is ONLY a fast-reject: a pass proves nothing, and the identical
+	// checks are repeated under the row locks below. Lock order is unchanged
+	// (servers row, then token row) and nothing here locks.
+	if err := r.enrollFastReject(ctx, serverID, enrollmentDigest); err != nil {
+		return 0, err
+	}
+	if err := r.inject("enroll_fast_pass"); err != nil {
+		return 0, err
+	}
+
 	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return 0, fmt.Errorf("begin server enroll: %w", err)
@@ -410,6 +424,38 @@ func (r *ServerRepository) Enroll(ctx context.Context, serverID string, enrollme
 		return 0, fmt.Errorf("commit server enroll: %w", err)
 	}
 	return version, nil
+}
+
+// enrollFastReject performs Enroll's checks without any lock: the server
+// exists and is active, an unconsumed token exists, it has not expired
+// (PostgreSQL clock), and its digest matches in constant time (against a
+// dummy digest when no token was found, so unknown server, missing token and
+// wrong token all perform one query and one comparison). It returns
+// ErrServerAuthorizationDenied on any refusal and nil when Enroll must go on
+// to re-check everything under lock. The unlocked read is never trusted.
+func (r *ServerRepository) enrollFastReject(ctx context.Context, serverID string, enrollmentDigest [32]byte) error {
+	var status string
+	var storedDigest []byte
+	var expiresAt *time.Time
+	var now time.Time
+	err := r.pool.QueryRow(ctx, `SELECT s.status,t.digest,t.expires_at,clock_timestamp() FROM servers s LEFT JOIN server_enrollment_tokens t ON t.server_id=s.id AND t.consumed_at IS NULL WHERE s.id=$1`, serverID).Scan(&status, &storedDigest, &expiresAt, &now)
+	found := true
+	if errors.Is(err, pgx.ErrNoRows) {
+		found = false
+	} else if err != nil {
+		return fmt.Errorf("server enroll fast check: %w", err)
+	}
+	stored := dummyCredentialDigest
+	if found && storedDigest != nil && len(storedDigest) == len(stored) {
+		copy(stored[:], storedDigest)
+	} else {
+		found = false
+	}
+	match := server.ConstantTimeEqualDigest(stored, enrollmentDigest)
+	if !found || status != "active" || expiresAt == nil || !now.Before(*expiresAt) || !match {
+		return ErrServerAuthorizationDenied
+	}
+	return nil
 }
 
 // RotateCredential revokes the current active credential and inserts

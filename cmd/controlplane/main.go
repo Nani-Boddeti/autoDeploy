@@ -56,6 +56,39 @@ const (
 	maxHeaderBytes    = 16 << 10
 )
 
+// startupTimeout bounds the startup database steps (ping, secret ledger check,
+// password policy load).
+const startupTimeout = 30 * time.Second
+
+// Server-side limits applied to every control-plane connection. They stop a
+// stuck row/advisory lock or runaway statement from wedging a request or the
+// lease sweeper. Both surface as transient SQLSTATEs (55P03 lock_timeout,
+// 57014 statement_timeout) in activation classification. Statements that need
+// longer set their own (metrics snapshot uses SET LOCAL statement_timeout);
+// migrations run on cmd/migrate's own connection and are not limited.
+const (
+	poolLockTimeoutMS      = "10000" // 10s: the longest legitimate lock holder is a short tx
+	poolStatementTimeoutMS = "60000" // 60s: above the 45s sweep bound, below any wedge
+)
+
+// controlPlanePoolConfig parses dsn and applies the timeouts above unless the
+// DSN already sets them explicitly.
+func controlPlanePoolConfig(dsn string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	for k, v := range map[string]string{"lock_timeout": poolLockTimeoutMS, "statement_timeout": poolStatementTimeoutMS} {
+		if _, set := cfg.ConnConfig.RuntimeParams[k]; !set {
+			cfg.ConnConfig.RuntimeParams[k] = v
+		}
+	}
+	return cfg, nil
+}
+
 func main() {
 	if err := run(context.Background()); err != nil {
 		logger := controlplaneLogger(os.Stderr, nil)
@@ -102,7 +135,11 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return failAt(err)
 	}
-	pool, err := pgxpool.New(ctx, dsn)
+	poolConfig, err := controlPlanePoolConfig(dsn)
+	if err != nil {
+		return failAt(err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return failAt(err)
 	}
@@ -110,7 +147,11 @@ func run(ctx context.Context) error {
 	buildInfo, buildInfoOK := debug.ReadBuildInfo()
 	metricSet := newMetricsSet(buildVersion(buildInfo, buildInfoOK), postgres.NewMetricsRepository(pool).MetricsSnapshot, processLogger)
 	repository := postgres.NewAuthRepository(pool)
-	if err = repository.Ping(ctx); err != nil {
+	// Startup database steps share one deadline so an unreachable or wedged
+	// database fails the unit instead of hanging it. Serving uses ctx.
+	startupCtx, cancelStartup := context.WithTimeout(ctx, startupTimeout)
+	defer cancelStartup()
+	if err = repository.Ping(startupCtx); err != nil {
 		return failAt(err)
 	}
 	enabled, err := config.SecretSubsystemEnabled()
@@ -122,11 +163,11 @@ func run(ctx context.Context) error {
 		if ringErr != nil {
 			return failAt(errors.New("secret subsystem unavailable"))
 		}
-		if readyErr := secretLedgerReady(ctx, postgres.NewKeyRepository(pool), ring, generation); readyErr != nil {
+		if readyErr := secretLedgerReady(startupCtx, postgres.NewKeyRepository(pool), ring, generation); readyErr != nil {
 			return failAt(errors.New("secret subsystem unavailable"))
 		}
 	}
-	policy, err := repository.LoadPasswordPolicy(ctx)
+	policy, err := repository.LoadPasswordPolicy(startupCtx)
 	if err != nil {
 		return failAt(err)
 	}
@@ -215,6 +256,7 @@ func run(ctx context.Context) error {
 	}
 	var agentHandler http.Handler
 	var sweeper *postgres.AgentLeaseSweeper
+	var retention *postgres.EventRetentionPurger
 	if agentConfig.Enabled {
 		agentHandler = agenthttp.Handler{
 			Enroller:          serverRepository,
@@ -265,6 +307,15 @@ func run(ctx context.Context) error {
 		if purgeErr != nil {
 			return purgeErr
 		}
+		// F13 retention: hourly purge of old webhook deliveries, terminal-job
+		// events and route events, single-flight across replicas.
+		retentionPurger, retentionErr := postgres.NewEventRetentionPurger(pool, postgres.EventRetentionOptions{
+			OnError: func() { processLogger.Error("event retention purge failed", logging.KeyComponent, "event_retention") },
+		})
+		if retentionErr != nil {
+			return retentionErr
+		}
+		retention = retentionPurger
 		sweeper = postgres.NewAgentLeaseSweeper(pool, leaseRepository).WithTick(agentConfig.SweepInterval).WithErrorHandler(func() { processLogger.Error("agent lease sweep failed", logging.KeyComponent, "lease_sweep") }).WithRunHandler(metricSet.onSweepRun).WithLogPurge(logPurger)
 	}
 	handler, err := web.New(repository, webOptions)
@@ -308,9 +359,31 @@ func run(ctx context.Context) error {
 		sweeperDone = make(chan struct{})
 		go func() { defer close(sweeperDone); sweeper.Run(sweeperContext) }()
 	}
+	var retentionDone chan struct{}
+	var retentionCancel context.CancelFunc
+	if retention != nil {
+		var retentionContext context.Context
+		retentionContext, retentionCancel = context.WithCancel(context.Background())
+		retentionDone = make(chan struct{})
+		go func() { defer close(retentionDone); retention.Run(retentionContext) }()
+	}
+	// stopRetention joins the purger within the bounded shutdown window.
+	stopRetention := func(wait context.Context) {
+		if retentionCancel == nil {
+			return
+		}
+		retentionCancel()
+		select {
+		case <-retentionDone:
+		case <-wait.Done():
+		}
+	}
 	// Deferred after the pool close, so it runs first on every return path:
 	// the pool is never closed while a sweep may still be using it.
 	defer func() {
+		waitRetention, cancelRetention := newShutdownContext()
+		defer cancelRetention()
+		stopRetention(waitRetention)
 		if sweeperCancel == nil {
 			return
 		}
@@ -348,6 +421,7 @@ func run(ctx context.Context) error {
 		case <-shutdownContext.Done():
 		}
 	}
+	stopRetention(shutdownContext)
 	if shutdownErr != nil {
 		return shutdownErr
 	}

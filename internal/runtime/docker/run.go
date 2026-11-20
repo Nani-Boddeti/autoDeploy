@@ -196,6 +196,27 @@ func buildEnvEntries(env []ContainerEnv) ([]string, error) {
 	return out, nil
 }
 
+// Container hardening defaults (audit F2, owner decision D2a). Applied to
+// every runtime container; not user-configurable.
+const (
+	// noNewPrivileges is the Engine API SecurityOpt string form (the CLI's
+	// --security-opt no-new-privileges maps to the same value): setuid
+	// binaries cannot gain privileges.
+	noNewPrivileges = "no-new-privileges:true"
+	// containerPidsLimit bounds the container's process count so a fork bomb
+	// cannot exhaust host PIDs. The cgroup pids limit counts threads as
+	// well as processes, so it is sized for thread-heavy runtimes (JVM, Go).
+	containerPidsLimit int64 = 4096
+)
+
+// containerDropCaps lists default-granted capabilities dropped because common
+// workloads do not need them and they widen kernel attack surface. The
+// compatible set deliberately keeps CHOWN, SETUID, SETGID and
+// NET_BIND_SERVICE (and the other defaults) so root-entrypoint images such as
+// nginx still start; a CapDrop ALL + add-back design was rejected for that
+// reason.
+var containerDropCaps = []string{"NET_RAW", "MKNOD", "SYS_CHROOT", "AUDIT_WRITE", "SETFCAP"}
+
 // buildContainerCreatePayload translates a validated RunContainerRequest
 // plus its already-built labels into the exact wire request engine.go's
 // CreateContainer sends. It is pure (no I/O), which is what makes every
@@ -220,6 +241,10 @@ func buildContainerCreatePayload(req RunContainerRequest, labels map[string]stri
 			},
 			NanoCPUs: int64(req.CPUMillis) * millisPerCPU,
 			Memory:   req.MemoryBytes,
+			// Fresh slices so callers can never mutate the shared defaults.
+			SecurityOpt: []string{noNewPrivileges},
+			PidsLimit:   containerPidsLimit,
+			CapDrop:     append([]string(nil), containerDropCaps...),
 		},
 	}
 }

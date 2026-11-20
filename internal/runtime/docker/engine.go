@@ -341,6 +341,11 @@ type containerHostConfig struct {
 	RestartPolicy containerRestartPolicy `json:"RestartPolicy"`
 	NanoCPUs      int64                  `json:"NanoCpus,omitempty"`
 	Memory        int64                  `json:"Memory"`
+	// SecurityOpt, PidsLimit and CapDrop are the F2 hardening defaults; see
+	// the constants in run.go for the rationale.
+	SecurityOpt []string `json:"SecurityOpt,omitempty"`
+	PidsLimit   int64    `json:"PidsLimit,omitempty"`
+	CapDrop     []string `json:"CapDrop,omitempty"`
 }
 
 type containerRestartPolicy struct {

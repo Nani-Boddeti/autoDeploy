@@ -148,8 +148,11 @@ type Handler struct {
 	CheckoutActivator         CheckoutActivator
 	CheckoutRegistry          *CheckoutRegistry
 	TrustedProxyCIDRs         []netip.Prefix
-	Clock                     Clock
-	RequestTimeout            time.Duration
+	// EnrollLimiter rate-limits the unauthenticated enroll route per server
+	// id. Nil uses a shared process-wide default.
+	EnrollLimiter  *EnrollLimiter
+	Clock          Clock
+	RequestTimeout time.Duration
 	// Logger receives process-log lines. Nil discards them: it never
 	// defaults to standard error, so every line goes through the redacting
 	// logger the caller injects.

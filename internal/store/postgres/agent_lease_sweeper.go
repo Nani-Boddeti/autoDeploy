@@ -13,6 +13,13 @@ import (
 // advisory lock key used elsewhere in this codebase; there are none today.
 const agentLeaseSweeperAdvisoryLockKey = int64(0x61676e745f6c7332) // "agnt_ls2"
 
+// sweepTimeoutMultiplier bounds one sweep to this many ticks (45s at the
+// default 15s tick). It sits below the pool's 60s statement_timeout so the
+// client-side bound normally fires first.
+const sweepTimeoutMultiplier = 3
+
+func sweepTimeoutFor(tick time.Duration) time.Duration { return sweepTimeoutMultiplier * tick }
+
 // AgentLeaseSweeper periodically calls AgentLeaseRepository.ExpireBatch so
 // authority-expired leases are recovered even when no agent ever renews or
 // completes them (ADR 0004 recovery; Step 4 sweeper). Exactly one replica's
@@ -96,7 +103,12 @@ func (s *AgentLeaseSweeper) Run(ctx context.Context) {
 			if s.sweepFn != nil {
 				sweep = s.sweepFn
 			}
-			n, err := sweep(ctx)
+			// A wedged statement or row lock must not stall lease expiry and
+			// log purge indefinitely: bound each sweep and report the
+			// timeout like any other failed tick.
+			sweepCtx, cancel := context.WithTimeout(ctx, sweepTimeoutFor(s.tick))
+			n, err := sweep(sweepCtx)
+			cancel()
 			if err != nil && ctx.Err() == nil && s.onError != nil {
 				s.onError()
 			}

@@ -160,7 +160,7 @@ func operationsFailure(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, postgres.ErrOperationsInvalidInput):
 		badRequest(w)
 	default:
-		plain(w, http.StatusInternalServerError, "the page could not be loaded; retry\n")
+		storeFailure(w, err, "the page could not be loaded; retry\n")
 	}
 }
 
@@ -615,6 +615,6 @@ func (h *Handler) deploymentCancel(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, postgres.ErrServerAuthorizationDenied):
 		badRequest(w)
 	default:
-		plain(w, http.StatusInternalServerError, "the deployment could not be cancelled; retry\n")
+		storeFailure(w, err, "the deployment could not be cancelled; retry\n")
 	}
 }

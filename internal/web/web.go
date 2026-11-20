@@ -24,6 +24,8 @@ import (
 	"autodeploy/internal/healthgate"
 	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -1056,7 +1058,7 @@ func resolveError(w http.ResponseWriter, err error, outcome string) {
 		// Not a refusal of the operator's input (a database failure, a
 		// cancelled context, a failed commit): saying "bad request" would
 		// send the operator to fix a form that is fine.
-		plain(w, http.StatusInternalServerError, "the environment could not be resolved; retry\n")
+		storeFailure(w, err, "the environment could not be resolved; retry\n")
 	}
 }
 
@@ -1952,6 +1954,13 @@ func (h *Handler) securityHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")
+	// HSTS: PublicOrigin is always https (CanonicalHTTPSOrigin rejects
+	// anything else), so every response from this handler is HTTPS-only.
+	// One day for now (owner decision); raise to one year in 22-6 once public
+	// ACME certs are in place. No includeSubDomains/preload: V1 is a single host, and
+	// subdomains carry deployed apps whose TLS the operator controls;
+	// preload is irreversible in practice and must be an explicit decision.
+	w.Header().Set("Strict-Transport-Security", "max-age=86400")
 }
 func loginCookie(value string, now time.Time) *http.Cookie {
 	return &http.Cookie{Name: loginCookieName, Value: value, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: int(auth.LoginEnvelopeMaxAge.Seconds()), Expires: now.Add(auth.LoginEnvelopeMaxAge)}
@@ -1979,6 +1988,22 @@ func plain(w http.ResponseWriter, status int, body string) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, body)
+}
+
+// storeFailure is the shared rendering point for an unexpected store error.
+// SQLSTATE 55P03 (lock_not_available: the pool's lock_timeout fired) and
+// 57014 (query_canceled: statement_timeout fired) mean the database was
+// busy, not that the request was wrong or the server broken, so they answer
+// 503 with Retry-After; anything else keeps the caller's 500 message. The
+// error text is never echoed (it can carry SQL or connection detail).
+func storeFailure(w http.ResponseWriter, err error, internalMsg string) {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "55P03" || pgErr.Code == "57014") {
+		w.Header().Set("Retry-After", "5")
+		plain(w, http.StatusServiceUnavailable, "unavailable; retry\n")
+		return
+	}
+	plain(w, http.StatusInternalServerError, internalMsg)
 }
 func badRequest(w http.ResponseWriter) { plain(w, http.StatusBadRequest, "bad request\n") }
 func methodNotAllowed(w http.ResponseWriter, methods ...string) {

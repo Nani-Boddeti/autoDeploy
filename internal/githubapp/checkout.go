@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"autodeploy/internal/crypto"
+	"autodeploy/internal/errclass"
+	"autodeploy/internal/logging"
 )
 
 var (
@@ -34,8 +39,28 @@ type CheckoutBinding struct {
 	AuthorizationRevision int64
 }
 
+const maxCloneURLLength = 1024
+
+// cloneURLPath is the only accepted clone path: /owner/repo.git. The class
+// excludes "/", "%" and "?" so encoded separators cannot appear.
+var cloneURLPath = regexp.MustCompile(`^/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\.git$`)
+
+// CloneURLValid reports whether CloneURL is exactly https://github.com/<owner>/<repo>.git
+// with no userinfo, port, query, fragment, encoded separators or dot segments.
 func (b CheckoutBinding) CloneURLValid() bool {
-	return strings.HasPrefix(b.CloneURL, "https://github.com/") && strings.HasSuffix(b.CloneURL, ".git") && len(b.CloneURL) <= 1024
+	if len(b.CloneURL) > maxCloneURLLength || !strings.HasPrefix(b.CloneURL, "https://github.com/") || strings.ContainsAny(b.CloneURL, "?#") {
+		return false
+	}
+	u, err := url.Parse(b.CloneURL)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.Opaque != "" ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || u.RawPath != "" || u.OmitHost {
+		return false
+	}
+	m := cloneURLPath.FindStringSubmatch(u.Path)
+	if m == nil || m[1] == "." || m[1] == ".." || m[2] == "." || m[2] == ".." {
+		return false
+	}
+	return true
 }
 
 func (b CheckoutBinding) valid() bool {
@@ -103,6 +128,9 @@ func (l *CheckoutLease) ExpiresAt() time.Time     { return l.expires }
 
 // Revoke is idempotent locally. A provider revocation failure is surfaced so
 // callers fail closed instead of silently continuing with an exposed token.
+// revokeTimeout bounds one provider token revocation.
+var revokeTimeout = 15 * time.Second // var so tests can shorten it
+
 func (l *CheckoutLease) Revoke(ctx context.Context) error {
 	if l == nil {
 		return nil
@@ -112,7 +140,11 @@ func (l *CheckoutLease) Revoke(ctx context.Context) error {
 	if l.token == "" {
 		return nil
 	}
-	if err := l.provider.RevokeToken(context.WithoutCancel(ctx), l.token); err != nil {
+	// WithoutCancel drops the caller's deadline too, so bound the call here:
+	// a hung provider must not hold l.mu or a goroutine forever.
+	revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), revokeTimeout)
+	defer cancel()
+	if err := l.provider.RevokeToken(revokeCtx, l.token); err != nil {
 		return err
 	}
 	l.token = ""
@@ -177,7 +209,13 @@ func (l *CheckoutLease) invalidate() {
 	if cancel != nil {
 		cancel()
 	}
-	go func() { _ = l.Revoke(context.Background()) }()
+	go func() {
+		// Revoke bounds its own provider call (revokeTimeout).
+		if err := l.Revoke(context.Background()); err != nil {
+			// Fixed message and class only: provider errors can carry request detail.
+			slog.Warn("checkout lease revoke after invalidation failed", logging.KeyClass, errclass.Of(err))
+		}
+	}()
 }
 
 // Close consumes the durable reservation and revokes its ephemeral token.

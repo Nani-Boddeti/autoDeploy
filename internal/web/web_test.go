@@ -582,3 +582,14 @@ func TestThrottleReservationPrecedesKnownUserLookup(t *testing.T) {
 		t.Fatalf("wrong throttle/user order: %#v", repo.events)
 	}
 }
+
+func TestSecurityHeadersPinHSTS(t *testing.T) {
+	h := testHandler(t, &repositoryStub{})
+	request := httptest.NewRequest(http.MethodGet, "https://admin.example.test/login", nil)
+	request.RemoteAddr = "192.0.2.10:1234"
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if got := response.Header().Get("Strict-Transport-Security"); got != "max-age=86400" {
+		t.Fatalf("Strict-Transport-Security = %q", got)
+	}
+}

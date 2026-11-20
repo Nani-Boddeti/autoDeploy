@@ -136,6 +136,6 @@ func (h *Handler) manualDeployFailure(w http.ResponseWriter, err error, stage st
 		// Unexpected: record the step and error class only, never the error
 		// text, which can carry a DSN, token or SQL detail.
 		h.logger().Error("manual deploy failed", "stage", stage, "class", errclass.Of(err))
-		plain(w, http.StatusInternalServerError, "the deployment could not be queued; retry\n")
+		storeFailure(w, err, "the deployment could not be queued; retry\n")
 	}
 }
