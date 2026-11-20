@@ -13,6 +13,8 @@
 #                    owner/runtime passwords and URLs, KEK files and manifest, throttle and
 #                    CSRF keys: without them the kept volume cannot be reopened and secrets
 #                    wrapped by a lost KEK are unrecoverable)
+#                  - /var/lib/autodeploy/traefik/acme (public mode: ACME account key and
+#                    issued certificates; Let's Encrypt rate limits make them costly to lose)
 #                  - the checkout XFS image /var/lib/autodeploy/checkout.xfs and the quota
 #                    ledger /var/lib/autodeploy/checkout-quota, including binding.env
 #                    there (the ledger binds the checkout UID/GID and loop device
@@ -49,6 +51,9 @@ readonly TRUST_CRT=/usr/local/share/ca-certificates/autodeploy-private-ca.crt
 readonly HOSTS_FILE=/etc/hosts
 readonly MARK_BEGIN="# BEGIN autodeploy-private-ca (managed by deploy/host/private-ca.sh)"
 readonly MARK_END="# END autodeploy-private-ca"
+readonly PUBLIC_MARK_BEGIN="# BEGIN autodeploy-public-cp (managed by deploy/host/install-app.sh)"
+readonly PUBLIC_MARK_END="# END autodeploy-public-cp"
+readonly ACME_DIR="$STATE_ROOT/traefik/acme"
 readonly PG_VOLUME=autodeploy-postgres-data
 
 log() { printf '==> %s\n' "$*"; }
@@ -64,7 +69,7 @@ while (($#)); do
     --yes) YES=1 ;;
     --keep-data) KEEP_FLAG=1 ;;
     --destroy-data) DESTROY=1; KEEP=0 ;;
-    -h|--help) sed -n '2,36p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) awk 'NR==1{next} /^#/{print; next} {exit}' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
@@ -104,17 +109,18 @@ fi
 # The managed /etc/hosts block is edited only if its markers are intact: BEGIN and END each
 # exactly once, in order. Checked up front so a damaged file stops the run before anything
 # is removed.
-hosts_state() { # -> none | ok ; dies on anything else
-  local nb ne lb le
-  nb="$(grep -cxF "$MARK_BEGIN" "$HOSTS_FILE" 2>/dev/null || true)"
-  ne="$(grep -cxF "$MARK_END" "$HOSTS_FILE" 2>/dev/null || true)"
+hosts_state() { # [BEGIN END] (default: private-ca markers) -> none | ok ; dies on anything else
+  local mb="${1:-$MARK_BEGIN}" me="${2:-$MARK_END}" nb ne lb le
+  nb="$(grep -cxF "$mb" "$HOSTS_FILE" 2>/dev/null || true)"
+  ne="$(grep -cxF "$me" "$HOSTS_FILE" 2>/dev/null || true)"
   if [[ "$nb" == 0 && "$ne" == 0 ]]; then echo none; return; fi
-  lb="$(grep -nxF "$MARK_BEGIN" "$HOSTS_FILE" | cut -d: -f1)"
-  le="$(grep -nxF "$MARK_END" "$HOSTS_FILE" | cut -d: -f1)"
+  lb="$(grep -nxF "$mb" "$HOSTS_FILE" | cut -d: -f1)"
+  le="$(grep -nxF "$me" "$HOSTS_FILE" | cut -d: -f1)"
   if [[ "$nb" == 1 && "$ne" == 1 ]] && ((lb < le)); then echo ok; return; fi
   die "$HOSTS_FILE has a damaged autodeploy block (BEGIN x$nb, END x$ne, or out of order); fix it by hand and re-run. Nothing was changed."
 }
 HOSTS_STATE="$(hosts_state)" || exit 1
+PUBLIC_HOSTS_STATE="$(hosts_state "$PUBLIC_MARK_BEGIN" "$PUBLIC_MARK_END")" || exit 1
 
 # ---- 1. stop and remove units --------------------------------------------------------
 log "stopping and disabling services (agent first)"
@@ -182,6 +188,16 @@ if [[ "$HOSTS_STATE" == ok ]]; then
   mv -f "$tmp" "$HOSTS_FILE"
 fi
 
+if [[ "$PUBLIC_HOSTS_STATE" == ok ]]; then
+  log "removing the public-mode managed block from $HOSTS_FILE"
+  [[ -e "$HOSTS_FILE.autodeploy.bak" ]] || cp -p "$HOSTS_FILE" "$HOSTS_FILE.autodeploy.bak"
+  tmp="$(mktemp "$HOSTS_FILE.XXXXXX")"
+  awk -v b="$PUBLIC_MARK_BEGIN" -v e="$PUBLIC_MARK_END" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$HOSTS_FILE" >"$tmp"
+  chmod --reference="$HOSTS_FILE" "$tmp"
+  chown --reference="$HOSTS_FILE" "$tmp"
+  mv -f "$tmp" "$HOSTS_FILE"
+fi
+
 # ---- 4. loop mount and image ---------------------------------------------------------
 # Units (and their cgroups/sockets) are gone, so nothing holds the volume. The mount unit
 # file is removed in every case; the image only without --keep-data.
@@ -222,9 +238,18 @@ rmdir /srv/autodeploy 2>/dev/null || true
 if ((KEEP)); then
   # Remove everything under /etc/autodeploy and /var/lib/autodeploy except the kept items.
   find "$ETC_DIR" -mindepth 1 -maxdepth 1 ! -name secrets ! -name controlplane -exec rm -rf -- {} +
-  find "$STATE_ROOT" -mindepth 1 -maxdepth 1 ! -name checkout.xfs ! -name checkout-quota -exec rm -rf -- {} +
+  if [[ -d $ACME_DIR ]]; then
+    # Public mode: the ACME account key and issued certificates are irreplaceable (Let's Encrypt
+    # rate limits): keep them unless --destroy-data; everything else under traefik/ goes.
+    find "$STATE_ROOT" -mindepth 1 -maxdepth 1 ! -name checkout.xfs ! -name checkout-quota ! -name traefik -exec rm -rf -- {} +
+    find "$STATE_ROOT/traefik" -mindepth 1 -maxdepth 1 ! -name acme -exec rm -rf -- {} +
+    log "kept: $ACME_DIR (ACME account key and certificates; deleted only by --destroy-data)"
+  else
+    find "$STATE_ROOT" -mindepth 1 -maxdepth 1 ! -name checkout.xfs ! -name checkout-quota -exec rm -rf -- {} +
+  fi
   log "kept: $ETC_DIR/secrets $ETC_DIR/controlplane $IMAGE $LEDGER_DIR (and Docker volume $PG_VOLUME)"
 else
+  if [[ -d $ACME_DIR ]]; then log "removing $ACME_DIR (--destroy-data)"; fi
   rm -rf -- "${ETC_DIR:?}" "${STATE_ROOT:?}"
 fi
 
