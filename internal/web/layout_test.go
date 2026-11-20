@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
+	"autodeploy/internal/auth"
 	"autodeploy/internal/store/postgres"
 )
 
@@ -97,12 +99,12 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		pages[target] = rr.Body.String()
 	}
 	var buf bytes.Buffer
-	if err := enrollmentTokenTemplate.Execute(&buf, struct{ ServerID, Token, ExpiresAt string }{"s", "tok", "later"}); err != nil {
+	if err := enrollmentTokenTemplate.Execute(&buf, enrollmentView{Nav: h.navFor("servers", p), ServerID: "s", Token: "tok", ExpiresAt: "later"}); err != nil {
 		t.Fatal(err)
 	}
 	pages["enrollment"] = buf.String()
 	buf.Reset()
-	if err := githubCompleteTemplate.Execute(&buf, struct{ CSRF string }{"c"}); err != nil {
+	if err := githubCompleteTemplate.Execute(&buf, githubCompleteView{Nav: h.navFor("github", p), CSRF: "c"}); err != nil {
 		t.Fatal(err)
 	}
 	pages["github-complete"] = buf.String()
@@ -118,6 +120,98 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		}
 		if name != "/login" && !strings.Contains(body, `<nav aria-label="Primary">`) {
 			t.Errorf("%s is missing the shared nav", name)
+		}
+	}
+}
+
+func navTestHandler(t *testing.T) (*Handler, auth.Principal) {
+	t.Helper()
+	h, _, p := serversHandler(t)
+	h.config.OperationsReader = &operationsStub{detail: sampleDetail("leased", true)}
+	return h, p
+}
+
+func navPage(t *testing.T, h *Handler, p auth.Principal, target string) string {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, serversRequest(http.MethodGet, target, nil, p, h))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("%s = %d", target, rr.Code)
+	}
+	return rr.Body.String()
+}
+
+func TestNavShowsAvailablePages(t *testing.T) {
+	h, p := navTestHandler(t)
+	pages := []struct{ target, currentHref string }{
+		{"/", "/"},
+		{"/deployments", "/deployments"},
+		{"/deployments/detail?id=dep-1", "/deployments"},
+		{"/projects", "/projects"},
+		{"/servers", "/servers"},
+	}
+	for _, pg := range pages {
+		body := navPage(t, h, p, pg.target)
+		for _, href := range []string{"/", "/deployments", "/projects", "/#github", "/servers"} {
+			if !strings.Contains(body, `href="`+href+`"`) {
+				t.Errorf("%s nav lacks href %q", pg.target, href)
+			}
+		}
+		if n := strings.Count(body, `aria-current="page"`); n != 1 {
+			t.Errorf("%s has %d aria-current, want 1", pg.target, n)
+		}
+		if !strings.Contains(body, `href="`+pg.currentHref+`" aria-current="page"`) {
+			t.Errorf("%s: current item is not %q", pg.target, pg.currentHref)
+		}
+	}
+
+	noServers, p2 := navTestHandler(t)
+	noServers.config.ServerAdmin = nil
+	if body := navPage(t, noServers, p2, "/projects"); strings.Contains(body, `href="/servers"`) {
+		t.Error("nav shows /servers with ServerAdmin nil")
+	}
+	noOps, p3 := navTestHandler(t)
+	noOps.config.OperationsReader = nil
+	body := navPage(t, noOps, p3, "/")
+	for _, href := range []string{"/projects", "/deployments"} {
+		if strings.Contains(body, `href="`+href+`"`) {
+			t.Errorf("nav shows %s with OperationsReader nil", href)
+		}
+	}
+}
+
+func TestNavRendersSignOutForm(t *testing.T) {
+	h, p := navTestHandler(t)
+	body := navPage(t, h, p, "/projects")
+	if !strings.Contains(body, `<form method="post" action="/logout">`) {
+		t.Fatal("sign-out form missing from nav")
+	}
+	if want := `name="csrf" value="` + serversCSRF(t, h, p) + `"`; !strings.Contains(body, want) {
+		t.Fatalf("sign-out form lacks session csrf field %q", want)
+	}
+}
+
+func TestLandingHasSingleSignOut(t *testing.T) {
+	h, p := navTestHandler(t)
+	if n := strings.Count(navPage(t, h, p, "/"), `action="/logout"`); n != 1 {
+		t.Fatalf("landing has %d sign-out forms, want 1 (sidebar only)", n)
+	}
+}
+
+func TestStylesheetGuards(t *testing.T) {
+	css := string(appCSS)
+	for _, banned := range []string{"url(", "@import", "background-clip", "backdrop-filter"} {
+		if strings.Contains(css, banned) {
+			t.Errorf("stylesheet contains %q", banned)
+		}
+	}
+	// Side borders (physical or logical) may only be 0 or 1px; var(), keywords
+	// (thin/medium/thick) and wider widths are refused (impeccable side-stripe ban).
+	side := regexp.MustCompile(`border-(?:left|right|inline(?:-start|-end)?)(?:-width)?\s*:\s*([^;}]+)`)
+	allowed := regexp.MustCompile(`^\s*(?:0(?:px)?|1px)(?:\s|$)`)
+	for _, m := range side.FindAllStringSubmatch(css, -1) {
+		if !allowed.MatchString(m[1]) {
+			t.Errorf("side border wider than 1px: %q", m[0])
 		}
 	}
 }

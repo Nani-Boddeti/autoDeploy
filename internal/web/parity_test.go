@@ -27,11 +27,32 @@ import (
 // the moved fragments in the same commit (the comments name the slice).
 // Fragments are exact substrings of the rendered HTML.
 func TestInformationParity(t *testing.T) {
-	entries := []struct {
-		name        string
-		render      func(t *testing.T) string
-		mustContain []string
-	}{
+	entries := parityEntries()
+	for _, e := range entries {
+		t.Run(e.name, func(t *testing.T) {
+			if len(e.mustContain) == 0 {
+				t.Fatalf("parity entry %q pins no fragments", e.name)
+			}
+			page := e.render(t)
+			for _, frag := range e.mustContain {
+				if !strings.Contains(page, frag) {
+					t.Errorf("parity entry %q lost fragment %q", e.name, frag)
+				}
+			}
+		})
+	}
+}
+
+// parityEntry is one rendered page state plus the fragments it must keep.
+type parityEntry struct {
+	name        string
+	render      func(t *testing.T) string
+	mustContain []string
+}
+
+// parityEntries lists every current page/state; ui_dump_test.go reuses it.
+func parityEntries() []parityEntry {
+	return []parityEntry{
 		{"landing", parityLanding, landingFragments()},
 		{"projects", parityProjects, projectsFragments()},
 		{"deployments", parityDeployments, deploymentsFragments()},
@@ -51,19 +72,6 @@ func TestInformationParity(t *testing.T) {
 		{"github complete", parityGitHubComplete, []string{`action="/github/setup/complete"`, `name="csrf" value="csrf-complete"`}},
 		{"github continue", parityGitHubContinue, []string{`href="/github/setup/complete"`}},
 	}
-	for _, e := range entries {
-		t.Run(e.name, func(t *testing.T) {
-			if len(e.mustContain) == 0 {
-				t.Fatalf("parity entry %q pins no fragments", e.name)
-			}
-			page := e.render(t)
-			for _, frag := range e.mustContain {
-				if !strings.Contains(page, frag) {
-					t.Errorf("parity entry %q lost fragment %q", e.name, frag)
-				}
-			}
-		})
-	}
 }
 
 // ---- helpers ----
@@ -79,6 +87,14 @@ func pageGet(t *testing.T, h *Handler, p auth.Principal, target string) string {
 		t.Fatalf("GET %s = %d", target, rr.Code)
 	}
 	return rr.Body.String()
+}
+
+// parityNav builds a fully populated nav (all dependencies set) for pages that
+// are rendered straight from their template.
+func parityNav(t *testing.T, active string) navView {
+	t.Helper()
+	h, p := navTestHandler(t)
+	return h.navFor(active, p)
 }
 
 func execTemplate(t *testing.T, run func(*bytes.Buffer) error) string {
@@ -112,7 +128,7 @@ const (
 func parityLanding(t *testing.T) string {
 	return execTemplate(t, func(b *bytes.Buffer) error {
 		return landingTemplate.Execute(b, landingView{
-			CSRF: "csrf-landing", ShowBind: true,
+			Nav: parityNav(t, "home"), CSRF: "csrf-landing", ShowBind: true,
 			Repositories: []postgres.BindableRepository{{RepositoryID: 201, FullName: "owner/demo", BoundProject: "demo"}, {RepositoryID: 202, FullName: "owner/other"}},
 			Servers:      []landingServer{{ID: "server_1", Name: "acer"}},
 		})
@@ -562,7 +578,7 @@ func routeNewFragments() []string {
 
 func parityEnrollmentToken(t *testing.T) string {
 	return execTemplate(t, func(b *bytes.Buffer) error {
-		return enrollmentTokenTemplate.Execute(b, struct{ ServerID, Token, ExpiresAt string }{"srv_enroll", "tok-enroll-secret", "2026-03-04T05:06:07Z"})
+		return enrollmentTokenTemplate.Execute(b, enrollmentView{Nav: parityNav(t, "servers"), ServerID: "srv_enroll", Token: "tok-enroll-secret", ExpiresAt: "2026-03-04T05:06:07Z"})
 	})
 }
 
@@ -572,10 +588,12 @@ func enrollmentFragments() []string {
 
 func parityGitHubComplete(t *testing.T) string {
 	return execTemplate(t, func(b *bytes.Buffer) error {
-		return githubCompleteTemplate.Execute(b, struct{ CSRF string }{"csrf-complete"})
+		return githubCompleteTemplate.Execute(b, githubCompleteView{Nav: parityNav(t, "github"), CSRF: "csrf-complete"})
 	})
 }
 
 func parityGitHubContinue(t *testing.T) string {
-	return execTemplate(t, func(b *bytes.Buffer) error { return githubContinueTemplate.Execute(b, nil) })
+	return execTemplate(t, func(b *bytes.Buffer) error {
+		return githubContinueTemplate.Execute(b, githubContinueView{Nav: parityNav(t, "github")})
+	})
 }

@@ -183,8 +183,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.URL.Path == "/static/app.css" {
-		serveStylesheet(w, r)
+	if asset, ok := staticAssets[r.URL.Path]; ok {
+		serveStatic(w, r, asset)
 		return
 	}
 	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" {
@@ -602,7 +602,7 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	view := landingView{CSRF: csrf, ShowBind: h.config.GitHubSetup != nil}
+	view := landingView{Nav: h.navFor("home", principal), CSRF: csrf, ShowBind: h.config.GitHubSetup != nil}
 	if view.ShowBind {
 		// Best effort: a failed lookup only hides the pick-lists; the form still accepts typed IDs.
 		if h.config.RepositoryLister != nil {
@@ -618,13 +618,13 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = landingTemplate.Execute(w, view)
+	renderOperations(w, landingTemplate, view)
 }
 
 // landingView is the landing page's data. The binding form posts to /github/bindings, whose
 // handler (githubBind) already existed without any form, so no repository could ever be bound.
 type landingView struct {
+	Nav          navView
 	CSRF         string
 	ShowBind     bool
 	Repositories []postgres.BindableRepository
@@ -689,8 +689,14 @@ func (h *Handler) githubCallback(w http.ResponseWriter, r *http.Request) {
 	// cross-site and browsers withhold the SameSite=Strict session cookie at
 	// /github/setup/complete (observed on the acer: bounced to /login). A link on
 	// this same-origin page makes the next navigation same-site.
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = githubContinueTemplate.Execute(w, nil)
+	// The callback arrives cross-site, so the session cookie is usually absent: nav without sign-out.
+	var nav navView
+	if _, p, ok := h.session(r.Context(), r); ok {
+		nav = h.navFor("github", p)
+	} else {
+		nav = h.navFor("github", auth.Principal{})
+	}
+	renderOperations(w, githubContinueTemplate, githubContinueView{Nav: nav})
 }
 func (h *Handler) githubCompleteGet(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil {
@@ -708,8 +714,7 @@ func (h *Handler) githubCompleteGet(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = githubCompleteTemplate.Execute(w, struct{ CSRF string }{csrf})
+	renderOperations(w, githubCompleteTemplate, githubCompleteView{Nav: h.navFor("github", p), CSRF: csrf})
 }
 func (h *Handler) githubCompletePost(w http.ResponseWriter, r *http.Request) {
 	if h.config.GitHubSetup == nil || h.provenance(r) != nil {
@@ -817,15 +822,14 @@ func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	view := serversView{CSRF: csrf, ResolveReasonMax: maxResolveReasonBytes}
+	view := serversView{Nav: h.navFor("servers", p), CSRF: csrf, ResolveReasonMax: maxResolveReasonBytes}
 	for _, s := range summaries {
 		view.Servers = append(view.Servers, serverRow{ID: s.ID, Name: s.Name, Status: string(s.Status), CreatedAt: formatTimestamp(s.CreatedAt), LastHeartbeatAt: formatTimestamp(s.LastHeartbeatAt), ActiveCredentialVersion: formatCredentialVersion(s.ActiveCredentialVersion), Enrollment: string(s.Enrollment)})
 	}
 	for _, e := range environments {
 		view.ReconcilingEnvironments = append(view.ReconcilingEnvironments, reconcilingRow{EnvironmentID: e.EnvironmentID, ConfigHref: newEnvironmentLink(e.EnvironmentID).ConfigHref, RouteHref: newEnvironmentLink(e.EnvironmentID).RouteHref, AttemptID: strconv.FormatInt(e.AttemptID, 10), JobID: strconv.FormatInt(e.JobID, 10), ServerID: e.ServerID, Since: formatTimestamp(e.Since), Activation: activationLabel(e.Activation)})
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = serversTemplate.Execute(w, view)
+	renderOperations(w, serversTemplate, view)
 }
 
 // serversRegister mints a fresh server ID and single-use enrollment token
@@ -868,7 +872,7 @@ func (h *Handler) serversRegister(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	renderEnrollmentToken(w, registered.ID, token, expiresAt)
+	h.renderEnrollmentToken(w, p, registered.ID, token, expiresAt)
 }
 
 // serversEnrollment reissues a fresh enrollment token for an existing,
@@ -904,7 +908,7 @@ func (h *Handler) serversEnrollment(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	renderEnrollmentToken(w, serverID, token, expiresAt)
+	h.renderEnrollmentToken(w, p, serverID, token, expiresAt)
 }
 
 // serversReenroll issues a single-use re-enrollment token for an already
@@ -943,7 +947,7 @@ func (h *Handler) serversReenroll(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	renderEnrollmentToken(w, serverID, token, expiresAt)
+	h.renderEnrollmentToken(w, p, serverID, token, expiresAt)
 }
 
 // serversRevoke revokes a server and its active credential. Revocation
@@ -1265,9 +1269,9 @@ func buildBindingRows(bindings []postgres.RuntimeBinding) []bindingRow {
 	return rows
 }
 
-func renderEnvironmentConfig(w http.ResponseWriter, view runtimeConfigView) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = environmentConfigTemplate.Execute(w, view)
+func (h *Handler) renderEnvironmentConfig(w http.ResponseWriter, p auth.Principal, view runtimeConfigView) {
+	view.Nav = h.navFor("servers", p)
+	renderOperations(w, environmentConfigTemplate, view)
 }
 
 // environmentConfigGet renders one environment's runtime configuration and
@@ -1299,7 +1303,7 @@ func (h *Handler) environmentConfigGet(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	renderEnvironmentConfig(w, buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found))
+	h.renderEnvironmentConfig(w, p, buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found))
 }
 
 // renderConfigRejection re-fetches only the bindings table (never the
@@ -1320,7 +1324,7 @@ func (h *Handler) renderConfigRejection(w http.ResponseWriter, r *http.Request, 
 	if found {
 		submitted.Revision = strconv.FormatInt(cfg.Revision, 10)
 	}
-	renderEnvironmentConfig(w, submitted)
+	h.renderEnvironmentConfig(w, p, submitted)
 }
 
 // environmentConfigPost creates (expected_revision empty) or CAS-updates
@@ -1465,7 +1469,7 @@ func (h *Handler) environmentBindingAdd(w http.ResponseWriter, r *http.Request) 
 		default:
 			view.BindingError = "binding rejected: invalid values, or you are not authorized to configure this environment"
 		}
-		renderEnvironmentConfig(w, view)
+		h.renderEnvironmentConfig(w, p, view)
 		return
 	}
 	redirect(w, "/environments/config?environment_id="+url.QueryEscape(environmentID))
@@ -1513,9 +1517,9 @@ func buildRouteHeadView(csrf, environmentID string, head postgres.RouteHead, fou
 	return view
 }
 
-func renderRouteHead(w http.ResponseWriter, view routeHeadView) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = routeHeadTemplate.Execute(w, view)
+func (h *Handler) renderRouteHead(w http.ResponseWriter, p auth.Principal, view routeHeadView) {
+	view.Nav = h.navFor("servers", p)
+	renderOperations(w, routeHeadTemplate, view)
 }
 
 // environmentRouteGet renders one environment's route head. GET is
@@ -1549,7 +1553,7 @@ func (h *Handler) environmentRouteGet(w http.ResponseWriter, r *http.Request) {
 	}
 	view := buildRouteHeadView(csrf, environmentID, head, found)
 	view.Releases = h.environmentReleaseRows(r.Context(), p, environmentID)
-	renderRouteHead(w, view)
+	h.renderRouteHead(w, p, view)
 }
 
 // renderRouteRejection re-fetches the current route head so a rejected
@@ -1569,7 +1573,7 @@ func (h *Handler) renderRouteRejection(w http.ResponseWriter, r *http.Request, p
 		submitted.ReconciliationRequired = head.ReconciliationRequired
 	}
 	submitted.Releases = h.environmentReleaseRows(r.Context(), p, submitted.EnvironmentID)
-	renderRouteHead(w, submitted)
+	h.renderRouteHead(w, p, submitted)
 }
 
 // environmentRoutePost creates (expected_revision empty) or CAS-assigns
@@ -2028,6 +2032,7 @@ type reconcilingRow struct {
 	EnvironmentID, ConfigHref, RouteHref, AttemptID, JobID, ServerID, Since, Activation string
 }
 type serversView struct {
+	Nav                     navView
 	CSRF                    string
 	Servers                 []serverRow
 	ReconcilingEnvironments []reconcilingRow
@@ -2067,9 +2072,8 @@ func formatCredentialVersion(version int) string {
 // goes only into this response body -- never a redirect Location, never a
 // log. Cache-Control: no-store is already set process-wide by
 // securityHeaders above.
-func renderEnrollmentToken(w http.ResponseWriter, serverID, token string, expiresAt time.Time) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = enrollmentTokenTemplate.Execute(w, struct{ ServerID, Token, ExpiresAt string }{serverID, token, formatTimestamp(expiresAt)})
+func (h *Handler) renderEnrollmentToken(w http.ResponseWriter, p auth.Principal, serverID, token string, expiresAt time.Time) {
+	renderOperations(w, enrollmentTokenTemplate, enrollmentView{Nav: h.navFor("servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt)})
 }
 
 // serversTemplate lists registered servers with a registration form, a
@@ -2096,6 +2100,7 @@ type bindingRow struct {
 	DockerfileID string
 }
 type runtimeConfigView struct {
+	Nav                                                                   navView
 	CSRF, EnvironmentID                                                   string
 	Exists                                                                bool
 	Revision                                                              string
@@ -2118,6 +2123,7 @@ type runtimeConfigView struct {
 // layout's same-origin stylesheet (templates.go).
 
 type routeHeadView struct {
+	Nav                    navView
 	CSRF, EnvironmentID    string
 	Exists                 bool
 	Hostname               string

@@ -2,6 +2,6 @@
 {{define "head"}}{{template "headtop"}}<title>{{.}}</title></head><body>{{end}}
 {{define "headrefresh"}}{{template "headtop"}}<meta http-equiv="refresh" content="5"><title>{{.}}</title></head><body>{{end}}
 {{define "headrefreshfast"}}{{template "headtop"}}<meta http-equiv="refresh" content="3"><title>{{.}}</title></head><body>{{end}}
-{{define "nav"}}<header class="site"><a class="brand" href="/">AutoDeploy</a><nav aria-label="Primary"><a href="/"{{if eq . "home"}} aria-current="page"{{end}}>Overview</a><a href="/projects"{{if eq . "projects"}} aria-current="page"{{end}}>Projects</a><a href="/deployments"{{if eq . "deployments"}} aria-current="page"{{end}}>Deployments</a><a href="/servers"{{if eq . "servers"}} aria-current="page"{{end}}>Servers</a><a href="/#github"{{if eq . "github"}} aria-current="page"{{end}}>GitHub</a></nav></header>{{end}}
-{{define "foot"}}</body></html>{{end}}
+{{define "nav"}}<div class="shell"><aside class="sidebar"><a class="brand" href="/">AutoDeploy</a><nav aria-label="Primary">{{range .Groups}}<div class="nav-group"><p class="nav-heading">{{.Label}}</p><ul>{{range .Items}}<li><a href="{{.Href}}"{{if .Current}} aria-current="page"{{end}}>{{.Label}}</a></li>{{end}}</ul></div>{{end}}</nav>{{if .CSRF}}<div class="sidebar-foot"><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="btn ghost">Sign out</button></form></div>{{end}}</aside>{{end}}
+{{define "foot"}}</div></body></html>{{end}}
 {{define "execnotice"}}<p class="notice" role="note">Traffic activation is disabled on this control plane.</p>{{end}}

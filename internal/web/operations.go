@@ -248,6 +248,7 @@ func environmentLinks(ids []string) []environmentLink {
 }
 
 type projectsView struct {
+	Nav        navView
 	ExecNotice bool
 	Projects   []projectRow
 	CanDeploy  bool
@@ -264,7 +265,7 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := projectsView{ExecNotice: !h.config.ActivationEnabled}
+	view := projectsView{Nav: h.navFor("projects", p), ExecNotice: !h.config.ActivationEnabled}
 	if h.manualDeployEnabled() {
 		csrf, csrfErr := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
 		if csrfErr != nil {
@@ -331,6 +332,7 @@ type deploymentRow struct {
 }
 
 type deploymentsView struct {
+	Nav           navView
 	ExecNotice    bool
 	Deployments   []deploymentRow
 	ProjectID     string
@@ -384,7 +386,7 @@ func (h *Handler) deploymentsList(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := deploymentsView{ExecNotice: !h.config.ActivationEnabled, ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
+	view := deploymentsView{Nav: h.navFor("deployments", p), ExecNotice: !h.config.ActivationEnabled, ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
 	for _, d := range list.Items {
 		view.Deployments = append(view.Deployments, newDeploymentRow(d))
 	}
@@ -405,6 +407,7 @@ type attemptRow struct {
 type instanceRow struct{ ID, Attempt, Fence, State, Tone, Created string }
 
 type deploymentDetailView struct {
+	Nav          navView
 	ExecNotice   bool
 	Title        string
 	Refresh      bool
@@ -514,6 +517,7 @@ func (h *Handler) deploymentDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := deploymentDetailView{
+		Nav:        h.navFor("deployments", p),
 		ExecNotice: !h.config.ActivationEnabled,
 		Title:      "Deployment " + d.Deployment.DeploymentID, Summary: newDeploymentRow(d.Deployment),
 		Refresh: !terminalJobStates[d.Job.State], RefreshEvery: strconv.Itoa(detailRefreshSeconds),

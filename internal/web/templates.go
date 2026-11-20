@@ -34,9 +34,21 @@ var (
 	enrollmentTokenTemplate   = parsePage("server-enrollment-token")
 )
 
-// serveStylesheet serves the embedded stylesheet. It needs no session (the
+// staticAsset is one embedded, same-origin static file.
+type staticAsset struct {
+	contentType string
+	body        []byte
+}
+
+// staticAssets is the exact-path allowlist of served static files. There is no
+// directory serving: any other /static/ path is a 404.
+var staticAssets = map[string]staticAsset{
+	"/static/app.css": {contentType: "text/css; charset=utf-8", body: appCSS},
+}
+
+// serveStatic serves one allowlisted embedded asset. It needs no session (the
 // login page uses it), accepts GET/HEAD only and rejects any query string.
-func serveStylesheet(w http.ResponseWriter, r *http.Request) {
+func serveStatic(w http.ResponseWriter, r *http.Request, asset staticAsset) {
 	if r.URL.RawQuery != "" {
 		http.NotFound(w, r)
 		return
@@ -45,10 +57,10 @@ func serveStylesheet(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w, http.MethodGet, http.MethodHead)
 		return
 	}
-	w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(appCSS)))
+	w.Header().Set("Content-Type", asset.contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(asset.body)))
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodGet {
-		_, _ = w.Write(appCSS)
+		_, _ = w.Write(asset.body)
 	}
 }
