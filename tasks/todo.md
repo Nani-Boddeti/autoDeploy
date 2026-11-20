@@ -159,8 +159,10 @@ State transitions must be validated in the domain layer and committed transactio
 - [x] Implement blue/green activation, stop-then-start mode, release retention, and rollback.
       (acer: blue/green attempt 15, stop-then-start 17/19/20, rollback 18, retention + failed-candidate
       cleanup 2026-11-16 cleanups 1-11; tasks/21-plan.md "ACER SESSION 2026-11-16")
-- [ ] Implement minimal UI for projects, servers, environments, variables, domains, deployments,
+- [x] Implement minimal UI for projects, servers, environments, variables, domains, deployments,
       live logs, retry, cancel, and rollback.
+      (22-3, cc733f7..79d5314; acer round 7 on 04d2afe 2026-11-20: all sidebar pages, failing deploy
+      attempt 35 with reason + last probe on the detail page, live logs over SSE, restore deploy healthy)
 - [ ] Add metrics, structured sanitized logs, readiness/liveness endpoints, retention cleanup,
       backup instructions, and disaster-recovery documentation.
 - [ ] Package the control plane, agent, PostgreSQL, and Traefik for installation on Hetzner.
