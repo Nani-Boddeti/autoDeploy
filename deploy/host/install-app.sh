@@ -8,13 +8,22 @@
 # owner afterwards. It enables but does not start anything.
 #
 # Usage (as root):
-#   install-app.sh BINDIR
+#   install-app.sh [--insecure-no-checksum] BINDIR
 #
 #   BINDIR  directory with prebuilt linux/amd64 binaries: controlplane, agent, migrate,
-#           admin, secrets (GOOS=linux GOARCH=amd64 go build ./cmd/...), and optionally SHA256SUMS
-#           (sha256sum format; when present every binary must be listed and match, when
-#           absent a loud warning is printed). Inputs are copied to a root-only staging
-#           directory first; validation and installation use the copies.
+#           admin, secrets (GOOS=linux GOARCH=amd64 go build ./cmd/...) and SHA256SUMS
+#           (sha256sum format; every binary must be listed and match; a MISSING SHA256SUMS is
+#           fatal unless --insecure-no-checksum is given). Deliver SHA256SUMS, or its hash,
+#           over a channel separate from the binaries. Inputs are copied to a root-only
+#           staging directory first; validation and installation use the copies.
+#
+# Database roles (22-7 F1): migrations run as the OWNER role `autodeploy` (superuser created by
+# the postgres container; URL in /etc/autodeploy/secrets/database-owner-url, root-only, read
+# only by `autodeploy-run migrate`). Everything else (control plane, admin, secrets) uses the
+# least-privilege runtime role `autodeploy_app` (DML only) via controlplane/database-url.
+# On an existing install (database-url still holds the owner URL) re-running this script
+# creates the runtime credential, migrates as the owner, enables the runtime role's LOGIN,
+# switches database-url to the runtime URL and restarts the control plane.
 #
 # Tunables (environment, all optional, non-secret). IDs only matter on first run.
 #   CONTROLPLANE_ID=802                 uid and gid of autodeploy-controlplane
@@ -74,13 +83,16 @@ die() { printf 'install-app: error: %s\n' "$*" >&2; exit 1; }
 # shellcheck source=stage-lib.sh
 source "$KIT_DIR/stage-lib.sh"
 
-case "${1:-}" in
-  -h|--help) sed -n '2,38p' "${BASH_SOURCE[0]}"; exit 0 ;;
-  "") die "usage: install-app.sh BINDIR" ;;
-  -*) die "unknown option: $1" ;;
-esac
-(($# == 1)) || die "usage: install-app.sh BINDIR"
-BINDIR="$1"
+BINDIR=""
+while (($#)); do
+  case "$1" in
+    -h|--help) sed -n '2,50p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --insecure-no-checksum) INSECURE_NO_CHECKSUM=1; shift ;;
+    -*) die "unknown option: $1" ;;
+    *) [[ -z "$BINDIR" ]] || die "usage: install-app.sh [--insecure-no-checksum] BINDIR"; BINDIR="$1"; shift ;;
+  esac
+done
+[[ -n "$BINDIR" ]] || die "usage: install-app.sh [--insecure-no-checksum] BINDIR"
 
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "Linux x86_64 only"
@@ -420,17 +432,73 @@ for u in "${UNITS[@]}"; do
 done
 systemctl daemon-reload
 for u in "${UNITS[@]}"; do systemctl enable "$u.service" >/dev/null 2>&1; done
-# Apply pending migrations whenever the database is up: binaries from a newer
-# commit can need schema the running database lacks (found on the acer: the
-# manual deploy table from migration 000023 was missing). migrate is idempotent.
-if systemctl is-active --quiet autodeploy-postgres.service && [[ -s "$ETC_DIR/controlplane/database-url" ]]; then
-  log "applying pending database migrations"
-  "$LIB_DIR/autodeploy-run" migrate || die "database migration failed"
+# ---- 7. database: credentials, migrate as owner, activate runtime role ------------------
+# Binaries from a newer commit can need schema the running database lacks (found on the acer:
+# the manual deploy table from migration 000023 was missing). Migration ALWAYS runs before any
+# restart, and a restart that is pending while it cannot run is an error, never a silent skip.
+restart_pending() {
+  ((WAS_TRAEFIK && TRAEFIK_CHANGED)) || ((WAS_CP && (CP_CHANGED || CP_RESTART_DUE))) || ((WAS_AGENT && AGENT_CHANGED))
+}
+state_report() {
+  echo "install-app: host state: binaries, units and configuration are INSTALLED; no service was restarted," >&2
+  echo "install-app: so running services still use their previous binaries. Fix the cause, then re-run install-app.sh." >&2
+}
+# A previous run (or autodeploy-run migrate) switched database-url to the runtime role but may have
+# died before restarting the control plane, which then still holds owner-credential connections.
+CP_MARKER=/var/lib/autodeploy/controlplane-restart-pending
+CP_RESTART_DUE=0
+if [[ -e $CP_MARKER ]]; then
+  CP_RESTART_DUE=1
+  log "restart marker present: the control plane must restart onto the runtime database role"
+fi
+# Swap marker is written by autodeploy-run migrate before the URL is replaced; re-check after it.
+PG_UP=0
+if systemctl is-active --quiet autodeploy-postgres.service; then PG_UP=1; fi
+if ((PG_UP)); then
+  [[ -s "$ETC_DIR/secrets/postgres-password" ]] \
+    || { state_report; die "autodeploy-postgres is running but $ETC_DIR/secrets/postgres-password is missing: cannot migrate"; }
+  # Idempotent: creates only what is missing (owner URL, runtime password, runtime URL if absent).
+  "$KIT_DIR/create-credentials.sh" --database-only || { state_report; die "creating database credentials failed"; }
+  # An existing install still has the owner URL in database-url: the running control plane must
+  # restart onto the runtime URL after the switch that autodeploy-run migrate performs.
+  if grep -q '^postgres://autodeploy:' "$ETC_DIR/controlplane/database-url" 2>/dev/null; then
+    log "database-url holds the owner credential: it will be switched to the runtime role"
+    mark CP_CHANGED
+  fi
+  log "applying pending database migrations (as the owner role) and enabling the runtime role"
+  "$LIB_DIR/autodeploy-run" migrate || { state_report; die "database migration/role activation failed"; }
+  if [[ -e $CP_MARKER ]]; then CP_RESTART_DUE=1; fi
+elif restart_pending; then
+  state_report
+  die "autodeploy-postgres is not running but a service restart is pending: cannot migrate first. Start it (systemctl start autodeploy-postgres), then re-run install-app.sh"
+else
+  log "autodeploy-postgres is not running: migrations skipped (nothing to restart; migrate after starting it, see below)"
 fi
 
 # A running service keeps its old binary/config until restarted. PostgreSQL is left alone.
 if ((WAS_TRAEFIK && TRAEFIK_CHANGED)); then log "restarting autodeploy-traefik"; systemctl restart autodeploy-traefik.service; fi
-if ((WAS_CP && CP_CHANGED)); then log "restarting autodeploy-controlplane"; systemctl restart autodeploy-controlplane.service; fi
+if ((WAS_CP && (CP_CHANGED || CP_RESTART_DUE))); then
+  log "restarting autodeploy-controlplane"
+  # set -e is active: a failed restart aborts here and the marker is KEPT for the next run.
+  systemctl restart autodeploy-controlplane.service
+  # Type=simple: restart returning proves nothing. Require active, then still active after a
+  # stable window (a crash-looping unit flaps), within a bounded wait. Marker KEPT on failure.
+  cp_ok=0; cp_streak=0
+  for ((i = 0; i < 30; i++)); do
+    if systemctl is-active --quiet autodeploy-controlplane.service; then
+      cp_streak=$((cp_streak + 1))
+      if ((cp_streak >= 5)); then cp_ok=1; break; fi
+    else
+      cp_streak=0
+    fi
+    sleep 1
+  done
+  ((cp_ok)) || die "autodeploy-controlplane did not stay active for 5s within 30s after restart; restart marker kept ($CP_MARKER); see: journalctl -u autodeploy-controlplane"
+  rm -f "$CP_MARKER" # marker this installer/autodeploy-run created; restart verified
+elif ((CP_RESTART_DUE)); then
+  # Control plane not running: nothing holds old credentials; its next start uses the runtime URL.
+  rm -f "$CP_MARKER"
+fi
 if ((WAS_AGENT && AGENT_CHANGED)); then log "restarting autodeploy-agent"; systemctl restart autodeploy-agent.service; fi
 if ((PG_UNIT_CHANGED)); then log "note: the PostgreSQL unit changed; restart it yourself when convenient (systemctl restart autodeploy-postgres)"; fi
 
@@ -444,7 +512,7 @@ cat <<NEXTEOF
       sudo $KIT_DIR/create-credentials.sh
  3. Start the database and the proxy, apply migrations, start the control plane:
       sudo systemctl start autodeploy-postgres autodeploy-traefik
-      sudo $LIB_DIR/autodeploy-run migrate
+      sudo $LIB_DIR/autodeploy-run migrate   # as the owner role; then enables the runtime role
       sudo $LIB_DIR/autodeploy-run admin bootstrap --username administrator   # prompts on the terminal
       sudo systemctl start autodeploy-controlplane
  4. Sign in at https://$CP_HOST (import /etc/autodeploy/ca/ca.crt into your browser), register this

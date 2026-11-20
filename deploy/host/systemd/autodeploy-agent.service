@@ -75,11 +75,18 @@ TimeoutStopSec=330
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
-# ProtectSystem=full (not strict): strict would also remount the checkout XFS volume
-# read-only for the agent; whether the build path ever writes a checkout workspace
-# through a descriptor is unverified, so the first real run uses the less intrusive mode.
-# Revisit with strict + ReadWritePaths after 18e.
-ProtectSystem=full
+# ProtectSystem=strict (22-7 F12h): the whole file system is read-only except the paths below, every
+# one of which the agent writes (verified against cmd/agent, internal/agent/{state,client},
+# internal/runtime/{traefik,docker}):
+#   /var/lib/autodeploy/agent                state dir: credential, fence/drain/activation state,
+#                                            and HOME/DOCKER_CONFIG (agent/home) for docker + buildx
+#   /var/lib/autodeploy/traefik/dynamic      Traefik route files (+ the startup writability probe)
+# /tmp (buildx metadata, os.MkdirTemp) is the unit's PrivateTmp and stays writable. The checkout
+# volume /srv/autodeploy/checkout is mounted read-only into the agent's view: the agent only reads
+# finished workspaces (build context); the quota helper that creates and removes them is its own unit.
+# Both paths are created by install-app.sh; a missing one stops the unit (status 226/NAMESPACE).
+ProtectSystem=strict
+ReadWritePaths=/var/lib/autodeploy/agent /var/lib/autodeploy/traefik/dynamic
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

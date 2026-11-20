@@ -37,9 +37,12 @@ stored secret.
 - `/etc/autodeploy/controlplane/github-app-private-key` and `github-webhook-secret-1` (written by
   `enable-github.sh`; the App key can also be re-downloaded from the GitHub App settings, the webhook
   secret must then be re-pasted into the App's webhook settings)
-- `/etc/autodeploy/controlplane/database-url` and `/etc/autodeploy/secrets/postgres-password` (the role
+- `/etc/autodeploy/controlplane/database-url` (runtime role `autodeploy_app`, DML only),
+  `/etc/autodeploy/secrets/runtime-db-password`, `/etc/autodeploy/secrets/database-owner-url` (owner role
+  `autodeploy`, migrations only, root-only) and `/etc/autodeploy/secrets/postgres-password` (the owner
   password only seeds the role on a first start of an empty volume, see `create-credentials.sh`; on a new
-  host `create-credentials.sh` generates a matching pair, so these are optional)
+  host `create-credentials.sh --database-only` generates them and `autodeploy-run migrate` enables the
+  runtime role's login, so these are optional; after restoring a dump always run `autodeploy-run migrate`)
 - `/etc/autodeploy/*.env`: `controlplane.env`, `controlplane-github.env`, `host.env`, `agent.env`,
   `agent-local.env`, `checkout.env` (non-secret, but `agent-local.env` holds the server id and
   `controlplane-github.env` the GitHub App ids)

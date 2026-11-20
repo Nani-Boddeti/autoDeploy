@@ -13,11 +13,14 @@
 #   4. if both are active: run the privileged smoke test (BINDIR/gitcheckout.test, as
 #      autodeploy-agent, env from smoke.env or smoke.env.example). If it fails, restart both
 #      helpers under strace and run the smoke once more to capture the spawn path.
-#   5. everything lands in ONE directory /var/tmp/autodeploy-diag/<timestamp>/ (world readable)
-#      and a short summary is printed. Drop-ins and temp files are always removed (trap).
+#   5. everything lands in ONE root-only directory /var/lib/autodeploy/diag/<timestamp>.XXXXXX/
+#      (0700 root, files 0600) and a short summary is printed. Copy it out explicitly
+#      (e.g. sudo tar -C /var/lib/autodeploy/diag -czf ~/diag.tgz <dir>) after reviewing it.
+#      Drop-ins and temp files are always removed (trap).
 #
 # No secrets are read or written: the units carry only IDs, paths and limits, and strace is
-# run without -v, so environment blocks are not dumped.
+# run without -v, so environment blocks are not dumped, and data-carrying syscalls
+# (read/write/recv/send families) are not traced, so no payload bytes are captured.
 set -uo pipefail
 
 KIT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,11 +46,28 @@ HAVE_STRACE=1
 command -v strace >/dev/null || { HAVE_STRACE=0; printf 'diagnose: strace not installed (apt install strace); traces will be skipped\n' >&2; }
 
 TS="$(date +%Y%m%d-%H%M%S)"
-REPORT="/var/tmp/autodeploy-diag/$TS"
-mkdir -p "$REPORT" || die "cannot create $REPORT"
-chmod 0755 /var/tmp/autodeploy-diag "$REPORT"
+# Root-only report directory. Refuse a pre-existing parent that is a symlink, not a directory
+# or not owned by root: a predictable, attacker-creatable path must never receive root's writes.
+DIAG_ROOT="$STATE_ROOT/diag"
+[[ -d $STATE_ROOT && ! -L $STATE_ROOT ]] || install -d -o root -g root -m 0755 "$STATE_ROOT" || die "cannot create $STATE_ROOT"
+if [[ -e $DIAG_ROOT || -L $DIAG_ROOT ]]; then
+  [[ -d $DIAG_ROOT && ! -L $DIAG_ROOT ]] || die "$DIAG_ROOT is a symlink or not a directory: refusing"
+  [[ "$(stat -c %u "$DIAG_ROOT")" == 0 ]] || die "$DIAG_ROOT is not owned by root: refusing"
+  chmod 0700 "$DIAG_ROOT"
+else
+  install -d -o root -g root -m 0700 "$DIAG_ROOT" || die "cannot create $DIAG_ROOT"
+fi
+REPORT="$(mktemp -d "$DIAG_ROOT/$TS.XXXXXX")" || die "cannot create a report directory under $DIAG_ROOT"
+chmod 0700 "$REPORT"
 SUMMARY="$REPORT/summary.txt"
 : >"$SUMMARY"
+
+# Root-only: directories 0700, files 0600, never group/world readable.
+seal_report() {
+  find "$REPORT" -type d -exec chmod 0700 {} + 2>/dev/null
+  find "$REPORT" -type f -exec chmod 0600 {} + 2>/dev/null
+  return 0
+}
 
 DROPINS=()
 TRACES=()
@@ -65,7 +85,7 @@ cleanup() {
   if ((reload)); then systemctl daemon-reload; fi
   if ((${#TRACES[@]})); then rm -f -- "${TRACES[@]}"; fi
   if [[ -n $SMOKE_TMP ]]; then rm -rf -- "$SMOKE_TMP"; fi
-  chmod -R a+rX "$REPORT" 2>/dev/null
+  seal_report
   return 0
 }
 trap cleanup EXIT
@@ -142,6 +162,10 @@ install_dropin() { # unit
     cmd="$(unit_execstart "$u")"
   fi
   mkdir -p "$d"
+  # Pre-create the trace file exclusively (noclobber = O_EXCL) as 0600 so strace never writes
+  # into an attacker-prepared path and the trace is not world-readable.
+  rm -f -- "$trace"
+  (umask 077; set -C; : >"$trace") || die "cannot create $trace"
   DROPINS+=("$d/zz-diagnose.conf")
   TRACES+=("$trace")
   cat >"$d/zz-diagnose.conf" <<EOF
@@ -151,7 +175,7 @@ Restart=no
 SystemCallFilter=ptrace
 CapabilityBoundingSet=CAP_SYS_PTRACE
 ExecStart=
-ExecStart=$(command -v strace) -f -s 128 -o $trace -- $cmd
+ExecStart=$(command -v strace) -f -s 128 -e trace=!read,write,pread64,pwrite64,readv,writev,recvfrom,sendto,recvmsg,sendmsg,recvmmsg,sendmmsg -o $trace -- $cmd
 EOF
 }
 
@@ -308,7 +332,9 @@ summary() {
   done
 }
 summary 2>&1 | head -n 30 | tee -a "$SUMMARY"
-chmod -R a+rX "$REPORT"
-echo "full report: $REPORT"
+seal_report
+echo "full report (root-only 0700): $REPORT"
+echo "it is NOT copied anywhere: review it, then copy it out explicitly, e.g."
+echo "  sudo tar -C $DIAG_ROOT -czf ~/diag.tgz $(basename -- "$REPORT")"
 if ((INSTALL_RC != 0 || PREFLIGHT_RC != 0 || SMOKE1_RC != 0)); then exit 1; fi
 exit 0

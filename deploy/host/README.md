@@ -11,6 +11,34 @@ HEAD where `executorEnabled` (cmd/agent) and `activationEnabled` (cmd/controlpla
 `true`; the working tree is untouched and the worktree is removed on exit. The result is
 gate-flipped: for the acer only, never release or commit it. Uncommitted changes are not built.
 
+## Installing binaries: SHA256SUMS is mandatory
+
+`install-app.sh` and `install-checkout.sh` refuse to run when `BINDIR/SHA256SUMS` is missing (the
+binaries run as root); `--insecure-no-checksum` is the explicit, loud escape hatch for throwaway hosts.
+A SHA256SUMS that travels in the same directory/channel as the binaries proves nothing against an
+attacker who can change that channel: deliver `SHA256SUMS` (or at least its own sha256, e.g.
+`sha256sum SHA256SUMS`) separately (different transport, or read out to the operator) and compare before
+installing.
+
+## Database roles
+
+Migrations run as the owner role `autodeploy` through `autodeploy-run migrate` (root-only
+`/etc/autodeploy/secrets/database-owner-url`). Control plane, `admin` and `secrets` use the runtime role
+`autodeploy_app` (DML only) from `controlplane/database-url`. Re-running `install-app.sh` on an existing
+install creates the missing credentials, migrates, enables the runtime role and switches the URL.
+
+## diagnose.sh
+
+Reports go to a root-only directory `/var/lib/autodeploy/diag/<timestamp>.XXXXXX` (0700, files 0600);
+strace does not capture read/write payloads. Nothing is copied out for you: review the report and copy it
+explicitly (`sudo tar -C /var/lib/autodeploy/diag -czf ~/diag.tgz <dir>`).
+
+## uninstall.sh
+
+`uninstall.sh --yes` keeps the PostgreSQL volume, credentials, KEK files and the checkout image/ledger.
+`--destroy-data` deletes them too, lists what is lost (including KEK files) and aborts before deleting any
+secret if the Docker volume cannot be removed.
+
 ## enable-github.sh (root, on the host)
 
 Prerequisites: install-app.sh, create-credentials.sh, the database running and migrated, the GitHub

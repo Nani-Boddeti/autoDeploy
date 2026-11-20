@@ -7,17 +7,19 @@
 #   trusted binary directory, quota ledger, and the helper systemd units.
 #
 # Usage (as root):
-#   install-checkout.sh [--git FILE] [--git-remote-https FILE] [--image-size SIZE] BINDIR
+#   install-checkout.sh [--git FILE] [--git-remote-https FILE] [--image-size SIZE] [--insecure-no-checksum] BINDIR
 #
 #   BINDIR  directory with prebuilt linux/amd64 binaries:
 #             checkout-quota-service, checkout-exec, git (see --git), git-remote-https,
 #             github-askpass (optional; only needed for authenticated fetches)
-#           and optionally SHA256SUMS (sha256sum format, basename entries; when present
-#           EVERY file above must be listed and match, else the install stops; when
-#           absent a loud warning is printed). Inputs are copied to a root-only staging
+#           and SHA256SUMS (sha256sum format, basename entries; EVERY file above must be
+#           listed and match, else the install stops; a MISSING SHA256SUMS is fatal unless
+#           --insecure-no-checksum is given, which only prints a loud warning). Inputs are copied to a root-only staging
 #           directory first and everything is validated and installed from the copies.
 #   --git-remote-https FILE   the static git-remote-https (default BINDIR/git-remote-https); installed
 #           next to git, which execs it for every https fetch.
+#   --insecure-no-checksum   proceed without BINDIR/SHA256SUMS (the binaries run as root; never in
+#           production). Transfer SHA256SUMS, or its hash, over a channel separate from the binaries.
 #   --git   use FILE as the trusted git instead of BINDIR/git. checkout-exec only
 #           accepts a root-owned ELF of type ET_EXEC (statically linked, non-PIE);
 #           the distribution /usr/bin/git is a PIE and is refused. In SHA256SUMS it is
@@ -53,7 +55,7 @@ readonly IMAGE="$STATE_ROOT/checkout.xfs"
 readonly QUOTA_STATE_DIR="$STATE_ROOT/checkout-quota"
 readonly QUOTA_STATE_FILE="$QUOTA_STATE_DIR/ledger.json"
 # Root-only record of what the ledger is bound to (checkout UID/GID, loop device). Lives
-# beside the ledger so it survives `uninstall.sh --keep-data` together with it.
+# beside the ledger so it survives `uninstall.sh (default; data is kept unless --destroy-data)` together with it.
 readonly BINDING_FILE="$QUOTA_STATE_DIR/binding.env"
 readonly LOOP_DEV=/dev/loop200   # pinned by autodeploy-checkout-loop.service; 7:200 never changes
 readonly LOOP_MAJMIN=7:200
@@ -102,12 +104,13 @@ while (($#)); do
     --git) GIT_SRC="${2:?--git needs a file}"; shift 2 ;;
     --git-remote-https) GIT_HTTPS_SRC="${2:?--git-remote-https needs a file}"; shift 2 ;;
     --image-size) IMAGE_SIZE="${2:?--image-size needs a value}"; shift 2 ;;
-    -h|--help) sed -n '2,39p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --insecure-no-checksum) INSECURE_NO_CHECKSUM=1; shift ;;
+    -h|--help) sed -n '2,42p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) die "unknown option: $1" ;;
     *) [[ -z "$BINDIR" ]] || die "only one BINDIR allowed"; BINDIR="$1"; shift ;;
   esac
 done
-[[ -n "$BINDIR" ]] || die "usage: install-checkout.sh [--git FILE] [--git-remote-https FILE] [--image-size SIZE] BINDIR"
+[[ -n "$BINDIR" ]] || die "usage: install-checkout.sh [--git FILE] [--git-remote-https FILE] [--image-size SIZE] [--insecure-no-checksum] BINDIR"
 
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "Linux x86_64 only"
@@ -208,7 +211,7 @@ others="$(getent passwd | awk -F: -v g="$CHECKOUT_GID" -v a="$CHECKOUT_USER" '$4
 
 # Changing either checkout identity after ledger creation needs a migration. The facts
 # the ledger is bound to are recorded in $BINDING_FILE (beside the ledger, so they
-# survive uninstall.sh --keep-data); /etc/autodeploy/checkout.env is only a derived copy.
+# survive uninstall.sh (default; data is kept unless --destroy-data)); /etc/autodeploy/checkout.env is only a derived copy.
 # Written by step 7 BEFORE --initialize as STATE=pending and finalized to STATE=bound.
 bind_get() { sed -n "s/^$1=//p" "$BINDING_FILE" 2>/dev/null | head -n1; }
 BIND_STATE=""

@@ -48,6 +48,11 @@ RestartSec=5
 SuccessExitStatus=130 137 143
 
 # The unit only runs the docker CLI against /var/run/docker.sock.
+# CapabilityBoundingSet= (empty): root here only needs to open the socket (owner rw bits on
+# root:docker 0660), which needs no capability; the container's own caps are set by --cap-add
+# in the daemon, not by this unit. (22-7 F12h; verify on the acer: unit starts, pg_isready passes.)
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

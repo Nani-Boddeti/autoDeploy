@@ -7,6 +7,8 @@
 # those COPIES, so a file that changes (or is swapped) in BINDIR after the copy
 # cannot alter what was checked.
 STAGE=""
+# Set to 1 by the caller's --insecure-no-checksum flag: the ONLY way to proceed without SHA256SUMS.
+INSECURE_NO_CHECKSUM=0
 declare -A STAGED=() # staged name -> source basename (key into SHA256SUMS)
 
 stage_init() {
@@ -29,14 +31,19 @@ stage_require_elf() { # name label: ELF64 little-endian x86-64
 }
 
 # Verify every staged file against BINDIR/SHA256SUMS ("<sha256>  <basename>" lines, as
-# written by sha256sum or build-static-git.sh). Without a SUMS file only a loud warning
-# is printed. With one, EVERY staged file must be listed and match.
+# written by sha256sum or build-static-git.sh). A missing SUMS file is FATAL: these binaries run
+# as root. The only bypass is the explicit --insecure-no-checksum flag (INSECURE_NO_CHECKSUM=1),
+# which prints a loud warning. With a SUMS file, EVERY staged file must be listed and match.
+# Deliver SHA256SUMS (or its own hash) over a channel separate from the binaries.
 stage_verify() { # bindir
   local sums="$1/SHA256SUMS" name
   if [[ ! -e "$sums" ]]; then
+    if [[ "${INSECURE_NO_CHECKSUM:-0}" != 1 ]]; then
+      die "$sums not found: refusing to install unverified binaries that run as root. Create it with: (cd $1 && sha256sum <files> > SHA256SUMS), or pass --insecure-no-checksum to skip verification (not for production)"
+    fi
     {
-      echo "install: WARNING: $sums not found: the binaries are NOT integrity-checked."
-      echo "install: WARNING: they run as root. Create it with: (cd $1 && sha256sum <files> > SHA256SUMS)"
+      echo "install: WARNING: $sums not found and --insecure-no-checksum given: the binaries are NOT integrity-checked."
+      echo "install: WARNING: they run as root."
     } >&2
     return 0
   fi

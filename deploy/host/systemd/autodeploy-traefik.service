@@ -55,6 +55,11 @@ Restart=on-failure
 RestartSec=5
 SuccessExitStatus=130 137 143
 
+# Only the docker CLI runs here as root, talking to /var/run/docker.sock (no capability needed;
+# NET_BIND_SERVICE etc. are granted to the container by dockerd via --cap-add above).
+# (22-7 F12h; verify on the acer: unit starts, ports 80/443 answer.)
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

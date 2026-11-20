@@ -10,6 +10,13 @@
 #                   autodeploy-run admin reset-password --username administrator
 #                   autodeploy-run secrets secret init-active-kek --kek kek-1
 #                   autodeploy-run secrets secret verify
+#
+# Database roles (22-7 F1): `migrate` is the ONLY command that uses the OWNER role: it runs as
+# root with /etc/autodeploy/secrets/database-owner-url (root-only), then enables LOGIN for the
+# least-privilege runtime role autodeploy_app (password from secrets/runtime-db-password, fed to
+# psql on stdin: never in argv, the environment or logs) and, on an existing install whose
+# controlplane/database-url still holds the owner URL, replaces it with the runtime URL.
+# `admin` and `secrets` run as the control-plane user with the runtime URL (no DDL needed).
 # `admin` and `secrets` need an interactive terminal (they refuse otherwise),
 # except `secrets secret verify`, which takes no value and may run piped.
 set -euo pipefail
@@ -18,6 +25,13 @@ readonly APP_DIR=/usr/local/lib/autodeploy/app
 readonly ENV_FILE=/etc/autodeploy/controlplane.env
 readonly GITHUB_ENV_FILE=/etc/autodeploy/controlplane-github.env
 readonly RUN_USER=autodeploy-controlplane
+readonly OWNER_URL_FILE=/etc/autodeploy/secrets/database-owner-url
+readonly RT_PW_FILE=/etc/autodeploy/secrets/runtime-db-password
+readonly CP_URL_FILE=/etc/autodeploy/controlplane/database-url
+# Root-only marker: the URL swap happened (or is about to) and the control plane has not yet been
+# restarted onto it. install-app.sh restarts on it and clears it only after a successful restart.
+readonly CP_RESTART_MARKER=/var/lib/autodeploy/controlplane-restart-pending
+readonly PG_CONTAINER=autodeploy-postgres
 
 die() { printf 'autodeploy-run: error: %s\n' "$*" >&2; exit 1; }
 
@@ -37,6 +51,51 @@ if [[ -r $GITHUB_ENV_FILE ]]; then
   while IFS= read -r line; do
     [[ "$line" =~ ^AUTODEPLOY_[A-Z0-9_]+=.*$ ]] && vars+=("$line")
   done <"$GITHUB_ENV_FILE"
+fi
+
+if [[ $tool == migrate ]]; then
+  [[ -s $OWNER_URL_FILE && -s $RT_PW_FILE ]] \
+    || die "$OWNER_URL_FILE or $RT_PW_FILE missing: run create-credentials.sh --database-only (install-app.sh does)"
+  # The owner URL file is root-owned (not readable by the control-plane user): run as root with the
+  # credential loader told to expect uid 0. Drop any URL/owner settings from the env files first.
+  ovars=()
+  for line in "${vars[@]}"; do
+    [[ "$line" =~ ^AUTODEPLOY_(DATABASE_URL_FILE|CREDENTIAL_OWNER_UID)= ]] || ovars+=("$line")
+  done
+  env -i "PATH=/usr/bin:/bin" "TERM=${TERM:-dumb}" "${ovars[@]}" \
+    "AUTODEPLOY_DATABASE_URL_FILE=$OWNER_URL_FILE" "AUTODEPLOY_CREDENTIAL_OWNER_UID=0" \
+    "$APP_DIR/migrate" "$@" || die "migrate failed (owner role); runtime role NOT changed"
+
+  rt_pw="$(<"$RT_PW_FILE")"
+  [[ "$rt_pw" =~ ^[0-9a-f]{48}$ ]] || die "$RT_PW_FILE is malformed"
+  export DOCKER_HOST=unix:///var/run/docker.sock DOCKER_CONFIG=/nonexistent
+  # SQL goes over stdin (printf is a shell builtin: the password is in no argv). The two SETs keep
+  # the statement text out of the server log even if the ALTER fails (owner is a superuser).
+  printf '%s\n' "SET log_statement = 'none';" "SET log_min_error_statement = panic;" \
+    "ALTER ROLE autodeploy_app LOGIN PASSWORD '$rt_pw';" \
+    | /usr/bin/docker exec -i "$PG_CONTAINER" psql -U autodeploy -d autodeploy -X -q -v ON_ERROR_STOP=1 -f - >/dev/null \
+    || die "migrated, but enabling LOGIN for autodeploy_app failed: the runtime role is unusable until this succeeds; re-run 'autodeploy-run migrate'"
+
+  # Existing install: switch database-url from the owner to the runtime URL (atomic replace).
+  if grep -q '^postgres://autodeploy:' "$CP_URL_FILE" 2>/dev/null; then
+    # Marker FIRST (durable before the swap): a crash anywhere after this leaves a restart pending.
+    (umask 077; : >"$CP_RESTART_MARKER") || die "cannot write $CP_RESTART_MARKER; database-url NOT switched"
+    tmp="$(umask 077; mktemp "$CP_URL_FILE.XXXXXX")"
+    # Remove only this temp file (it holds the runtime password) if anything fails before the mv;
+    # the previous EXIT trap, if any, is saved and restored after the mv.
+    eval "set -- $(trap -p EXIT)"; prev_exit_cmd="${3:-}" # "trap -- 'cmd' EXIT" -> cmd
+    trap 'rm -f -- "$tmp"; '"$prev_exit_cmd" EXIT
+    printf 'postgres://autodeploy_app:%s@127.0.0.1:5432/autodeploy?sslmode=disable\n' "$rt_pw" >"$tmp"
+    chown "$RUN_USER:$RUN_USER" "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$CP_URL_FILE"
+    trap - EXIT
+    if [[ -n $prev_exit_cmd ]]; then trap -- "$prev_exit_cmd" EXIT; fi
+    unset prev_exit_cmd
+    echo "autodeploy-run: $CP_URL_FILE now holds the runtime URL; restart autodeploy-controlplane to use it" >&2
+  fi
+  unset rt_pw
+  exit 0
 fi
 
 # Who is at the keyboard: the sudo caller, else the login name, else root. Attribution for the

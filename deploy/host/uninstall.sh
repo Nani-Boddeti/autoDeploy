@@ -3,20 +3,24 @@
 # create-credentials.sh and private-ca.sh created (steps 18a-1 and 18a-2).
 #
 # Usage (as root):
-#   uninstall.sh --yes [--keep-data]
+#   uninstall.sh --yes [--destroy-data]
 #
-#   --yes        required. Without it the script prints what it would remove and exits.
-#   --keep-data  keep what is expensive or irreplaceable, remove everything else:
+#   --yes           required. Without it the script prints what it would remove and exits.
+#   --destroy-data  ALSO delete the irreplaceable data. Without it (the default, and the old
+#                   --keep-data, still accepted as a no-op alias) data is KEPT:
 #                  - the PostgreSQL data volume autodeploy-postgres-data
 #                  - /etc/autodeploy/secrets and /etc/autodeploy/controlplane (the database
-#                    password and URL, throttle and CSRF keys: without them the kept volume
-#                    cannot be reopened)
+#                    owner/runtime passwords and URLs, KEK files and manifest, throttle and
+#                    CSRF keys: without them the kept volume cannot be reopened and secrets
+#                    wrapped by a lost KEK are unrecoverable)
 #                  - the checkout XFS image /var/lib/autodeploy/checkout.xfs and the quota
 #                    ledger /var/lib/autodeploy/checkout-quota, including binding.env
 #                    there (the ledger binds the checkout UID/GID and loop device
 #                    7:200, and binding.env records both, so the image, ledger and
 #                    binding belong together; /etc/autodeploy/checkout.env is only
 #                    a derived copy and is removed)
+#                  With --destroy-data, if the Docker volume cannot be removed (Docker
+#                  unreachable, volume in use) the run aborts BEFORE any secret is deleted.
 #                Users and groups ARE removed; a reinstall recreates the same fixed IDs
 #                (800/801/802), so the kept files line up again.
 #
@@ -52,27 +56,50 @@ warn() { printf 'uninstall: warning: %s\n' "$*" >&2; }
 die() { printf 'uninstall: error: %s\n' "$*" >&2; exit 1; }
 
 YES=0
-KEEP=0
+KEEP=1 # data is kept unless --destroy-data
+DESTROY=0
+KEEP_FLAG=0
 while (($#)); do
   case "$1" in
     --yes) YES=1 ;;
-    --keep-data) KEEP=1 ;;
-    -h|--help) sed -n '2,31p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --keep-data) KEEP_FLAG=1 ;;
+    --destroy-data) DESTROY=1; KEEP=0 ;;
+    -h|--help) sed -n '2,36p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
   shift
 done
+((DESTROY && KEEP_FLAG)) && die "--destroy-data and --keep-data are contradictory"
 [[ $EUID -eq 0 ]] || die "must run as root"
 if ((YES == 0)); then
   printf 'uninstall: refusing to run without --yes. This stops all AutoDeploy services and deletes\n'
-  printf 'their users, configuration, credentials, the private CA and %s.\n' "$([[ -e $IMAGE ]] && echo "the checkout image $IMAGE" || echo "(no checkout image found)")"
-  printf 'Add --keep-data to preserve the PostgreSQL volume, its credentials and the quota ledger/image.\n'
+  printf 'their users, configuration, the private CA and the app files. By default the PostgreSQL volume, its\n'
+  printf 'credentials, the KEK files and the quota ledger/checkout image are KEPT.\n'
+  printf 'Add --destroy-data to delete them too (irreversible).\n'
   exit 2
 fi
 
 export DOCKER_HOST=unix:///var/run/docker.sock DOCKER_CONFIG=/nonexistent
 unset DOCKER_CONTEXT
 have_docker() { command -v docker >/dev/null && docker info >/dev/null 2>&1; }
+
+# --destroy-data is irreversible: say exactly what is lost, and refuse to start when Docker (and
+# so the PostgreSQL volume) cannot be reached, so secrets are never deleted next to an orphaned volume.
+if ((DESTROY)); then
+  have_docker || die "--destroy-data needs a reachable Docker Engine to remove volume $PG_VOLUME; refusing before anything is changed (start Docker, or run without --destroy-data)"
+  {
+    echo "uninstall: WARNING: --destroy-data will PERMANENTLY delete:"
+    echo "  - the PostgreSQL volume $PG_VOLUME (all projects, deployments, users, audit history)"
+    echo "  - $ETC_DIR/secrets and $ETC_DIR/controlplane (database passwords, throttle/CSRF keys)"
+    kek_files="$(compgen -G "$ETC_DIR/controlplane/secret-*" || true)"
+    if [[ -n $kek_files || -e $ETC_DIR/controlplane/kek-manifest.json ]]; then
+      echo "  - KEK FILES (secret-<id>, kek-manifest.json): every application secret wrapped by them becomes UNRECOVERABLE:"
+      printf '      %s\n' $kek_files
+    fi
+    echo "  - the checkout image $IMAGE and ledger $LEDGER_DIR"
+    echo "  Make sure a database backup AND a separate KEK backup exist (docs/operations/backup-restore.md)."
+  } >&2
+fi
 
 # The managed /etc/hosts block is edited only if its markers are intact: BEGIN and END each
 # exactly once, in order. Checked up front so a damaged file stops the run before anything
@@ -115,13 +142,21 @@ if have_docker; then
   if ((KEEP)); then
     log "keeping Docker volume $PG_VOLUME"
   else
-    docker volume rm "$PG_VOLUME" >/dev/null 2>&1 || true
+    # Abort BEFORE deleting any secret if the volume survives: credentials without their volume
+    # (or the reverse) would leave an unrecoverable orphan.
+    # Distinguish "no such volume" (ls succeeds, empty) from any other failure (ls fails): an
+    # unexpected error aborts here, before secrets are touched.
+    vol_ls="$(docker volume ls -q --filter "name=^${PG_VOLUME}\$" 2>/dev/null)" \
+      || die "could not determine whether Docker volume $PG_VOLUME exists (docker volume ls failed). Secrets and data under $ETC_DIR and $STATE_ROOT were NOT deleted; services are already stopped. Fix Docker and re-run"
+    if [[ $vol_ls == "$PG_VOLUME" ]] && ! docker volume rm "$PG_VOLUME" >/dev/null 2>&1; then
+      die "could not remove Docker volume $PG_VOLUME (in use?). Secrets and data under $ETC_DIR and $STATE_ROOT were NOT deleted; services are already stopped. Fix it and re-run"
+    fi
     # Images pinned by the units; ignore failure when something else still uses them.
     docker image rm "postgres:18.6@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42" >/dev/null 2>&1 || true
     docker image rm "traefik:v3.7.18@sha256:9c437ac4f09ce6f4980a8544902d3475fdf70a1a7c578729581d2535dfa7d635" >/dev/null 2>&1 || true
   fi
 else
-  warn "Docker Engine not reachable: containers, network, volume and images were NOT removed"
+  warn "Docker Engine not reachable: containers, network, volume and images were NOT removed (data is kept)"
 fi
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
   # Rules added by install-app.sh carry the comment "autodeploy: traefik" (the older kit's

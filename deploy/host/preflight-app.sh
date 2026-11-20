@@ -237,6 +237,10 @@ fi
 stat_is() { [[ "$(stat -c '%U:%G:%a' "$1" 2>/dev/null)" == "$2" ]]; }
 if is_root; then
   check "postgres-password is root:root 0600 [root]" stat_is "$ETC_DIR/secrets/postgres-password" root:root:600
+  check "secrets/database-owner-url is root:root 0600 [root]" stat_is "$ETC_DIR/secrets/database-owner-url" root:root:600
+  check "secrets/runtime-db-password is root:root 0600 [root]" stat_is "$ETC_DIR/secrets/runtime-db-password" root:root:600
+  runtime_url_ok() { grep -q '^postgres://autodeploy_app:' "$ETC_DIR/controlplane/database-url"; }
+  check "controlplane/database-url uses the runtime role autodeploy_app, not the owner [root]" runtime_url_ok
   for f in database-url username-throttle-key-1 csrf-key-1; do
     check "controlplane/$f is $CP_USER:$CP_USER 0600 [root]" stat_is "$ETC_DIR/controlplane/$f" "$CP_USER:$CP_USER:600"
   done
