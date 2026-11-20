@@ -404,6 +404,42 @@ td .actions form input:not([type="checkbox"]):not([type="radio"]), td .actions f
 .env-table td.links { white-space: normal; }
 .host { color: var(--link); font-size: 0.8rem; }
 
+/* Environment strip (config and route pages), log picker, deployments filter. */
+.strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs);
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 0 var(--space-md);
+  padding: var(--space-2xs);
+  background: var(--alt);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.strip a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 6px 14px;
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-size: 0.9rem;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+  transition: background-color 120ms;
+}
+.strip a:hover { background: var(--surface); }
+.strip a[aria-current="true"] { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.strip-form, .picker, .filter-form { margin: 0 0 var(--space-md); }
+.picker select { min-width: min(24rem, 100%); max-width: 100%; }
+.form-note { flex: 0 0 100%; max-width: none; margin: 0; }
+.env-empty { display: flex; flex-direction: column; gap: var(--space-sm); margin: 0 0 var(--space-lg); }
+.env-empty h2, .env-empty p { margin: 0; }
+.pending { display: flex; flex-direction: column; gap: var(--space-sm); margin: 0; padding: 0; list-style: none; }
+.pending li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs) var(--space-md); padding: var(--space-sm) var(--space-md); background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.pending .actions { margin-left: auto; }
+
 @media (max-width: 759px) {
   .board-row { grid-template-columns: minmax(0, 1fr); }
   .actions { gap: var(--space-xs); }

@@ -25,10 +25,21 @@ func hasOverview(h *Handler) bool {
 
 func hasServers(h *Handler) bool { return h.config.ServerAdmin != nil }
 
+// The first-class pages choose their environment from the overview read, so
+// they appear only when it exists as well as their own dependency.
+func hasConfigPage(h *Handler) bool { return h.config.RuntimeConfigAdmin != nil && hasOverview(h) }
+
+func hasRoutesPage(h *Handler) bool { return h.config.RouteHeadAdmin != nil && hasOverview(h) }
+
+func hasLogsPage(h *Handler) bool { return h.config.DeploymentLogReader != nil && hasOperations(h) }
+
 var navItems = []navDef{
 	{Key: "home", Label: "Overview", Href: "/", Group: "Operate", enabled: always},
 	{Key: "environments", Label: "Environments", Href: "/environments", Group: "Operate", enabled: hasOverview},
 	{Key: "deployments", Label: "Deployments", Href: "/deployments", Group: "Operate", enabled: hasOperations},
+	{Key: "logs", Label: "Logs", Href: "/deployments/logs", Group: "Operate", enabled: hasLogsPage},
+	{Key: "config", Label: "Runtime config", Href: "/environments/config", Group: "Configure", enabled: hasConfigPage},
+	{Key: "routes", Label: "Routes", Href: "/environments/route", Group: "Configure", enabled: hasRoutesPage},
 	{Key: "projects", Label: "Projects", Href: "/projects", Group: "Configure", enabled: hasOperations},
 	{Key: "github", Label: "GitHub", Href: "/github", Group: "Configure", enabled: always},
 	{Key: "servers", Label: "Servers", Href: "/servers", Group: "Infrastructure", enabled: hasServers},

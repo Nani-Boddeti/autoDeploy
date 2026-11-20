@@ -91,7 +91,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		t.Fatalf("/login = %d", login.Code)
 	}
 	pages["/login"] = login.Body.String()
-	for _, target := range []string{"/", "/environments", "/servers", "/github", "/reconciliation", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1"} {
+	for _, target := range []string{"/", "/environments", "/servers", "/github", "/reconciliation", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/environments/route", "/environments/config", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1", "/deployments/logs"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, serversRequest(http.MethodGet, target, nil, p, h))
 		if rr.Code != http.StatusOK {

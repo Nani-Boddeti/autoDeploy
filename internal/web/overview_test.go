@@ -552,6 +552,23 @@ func emptyDumpPages() map[string]func(t *testing.T) string {
 			return pageGet(t, h, p, "/github")
 		},
 		"reconciliation-empty": empty("/reconciliation"),
+		// 22-3h: first-class pages with no owned environment or deployment.
+		"environment-config-empty": func(t *testing.T) string {
+			h, _, _, _, p := fcHandler(t, []postgres.EnvironmentOverview{fourRows()[1]})
+			return pageGet(t, h, p, "/environments/config")
+		},
+		"environment-route-empty": func(t *testing.T) string {
+			h, _, _, _, p := fcHandler(t, nil)
+			return pageGet(t, h, p, "/environments/route")
+		},
+		"logs-empty": func(t *testing.T) string {
+			h, _, _, p := logsPickerHandler(t, nil)
+			return pageGet(t, h, p, "/deployments/logs")
+		},
+		"environment-config-many": func(t *testing.T) string {
+			h, _, _, _, p := fcHandler(t, manyOwned(14))
+			return pageGet(t, h, p, "/environments/config")
+		},
 		"reconciliation-empty-servers": func(t *testing.T) string {
 			h, admin, p := serversHandler(t)
 			admin.servers = []postgres.ServerSummary{okServer()}

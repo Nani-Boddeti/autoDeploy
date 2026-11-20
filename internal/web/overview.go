@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"time"
 
@@ -392,4 +393,106 @@ func (h *Handler) environmentsList(w http.ResponseWriter, r *http.Request) {
 		view.Checklist = h.newChecklist(facts.repoCount > 0, facts.hasActiveServer(), anyBound(rows), 0)
 	}
 	renderOperations(w, environmentsTemplate, view)
+}
+
+// ---- environment strip (22-3h) ----
+
+// envChoice is one environment of the "envstrip" partial.
+type envChoice struct {
+	ID, Href string
+	Current  bool
+}
+
+// ownedChoices lists the OWNED environments of the overview rows, sorted by id,
+// each linking to page. Bound-only environments are skipped: the config and
+// route stores deny them (environmentOwnedBy), so a link would only 400.
+func ownedChoices(rows []postgres.EnvironmentOverview, page, selected string) []envChoice {
+	choices := make([]envChoice, 0, len(rows))
+	for _, e := range rows {
+		if !e.Owned {
+			continue
+		}
+		choices = append(choices, envChoice{ID: e.EnvironmentID, Href: page + "?environment_id=" + url.QueryEscape(e.EnvironmentID), Current: e.EnvironmentID == selected})
+	}
+	sort.Slice(choices, func(i, j int) bool { return choices[i].ID < choices[j].ID })
+	return choices
+}
+
+// environmentChoices reads the overview and returns the owned environments as
+// strip choices for page, marking selected. Without an overview reader it
+// returns nil, nil.
+func (h *Handler) environmentChoices(ctx context.Context, p auth.Principal, page, selected string) ([]envChoice, error) {
+	reader, ok := h.overviewReader()
+	if !ok {
+		return nil, nil
+	}
+	rows, err := reader.ListEnvironmentOverview(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return ownedChoices(rows, page, selected), nil
+}
+
+// stripFor is environmentChoices for page renders: the strip is decoration, so
+// a failed read only omits it (logged at debug) and never fails the page.
+func (h *Handler) stripFor(ctx context.Context, p auth.Principal, page, selected string) []envChoice {
+	choices, err := h.environmentChoices(ctx, p, page, selected)
+	if err != nil {
+		h.logger().Debug("environment strip: overview read failed", "error", err)
+		return nil
+	}
+	return choices
+}
+
+// envEmptyView is the zero-owned-environments state of the config and route
+// pages: the setup checklist plus the bound-but-never-deployed environments,
+// each with the inline Deploy form.
+type envEmptyView struct {
+	Checklist *checklistView
+	Pending   []boardRow
+}
+
+// newEnvEmptyView builds the empty state from the overview rows (none owned).
+func (h *Handler) newEnvEmptyView(ctx context.Context, p auth.Principal, rows []postgres.EnvironmentOverview) (*envEmptyView, error) {
+	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
+	if err != nil {
+		return nil, err
+	}
+	var pending []postgres.EnvironmentOverview
+	for _, e := range rows {
+		if !e.Owned && e.Bound {
+			pending = append(pending, e)
+		}
+	}
+	board, err := h.buildBoard(pending, csrf, "/environments")
+	if err != nil {
+		return nil, err
+	}
+	facts := h.loadSetupFacts(ctx, p)
+	checklist := h.newChecklist(facts.repoCount > 0, facts.hasActiveServer(), anyBound(rows), 0)
+	checklist.Compact = len(rows) > 0
+	return &envEmptyView{Checklist: checklist, Pending: board}, nil
+}
+
+// defaultEnvironment serves the no-id GET of the config and route pages. It
+// returns the strip with the first owned environment current, or an empty view
+// when the owner has none. ok is false after a response was written.
+func (h *Handler) defaultEnvironment(w http.ResponseWriter, r *http.Request, p auth.Principal, page string) (choices []envChoice, empty *envEmptyView, ok bool) {
+	reader, _ := h.overviewReader()
+	rows, err := reader.ListEnvironmentOverview(r.Context(), p)
+	if err != nil {
+		operationsFailure(w, r, err)
+		return nil, nil, false
+	}
+	choices = ownedChoices(rows, page, "")
+	if len(choices) > 0 {
+		choices[0].Current = true
+		return choices, nil, true
+	}
+	empty, err = h.newEnvEmptyView(r.Context(), p, rows)
+	if err != nil {
+		plain(w, http.StatusInternalServerError, "the page could not be rendered\n")
+		return nil, nil, false
+	}
+	return nil, empty, true
 }

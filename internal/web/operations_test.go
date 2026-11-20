@@ -367,8 +367,12 @@ func TestOperationsPagesStayCSPClean(t *testing.T) {
 			t.Errorf("%s Cache-Control = %q", target, rr.Header().Get("Cache-Control"))
 		}
 		body := rr.Body.String()
-		// The sidebar's sign-out form is the only form these read-only pages may carry.
-		lower := strings.ToLower(strings.Replace(body, `<form method="post" action="/logout">`, "", 1))
+		// The sidebar's sign-out form and the GET filter/picker forms (22-3h) are the only forms these read-only pages may carry.
+		lower := body
+		for _, allowed := range []string{`<form method="post" action="/logout">`, `<form method="get" action="/deployments" class="filter-form">`, `<form method="get" action="/deployments/logs" class="picker">`} {
+			lower = strings.Replace(lower, allowed, "", 1)
+		}
+		lower = strings.ToLower(lower)
 		if !strings.Contains(body, `<link rel="stylesheet" href="/static/app.css">`) || !strings.Contains(body, `<nav aria-label="Primary">`) {
 			t.Errorf("%s missing layout", target)
 		}

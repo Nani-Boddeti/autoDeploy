@@ -1320,7 +1320,10 @@ func buildBindingRows(bindings []postgres.RuntimeBinding) []bindingRow {
 }
 
 func (h *Handler) renderEnvironmentConfig(w http.ResponseWriter, r *http.Request, p auth.Principal, view runtimeConfigView) {
-	view.Nav = h.navFor(r.Context(), "servers", p)
+	view.Nav = h.navFor(r.Context(), "config", p)
+	if view.Strip == nil && view.Empty == nil {
+		view.Strip = h.stripFor(r.Context(), p, "/environments/config", view.EnvironmentID)
+	}
 	renderOperations(w, environmentConfigTemplate, view)
 }
 
@@ -1334,14 +1337,29 @@ func (h *Handler) environmentConfigGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	if len(q) != 1 || len(q["environment_id"]) != 1 {
-		badRequest(w)
-		return
-	}
-	environmentID := q.Get("environment_id")
-	if !github.ValidOpaqueID(environmentID) {
-		badRequest(w)
-		return
+	var environmentID string
+	var strip []envChoice
+	if _, overview := h.overviewReader(); overview && len(q) == 0 {
+		// 22-3h: environment_id is optional; default to the first owned environment.
+		choices, empty, ok := h.defaultEnvironment(w, r, p, "/environments/config")
+		if !ok {
+			return
+		}
+		if empty != nil {
+			h.renderEnvironmentConfig(w, r, p, runtimeConfigView{Empty: empty})
+			return
+		}
+		environmentID, strip = choices[0].ID, choices
+	} else {
+		if len(q) != 1 || len(q["environment_id"]) != 1 {
+			badRequest(w)
+			return
+		}
+		environmentID = q.Get("environment_id")
+		if !github.ValidOpaqueID(environmentID) {
+			badRequest(w)
+			return
+		}
 	}
 	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
 	if err != nil {
@@ -1353,7 +1371,9 @@ func (h *Handler) environmentConfigGet(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnvironmentConfig(w, r, p, buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found))
+	view := buildRuntimeConfigView(csrf, environmentID, cfg, bindings, found)
+	view.Strip = strip
+	h.renderEnvironmentConfig(w, r, p, view)
 }
 
 // renderConfigRejection re-fetches only the bindings table (never the
@@ -1568,7 +1588,10 @@ func buildRouteHeadView(csrf, environmentID string, head postgres.RouteHead, fou
 }
 
 func (h *Handler) renderRouteHead(w http.ResponseWriter, r *http.Request, p auth.Principal, view routeHeadView) {
-	view.Nav = h.navFor(r.Context(), "servers", p)
+	view.Nav = h.navFor(r.Context(), "routes", p)
+	if view.Strip == nil && view.Empty == nil {
+		view.Strip = h.stripFor(r.Context(), p, "/environments/route", view.EnvironmentID)
+	}
 	renderOperations(w, routeHeadTemplate, view)
 }
 
@@ -1582,14 +1605,29 @@ func (h *Handler) environmentRouteGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	if len(q) != 1 || len(q["environment_id"]) != 1 {
-		badRequest(w)
-		return
-	}
-	environmentID := q.Get("environment_id")
-	if !github.ValidOpaqueID(environmentID) {
-		badRequest(w)
-		return
+	var environmentID string
+	var strip []envChoice
+	if _, overview := h.overviewReader(); overview && len(q) == 0 {
+		// 22-3h: environment_id is optional; default to the first owned environment.
+		choices, empty, ok := h.defaultEnvironment(w, r, p, "/environments/route")
+		if !ok {
+			return
+		}
+		if empty != nil {
+			h.renderRouteHead(w, r, p, routeHeadView{Empty: empty})
+			return
+		}
+		environmentID, strip = choices[0].ID, choices
+	} else {
+		if len(q) != 1 || len(q["environment_id"]) != 1 {
+			badRequest(w)
+			return
+		}
+		environmentID = q.Get("environment_id")
+		if !github.ValidOpaqueID(environmentID) {
+			badRequest(w)
+			return
+		}
 	}
 	csrf, err := auth.NewSessionCSRF(h.config.CSRFKeys, p.SessionID, h.config.PublicOrigin)
 	if err != nil {
@@ -1603,6 +1641,7 @@ func (h *Handler) environmentRouteGet(w http.ResponseWriter, r *http.Request) {
 	}
 	view := buildRouteHeadView(csrf, environmentID, head, found)
 	view.Releases = h.environmentReleaseRows(r.Context(), p, environmentID)
+	view.Strip = strip
 	h.renderRouteHead(w, r, p, view)
 }
 
@@ -2161,7 +2200,11 @@ type bindingRow struct {
 	DockerfileID string
 }
 type runtimeConfigView struct {
-	Nav                                                                   navView
+	Nav navView
+	// Strip lists the owned environments (nil without an overview reader);
+	// Empty replaces the page body when the owner has none (22-3h).
+	Strip                                                                 []envChoice
+	Empty                                                                 *envEmptyView
 	CSRF, EnvironmentID                                                   string
 	Exists                                                                bool
 	Revision                                                              string
@@ -2185,6 +2228,8 @@ type runtimeConfigView struct {
 
 type routeHeadView struct {
 	Nav                    navView
+	Strip                  []envChoice
+	Empty                  *envEmptyView
 	CSRF, EnvironmentID    string
 	Exists                 bool
 	Hostname               string

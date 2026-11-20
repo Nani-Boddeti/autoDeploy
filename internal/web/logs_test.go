@@ -93,7 +93,7 @@ func TestLogsAuthAndMethods(t *testing.T) {
 
 func TestLogsQueryValidation(t *testing.T) {
 	h, ls, _, p := logsHandler(t)
-	for _, target := range []string{"/deployments/logs", "/deployments/logs?id=", "/deployments/logs?id=a&id=b", "/deployments/logs?id=dep-1&limit=5", "/deployments/logs?id=dep-1&x=1", "/deployments/logs?id=a%00b"} {
+	for _, target := range []string{"/deployments/logs?id=", "/deployments/logs?id=a&id=b", "/deployments/logs?id=dep-1&limit=5", "/deployments/logs?id=dep-1&x=1", "/deployments/logs?id=a%00b"} {
 		if rr := opsGet(h, p, http.MethodGet, target); rr.Code != http.StatusNotFound {
 			t.Errorf("%s = %d, want 404", target, rr.Code)
 		}

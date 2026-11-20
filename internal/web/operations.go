@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -225,6 +226,8 @@ type projectRow struct {
 	LatestCommit    string
 	LatestTime      string
 	LatestDetailURL string
+	// LatestReason is set only when the latest deployment failed.
+	LatestReason reasonView
 	// CanDeploy renders the manual Deploy form; Nonce is fresh per render.
 	CanDeploy bool
 	Nonce     string
@@ -297,6 +300,7 @@ func (h *Handler) projectsList(w http.ResponseWriter, r *http.Request) {
 			row.LatestCommit = d.ShortCommit()
 			row.LatestTime = formatTimestamp(d.CreatedAt)
 			row.LatestDetailURL = detailHref(d.DeploymentID)
+			row.LatestReason = failedReason(d.Status, d.FailureClass, d.FailureReason)
 		}
 		if view.CanDeploy && pr.HasBinding && pr.BindingActive && pr.RepositoryDefaultRef != "" {
 			nonce, nonceErr := newManualNonce()
@@ -343,6 +347,52 @@ type deploymentsView struct {
 	OlderHref     string
 	ClearHref     string
 	HasFilter     bool
+	// Filter feeds the GET filter form (22-3h).
+	Filter filterFormView
+}
+
+// filterOption is one <option> of a filter select; the empty ID is "All".
+type filterOption struct {
+	ID, Label string
+	Selected  bool
+}
+
+type filterFormView struct {
+	Projects, Environments []filterOption
+}
+
+// newFilterForm lists the owner's projects and their environments as options,
+// preselecting the active filters. A filter value missing from the lists (or a
+// failed project read, which leaves them empty) is still offered so the form
+// never silently drops the current state.
+func newFilterForm(projects []postgres.ProjectSummary, projectID, environmentID string) filterFormView {
+	projectIDs, environmentIDs := map[string]bool{}, map[string]bool{}
+	for _, pr := range projects {
+		projectIDs[pr.ProjectID] = true
+		for _, e := range pr.EnvironmentIDs {
+			environmentIDs[e] = true
+		}
+	}
+	options := func(known map[string]bool, current, all string) []filterOption {
+		if current != "" {
+			known[current] = true
+		}
+		ids := make([]string, 0, len(known))
+		for id := range known {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		out := make([]filterOption, 0, len(ids)+1)
+		out = append(out, filterOption{Label: all, Selected: current == ""})
+		for _, id := range ids {
+			out = append(out, filterOption{ID: id, Label: id, Selected: id == current})
+		}
+		return out
+	}
+	return filterFormView{
+		Projects:     options(projectIDs, projectID, "All projects"),
+		Environments: options(environmentIDs, environmentID, "All environments"),
+	}
 }
 
 func newDeploymentRow(d postgres.DeploymentSummary) deploymentRow {
@@ -390,6 +440,13 @@ func (h *Handler) deploymentsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	view := deploymentsView{Nav: h.navFor(r.Context(), "deployments", p), ExecNotice: !h.config.ActivationEnabled, ProjectID: projectID, EnvironmentID: environmentID, HasFilter: projectID != "" || environmentID != "", ClearHref: "/deployments"}
+	// The select options are a convenience: a failed project read only shrinks them.
+	projects, perr := h.config.OperationsReader.ListProjects(r.Context(), p)
+	if perr != nil {
+		h.logger().Debug("deployments filter: listing projects failed", "error", perr)
+		projects = nil
+	}
+	view.Filter = newFilterForm(projects, projectID, environmentID)
 	for _, d := range list.Items {
 		view.Deployments = append(view.Deployments, newDeploymentRow(d))
 	}

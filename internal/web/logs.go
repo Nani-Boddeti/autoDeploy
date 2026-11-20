@@ -72,7 +72,72 @@ type deploymentLogsView struct {
 	Groups     []logGroup
 	NewerHref  string
 	StartHref  string
+	FollowHref string
 	Refresh    bool
+	// Picker is the newest deployments as <select> options (nil when unavailable);
+	// Empty carries the zero-deployments state.
+	Picker []deploymentOption
+	Empty  *checklistView
+}
+
+// logPickerLimit is the number of newest deployments the log picker offers.
+const logPickerLimit = 20
+
+// deploymentOption is one entry of the log picker.
+type deploymentOption struct {
+	ID, Label string
+	Selected  bool
+}
+
+// deploymentOptions labels deployments "environment · commit · status · created".
+// The current deployment is always present and selected, even when it is older
+// than the newest list.
+func deploymentOptions(items []postgres.DeploymentSummary, current string) []deploymentOption {
+	if len(items) > logPickerLimit {
+		items = items[:logPickerLimit]
+	}
+	options := make([]deploymentOption, 0, len(items)+1)
+	found := false
+	for _, d := range items {
+		sel := d.DeploymentID == current
+		found = found || sel
+		options = append(options, deploymentOption{
+			ID: d.DeploymentID, Selected: sel,
+			Label: d.EnvironmentID + " \u00b7 " + d.ShortCommit() + " \u00b7 " + d.Status + " \u00b7 " + formatTimestamp(d.CreatedAt),
+		})
+	}
+	if !found {
+		options = append([]deploymentOption{{ID: current, Label: current, Selected: true}}, options...)
+	}
+	return options
+}
+
+// logPicker lists the newest deployments around an explicit id. The picker is a
+// convenience, so any failure (or a missing reader) only omits it.
+func (h *Handler) logPicker(r *http.Request, p auth.Principal, current string) []deploymentOption {
+	if h.config.OperationsReader == nil {
+		return nil
+	}
+	list, err := h.config.OperationsReader.ListDeployments(r.Context(), p, postgres.DeploymentFilter{}, postgres.DeploymentPage{Limit: logPickerLimit})
+	if err != nil {
+		h.logger().Debug("log picker: listing deployments failed", "error", err)
+		return nil
+	}
+	return deploymentOptions(list.Items, current)
+}
+
+// renderLogsEmpty renders the page for an owner with no deployments: the setup
+// checklist, never a bare sentence.
+func (h *Handler) renderLogsEmpty(w http.ResponseWriter, r *http.Request, p auth.Principal) {
+	facts := h.loadSetupFacts(r.Context(), p)
+	bound := false
+	if reader, ok := h.overviewReader(); ok {
+		if rows, err := reader.ListEnvironmentOverview(r.Context(), p); err == nil {
+			bound = anyBound(rows)
+		}
+	}
+	view := deploymentLogsView{Nav: h.navFor(r.Context(), "logs", p), ExecNotice: !h.config.ActivationEnabled, Title: "Logs", Empty: h.newChecklist(facts.repoCount > 0, facts.hasActiveServer(), bound, 0)}
+	renderOperations(w, logsTemplate, view)
 }
 
 // deploymentLogs renders one page of a deployment's log chunks.
@@ -97,7 +162,8 @@ func (h *Handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, single := singleParam(q, "id")
-	if !single || !validOperationsID(id) {
+	_, hasID := q["id"]
+	if hasID && (!single || !validOperationsID(id)) {
 		http.NotFound(w, r)
 		return
 	}
@@ -107,13 +173,38 @@ func (h *Handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var after int64
-	if _, present := q["after"]; present {
+	_, hasAfter := q["after"]
+	if hasAfter {
 		n, valid := parseChunkCursor(rawAfter)
 		if !valid {
 			badRequest(w)
 			return
 		}
 		after = n
+	}
+	var picker []deploymentOption
+	if !hasID {
+		// 22-3h: id is optional; default to the newest deployment. A cursor
+		// belongs to one deployment, so `after` without `id` is meaningless.
+		if hasAfter {
+			badRequest(w)
+			return
+		}
+		if h.config.OperationsReader == nil {
+			http.NotFound(w, r)
+			return
+		}
+		list, err := h.config.OperationsReader.ListDeployments(r.Context(), p, postgres.DeploymentFilter{}, postgres.DeploymentPage{Limit: logPickerLimit})
+		if err != nil {
+			operationsFailure(w, r, err)
+			return
+		}
+		if len(list.Items) == 0 {
+			h.renderLogsEmpty(w, r, p)
+			return
+		}
+		id = list.Items[0].DeploymentID
+		picker = deploymentOptions(list.Items, id)
 	}
 	page, err := h.config.DeploymentLogReader.ListDeploymentLogs(r.Context(), p, id, after, 0)
 	if err != nil {
@@ -123,7 +214,10 @@ func (h *Handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 		operationsFailure(w, r, err)
 		return
 	}
-	view := deploymentLogsView{Nav: h.navFor(r.Context(), "deployments", p), ExecNotice: !h.config.ActivationEnabled, Title: "Logs for deployment " + id, ID: id, DetailHref: detailHref(id)}
+	if hasID {
+		picker = h.logPicker(r, p, id)
+	}
+	view := deploymentLogsView{Nav: h.navFor(r.Context(), "logs", p), ExecNotice: !h.config.ActivationEnabled, Title: "Logs for deployment " + id, ID: id, DetailHref: detailHref(id), Picker: picker}
 	if after > 0 {
 		view.StartHref = logsHref(id, 0)
 	}
@@ -144,7 +238,15 @@ func (h *Handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 	} else if h.config.OperationsReader != nil {
 		// Best effort: any failure here only means no auto-refresh.
 		if d, derr := h.config.OperationsReader.GetDeploymentDetail(r.Context(), p, id); derr == nil {
-			view.Refresh = !terminalJobStates[d.Job.State]
+			live := !terminalJobStates[d.Job.State]
+			if hasID {
+				view.Refresh = live
+			} else if live {
+				// No-id mode resolves to the newest deployment on every load, so
+				// an auto-refresh could jump to a newer one; offer an explicit
+				// link that follows this deployment instead.
+				view.FollowHref = logsHref(id, 0)
+			}
 		}
 	}
 	renderOperations(w, logsTemplate, view)

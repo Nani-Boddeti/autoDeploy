@@ -79,6 +79,11 @@ func parityEntries() []parityEntry {
 		// 22-3f: the overview board and the environments page (new pages; the landing entry above is unchanged).
 		{"overview board", parityOverviewBoard, overviewBoardFragments()},
 		{"environments page", parityEnvironmentsPage, environmentsPageFragments()},
+		// 22-3h: no-id entry pages (strip, picker) and the deployments filter form.
+		{"environment config no id", parityConfigNoID, environmentNoIDFragments("/environments/config")},
+		{"environment route no id", parityRouteNoID, environmentNoIDFragments("/environments/route")},
+		{"deployment logs no id", parityLogsNoID, logsNoIDFragments()},
+		{"deployments filter form", parityDeploymentsFilter, deploymentsFilterFragments()},
 	}
 }
 
@@ -633,4 +638,57 @@ func parityGitHubContinue(t *testing.T) string {
 	return execTemplate(t, func(b *bytes.Buffer) error {
 		return githubContinueTemplate.Execute(b, githubContinueView{Nav: parityNav(t, "github")})
 	})
+}
+
+// ---- 22-3h: first-class entry pages and filters ----
+
+func parityConfigNoID(t *testing.T) string {
+	h, _, _, _, p := fcHandler(t, fourRows())
+	return pageGet(t, h, p, "/environments/config")
+}
+
+func parityRouteNoID(t *testing.T) string {
+	h, _, _, _, p := fcHandler(t, fourRows())
+	return pageGet(t, h, p, "/environments/route")
+}
+
+// environmentNoIDFragments pins the first owned environment (sorted by id),
+// the strip over the owned environments only, and the page's own form.
+func environmentNoIDFragments(path string) []string {
+	return []string{
+		`<nav aria-label="Environments" class="strip">`,
+		`<a href="` + path + `?environment_id=env-blocked" aria-current="true">env-blocked</a>`,
+		`<a href="` + path + `?environment_id=env-failed">env-failed</a>`,
+		`<a href="` + path + `?environment_id=env-live">env-live</a>`,
+		`action="` + path + `"`, `name="environment_id" value="env-blocked"`, `name="expected_revision" value=""`, `name="csrf" value="`,
+	}
+}
+
+func parityLogsNoID(t *testing.T) string {
+	h, ls, _, p := logsPickerHandler(t, nDeployments(3))
+	ls.page = postgres.DeploymentLogPage{Items: []postgres.DeploymentLogLine{line(1, 1, "build", "newest build line")}}
+	return pageGet(t, h, p, "/deployments/logs")
+}
+
+func logsNoIDFragments() []string {
+	return []string{
+		`<form method="get" action="/deployments/logs" class="picker">`, `<select name="id">`,
+		`<option value="dep-01" selected>`, `<option value="dep-02">`, `<option value="dep-03">`,
+		`>build<`, `newest build line`, hrefAttr("/deployments/detail?id=dep-01"),
+	}
+}
+
+func parityDeploymentsFilter(t *testing.T) string {
+	h, stub, p := filterHandler(t)
+	stub.list = postgres.DeploymentList{Items: nDeployments(1)}
+	return pageGet(t, h, p, "/deployments?project_id=proj-b")
+}
+
+func deploymentsFilterFragments() []string {
+	return []string{
+		`<form method="get" action="/deployments" class="filter-form">`, `<select name="project_id">`, `<select name="environment_id">`,
+		`<option value="proj-b" selected>proj-b</option>`, `<option value="proj-a">proj-a</option>`,
+		`<option value="env-1">env-1</option>`, `<option value="env-2">env-2</option>`, `<option value="env-3">env-3</option>`,
+		hrefAttr("/deployments"), `>dep-01<`,
+	}
 }
