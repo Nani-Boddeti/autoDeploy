@@ -246,6 +246,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.serversList(w, r)
+	case "/environments":
+		if _, ok := h.overviewReader(); !ok {
+			http.NotFound(w, r)
+			return
+		}
+		h.environmentsList(w, r)
 	case "/projects", "/deployments", "/deployments/detail":
 		if h.config.OperationsReader == nil {
 			http.NotFound(w, r)
@@ -591,8 +597,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
-	token, principal, ok := h.session(r.Context(), r)
-	_ = token
+	_, principal, ok := h.session(r.Context(), r)
 	if !ok {
 		redirect(w, "/login")
 		return
@@ -602,33 +607,72 @@ func (h *Handler) landing(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	view := landingView{Nav: h.navFor("home", principal), CSRF: csrf, ShowBind: h.config.GitHubSetup != nil}
-	if view.ShowBind {
-		// Best effort: a failed lookup only hides the pick-lists; the form still accepts typed IDs.
-		if h.config.RepositoryLister != nil {
-			if repos, err := h.config.RepositoryLister.ListBindableRepositories(r.Context(), principal); err == nil {
-				view.Repositories = repos
+	view := landingView{Nav: h.navFor("home", principal), CSRF: csrf, ShowBind: h.config.GitHubSetup != nil, ExecNotice: !h.config.ActivationEnabled}
+	// The environment board is the one required read: its failure maps like any operations read.
+	var rows []postgres.EnvironmentOverview
+	if reader, ok := h.overviewReader(); ok {
+		var readErr error
+		if rows, readErr = reader.ListEnvironmentOverview(r.Context(), principal); readErr != nil {
+			if errors.Is(readErr, postgres.ErrServerAuthorizationDenied) {
+				operationsFailure(w, r, readErr)
+				return
 			}
-		}
-		if h.config.ServerAdmin != nil {
-			if servers, err := h.config.ServerAdmin.ListServers(r.Context(), principal); err == nil {
-				for _, srv := range servers {
-					view.Servers = append(view.Servers, landingServer{ID: srv.ID, Name: srv.Name})
-				}
+			// Any other failure degrades the board only; the rest of the page still renders.
+			rows, view.BoardUnavailable = nil, true
+		} else {
+			if view.Board, err = h.buildBoard(rows, csrf, "/"); err != nil {
+				plain(w, http.StatusInternalServerError, "the page could not be rendered\n")
+				return
 			}
+			view.HasBoard = true
 		}
 	}
+	// Everything below is optional: a failed read degrades its own section with a notice.
+	facts := h.loadSetupFacts(r.Context(), principal)
+	if view.ShowBind {
+		view.Repositories = facts.repos
+		for _, srv := range facts.servers {
+			view.Servers = append(view.Servers, landingServer{ID: srv.ID, Name: srv.Name})
+		}
+	}
+	if h.config.ServerAdmin != nil {
+		view.HasServers, view.ServersUnavailable = true, facts.serversFailed
+		view.ServerRows = h.overviewServers(facts.servers)
+	}
+	if h.config.OperationsReader != nil {
+		list, listErr := h.config.OperationsReader.ListDeployments(r.Context(), principal, postgres.DeploymentFilter{}, postgres.DeploymentPage{Limit: overviewRecentLimit})
+		view.HasRecent, view.RecentUnavailable = true, listErr != nil
+		for _, d := range list.Items {
+			view.Recent = append(view.Recent, newDeploymentRow(d))
+		}
+	}
+	view.Attention = h.attentionItems(rows, facts.servers)
+	view.Checklist = h.newChecklist(facts.repoCount > 0, facts.hasActiveServer(), anyBound(rows), len(rows))
 	renderOperations(w, landingTemplate, view)
 }
 
-// landingView is the landing page's data. The binding form posts to /github/bindings, whose
-// handler (githubBind) already existed without any form, so no repository could ever be bound.
+// landingView is the Overview page's data (the type keeps its original name: the
+// parity guard and landing tests build it directly). The binding form posts to
+// /github/bindings; the GitHub section stays here until 22-3g moves it to /github.
 type landingView struct {
 	Nav          navView
 	CSRF         string
 	ShowBind     bool
 	Repositories []postgres.BindableRepository
 	Servers      []landingServer
+
+	ExecNotice         bool
+	Attention          []attentionItem
+	Checklist          *checklistView
+	HasBoard           bool
+	BoardUnavailable   bool
+	Board              []boardRow
+	HasRecent          bool
+	Recent             []deploymentRow
+	RecentUnavailable  bool
+	HasServers         bool
+	ServerRows         []overviewServer
+	ServersUnavailable bool
 }
 
 type landingServer struct{ ID, Name string }
@@ -998,7 +1042,12 @@ func (h *Handler) environmentsResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 5 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["attempt_id"]) != 1 || len(v["outcome"]) != 1 || len(v["reason"]) != 1 {
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	returnTo := takeReturnTo(v)
+	if len(v) != 5 || len(v["csrf"]) != 1 || len(v["environment_id"]) != 1 || len(v["attempt_id"]) != 1 || len(v["outcome"]) != 1 || len(v["reason"]) != 1 {
 		badRequest(w)
 		return
 	}
@@ -1023,7 +1072,7 @@ func (h *Handler) environmentsResolve(w http.ResponseWriter, r *http.Request) {
 		resolveError(w, err, outcome)
 		return
 	}
-	redirect(w, "/servers")
+	redirectAfter(w, returnTo, "/servers")
 }
 
 func validResolveOutcome(outcome string) bool {

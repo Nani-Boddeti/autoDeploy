@@ -71,6 +71,9 @@ func parityEntries() []parityEntry {
 		{"enrollment token", parityEnrollmentToken, enrollmentFragments()},
 		{"github complete", parityGitHubComplete, []string{`action="/github/setup/complete"`, `name="csrf" value="csrf-complete"`}},
 		{"github continue", parityGitHubContinue, []string{`href="/github/setup/complete"`}},
+		// 22-3f: the overview board and the environments page (new pages; the landing entry above is unchanged).
+		{"overview board", parityOverviewBoard, overviewBoardFragments()},
+		{"environments page", parityEnvironmentsPage, environmentsPageFragments()},
 	}
 }
 

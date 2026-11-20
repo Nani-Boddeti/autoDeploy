@@ -14,10 +14,16 @@ func always(*Handler) bool { return true }
 
 func hasOperations(h *Handler) bool { return h.config.OperationsReader != nil }
 
+func hasOverview(h *Handler) bool {
+	_, ok := h.overviewReader()
+	return ok
+}
+
 func hasServers(h *Handler) bool { return h.config.ServerAdmin != nil }
 
 var navItems = []navDef{
 	{Key: "home", Label: "Overview", Href: "/", Group: "Operate", enabled: always},
+	{Key: "environments", Label: "Environments", Href: "/environments", Group: "Operate", enabled: hasOverview},
 	{Key: "deployments", Label: "Deployments", Href: "/deployments", Group: "Operate", enabled: hasOperations},
 	{Key: "projects", Label: "Projects", Href: "/projects", Group: "Configure", enabled: hasOperations},
 	{Key: "github", Label: "GitHub", Href: "/#github", Group: "Configure", enabled: always},

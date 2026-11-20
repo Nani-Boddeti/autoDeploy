@@ -71,7 +71,12 @@ func (h *Handler) deploymentManual(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v, err := parseURLForm(r)
-	if err != nil || len(v) != 5 || len(v["csrf"]) != 1 || len(v["project_id"]) != 1 || len(v["request_nonce"]) != 1 || len(v["mode"]) != 1 || len(v["commit_sha"]) != 1 {
+	if err != nil {
+		badRequest(w)
+		return
+	}
+	returnTo := takeReturnTo(v)
+	if len(v) != 5 || len(v["csrf"]) != 1 || len(v["project_id"]) != 1 || len(v["request_nonce"]) != 1 || len(v["mode"]) != 1 || len(v["commit_sha"]) != 1 {
 		badRequest(w)
 		return
 	}
@@ -111,7 +116,7 @@ func (h *Handler) deploymentManual(w http.ResponseWriter, r *http.Request) {
 		h.manualDeployFailure(w, err, "enqueue")
 		return
 	}
-	redirect(w, detailHref(string(result.DeploymentID)))
+	redirectAfter(w, returnTo, detailHref(string(result.DeploymentID)))
 }
 
 func (h *Handler) manualDeployFailure(w http.ResponseWriter, err error, stage string) {

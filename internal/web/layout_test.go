@@ -81,7 +81,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 	h, _, p := serversHandler(t)
 	h.config.RouteHeadAdmin = &routeHeadAdminStub{}
 	h.config.RuntimeConfigAdmin = &runtimeConfigAdminStub{}
-	h.config.OperationsReader = &operationsStub{detail: sampleDetail("leased", true)}
+	h.config.OperationsReader = &overviewStub{operationsStub: &operationsStub{detail: sampleDetail("leased", true)}, rows: fourRows()}
 	h.config.DeploymentLogReader = &logStub{page: postgres.DeploymentLogPage{Items: []postgres.DeploymentLogLine{line(1, 1, "build", "hi")}}}
 	pages := map[string]string{}
 	login := httptest.NewRecorder()
@@ -90,7 +90,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 		t.Fatalf("/login = %d", login.Code)
 	}
 	pages["/login"] = login.Body.String()
-	for _, target := range []string{"/", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1"} {
+	for _, target := range []string{"/", "/environments", "/servers", "/environments/route?environment_id=env-a", "/environments/config?environment_id=env-a", "/projects", "/deployments", "/deployments/detail?id=dep-1", "/deployments/logs?id=dep-1"} {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, serversRequest(http.MethodGet, target, nil, p, h))
 		if rr.Code != http.StatusOK {
@@ -127,7 +127,7 @@ func TestEveryPageUsesLayoutAndStaysCSPClean(t *testing.T) {
 func navTestHandler(t *testing.T) (*Handler, auth.Principal) {
 	t.Helper()
 	h, _, p := serversHandler(t)
-	h.config.OperationsReader = &operationsStub{detail: sampleDetail("leased", true)}
+	h.config.OperationsReader = &overviewStub{operationsStub: &operationsStub{detail: sampleDetail("leased", true)}}
 	return h, p
 }
 
@@ -145,6 +145,7 @@ func TestNavShowsAvailablePages(t *testing.T) {
 	h, p := navTestHandler(t)
 	pages := []struct{ target, currentHref string }{
 		{"/", "/"},
+		{"/environments", "/environments"},
 		{"/deployments", "/deployments"},
 		{"/deployments/detail?id=dep-1", "/deployments"},
 		{"/projects", "/projects"},
@@ -152,7 +153,7 @@ func TestNavShowsAvailablePages(t *testing.T) {
 	}
 	for _, pg := range pages {
 		body := navPage(t, h, p, pg.target)
-		for _, href := range []string{"/", "/deployments", "/projects", "/#github", "/servers"} {
+		for _, href := range []string{"/", "/environments", "/deployments", "/projects", "/#github", "/servers"} {
 			if !strings.Contains(body, `href="`+href+`"`) {
 				t.Errorf("%s nav lacks href %q", pg.target, href)
 			}
@@ -170,10 +171,16 @@ func TestNavShowsAvailablePages(t *testing.T) {
 	if body := navPage(t, noServers, p2, "/projects"); strings.Contains(body, `href="/servers"`) {
 		t.Error("nav shows /servers with ServerAdmin nil")
 	}
+	// An OperationsReader without the overview read omits Environments (its route 404s).
+	noOverview, p4 := navTestHandler(t)
+	noOverview.config.OperationsReader = &operationsStub{}
+	if body := navPage(t, noOverview, p4, "/projects"); strings.Contains(body, `href="/environments"`) || !strings.Contains(body, `href="/projects"`) {
+		t.Error("nav Environments item must follow the overview reader only")
+	}
 	noOps, p3 := navTestHandler(t)
 	noOps.config.OperationsReader = nil
 	body := navPage(t, noOps, p3, "/")
-	for _, href := range []string{"/projects", "/deployments"} {
+	for _, href := range []string{"/environments", "/projects", "/deployments"} {
 		if strings.Contains(body, `href="`+href+`"`) {
 			t.Errorf("nav shows %s with OperationsReader nil", href)
 		}

@@ -329,6 +329,8 @@ type deploymentRow struct {
 	CancelRequested bool
 	CreatedAt       string
 	UpdatedAt       string
+	// Reason is set only for a failed deployment (class label and reason text).
+	Reason reasonView
 }
 
 type deploymentsView struct {
@@ -351,6 +353,7 @@ func newDeploymentRow(d postgres.DeploymentSummary) deploymentRow {
 		Commit: d.ShortCommit(), Status: d.Status, StatusTone: stateTone(d.Status),
 		JobState: d.JobState, JobTone: stateTone(d.JobState), CancelRequested: d.CancelRequested,
 		CreatedAt: formatTimestamp(d.CreatedAt), UpdatedAt: formatTimestamp(d.UpdatedAt),
+		Reason: failedReason(d.Status, d.FailureClass, d.FailureReason),
 	}
 }
 

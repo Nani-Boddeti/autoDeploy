@@ -32,4 +32,10 @@ func TestDumpPagesForReview(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Empty states are not parity pages; dump them so the checklist can be reviewed.
+	for name, render := range emptyDumpPages() {
+		if err := os.WriteFile(filepath.Join(dir, name+".html"), []byte(render(t)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
