@@ -103,7 +103,7 @@ func (f *actFake) route(resp agentclient.ActivateResponse) traefik.EnvironmentRo
 	}
 }
 
-func (f *actFake) Activate(context.Context, int64, int64, [32]byte) (agentclient.ActivateResponse, error) {
+func (f *actFake) Activate(context.Context, int64, int64, [32]byte, bool) (agentclient.ActivateResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.activateN++
@@ -394,7 +394,7 @@ func TestActivateBlockedInFlightUntilCancelIsUnknown(t *testing.T) {
 
 type blockingClient struct{ *actFake }
 
-func (blockingClient) Activate(ctx context.Context, _, _ int64, _ [32]byte) (agentclient.ActivateResponse, error) {
+func (blockingClient) Activate(ctx context.Context, _, _ int64, _ [32]byte, _ bool) (agentclient.ActivateResponse, error) {
 	<-ctx.Done()
 	return agentclient.ActivateResponse{}, ctx.Err()
 }

@@ -88,7 +88,7 @@ func TestActivateRequestAndResponse(t *testing.T) {
 	defer srv.Close()
 	var img [32]byte
 	img[0], img[31] = 0xab, 0xcd
-	resp, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, img)
+	resp, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, img, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestActivateMalformedResponses(t *testing.T) {
 				_, _ = w.Write([]byte(body))
 			}))
 			defer srv.Close()
-			_, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{})
+			_, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, false)
 			if !errors.Is(err, ErrMalformedResponse) {
 				t.Fatalf("err=%v, want ErrMalformedResponse", err)
 			}
@@ -148,7 +148,7 @@ func TestActivatePredecessorParsing(t *testing.T) {
 		body := activateBody(mutate)
 		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(body)) }))
 		defer srv.Close()
-		return newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{})
+		return newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, false)
 	}
 	t.Run("both empty", func(t *testing.T) {
 		resp, err := serve(t, func(m map[string]any) { m["predecessor_release_id"] = ""; m["predecessor_runtime_instance_id"] = "" })
@@ -211,7 +211,7 @@ func TestActivateSurfacesConflictCode(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"no_route_head"}`))
 	}))
 	defer srv.Close()
-	_, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{})
+	_, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, false)
 	if code, ok := ConflictCode(err); !ok || code != ConflictNoRouteHead || !errors.Is(err, ErrIntegrityConflict) {
 		t.Fatalf("err=%v code=%q", err, code)
 	}
@@ -331,7 +331,7 @@ func TestActivateRetries503WithIdenticalBody(t *testing.T) {
 	var bodies []string
 	srv := retryOnce503Server(activateBody(nil), &bodies)
 	defer srv.Close()
-	if _, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{1}); err != nil {
+	if _, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{1}, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(bodies) != 2 || bodies[0] != bodies[1] {
@@ -349,5 +349,137 @@ func TestReportActivationResultRetries503WithIdenticalBody(t *testing.T) {
 	}
 	if len(bodies) != 2 || bodies[0] != bodies[1] {
 		t.Fatalf("bodies=%q, want two identical", bodies)
+	}
+}
+
+func predecessorBlock(mutate func(map[string]any)) map[string]any {
+	m := map[string]any{
+		"container_port": 8080, "container_scheme": "http", "health_policy_revision": 2,
+		"health_gate_path": "/healthz", "health_gate_host": "app.example.com",
+		"health_policy": map[string]any{"success_threshold": 3, "interval_seconds": 2, "timeout_seconds": 2, "deadline_seconds": 60, "tcp_port": nil},
+	}
+	if mutate != nil {
+		mutate(m)
+	}
+	return m
+}
+
+func TestActivatePredecessorHealthRequestGoldenAndTarget(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(activateBody(func(m map[string]any) { m["predecessor_health"] = predecessorBlock(nil) })))
+	}))
+	defer srv.Close()
+	var img [32]byte
+	resp, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, img, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"attempt_id":5,"fence":3,"image_digest":"` + hex.EncodeToString(img[:]) + `","predecessor_health":true}`
+	if gotBody != want {
+		t.Fatalf("body=%s want %s", gotBody, want)
+	}
+	h := resp.PredecessorHealth
+	if h == nil || h.Host != "app.example.com" || h.Path != "/healthz" || h.Port != 8080 || h.Scheme != "http" ||
+		h.PolicyRevision != 2 || h.Policy.SuccessThreshold != 3 || h.Policy.DeadlineSeconds != 60 {
+		t.Fatalf("target=%+v", h)
+	}
+}
+
+func TestActivatePredecessorHealthBlockDefectsAreUnavailableNotErrors(t *testing.T) {
+	cases := map[string]any{
+		"absent":         nil,
+		"null":           json.RawMessage("null"),
+		"not an object":  "x",
+		"missing port":   predecessorBlock(func(m map[string]any) { delete(m, "container_port") }),
+		"missing host":   predecessorBlock(func(m map[string]any) { delete(m, "health_gate_host") }),
+		"missing policy": predecessorBlock(func(m map[string]any) { delete(m, "health_policy") }),
+		"partial policy": predecessorBlock(func(m map[string]any) { m["health_policy"] = map[string]any{"success_threshold": 3} }),
+		"invalid policy": predecessorBlock(func(m map[string]any) {
+			m["health_policy"] = map[string]any{"success_threshold": 0, "interval_seconds": 2, "timeout_seconds": 2, "deadline_seconds": 60, "tcp_port": nil}
+		}),
+		"bad scheme":    predecessorBlock(func(m map[string]any) { m["container_scheme"] = "ftp" }),
+		"bad port":      predecessorBlock(func(m map[string]any) { m["container_port"] = 70000 }),
+		"bad path":      predecessorBlock(func(m map[string]any) { m["health_gate_path"] = "healthz" }),
+		"unknown field": predecessorBlock(func(m map[string]any) { m["extra"] = 1 }),
+	}
+	for name, block := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(activateBody(func(m map[string]any) {
+					if block != nil {
+						m["predecessor_health"] = block
+					}
+				})))
+			}))
+			defer srv.Close()
+			resp, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, true)
+			if err != nil {
+				t.Fatalf("a defective block must not fail the activation: %v", err)
+			}
+			if resp.PredecessorHealth != nil || resp.OperationID != "op_1" {
+				t.Fatalf("resp=%+v", resp)
+			}
+		})
+	}
+}
+
+// An older control plane answers the unknown flag with a 400: retry exactly
+// once without it and report the target unavailable.
+func TestActivateOlderServerRejectsFlagRetriesOnceWithoutIt(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if strings.Contains(string(b), "predecessor_health") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid_request"}`))
+			return
+		}
+		_, _ = w.Write([]byte(activateBody(nil)))
+	}))
+	defer srv.Close()
+	resp, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.PredecessorHealth != nil {
+		t.Fatalf("target must be unavailable: %+v", resp.PredecessorHealth)
+	}
+	if len(bodies) != 2 || !strings.Contains(bodies[0], `"predecessor_health":true`) || strings.Contains(bodies[1], "predecessor_health") {
+		t.Fatalf("bodies=%v", bodies)
+	}
+}
+
+// A 400 that persists without the flag is returned, never looped.
+func TestActivateFlaglessRetryStill400IsNotLooped(t *testing.T) {
+	calls := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_request"}`))
+	}))
+	defer srv.Close()
+	if _, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, true); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("err=%v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d want 2", calls)
+	}
+}
+
+// A non-opted request never sends the flag and ignores a stray block.
+func TestActivateNotOptedIgnoresBlockAndNeverRetries(t *testing.T) {
+	calls := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(activateBody(func(m map[string]any) { m["predecessor_health"] = predecessorBlock(nil) })))
+	}))
+	defer srv.Close()
+	resp, err := newTestClient(t, srv, nil).Activate(context.Background(), 5, 3, [32]byte{}, false)
+	if err != nil || resp.PredecessorHealth != nil || calls != 1 {
+		t.Fatalf("resp=%+v err=%v calls=%d", resp, err, calls)
 	}
 }

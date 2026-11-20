@@ -1,6 +1,7 @@
 package agentclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -547,6 +548,67 @@ type ActivateResponse struct {
 	// both are set. A response that omits the keys is malformed.
 	PredecessorReleaseID         string
 	PredecessorRuntimeInstanceID string
+	// PredecessorHealth is the health target the predecessor was deployed
+	// with (slice 22-D2), kept in memory only. nil means unavailable: not
+	// requested, absent, partial or invalid in the response, or the server
+	// rejected the request flag. Never an error.
+	PredecessorHealth *PredecessorHealthTarget
+}
+
+// PredecessorHealthTarget is the control plane's frozen health target of the
+// release the route served before this switch, in the claim lease's field
+// names. A value of this type is always fully validated.
+type PredecessorHealthTarget struct {
+	Host           string
+	Path           string
+	Port           int
+	Scheme         string
+	PolicyRevision int
+	Policy         healthgate.Policy
+}
+
+// predecessorHealthWire is the lenient-by-design block of an Activate
+// response: every field is a pointer so a partial block is detectable, and
+// the whole block is decoded apart from the strict envelope so that no defect
+// in it can fail the activation.
+type predecessorHealthWire struct {
+	ContainerPort        *int              `json:"container_port"`
+	ContainerScheme      *string           `json:"container_scheme"`
+	HealthPolicyRevision *int              `json:"health_policy_revision"`
+	HealthGatePath       *string           `json:"health_gate_path"`
+	HealthGateHost       *string           `json:"health_gate_host"`
+	HealthPolicy         *healthPolicyWire `json:"health_policy"`
+}
+
+// parsePredecessorHealth returns the validated target, or nil for a missing,
+// null, partial or invalid block.
+func parsePredecessorHealth(raw json.RawMessage) *PredecessorHealthTarget {
+	if len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		return nil
+	}
+	var w predecessorHealthWire
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&w); err != nil {
+		return nil
+	}
+	if w.ContainerPort == nil || w.ContainerScheme == nil || w.HealthPolicyRevision == nil ||
+		w.HealthGatePath == nil || w.HealthGateHost == nil || w.HealthPolicy == nil {
+		return nil
+	}
+	if *w.ContainerPort < 1 || *w.ContainerPort > 65535 || *w.HealthPolicyRevision < 0 ||
+		(*w.ContainerScheme != "http" && *w.ContainerScheme != "https") ||
+		*w.HealthGateHost == "" || !strings.HasPrefix(*w.HealthGatePath, "/") {
+		return nil
+	}
+	policy, err := w.HealthPolicy.parse(true)
+	if err != nil {
+		return nil
+	}
+	return &PredecessorHealthTarget{
+		Host: *w.HealthGateHost, Path: *w.HealthGatePath, Port: *w.ContainerPort,
+		Scheme: *w.ContainerScheme, PolicyRevision: *w.HealthPolicyRevision, Policy: policy,
+	}
 }
 
 // Activate asks the control plane to authorize the traffic switch for
@@ -561,24 +623,37 @@ type ActivateResponse struct {
 // so callers must not treat it as "certainly not authorized". Retrying
 // Activate is safe because the server replays on (attempt, fence,
 // image_digest).
-func (c *Client) Activate(ctx context.Context, attemptID, fence int64, imageDigest [32]byte) (ActivateResponse, error) {
-	req := struct {
-		AttemptID   int64  `json:"attempt_id"`
-		Fence       int64  `json:"fence"`
-		ImageDigest string `json:"image_digest"`
-	}{AttemptID: attemptID, Fence: fence, ImageDigest: hex.EncodeToString(imageDigest[:])}
-	var resp struct {
-		OperationID                  string  `json:"operation_id"`
-		RouteRevision                int64   `json:"route_revision"`
-		Hostname                     string  `json:"hostname"`
-		EntrypointName               string  `json:"entrypoint_name"`
-		CertResolverName             string  `json:"cert_resolver_name"`
-		BackendRuntimeInstanceID     string  `json:"backend_runtime_instance_id"`
-		RouteDigest                  string  `json:"route_digest"`
-		PredecessorReleaseID         *string `json:"predecessor_release_id"`
-		PredecessorRuntimeInstanceID *string `json:"predecessor_runtime_instance_id"`
+func (c *Client) Activate(ctx context.Context, attemptID, fence int64, imageDigest [32]byte, wantPredecessorHealth bool) (ActivateResponse, error) {
+	type request struct {
+		AttemptID         int64  `json:"attempt_id"`
+		Fence             int64  `json:"fence"`
+		ImageDigest       string `json:"image_digest"`
+		PredecessorHealth bool   `json:"predecessor_health,omitempty"`
 	}
-	if err := c.post(ctx, pathActivate, req, &resp, true); err != nil {
+	req := request{AttemptID: attemptID, Fence: fence, ImageDigest: hex.EncodeToString(imageDigest[:]), PredecessorHealth: wantPredecessorHealth}
+	var resp struct {
+		OperationID                  string          `json:"operation_id"`
+		RouteRevision                int64           `json:"route_revision"`
+		Hostname                     string          `json:"hostname"`
+		EntrypointName               string          `json:"entrypoint_name"`
+		CertResolverName             string          `json:"cert_resolver_name"`
+		BackendRuntimeInstanceID     string          `json:"backend_runtime_instance_id"`
+		RouteDigest                  string          `json:"route_digest"`
+		PredecessorReleaseID         *string         `json:"predecessor_release_id"`
+		PredecessorRuntimeInstanceID *string         `json:"predecessor_runtime_instance_id"`
+		PredecessorHealth            json.RawMessage `json:"predecessor_health"`
+	}
+	err := c.post(ctx, pathActivate, req, &resp, true)
+	if err != nil && wantPredecessorHealth && errors.Is(err, ErrInvalidRequest) {
+		// An older control plane rejects the unknown flag with a 400. Retry
+		// exactly once without it (never a loop) and treat the predecessor
+		// target as unavailable, which fails closed.
+		req.PredecessorHealth = false
+		wantPredecessorHealth = false
+		resp.PredecessorHealth = nil
+		err = c.post(ctx, pathActivate, req, &resp, true)
+	}
+	if err != nil {
 		return ActivateResponse{}, err
 	}
 	if resp.OperationID == "" || resp.RouteRevision <= 0 || resp.Hostname == "" || resp.EntrypointName == "" ||
@@ -595,11 +670,16 @@ func (c *Client) Activate(ctx context.Context, attemptID, fence int64, imageDige
 	if !validPredecessor(*resp.PredecessorReleaseID, *resp.PredecessorRuntimeInstanceID, resp.BackendRuntimeInstanceID) {
 		return ActivateResponse{}, fmt.Errorf("%w: activate response predecessor identity", ErrMalformedResponse)
 	}
+	var predecessorHealth *PredecessorHealthTarget
+	if wantPredecessorHealth {
+		predecessorHealth = parsePredecessorHealth(resp.PredecessorHealth)
+	}
 	return ActivateResponse{
 		PredecessorReleaseID: *resp.PredecessorReleaseID, PredecessorRuntimeInstanceID: *resp.PredecessorRuntimeInstanceID,
 		OperationID: resp.OperationID, RouteRevision: resp.RouteRevision, Hostname: resp.Hostname,
 		EntrypointName: resp.EntrypointName, CertResolverName: resp.CertResolverName,
 		BackendRuntimeInstanceID: resp.BackendRuntimeInstanceID, RouteDigest: digest,
+		PredecessorHealth: predecessorHealth,
 	}, nil
 }
 

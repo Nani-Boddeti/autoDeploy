@@ -39,6 +39,17 @@ type stsDocker struct {
 	predGate      *docker.HealthGateResult
 	predGateErr   error
 	predGateBlock bool // block until the probe context ends (a hung gate)
+	// predOnlyPath, when set, makes the predecessor probe pass ONLY for that
+	// health path (a predecessor that serves 200 on its own path, 404 elsewhere).
+	predOnlyPath string
+	// predTargets records every predecessor probe's target, revision and policy.
+	predTargets []predProbeCall
+}
+
+type predProbeCall struct {
+	target   docker.HealthGateTarget
+	revision int
+	policy   healthgate.Policy
 }
 
 type stsCtr struct {
@@ -154,9 +165,13 @@ func (d *stsDocker) EnsureReleaseRuntimeContainer(_ context.Context, req docker.
 	return out, nil
 }
 
-func (d *stsDocker) RunHealthGate(ctx context.Context, containerID, _ string, _ int, policy healthgate.Policy, _ docker.HealthGateTarget) (docker.HealthGateResult, error) {
+func (d *stsDocker) RunHealthGate(ctx context.Context, containerID, _ string, revision int, policy healthgate.Policy, target docker.HealthGateTarget) (docker.HealthGateResult, error) {
 	if containerID == "pred-id" {
 		d.rec("probe:pred")
+		d.predTargets = append(d.predTargets, predProbeCall{target: target, revision: revision, policy: policy})
+		if d.predOnlyPath != "" && target.Path != d.predOnlyPath {
+			return docker.HealthGateResult{Reason: docker.HealthGateFailureDeadlineExceeded, LastProbe: "status=404"}, nil
+		}
 		if d.predGateBlock {
 			<-ctx.Done()
 			return docker.HealthGateResult{Reason: docker.HealthGateFailureContextCancelled}, nil
@@ -199,6 +214,12 @@ func newSTSRig(t *testing.T, withPredecessor bool) *stsRig {
 	if withPredecessor {
 		dk.add("pred-id", lease.EnvironmentID, stsPredRelease, predRT, true)
 		act.resp.PredecessorReleaseID, act.resp.PredecessorRuntimeInstanceID = stsPredRelease, predRT
+		// The predecessor's own health target (slice 22-D2); by default equal to
+		// the lease's so unrelated tests are unaffected.
+		act.resp.PredecessorHealth = &agentclient.PredecessorHealthTarget{
+			Host: lease.HealthGateHost, Path: lease.HealthGatePath, Port: lease.ContainerPort,
+			Scheme: lease.ContainerScheme, PolicyRevision: lease.HealthPolicyRevision, Policy: lease.HealthPolicy,
+		}
 	}
 	cp := &fakeControlPlane{secrets: fullSecrets()}
 	co := &fakeCheckout{result: happyCheckoutResult()}

@@ -273,7 +273,7 @@ var _ = agentclient.Lease{}
 func allProven() notSwitchedFacts {
 	return notSwitchedFacts{
 		leaseOptedIn: true, notRetained: true, hasPredecessor: true, stopSent: true, stopConfirmed: true,
-		candidateStopped: true, predecessorUp: true, snapshotTaken: true, predecessorProbe: true,
+		candidateStopped: true, predecessorUp: true, snapshotTaken: true, targetKnown: true, predecessorProbe: true,
 		revisionBelow: true, routeUnchanged: true,
 	}
 }
@@ -293,6 +293,7 @@ func TestNotSwitchedFactsEachFactVetoes(t *testing.T) {
 		"candidateStopped": func(f *notSwitchedFacts) { f.candidateStopped = false },
 		"predecessorUp":    func(f *notSwitchedFacts) { f.predecessorUp = false },
 		"snapshotTaken":    func(f *notSwitchedFacts) { f.snapshotTaken = false },
+		"targetKnown":      func(f *notSwitchedFacts) { f.targetKnown = false },
 		"predecessorProbe": func(f *notSwitchedFacts) { f.predecessorProbe = false },
 		"revisionBelow":    func(f *notSwitchedFacts) { f.revisionBelow = false },
 		"routeUnchanged":   func(f *notSwitchedFacts) { f.routeUnchanged = false },
@@ -384,5 +385,64 @@ func TestSTSNotSwitchedProbeSurvivesExpiredWindowContext(t *testing.T) {
 	}
 	if !rec.NotSwitched || !strings.Contains(rec.FailureSummary, "predecessor health probe ok") {
 		t.Fatalf("record = %+v, want not_switched with a passing probe (summary %q)", rec, rec.FailureSummary)
+	}
+}
+
+// Slice 22-D2: the predecessor is probed with ITS OWN health target, not the
+// new lease's (the lease path was changed to something the predecessor does
+// not serve, which is exactly what failed the candidate).
+func TestSTSNotSwitchedProbesPredecessorWithItsOwnTarget(t *testing.T) {
+	r := notSwitchedRig(t)
+	r.lease.HealthGatePath = "/autodeploy-missin"
+	r.lease.HealthGateHost = "new.example.com"
+	r.lease.ContainerPort = 9999
+	r.lease.HealthPolicy = healthgate.Policy{SuccessThreshold: 1, IntervalSeconds: 1, TimeoutSeconds: 1, DeadlineSeconds: 5}
+	own := healthgate.Policy{SuccessThreshold: 2, IntervalSeconds: 3, TimeoutSeconds: 3, DeadlineSeconds: 120}
+	r.act.resp.PredecessorHealth = &agentclient.PredecessorHealthTarget{
+		Host: "old.example.com", Path: "/healthz", Port: 8080, Scheme: "http", PolicyRevision: 7, Policy: own,
+	}
+	r.dk.predOnlyPath = "/healthz"
+	rec := runNotSwitched(t, r)
+	if !rec.NotSwitched {
+		t.Fatalf("want not_switched, got %q", rec.FailureSummary)
+	}
+	if len(r.dk.predTargets) != 1 {
+		t.Fatalf("probe calls = %d", len(r.dk.predTargets))
+	}
+	got := r.dk.predTargets[0]
+	if got.target.Path != "/healthz" || got.target.Host != "old.example.com" || got.target.Port != 8080 ||
+		got.target.Scheme != "http" || got.revision != 7 || got.policy != own {
+		t.Fatalf("probe used %+v, want the predecessor's own target", got)
+	}
+}
+
+// The probe bound derives from the predecessor's own policy deadline.
+func TestSTSNotSwitchedProbeBoundUsesPredecessorPolicy(t *testing.T) {
+	var seen healthgate.Policy
+	old := predecessorProbeBound
+	predecessorProbeBound = func(p healthgate.Policy) time.Duration { seen = p; return 5 * time.Second }
+	t.Cleanup(func() { predecessorProbeBound = old })
+	r := notSwitchedRig(t)
+	own := healthgate.Policy{SuccessThreshold: 2, IntervalSeconds: 3, TimeoutSeconds: 3, DeadlineSeconds: 120}
+	r.act.resp.PredecessorHealth.Policy = own
+	runNotSwitched(t, r)
+	if seen != own {
+		t.Fatalf("bound derived from %+v, want the predecessor's policy", seen)
+	}
+}
+
+// Target unavailable: no probe at all, the plain (blocking) failure.
+func TestSTSNotSwitchedTargetUnavailableNoProbe(t *testing.T) {
+	r := notSwitchedRig(t)
+	r.act.resp.PredecessorHealth = nil
+	rec := runNotSwitched(t, r)
+	if rec.NotSwitched {
+		t.Fatalf("claimed not_switched without a predecessor target: %q", rec.FailureSummary)
+	}
+	if len(r.dk.predTargets) != 0 || indexOf(r.seq, "probe:pred") >= 0 {
+		t.Fatalf("RunHealthGate ran on the predecessor without a target: %v", r.dk.predTargets)
+	}
+	if !strings.Contains(rec.FailureSummary, "predecessor health target unavailable") {
+		t.Fatalf("summary %q lacks the unavailable note", rec.FailureSummary)
 	}
 }

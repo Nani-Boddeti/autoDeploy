@@ -189,6 +189,10 @@ type stsRelease struct {
 	// every proof in notSwitchedProof held. activateWith copies it into the
 	// record only when the route switch was never entered.
 	notSwitched bool
+	// predecessorHealth is the health target the predecessor was deployed with
+	// (slice 22-D2), from the activate response; nil = unavailable. In memory
+	// only: never persisted, so crash recovery cannot claim not_switched.
+	predecessorHealth *agentclient.PredecessorHealthTarget
 }
 
 func (s *stsRelease) failure(ctx context.Context, rec state.PendingActivation, reason string) string {
@@ -431,6 +435,7 @@ type notSwitchedFacts struct {
 	candidateStopped bool
 	predecessorUp    bool // restartPredecessor reported it running
 	snapshotTaken    bool // a pre-stop route digest is on the record
+	targetKnown      bool // the predecessor's own health target is known
 	predecessorProbe bool // the bounded health probe passed
 	revisionBelow    bool // route-revision file < authorized revision
 	routeUnchanged   bool // on-disk digest readable and == the snapshot
@@ -440,7 +445,8 @@ type notSwitchedFacts struct {
 // only runs for a failure that could still qualify.
 func (f notSwitchedFacts) cheap() bool {
 	return f.leaseOptedIn && f.notRetained && f.hasPredecessor && f.stopSent &&
-		f.stopConfirmed && f.candidateStopped && f.predecessorUp && f.snapshotTaken
+		f.stopConfirmed && f.candidateStopped && f.predecessorUp && f.snapshotTaken &&
+		f.targetKnown
 }
 
 func (f notSwitchedFacts) provable() bool {
@@ -466,6 +472,9 @@ func (f notSwitchedFacts) provable() bool {
 		return false
 	}
 	if !f.snapshotTaken {
+		return false
+	}
+	if !f.targetKnown {
 		return false
 	}
 	if !f.predecessorProbe {
@@ -499,6 +508,14 @@ func (s *stsRelease) notSwitchedProof(ctx context.Context, rec state.PendingActi
 		candidateStopped: rb.candidateStopped,
 		predecessorUp:    rb.restartTried && rb.restart.Status == restartStarted,
 		snapshotTaken:    rec.PreStopRouteDigest != [32]byte{},
+		targetKnown:      s.predecessorHealth != nil,
+	}
+	if !f.targetKnown && f.leaseOptedIn && f.notRetained && f.hasPredecessor && f.stopSent &&
+		f.stopConfirmed && f.candidateStopped && f.predecessorUp && f.snapshotTaken {
+		// Everything else could qualify but the predecessor's own health
+		// target is unknown: no probe (the lease target would be the wrong
+		// one), plain failure.
+		return "predecessor health target unavailable", false
 	}
 	if !f.cheap() {
 		return "", false
@@ -522,18 +539,22 @@ func (s *stsRelease) notSwitchedProof(ctx context.Context, rec state.PendingActi
 }
 
 // probePredecessor runs the environment's health gate (the same RunHealthGate
-// and frozen policy the candidate went through) against the restarted
-// predecessor. It is bounded by predecessorProbeBound on a detached context
+// engine call) against the restarted predecessor with the predecessor's OWN
+// frozen health target and policy (s.predecessorHealth, slice 22-D2), never the
+// new lease's, which may have changed. It is bounded by predecessorProbeBound on a detached context
 // (an expired authorized window must not skip the proof). Any error or timeout
 // is "not healthy".
 func (s *stsRelease) probePredecessor(ctx context.Context, rec state.PendingActivation) (healthy bool, note string) {
-	e, lease := s.e, s.lease
+	e, target := s.e, s.predecessorHealth
 	logs := logship.FromContext(ctx)
+	if target == nil {
+		return false, "predecessor health target unavailable"
+	}
 	name, err := docker.ContainerName(rec.PredecessorRuntimeInstanceID)
 	if err != nil {
 		return false, "predecessor health probe not run (invalid runtime instance id)"
 	}
-	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), predecessorProbeBound(lease.HealthPolicy))
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), predecessorProbeBound(target.Policy))
 	defer cancel()
 	inspect, err := e.docker.InspectContainer(pctx, name)
 	if err != nil || !inspect.State.Running {
@@ -545,8 +566,8 @@ func (s *stsRelease) probePredecessor(ctx context.Context, rec state.PendingActi
 		logs.Linef(logship.StreamHealth, "predecessor health probe: container network check failed")
 		return false, "predecessor health probe not run (network check failed)"
 	}
-	gate, err := e.docker.RunHealthGate(pctx, inspect.ID, networkID, lease.HealthPolicyRevision, lease.HealthPolicy, docker.HealthGateTarget{
-		Host: lease.HealthGateHost, Path: lease.HealthGatePath, Port: lease.ContainerPort, Scheme: lease.ContainerScheme,
+	gate, err := e.docker.RunHealthGate(pctx, inspect.ID, networkID, target.PolicyRevision, target.Policy, docker.HealthGateTarget{
+		Host: target.Host, Path: target.Path, Port: target.Port, Scheme: target.Scheme,
 	})
 	switch {
 	case err != nil:

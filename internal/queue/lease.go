@@ -153,6 +153,22 @@ type ActivationResult struct {
 	// instance. Both empty on a first activation; never one without the other.
 	PredecessorReleaseID         string
 	PredecessorRuntimeInstanceID string
+	// PredecessorHealth is the predecessor release's own frozen health target
+	// (slice 22-D2). Set only when the caller asked for it AND it is
+	// available; nil otherwise (no predecessor, no frozen row, or any
+	// ambiguity: fail closed).
+	PredecessorHealth *PredecessorHealth
+}
+
+// PredecessorHealth is the frozen health target of the predecessor release's
+// winning activation attempt, exactly as that attempt's lease carried it.
+type PredecessorHealth struct {
+	ContainerPort        int
+	ContainerScheme      string
+	HealthPolicyRevision int
+	HealthGatePath       string
+	HealthGateHost       string
+	HealthPolicy         healthgate.Policy
 }
 
 // FrozenSecretReference is one frozen secret this attempt is authorized to

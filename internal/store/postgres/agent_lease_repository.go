@@ -1305,6 +1305,18 @@ var ErrAgentLeaseActivationNoRouteHead = errors.New("agent lease activation envi
 // anything further; a different image_digest is rejected as
 // ErrAgentLeaseIntegrityConflict ("a conflicting digest fails", ADR 0005).
 func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, imageDigest [32]byte) (queue.ActivationResult, error) {
+	return r.activate(ctx, serverID, presentedDigest, attemptID, fence, imageDigest, false)
+}
+
+// ActivateWithPredecessorHealth is Activate for a caller that also wants the
+// predecessor release's own frozen health target (slice 22-D2). Identical
+// semantics, locks and writes; the answer additionally carries
+// ActivationResult.PredecessorHealth when it is available.
+func (r *AgentLeaseRepository) ActivateWithPredecessorHealth(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, imageDigest [32]byte) (queue.ActivationResult, error) {
+	return r.activate(ctx, serverID, presentedDigest, attemptID, fence, imageDigest, true)
+}
+
+func (r *AgentLeaseRepository) activate(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, imageDigest [32]byte, wantPredecessorHealth bool) (queue.ActivationResult, error) {
 	if r == nil || r.pool == nil || !github.ValidOpaqueID(serverID) || attemptID <= 0 || fence <= 0 {
 		return queue.ActivationResult{}, ErrAgentLeaseInvalidInput
 	}
@@ -1473,6 +1485,9 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 			CertResolverName:             traefik.DefaultCertResolverName,
 			BackendRuntimeInstanceID:     candidateInstanceID,
 			RouteDigest:                  "sha256:" + hex.EncodeToString(existingRouteDigest),
+		}
+		if wantPredecessorHealth {
+			result.PredecessorHealth = predecessorHealthBlock(ctx, tx, predecessorReleaseID)
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate replay: %w", err)
@@ -1686,11 +1701,7 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		return queue.ActivationResult{}, err
 	}
 
-	if err = tx.Commit(ctx); err != nil {
-		return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate: %w", err)
-	}
-
-	return queue.ActivationResult{
+	result := queue.ActivationResult{
 		PredecessorReleaseID:         predecessorReleaseID,
 		PredecessorRuntimeInstanceID: predecessorRuntimeInstanceID,
 		OperationID:                  strconv.FormatInt(operationID, 10),
@@ -1700,7 +1711,78 @@ func (r *AgentLeaseRepository) Activate(ctx context.Context, serverID string, pr
 		CertResolverName:             traefik.DefaultCertResolverName,
 		BackendRuntimeInstanceID:     candidateInstanceID,
 		RouteDigest:                  routeDigestHex,
-	}, nil
+	}
+	if wantPredecessorHealth {
+		result.PredecessorHealth = predecessorHealthBlock(ctx, tx, predecessorReleaseID)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return queue.ActivationResult{}, fmt.Errorf("commit agent lease activate: %w", err)
+	}
+
+	return result, nil
+}
+
+// predecessorHealthBlock reads the predecessor release's own frozen health
+// target (slice 22-D2): its winning activation attempt (the same predicate
+// derivePredecessor uses) and that attempt's frozen agent_job_attempt_execution
+// row, mapped exactly as the claim lease builder maps it (loadAttemptExecution
+// plus HealthPolicy.WithDefaults). Plain read-only SELECTs, no lock, no write;
+// called after the route head lock, so the lock order is unchanged. Fails
+// closed: no predecessor, no winning attempt, no frozen row, a failed read or
+// an unusable (empty/zero) essential field all yield nil, never an error and
+// never a guess. The reads run inside a savepoint: a real SQL error (statement
+// timeout, cancelled ctx, connection fault) rolls back to it, so the outer
+// transaction stays usable and the activation still commits with no block.
+func predecessorHealthBlock(ctx context.Context, tx pgx.Tx, predecessorReleaseID string) *queue.PredecessorHealth {
+	if predecessorReleaseID == "" {
+		return nil
+	}
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return nil
+	}
+	cfg, ok := readPredecessorExecution(ctx, sp, predecessorReleaseID)
+	if !ok {
+		_ = sp.Rollback(ctx) // best effort: restores the outer tx after an aborted read
+		return nil
+	}
+	if err = sp.Commit(ctx); err != nil { // release the savepoint (read-only, nothing to keep)
+		return nil
+	}
+	if cfg.ContainerPort <= 0 || cfg.ContainerScheme == "" || cfg.HealthGatePath == "" || cfg.HealthGateHost == "" || cfg.HealthPolicyRevision <= 0 {
+		return nil
+	}
+	return &queue.PredecessorHealth{
+		ContainerPort:        cfg.ContainerPort,
+		ContainerScheme:      cfg.ContainerScheme,
+		HealthPolicyRevision: cfg.HealthPolicyRevision,
+		HealthGatePath:       cfg.HealthGatePath,
+		HealthGateHost:       cfg.HealthGateHost,
+		HealthPolicy:         cfg.HealthPolicy.WithDefaults(),
+	}
+}
+
+// predecessorHealthReadFault is a test seam (nil in production): when set it
+// runs inside the savepoint before the reads so a test can force a SQL error.
+var predecessorHealthReadFault func(ctx context.Context, tx pgx.Tx) error
+
+// readPredecessorExecution performs predecessorHealthBlock's two reads on the
+// savepoint. ok is false on any error or when there is nothing to read.
+func readPredecessorExecution(ctx context.Context, sp pgx.Tx, predecessorReleaseID string) (frozenExecutionSnapshot, bool) {
+	if predecessorHealthReadFault != nil {
+		if err := predecessorHealthReadFault(ctx, sp); err != nil {
+			return frozenExecutionSnapshot{}, false
+		}
+	}
+	attemptID, found, err := winningActivationAttempt(ctx, sp, predecessorReleaseID)
+	if err != nil || !found {
+		return frozenExecutionSnapshot{}, false
+	}
+	cfg, err := loadAttemptExecution(ctx, sp, attemptID)
+	if err != nil {
+		return frozenExecutionSnapshot{}, false
+	}
+	return cfg, true
 }
 
 // derivePredecessor names the release the route currently serves (the

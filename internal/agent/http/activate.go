@@ -15,6 +15,14 @@ type LeaseActivator interface {
 	Activate(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, imageDigest [32]byte) (queue.ActivationResult, error)
 }
 
+// PredecessorHealthActivator is the optional extension of LeaseActivator
+// (slice 22-D2): the same activation, plus the predecessor release's own
+// frozen health target in the result. The handler uses it only for a request
+// that asked for it; an Activator without it simply answers without a block.
+type PredecessorHealthActivator interface {
+	ActivateWithPredecessorHealth(ctx context.Context, serverID string, presentedDigest [32]byte, attemptID, fence int64, imageDigest [32]byte) (queue.ActivationResult, error)
+}
+
 // activateRequest carries no route digest of its own (2026-09-22
 // orchestrator decision overriding the Step 10c design draft): the control
 // plane renders the route document and computes its digest in tx1, so the
@@ -25,6 +33,9 @@ type activateRequest struct {
 	AttemptID   int64  `json:"attempt_id"`
 	Fence       int64  `json:"fence"`
 	ImageDigest string `json:"image_digest"`
+	// PredecessorHealth (optional, default false) asks for the predecessor
+	// release's own health target in the response (slice 22-D2).
+	PredecessorHealth bool `json:"predecessor_health,omitempty"`
 }
 
 func (req activateRequest) parse() (attemptID, fence int64, digest [32]byte, ok bool) {
@@ -50,6 +61,21 @@ type activateResponse struct {
 	// together when the route had no active release (first activation).
 	PredecessorReleaseID         string `json:"predecessor_release_id"`
 	PredecessorRuntimeInstanceID string `json:"predecessor_runtime_instance_id"`
+	// Present only when the request asked for it and the control plane has the
+	// predecessor's frozen target (slice 22-D2); omitted otherwise so every
+	// other response is byte-identical.
+	PredecessorHealth *predecessorHealthView `json:"predecessor_health,omitempty"`
+}
+
+// predecessorHealthView carries the predecessor attempt's frozen health target
+// under the same field names the claim lease uses for them.
+type predecessorHealthView struct {
+	ContainerPort        int               `json:"container_port"`
+	ContainerScheme      string            `json:"container_scheme"`
+	HealthPolicyRevision int               `json:"health_policy_revision"`
+	HealthGatePath       string            `json:"health_gate_path"`
+	HealthGateHost       string            `json:"health_gate_host"`
+	HealthPolicy         *healthPolicyView `json:"health_policy"`
 }
 
 // handleActivate serves POST /agent/v1/leases/activate (Step 10c tx1). A
@@ -77,12 +103,22 @@ func (h Handler) handleActivate(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	result, err := h.Activator.Activate(r.Context(), serverID, digest, attemptID, fence, imageDigest)
+	var (
+		result queue.ActivationResult
+		err    error
+	)
+	phA, extended := h.Activator.(PredecessorHealthActivator)
+	extended = extended && req.PredecessorHealth
+	if extended {
+		result, err = phA.ActivateWithPredecessorHealth(r.Context(), serverID, digest, attemptID, fence, imageDigest)
+	} else {
+		result, err = h.Activator.Activate(r.Context(), serverID, digest, attemptID, fence, imageDigest)
+	}
 	if err != nil {
 		h.mapError(w, err)
 		return
 	}
-	h.writeJSON(w, http.StatusOK, activateResponse{
+	resp := activateResponse{
 		OperationID:                  result.OperationID,
 		RouteRevision:                result.RouteRevision,
 		Hostname:                     result.Hostname,
@@ -92,5 +128,16 @@ func (h Handler) handleActivate(w http.ResponseWriter, r *http.Request) {
 		RouteDigest:                  result.RouteDigest,
 		PredecessorReleaseID:         result.PredecessorReleaseID,
 		PredecessorRuntimeInstanceID: result.PredecessorRuntimeInstanceID,
-	})
+	}
+	if ph := result.PredecessorHealth; ph != nil && extended {
+		resp.PredecessorHealth = &predecessorHealthView{
+			ContainerPort:        ph.ContainerPort,
+			ContainerScheme:      ph.ContainerScheme,
+			HealthPolicyRevision: ph.HealthPolicyRevision,
+			HealthGatePath:       ph.HealthGatePath,
+			HealthGateHost:       ph.HealthGateHost,
+			HealthPolicy:         newHealthPolicyView(ph.HealthPolicy),
+		}
+	}
+	h.writeJSON(w, http.StatusOK, resp)
 }

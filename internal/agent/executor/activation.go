@@ -69,7 +69,7 @@ const (
 // ActivationClient is the control-plane capability the activation sequence
 // needs. *agentclient.Client satisfies it.
 type ActivationClient interface {
-	Activate(ctx context.Context, attemptID, fence int64, imageDigest [32]byte) (agentclient.ActivateResponse, error)
+	Activate(ctx context.Context, attemptID, fence int64, imageDigest [32]byte, wantPredecessorHealth bool) (agentclient.ActivateResponse, error)
 	ReportActivationResult(ctx context.Context, attemptID, fence int64, operationID string, result agentclient.ActivationResult) error
 }
 
@@ -296,6 +296,9 @@ func (e *Executor) activateWith(ctx context.Context, lease agentclient.Lease, im
 	var summary string
 	switchEntered := false
 	if release != nil {
+		// In memory only (never persisted): crash recovery never claims
+		// not_switched, so it never needs the predecessor's health target.
+		release.predecessorHealth = resp.PredecessorHealth
 		summary = release.beforeSwitch(dctx, &rec)
 	}
 	if summary == "" {
@@ -419,7 +422,7 @@ func (a *activationRunner) authorize(ctx context.Context, lease agentclient.Leas
 			}
 			backoff *= 2
 		}
-		resp, err := a.cfg.Client.Activate(ctx, lease.AttemptID, lease.Fence, imageDigest)
+		resp, err := a.cfg.Client.Activate(ctx, lease.AttemptID, lease.Fence, imageDigest, lease.ActivationNotSwitched)
 		if err == nil {
 			return resp, nil
 		}

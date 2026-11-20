@@ -314,7 +314,7 @@ func loadAttemptExecution(ctx context.Context, tx pgx.Tx, attemptID int64) (froz
 	if err := tx.QueryRow(ctx, `SELECT container_port, container_scheme, release_strategy, drain_seconds, health_policy_revision, cpu_millis, memory_bytes, restart_policy, environment_runtime_config_revision, health_gate_path, health_gate_host, health_success_threshold, health_interval_seconds, health_timeout_seconds, health_deadline_seconds, health_tcp_port FROM agent_job_attempt_execution WHERE attempt_id=$1`, attemptID).
 		Scan(&cfg.ContainerPort, &cfg.ContainerScheme, &cfg.ReleaseStrategy, &cfg.DrainSeconds, &cfg.HealthPolicyRevision, &cfg.CPUMillis, &cfg.MemoryBytes, &cfg.RestartPolicy, &cfg.ConfigRevision, &cfg.HealthGatePath, &cfg.HealthGateHost,
 			&cfg.HealthPolicy.SuccessThreshold, &cfg.HealthPolicy.IntervalSeconds, &cfg.HealthPolicy.TimeoutSeconds, &cfg.HealthPolicy.DeadlineSeconds, &tcpPort); err != nil {
-		return frozenExecutionSnapshot{}, fmt.Errorf("load attempt %d execution for copy-forward: %w", attemptID, err)
+		return frozenExecutionSnapshot{}, fmt.Errorf("load attempt %d frozen execution: %w", attemptID, err)
 	}
 	if tcpPort != nil {
 		cfg.HealthPolicy.TCPPort = *tcpPort

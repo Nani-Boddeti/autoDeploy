@@ -580,3 +580,29 @@ interplay, acme.json persistence/renewal, ufw+Docker, full deploy e2e (22-7 gate
   Shell tests: netcheck 45, firewall_ssh 19, preflight_public 17, script_structure, lan_mode_identical all green.
   Unproven until a public VPS: real issuance (staging then prod), HTTP-01 vs entrypoint redirect, renewal, DNS, ufw +
   Docker, first-issuance vs 3m probe. deploy/host/uninstall.sh.bak0 = stray untracked backup, owner: keep, never commit.
+
+## 22-D2 design: probe the restarted predecessor with ITS OWN health target (2026-11-20, APPROVED)
+Acer attempt 27: STS candidate failed (health path changed to /autodeploy-missin), predecessor restarted and serving 200,
+but probePredecessor (sts.go ~529-560) used the NEW lease's host/path/port/scheme/policy -> 404 -> no not_switched ->
+environment blocked. Owner: probe with the target the predecessor was deployed with; fail closed when unknown.
+- Source: control plane (authority). Health target is frozen per attempt in agent_job_attempt_execution (000017 path/host,
+  000028 tuning). Agent state and Docker labels carry no health target (labels closed set, digest only).
+- Wire: Activate request gains optional `predecessor_health: true`, sent only when lease.ActivationNotSwitched; response
+  gains `predecessor_health {host,path,port,scheme,policy_revision,policy}` only when requested (non-opted bytes golden-
+  pinned unchanged). Server lookup = one read-only SELECT inside Activate after the route_heads lock (and on replay,
+  same answer): expected_active_release_id -> its WINNING activation attempt (same predicate as 21B retained identity)
+  -> frozen execution row. Absent/ambiguous -> no block. No new locks/writes, lock order unchanged, no migration.
+- Agent: strict decode; missing/partial/invalid block or server rejecting the flag -> "target unavailable" -> no probe ->
+  plain failure (today's block), never a deploy error or retry loop. New fact predecessorTargetKnown in notSwitchedFacts.
+  Probe uses predecessor host/path/port/scheme/policy and its deadline for the bound. Kept in memory (crash recovery never
+  claims not_switched).
+- Tests: agent (lease path wrong + predecessor path right -> not_switched; mutation: revert to lease fields -> fails;
+  absent -> no probe; fact veto table); wire golden both directions + strict decoder + client malformed/partial; store
+  integration (older revision + different path returns predecessor's values not current env config, replay, rollback-
+  release predecessor, missing row, lock-order race suite unchanged). Then acer rerun of section C.
+- 2026-11-20: 22-D2 DONE mac-side: Activate request opt-in `predecessor_health:true` (sent only for ActivationNotSwitched
+  leases) -> response block with the predecessor's winning attempt's frozen health target (read in a savepoint after the
+  route_heads lock; any read error -> no block, outer tx intact). Agent probes the restarted predecessor with it; absent/
+  invalid/older-server -> fail closed (operator block). Wiring pinned at compile time (cmd/controlplane/wiring_test.go);
+  real handler <-> real client contract test. Review PASS WITH NOTES, LOWs fixed. make check, integration sweep, agent
+  race x3 green. Acer: rerun section C (health path change on STS) -> expect deployment failed, env NOT blocked.
