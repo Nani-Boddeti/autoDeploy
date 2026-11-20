@@ -107,9 +107,9 @@ func (h resolveHarness) resolve(outcome string) *httptest.ResponseRecorder {
 
 func (h resolveHarness) listed() bool {
 	h.t.Helper()
-	rr := h.request(http.MethodGet, "/servers", nil)
+	rr := h.request(http.MethodGet, "/reconciliation", nil)
 	if rr.Code != http.StatusOK {
-		h.t.Fatalf("GET /servers = %d", rr.Code)
+		h.t.Fatalf("GET /reconciliation = %d", rr.Code)
 	}
 	return strings.Contains(rr.Body.String(), `<td>`+h.env.EnvironmentID+` (`)
 }
@@ -126,7 +126,7 @@ func TestResolveFormEndToEndActivationBlock(t *testing.T) {
 	if !h.listed() {
 		t.Fatal("setup: the activation-blocked environment is not listed")
 	}
-	rr := h.request(http.MethodGet, "/servers", nil)
+	rr := h.request(http.MethodGet, "/reconciliation", nil)
 	if !strings.Contains(rr.Body.String(), "<td>reconciliation_required</td>") {
 		t.Fatal("the Activation column does not show reconciliation_required")
 	}
@@ -140,7 +140,7 @@ func TestResolveFormEndToEndActivationBlock(t *testing.T) {
 	}
 
 	rr = h.resolve("not_activated")
-	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/servers" {
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/reconciliation" {
 		t.Fatalf("not_activated = %d location=%q body=%q", rr.Code, rr.Header().Get("Location"), rr.Body.String())
 	}
 	if h.listed() {
@@ -155,7 +155,7 @@ func TestResolveFormEndToEndPlainBlock(t *testing.T) {
 	if !h.listed() {
 		t.Fatal("setup: the plain-blocked environment is not listed")
 	}
-	if rr := h.request(http.MethodGet, "/servers", nil); !strings.Contains(rr.Body.String(), "<td>none</td>") {
+	if rr := h.request(http.MethodGet, "/reconciliation", nil); !strings.Contains(rr.Body.String(), "<td>none</td>") {
 		t.Fatal("the Activation column does not show none")
 	}
 	rr := h.resolve("not_activated")
@@ -166,7 +166,7 @@ func TestResolveFormEndToEndPlainBlock(t *testing.T) {
 		t.Fatal("a refused resolution unblocked the environment")
 	}
 	rr = h.resolve("no_activation")
-	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/servers" {
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/reconciliation" {
 		t.Fatalf("no_activation = %d %q", rr.Code, rr.Body.String())
 	}
 	if h.listed() {
@@ -218,7 +218,7 @@ func TestResolveFormEndToEndActivatedAndAudit(t *testing.T) {
 		t.Fatal("a refused resolution wrote an audit row or a job event")
 	}
 	rr := h.resolve("activated")
-	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/servers" {
+	if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/reconciliation" {
 		t.Fatalf("activated = %d %q", rr.Code, rr.Body.String())
 	}
 	if h.listed() {
@@ -303,9 +303,9 @@ func TestResolveFormEndToEndRouteMoved(t *testing.T) {
 // carries the hidden attempt_id of the blocked attempt.
 func TestResolveFormAttemptAnchor(t *testing.T) {
 	h := newResolveHarness(t, postgres.NewActivationBlockForTest(t, 190, true))
-	page := h.request(http.MethodGet, "/servers", nil).Body.String()
+	page := h.request(http.MethodGet, "/reconciliation", nil).Body.String()
 	if want := `name="attempt_id" value="` + strconv.FormatInt(h.env.AttemptID, 10) + `"`; !strings.Contains(page, want) {
-		t.Fatalf("servers page lacks %s", want)
+		t.Fatalf("reconciliation page lacks %s", want)
 	}
 	events, audits := h.count(eventsQuery), h.count(auditQuery)
 	stale := h.request(http.MethodPost, "/environments/resolve", url.Values{"csrf": {h.csrf}, "environment_id": {h.env.EnvironmentID}, "attempt_id": {strconv.FormatInt(h.env.AttemptID+1, 10)}, "outcome": {"not_activated"}, "reason": {"stale form"}})
