@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -685,6 +686,91 @@ func truncateUTF8(s string, max int) string {
 		cut--
 	}
 	return s[:cut]
+}
+
+// maxShippedProbeBytes bounds the health-gate last-probe line shipped to the
+// control plane.
+const maxShippedProbeBytes = 200
+
+// shipLastProbe ships the health gate's last probe observation on the health
+// stream right after the "health gate: failed" line (the control plane shows
+// it next to the failure reason). Newlines are flattened so it stays one line,
+// the text is cut to maxShippedProbeBytes on a rune boundary, and nothing is
+// shipped for an empty probe. The shipper redacts it over the secret set.
+func shipLastProbe(logs *logship.Attempt, probe string) {
+	probe = strings.TrimSpace(strings.NewReplacer("\r", " ", "\n", " ").Replace(probe))
+	if probe == "" {
+		return
+	}
+	probe = safeProbe(probe)
+	logs.Linef(logship.StreamHealth, "health gate: last probe: %s", truncateUTF8(probe, maxShippedProbeBytes))
+}
+
+// probeWithheld replaces a probe whose shape is not on the allowlist.
+const probeWithheld = "probe detail withheld"
+
+var (
+	probeStatusRE = regexp.MustCompile(`^status=[1-5][0-9]{2}$`)
+	probeErrBody  = regexp.MustCompile(`^[A-Za-z0-9 .,:/_\-\[\]"%()=?&+]+$`)
+)
+
+// probeErrorSuffixes are the fixed Go network-error endings the health probes
+// can record: dial/read failures from net (newTCPProbe, health.go:396-399) and
+// the HTTP client error recorded at health.go:565-568.
+var probeErrorSuffixes = []string{
+	"connection refused", "i/o timeout", "context deadline exceeded",
+	"connection reset by peer", "EOF", "no route to host", "network is unreachable",
+	"no such host", "server misbehaving",
+	"(Client.Timeout exceeded while awaiting headers)", "broken pipe",
+}
+
+// safeProbe returns probe unchanged only when every "; "-separated segment (at
+// most two: HTTP trace and TCP trace, joined at health.go:365-367) is a known
+// shape: "status=NNN", "tcp ok", or "(tcp error|error): <body>" with a
+// restricted character set, at most 180 bytes and a known network-error
+// suffix. Anything else becomes probeWithheld.
+//
+// Owner decision 22-3e D5 follow-up (2026-11-20): the probe is free text from
+// the tenant's app/network and the shipper's redaction only masks values in its
+// secret set. Rollback attempts never materialize secrets, so that set is empty
+// there and redaction cannot protect the line; an allowlist of the shapes
+// health.go documents (LastProbe contract, health.go:164 and :226) is applied
+// on every path instead.
+func safeProbe(probe string) string {
+	segs := strings.Split(probe, "; ")
+	if len(segs) > 2 {
+		return probeWithheld
+	}
+	for _, seg := range segs {
+		if !safeProbeSegment(seg) {
+			return probeWithheld
+		}
+	}
+	return probe
+}
+
+func safeProbeSegment(seg string) bool {
+	if probeStatusRE.MatchString(seg) || seg == "tcp ok" {
+		return true
+	}
+	var body string
+	switch {
+	case strings.HasPrefix(seg, "tcp error: "):
+		body = strings.TrimPrefix(seg, "tcp error: ")
+	case strings.HasPrefix(seg, "error: "):
+		body = strings.TrimPrefix(seg, "error: ")
+	default:
+		return false
+	}
+	if len(body) > 180 || !probeErrBody.MatchString(body) {
+		return false
+	}
+	for _, suffix := range probeErrorSuffixes {
+		if strings.HasSuffix(body, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func routeDigestString(d [32]byte) string { return "sha256:" + hex.EncodeToString(d[:]) }

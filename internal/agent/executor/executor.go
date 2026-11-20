@@ -415,6 +415,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 		if !gateResult.Success {
 			class := docker.ClassifyHealthGateResult(gateResult)
 			logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s class=%s)", gateResult.Reason, class)
+			shipLastProbe(logs, gateResult.LastProbe)
 			logs.Diagf(logship.StreamHealth, "health gate: failed: last_probe=%q exit_code=%d oom_killed=%t", gateResult.LastProbe, gateResult.ExitCode, gateResult.OOMKilled)
 			return e.outcome(lease, false, class)
 		}

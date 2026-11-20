@@ -83,6 +83,7 @@ func (e *Executor) executeRollback(ctx context.Context, lease agentclient.Lease,
 		if !gate.Success {
 			class := docker.ClassifyHealthGateResult(gate)
 			logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s class=%s)", gate.Reason, class)
+			shipLastProbe(logs, gate.LastProbe)
 			logs.Diagf(logship.StreamHealth, "health gate: failed: last_probe=%q exit_code=%d oom_killed=%t", gate.LastProbe, gate.ExitCode, gate.OOMKilled)
 			return e.outcome(lease, false, class)
 		}

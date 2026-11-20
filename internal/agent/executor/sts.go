@@ -308,6 +308,7 @@ func (s *stsRelease) beforeSwitch(ctx context.Context, rec *state.PendingActivat
 		return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; candidate health gate errored (%s)", class))
 	case !gate.Success:
 		logs.Linef(logship.StreamHealth, "health gate: failed (reason=%s)", gate.Reason)
+		shipLastProbe(logs, gate.LastProbe)
 		return s.failPostStop(ctx, rec, fmt.Sprintf("predecessor stopped; candidate failed health gate: reason=%s last_probe=%q", gate.Reason, gate.LastProbe))
 	}
 	logs.Linef(logship.StreamHealth, "health gate: passed")
