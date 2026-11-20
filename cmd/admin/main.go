@@ -33,18 +33,7 @@ func main() {
 			return configErr
 		}
 		ctx := context.Background()
-		conn, connectErr := pgx.Connect(ctx, dsn)
-		if connectErr != nil {
-			return connectErr
-		}
-		if migrationErr := migrations.Apply(ctx, conn); migrationErr != nil {
-			_ = conn.Close(ctx)
-			return migrationErr
-		}
-		if closeErr := conn.Close(ctx); closeErr != nil {
-			return closeErr
-		}
-		pool, poolErr := pgxpool.New(ctx, dsn)
+		pool, poolErr := openPool(ctx, dsn)
 		if poolErr != nil {
 			return poolErr
 		}
@@ -59,10 +48,38 @@ func main() {
 		}
 		return admincli.ResetPassword(ctx, username, ring, dependencies)
 	})
+	if errors.Is(err, errSchemaNotCurrent) {
+		fmt.Fprintln(os.Stderr, errSchemaNotCurrent.Error())
+		os.Exit(1)
+	}
 	if err != nil {
 		fail()
 	}
 	fmt.Fprintln(os.Stdout, "administrator operation completed")
+}
+
+// errSchemaNotCurrent is the only database-readiness text shown to the operator.
+var errSchemaNotCurrent = errors.New("database schema is not current; run autodeploy-run migrate")
+
+// openPool never migrates: admin runs as the runtime role (no CREATE, no
+// ledger writes). It verifies read-only that every embedded migration is
+// recorded, then returns the pool.
+func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	checkErr := migrations.CheckCurrent(ctx, conn)
+	if closeErr := conn.Close(ctx); checkErr == nil {
+		checkErr = closeErr
+	}
+	if errors.Is(checkErr, migrations.ErrNotCurrent) {
+		return nil, errSchemaNotCurrent
+	}
+	if checkErr != nil {
+		return nil, checkErr
+	}
+	return pgxpool.New(ctx, dsn)
 }
 
 func parseArgs(args []string) (string, string, error) {

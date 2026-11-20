@@ -5,16 +5,70 @@ import (
 	"context"
 	"crypto/sha256"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 //go:embed *.sql
 var files embed.FS
 var migrationFiles fs.FS = files
+
+// ErrNotCurrent reports that the database ledger lacks an embedded migration
+// or holds a different checksum for it.
+var ErrNotCurrent = errors.New("database schema is not current")
+
+// CheckCurrent is a read-only readiness check for processes that run as the
+// runtime role (no CREATE, no ledger writes): every embedded migration must
+// be recorded in schema_migrations with a matching checksum. It returns
+// ErrNotCurrent for a missing ledger, a missing row, or a checksum mismatch;
+// any other error is a query failure.
+func CheckCurrent(ctx context.Context, conn *pgx.Conn) error {
+	rows, err := conn.Query(ctx, `SELECT name, checksum FROM schema_migrations`)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+			return ErrNotCurrent
+		}
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	defer rows.Close()
+	stored := map[string]*string{}
+	for rows.Next() {
+		var name string
+		var checksum *string
+		if err := rows.Scan(&name, &checksum); err != nil {
+			return fmt.Errorf("read migration ledger: %w", err)
+		}
+		stored[name] = checksum
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read migration ledger: %w", err)
+	}
+	entries, err := fs.ReadDir(migrationFiles, ".")
+	if err != nil {
+		return fmt.Errorf("read migrations: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || len(name) <= 4 || name[len(name)-4:] != ".sql" {
+			continue
+		}
+		contents, err := fs.ReadFile(migrationFiles, name)
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+		sum, ok := stored[name]
+		if !ok || sum == nil || *sum != fmt.Sprintf("%x", sha256.Sum256(contents)) {
+			return ErrNotCurrent
+		}
+	}
+	return nil
+}
 
 // Apply records and applies each embedded migration exactly once.
 func Apply(ctx context.Context, conn *pgx.Conn) error {
