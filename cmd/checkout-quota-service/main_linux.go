@@ -18,7 +18,13 @@ import (
 func main() {
 	initialize := flag.Bool("initialize", false, "explicitly create a pristine quota ledger")
 	initialProjectID := flag.Uint("initial-project-id", 0, "required nonzero project-ID high-water floor with -initialize")
+	reclaimTTL := flag.Duration("reclaim-ttl", checkoutquota.DefaultReclaimTTL, "age at which an active allocation is reclaimed (minimum 1h)")
+	sweepInterval := flag.Duration("sweep-interval", checkoutquota.DefaultSweepInterval, "period of the stale-allocation sweep (minimum 1m)")
 	flag.Parse()
+	if checkoutquota.ValidateSweep(*reclaimTTL, *sweepInterval) != nil {
+		fmt.Fprintln(os.Stderr, "invalid checkout quota service configuration")
+		os.Exit(2)
+	}
 	if flag.NArg() != 9 || (*initialize && (*initialProjectID == 0 || uint64(*initialProjectID) > uint64(^uint32(0)))) || (!*initialize && *initialProjectID != 0) {
 		fmt.Fprintln(os.Stderr, "invalid checkout quota service configuration")
 		os.Exit(2)
@@ -34,7 +40,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "invalid checkout quota service configuration")
 		os.Exit(2)
 	}
-	svc, err := checkoutquota.New(checkoutquota.Config{CheckoutRoot: args[0], SocketPath: args[1], StatePath: args[2], AgentUID: uint32(agentUID), AgentGID: uint32(agentGID), CheckoutUID: uint32(checkoutUID), CheckoutGID: uint32(checkoutGID), MaxBytes: bytes, MaxInodes: inodes, Initialize: *initialize, InitialProjectID: uint32(*initialProjectID)})
+	svc, err := checkoutquota.New(checkoutquota.Config{CheckoutRoot: args[0], SocketPath: args[1], StatePath: args[2], AgentUID: uint32(agentUID), AgentGID: uint32(agentGID), CheckoutUID: uint32(checkoutUID), CheckoutGID: uint32(checkoutGID), MaxBytes: bytes, MaxInodes: inodes, ReclaimTTL: *reclaimTTL, SweepInterval: *sweepInterval, Initialize: *initialize, InitialProjectID: uint32(*initialProjectID)})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "checkout quota service unavailable")
 		os.Exit(1)

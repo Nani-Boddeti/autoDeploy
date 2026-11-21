@@ -5,7 +5,33 @@ package checkoutquota
 
 import (
 	"errors"
+	"fmt"
+	"time"
 )
+
+// Stale-allocation reclaim knobs (23-H, owner decision D3). An allocation that
+// stays `active` this long has lost its holder: the longest legitimate hold is
+// checkout (120s spawn limit) plus one build (--build-timeout, at most 2h,
+// cmd/agent/main.go). The floor is that 2h + 2m plus margin, rounded up to 3h;
+// the default (6h) sits far above it.
+const (
+	DefaultReclaimTTL    = 6 * time.Hour
+	MinReclaimTTL        = 3 * time.Hour
+	DefaultSweepInterval = 10 * time.Minute
+	MinSweepInterval     = time.Minute
+)
+
+// ValidateSweep checks explicit reclaim settings. Zero values mean "use the
+// default" only in Config; here both must be concrete.
+func ValidateSweep(ttl, interval time.Duration) error {
+	if ttl < MinReclaimTTL {
+		return fmt.Errorf("%w: reclaim ttl must be at least %s", ErrInvalid, MinReclaimTTL)
+	}
+	if interval < MinSweepInterval {
+		return fmt.Errorf("%w: sweep interval must be at least %s", ErrInvalid, MinSweepInterval)
+	}
+	return nil
+}
 
 var (
 	ErrUnavailable = errors.New("checkout quota service unavailable")
@@ -33,10 +59,15 @@ type Config struct {
 	// CheckoutUID and CheckoutGID are the fixed, non-root identity that owns
 	// active workspaces. They are intentionally separate from the agent socket
 	// identity: the checkout process must not be able to connect to helpers.
-	CheckoutUID      uint32
-	CheckoutGID      uint32
-	MaxBytes         uint64
-	MaxInodes        uint64
+	CheckoutUID uint32
+	CheckoutGID uint32
+	MaxBytes    uint64
+	MaxInodes   uint64
+	// ReclaimTTL is the age at which an `active` allocation is reclaimed by the
+	// periodic sweep; SweepInterval is the sweep period. Zero selects the
+	// defaults; explicit values are validated by ValidateSweep.
+	ReclaimTTL       time.Duration
+	SweepInterval    time.Duration
 	Initialize       bool   // one-time, explicit operator ledger initialization
 	InitialProjectID uint32 // required only with Initialize; never defaults to one
 }

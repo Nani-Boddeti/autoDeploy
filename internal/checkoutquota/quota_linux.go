@@ -13,8 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +96,9 @@ type allocation struct {
 	Bytes  uint64   `json:"bytes"`
 	Inodes uint64   `json:"inodes"`
 	State  string   `json:"state"`
+	// Activated is when Ack made the allocation active. Ledgers written before
+	// 23-H lack it (zero): the sweep then ages the entry from service start.
+	Activated time.Time `json:"activated,omitzero"`
 }
 
 type Service struct {
@@ -106,6 +111,14 @@ type Service struct {
 	mu        sync.Mutex
 	ledger    ledger
 	conn      chan struct{}
+
+	started  time.Time // aging origin for active entries without Activated
+	ttl      time.Duration
+	interval time.Duration // sweep period
+	// Test seams; nil means production behavior.
+	clock       func() time.Time
+	cleanupHook func(fd int, record allocation) error
+	missingHook func(a allocation) error
 }
 
 const (
@@ -199,6 +212,7 @@ func (s *Service) Serve(ctx context.Context) error {
 		}
 	}()
 	defer close(done)
+	go s.sweepLoop(ctx, done)
 	for {
 		conn, _, e := accept4Retry(fd, unix.SOCK_CLOEXEC)
 		if e != nil {
@@ -449,6 +463,16 @@ func New(c Config) (*Service, error) {
 	if c.CheckoutRoot == "" || !filepath.IsAbs(c.CheckoutRoot) || c.StatePath == "" || !filepath.IsAbs(c.StatePath) || filepath.Base(c.StatePath) == "/" || c.AgentUID == 0 || c.AgentGID == 0 || c.CheckoutUID == 0 || c.CheckoutGID == 0 || c.CheckoutUID == c.AgentUID || c.CheckoutGID == c.AgentGID || c.MaxBytes == 0 || c.MaxInodes == 0 || (c.Initialize && (c.InitialProjectID == 0 || c.InitialProjectID == ^uint32(0))) {
 		return nil, ErrInvalid
 	}
+	ttl, interval := c.ReclaimTTL, c.SweepInterval
+	if ttl == 0 {
+		ttl = DefaultReclaimTTL
+	}
+	if interval == 0 {
+		interval = DefaultSweepInterval
+	}
+	if err := ValidateSweep(ttl, interval); err != nil {
+		return nil, err
+	}
 	if err := trustedPath(c.CheckoutRoot); err != nil {
 		return nil, err
 	}
@@ -498,7 +522,7 @@ func New(c Config) (*Service, error) {
 		root.Close()
 		return nil, err
 	}
-	s := &Service{cfg: c, root: root, lockFD: lockFD, stateDir: stateDir, stateName: stateName, mount: m, ledger: l}
+	s := &Service{cfg: c, root: root, lockFD: lockFD, stateDir: stateDir, stateName: stateName, mount: m, ledger: l, started: time.Now(), ttl: ttl, interval: interval}
 	// A damaged individual record never grants access. Reconciliation is
 	// best-effort per record, so one uncertain checkout does not brick restart.
 	if err := s.reconcile(); err != nil {
@@ -682,6 +706,7 @@ func (s *Service) Ack(handle [16]byte) error {
 	active := cloneLedger(s.ledger)
 	a = active.Active[record.Name]
 	a.State = stateActive
+	a.Activated = s.now().UTC()
 	active.Active[record.Name] = a
 	if err = s.persist(active); err != nil {
 		_ = s.withdrawOfferLocked(fd, handle)
@@ -831,10 +856,17 @@ func (s *Service) Release(workspaceFD int, handle [16]byte) error {
 		}
 		return ErrDenied
 	}
-	if err := revokeWorkspace(workspaceFD); err != nil {
+	return s.releaseRecordLocked(workspaceFD, *record)
+}
+
+// releaseRecordLocked is the one release path shared by Release and the stale
+// sweep: revoke caller access, persist the releasing intent, then clean up.
+// Callers hold s.mu and have matched record to fd.
+func (s *Service) releaseRecordLocked(fd int, record allocation) error {
+	if err := revokeWorkspace(fd); err != nil {
 		return err
 	}
-	if err := s.verifyWorkspaceFD(workspaceFD); err != nil {
+	if err := s.verifyWorkspaceFD(fd); err != nil {
 		return err
 	}
 	// Record the irreversible cleanup intent before changing project accounting.
@@ -849,7 +881,147 @@ func (s *Service) Release(workspaceFD int, handle [16]byte) error {
 	// This transition is persisted before deletion. A crash leaves a root-only
 	// workspace in stateReleasing, which reconciliation retries without ever
 	// restoring caller access.
-	return s.cleanupLocked(workspaceFD, *record)
+	return s.cleanupRecordLocked(fd, record)
+}
+
+func (s *Service) cleanupRecordLocked(fd int, record allocation) error {
+	if s.cleanupHook != nil {
+		return s.cleanupHook(fd, record)
+	}
+	return s.cleanupLocked(fd, record)
+}
+
+func (s *Service) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
+}
+
+// sweepLoop reclaims stale active allocations until ctx ends or Serve returns.
+func (s *Service) sweepLoop(ctx context.Context, stop <-chan struct{}) {
+	t := time.NewTicker(s.interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-t.C:
+			s.reclaimStale()
+		}
+	}
+}
+
+// maxSweepEntries caps the work done per sweep tick so a mass expiry cannot
+// hold the ledger lock (shared with every RPC) for long; the rest wait for the
+// next tick.
+const maxSweepEntries = 16
+
+// reclaimStale runs one sweep under the same lock as the RPC handlers, always
+// through the normal release/cleanup helpers:
+//   - `active` entries whose age reached the TTL are released (oldest first);
+//   - `releasing` entries (holder gone, an earlier cleanup failed; already
+//     root-only, so no TTL) get their cleanup retried.
+//
+// Entries in any other state are never touched (reconcile owns them). At most
+// maxSweepEntries entries are processed per call. It returns how many
+// allocations were completed.
+func (s *Service) reclaimStale() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.now()
+	type candidate struct {
+		a     allocation
+		since time.Time
+	}
+	var stale, releasing []candidate
+	for _, a := range s.ledger.Active {
+		since := a.Activated
+		if since.IsZero() {
+			since = s.started
+		}
+		switch a.State {
+		case stateActive:
+			if now.Sub(since) >= s.ttl {
+				stale = append(stale, candidate{a, since})
+			}
+		case stateReleasing:
+			releasing = append(releasing, candidate{a, since})
+		}
+	}
+	oldestFirst := func(c []candidate) {
+		sort.Slice(c, func(i, j int) bool {
+			if !c[i].since.Equal(c[j].since) {
+				return c[i].since.Before(c[j].since)
+			}
+			return c[i].a.ID < c[j].a.ID
+		})
+	}
+	oldestFirst(stale)
+	oldestFirst(releasing)
+	work := append(stale, releasing...)
+	if len(work) > maxSweepEntries {
+		work = work[:maxSweepEntries]
+	}
+	n := 0
+	for _, c := range work {
+		a := c.a
+		age := now.Sub(c.since).Round(time.Second)
+		fd, err := unix.Openat(int(s.root.Fd()), a.Name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if errors.Is(err, unix.ENOENT) {
+			// Same handling as the startup reconcile for a missing directory.
+			if s.finishMissingLocked(a) != nil {
+				log.Printf("checkout quota: allocation id=%d age=%s directory missing, completion incomplete", a.ID, age)
+				continue
+			}
+			n++
+			log.Printf("checkout quota: completed allocation id=%d age=%s directory already gone", a.ID, age)
+			continue
+		}
+		if err != nil {
+			log.Printf("checkout quota: allocation id=%d age=%s not opened, skipped", a.ID, age)
+			continue
+		}
+		if s.matchesRecordFD(fd, a) != nil {
+			unix.Close(fd)
+			continue
+		}
+		if a.State == stateActive {
+			err = s.releaseRecordLocked(fd, a)
+		} else {
+			err = s.cleanupRecordLocked(fd, a)
+		}
+		unix.Close(fd)
+		if err != nil {
+			log.Printf("checkout quota: allocation id=%d state=%s age=%s reclaim incomplete: %v", a.ID, a.State, age, err)
+			continue
+		}
+		n++
+		if a.State == stateActive {
+			log.Printf("checkout quota: reclaimed stale allocation id=%d age=%s", a.ID, age)
+		} else {
+			log.Printf("checkout quota: completed releasing allocation id=%d age=%s", a.ID, age)
+		}
+	}
+	return n
+}
+
+// finishMissingLocked completes an allocation whose workspace directory is
+// already gone: once kernel usage is zero, clear the limits and record the
+// terminal state. Shared with the startup reconcile.
+func (s *Service) finishMissingLocked(a allocation) error {
+	if s.missingHook != nil {
+		return s.missingHook(a)
+	}
+	if !usageCleared(int(s.root.Fd()), int(a.ID)) {
+		return ErrRetryable
+	}
+	if err := clearLimits(int(s.root.Fd()), a.ID); err != nil {
+		return err
+	}
+	return s.completeLocked(a)
 }
 
 func terminalKey(handle [16]byte) string { return fmt.Sprintf("%x", sha256.Sum256(handle[:])) }
@@ -1194,13 +1366,7 @@ func (s *Service) reconcile() error {
 			if !errors.Is(err, unix.ENOENT) {
 				continue
 			}
-			if !usageCleared(int(s.root.Fd()), int(a.ID)) {
-				continue
-			}
-			if err = clearLimits(int(s.root.Fd()), a.ID); err != nil {
-				continue
-			}
-			_ = s.completeLocked(a)
+			_ = s.finishMissingLocked(a)
 			continue
 		}
 		// Do not use a path after this point. Every operation is descriptor based.
