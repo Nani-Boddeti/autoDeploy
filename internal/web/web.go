@@ -881,12 +881,12 @@ func (h *Handler) serversList(w http.ResponseWriter, r *http.Request) {
 	}
 	summaries, err := h.config.ServerAdmin.ListServers(r.Context(), p)
 	if err != nil {
-		badRequest(w)
+		operationsFailure(w, r, err)
 		return
 	}
 	environments, err := h.config.ServerAdmin.ListReconcilingEnvironments(r.Context(), p)
 	if err != nil {
-		badRequest(w)
+		operationsFailure(w, r, err)
 		return
 	}
 	view := serversView{Nav: h.navForCount("servers", p, len(environments)), CSRF: csrf, ReconcilingText: reconcilingText(len(environments)), EnrollHint: enrollCommand(h.config.PublicOrigin, "<SERVER_ID>")}

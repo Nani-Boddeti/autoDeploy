@@ -47,7 +47,7 @@ func (h *Handler) reconciliationPage(w http.ResponseWriter, r *http.Request) {
 	}
 	blocked, err := h.config.ServerAdmin.ListReconcilingEnvironments(r.Context(), p)
 	if err != nil {
-		badRequest(w)
+		operationsFailure(w, r, err)
 		return
 	}
 	view := reconciliationView{Nav: h.navForCount("reconciliation", p, len(blocked)), CSRF: csrf, ResolveReasonMax: maxResolveReasonBytes}

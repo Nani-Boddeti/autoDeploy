@@ -110,8 +110,12 @@ func TestReconciliationRouteAvailability(t *testing.T) {
 func TestReconciliationListErrorIsGeneric(t *testing.T) {
 	h, _, admin, p := overviewHandler(t, nil)
 	admin.envListErr = errors.New("db down")
-	if rr := opsGet(h, p, http.MethodGet, "/reconciliation"); rr.Code != http.StatusBadRequest {
-		t.Fatalf("env list error = %d", rr.Code)
+	if rr := opsGet(h, p, http.MethodGet, "/reconciliation"); rr.Code != http.StatusInternalServerError || strings.Contains(rr.Body.String(), "db down") {
+		t.Fatalf("env list error = %d %q", rr.Code, rr.Body.String())
+	}
+	admin.envListErr = postgres.ErrServerAuthorizationDenied
+	if rr := opsGet(h, p, http.MethodGet, "/reconciliation"); rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/login" {
+		t.Fatalf("env list denied = %d %q", rr.Code, rr.Header().Get("Location"))
 	}
 }
 

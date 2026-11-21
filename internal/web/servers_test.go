@@ -633,20 +633,29 @@ func TestServersListRendersAndEscapesNamesAndRepositoryDenialIsGeneric(t *testin
 		t.Fatal("servers page lacks the reconciliation banner")
 	}
 
-	// A repository read failure renders the generic error page, not a
-	// distinguishable failure.
-	admin.listErr = errors.New("db down")
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, serversRequest(http.MethodGet, "/servers", nil, p, h))
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("denied list = %d", rr.Code)
-	}
-	admin.listErr = nil
-	admin.envListErr = errors.New("db down")
-	rr = httptest.NewRecorder()
-	h.ServeHTTP(rr, serversRequest(http.MethodGet, "/servers", nil, p, h))
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("denied environment list = %d", rr.Code)
+	// A repository read failure maps like every other operations page: a
+	// generic 500 for store errors (no detail), a /login redirect when the
+	// session became invalid between the page's own check and the read.
+	for _, c := range []struct {
+		name string
+		set  func(error)
+	}{
+		{"servers", func(e error) { admin.listErr = e }},
+		{"environments", func(e error) { admin.envListErr = e }},
+	} {
+		c.set(errors.New("db down"))
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, serversRequest(http.MethodGet, "/servers", nil, p, h))
+		if rr.Code != http.StatusInternalServerError || strings.Contains(rr.Body.String(), "db down") {
+			t.Fatalf("%s list store error = %d %q", c.name, rr.Code, rr.Body.String())
+		}
+		c.set(postgres.ErrServerAuthorizationDenied)
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, serversRequest(http.MethodGet, "/servers", nil, p, h))
+		if rr.Code != http.StatusSeeOther || rr.Header().Get("Location") != "/login" {
+			t.Fatalf("%s list denied = %d %q", c.name, rr.Code, rr.Header().Get("Location"))
+		}
+		c.set(nil)
 	}
 }
 
