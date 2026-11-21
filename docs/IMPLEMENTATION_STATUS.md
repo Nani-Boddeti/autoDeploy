@@ -1,6 +1,6 @@
 # AutoDeploy implementation handoff
 
-Snapshot: 2026-11-19. Branch: main; origin/main = da24fe7 (22-2 build limits/builder/cache/build args 14bb581, 22-2f terminal secret put/replace 369175a, end-of-day docs da24fe7); step 22-4 observability is code-complete on the mac and pending commit (22-4a/b structured redacted logging, 22-4c metrics endpoint, 22-4d `secrets secret verify`, 22-4e backup/restore + observability docs and deploy/host/backup-db.sh). Migrations run through 000028 (22-4 adds none). The acer runs build 14bb581; 369175a is staged, not installed. Gates executorEnabled/activationEnabled still false in committed code. `.tmp/` is gitignored; never use blanket `git add`; inspect git status --short before staging.
+Snapshot: 2026-11-21. Branch: main; origin/main = efc7745 (plan 23 dev follow-ups 23-A..23-H cb29c69..83084be, proven on the acer in round 8 519f78a; follow-up docs efc7745). The UI outcome (22-3) is done. Migrations run through 000031. The acer runs build 83084be. Still open: public VPS/ACME end to end (incl. gate 3), backup/restore drill (owner: do last), build secret mounts, and the 24h retention check on a continuously running host. Gates executorEnabled/activationEnabled still false in committed code. `.tmp/` is gitignored; never use blanket `git add`; inspect git status --short before staging.
 
 ## Scope and current progress
 
@@ -305,7 +305,7 @@ From step 15 (operations UI and deployment logs; plans in tasks/15-plan.md and t
 - Done (859acc8..639f4f8, migration 000022): projects list, deployments list and detail, cancel (over unchanged
   `RequestCancellation`), and deploy-step logs: append-only storage with caps, agent upload endpoint, agent
   shipper with exact-value redaction, retention purge, and the `/deployments/logs` page.
-- Deferred: retry (after the real-host run), rollback button (slice 11), container runtime logs, drain log lines
+- Deferred: retry (after the real-host run), rollback button (slice 11; since done: rollback jobs cbcddd3, inline rollback action in 22-3), container runtime logs, drain log lines
   (the drain record lacks the fence), and a visual browser check of the pages (not yet done).
 - Web UI: the CSP gained only `style-src 'self'` (a same-origin embedded stylesheet at `/static/app.css`); no
   scripts anywhere; live pages poll with meta-refresh (5s detail, 3s logs tail).
