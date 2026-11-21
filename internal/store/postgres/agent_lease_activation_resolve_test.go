@@ -312,6 +312,7 @@ func plainBlock(t *testing.T, seed byte) activatedFixture {
 	f := newLeaseFixture(t, seed)
 	f.insertRouteHead(t, "app.example.com")
 	attemptID := f.leaseJob(t, 1, 90)
+	f.advanceDeploymentTo(t, deployment.StatusStarting) // 23-F: only a host-mutating phase blocks
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 	a := activatedFixture{leaseFixture: f, attemptID: attemptID, repo: repo}
 	a.lapse(t, "2 seconds")

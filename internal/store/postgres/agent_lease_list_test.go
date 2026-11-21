@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/deployment"
 )
 
 // TestAgentLeaseListReconcilingEnvironmentsOwnerScoped exercises the web
@@ -20,6 +21,7 @@ import (
 func TestAgentLeaseListReconcilingEnvironmentsOwnerScoped(t *testing.T) {
 	f := newLeaseFixture(t, 250)
 	attemptID := f.leaseJob(t, 1, 1)
+	f.advanceDeploymentTo(t, deployment.StatusStarting) // 23-F: only a host-mutating phase blocks
 	time.Sleep(1100 * time.Millisecond)
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 	ctx := context.Background()
@@ -80,6 +82,7 @@ func TestAgentLeaseClaimRefusesOrdinaryCloseFlagUntilOperatorResolves(t *testing
 	repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 	ctx := context.Background()
 	attemptID := f.leaseJob(t, 1, 1)
+	f.advanceDeploymentTo(t, deployment.StatusStarting) // 23-F: only a host-mutating phase blocks
 	time.Sleep(1100 * time.Millisecond)
 	if _, err := repo.ExpireBatch(ctx, 10); err != nil {
 		t.Fatal(err)

@@ -895,7 +895,9 @@ func validOperationID(id string) bool {
 // cancellation was already requested) or expired; the environment fence advances and the slot is marked
 // reconciliation_required with its occupant cleared (an already-executing
 // host syscall cannot be preempted, so no new work may use the slot until
-// the agent reconciles); and the job is terminalized/retried/dead-lettered
+// the agent reconciles) -- except that, before any container call is possible
+// (attemptLeftNoHostState, ADR 0004 amendment 2026-11-21), it is vacated
+// without the flag; and the job is terminalized/retried/dead-lettered
 // exactly as ADR 0004's expiry section specifies -- attempt_count is never
 // incremented here, since it counts started attempts, not closures.
 //
@@ -959,6 +961,49 @@ func divertUnresolvedActivation(ctx context.Context, tx pgx.Tx, inject func(stri
 	return true, nil
 }
 
+// deploymentStatusLeavesNoHostState is the 23-F predicate (ADR 0004 amendment
+// 2026-11-21): an attempt whose deployment is in one of these statuses cannot
+// have created or started a candidate container, because the agent creates or
+// starts none until its starting report is accepted under the current fence.
+// It is an ALLOWLIST by the negative-definition rule: any status not named
+// here (starting, health_checking, activating, a terminal status, anything
+// added later) is treated as possibly host-mutating and keeps the
+// reconciliation block.
+func deploymentStatusLeavesNoHostState(status deployment.Status) bool {
+	switch status {
+	case deployment.StatusQueued, deployment.StatusAssigned, deployment.StatusFetching, deployment.StatusBuilding:
+		return true
+	default:
+		return false
+	}
+}
+
+// attemptLeftNoHostState reports whether closing attemptID may vacate its slot
+// without reconciliation_required: the deployment status is in the allowlist
+// AND no release operation exists for the attempt (the unresolved activate
+// case is diverted before this runs; a resolved one, or any other kind, means
+// the host was mutated). The reads are plain SELECTs under the slot, job and
+// attempt locks the caller already holds, in ADR 0004 order (release_operations
+// before deployments); neither is locked here.
+func attemptLeftNoHostState(ctx context.Context, tx pgx.Tx, attemptID int64, environmentID, deploymentID string) (bool, error) {
+	var hasOperation bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM release_operations WHERE attempt_id=$1 AND environment_id=$2)`, attemptID, environmentID).Scan(&hasOperation); err != nil {
+		return false, fmt.Errorf("check release operations for closed attempt: %w", err)
+	}
+	if hasOperation {
+		return false, nil
+	}
+	var status string
+	err := tx.QueryRow(ctx, `SELECT status FROM deployments WHERE id=$1`, deploymentID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read deployment status for closed attempt: %w", err)
+	}
+	return deploymentStatusLeavesNoHostState(deployment.Status(status)), nil
+}
+
 func closeAttemptOrdinary(ctx context.Context, tx pgx.Tx, deployments *DeploymentRepository, inject func(string) error, jobID, attemptID int64, environmentID string, attemptNumber int, deploymentID string, cancelRequested bool, now time.Time) error {
 	closedState := "expired"
 	if cancelRequested {
@@ -971,7 +1016,18 @@ func closeAttemptOrdinary(ctx context.Context, tx pgx.Tx, deployments *Deploymen
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, `UPDATE environment_slots SET fence=fence+1, current_attempt_id=NULL, reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=$3 WHERE environment_id=$1`,
+	vacateOnly, err := attemptLeftNoHostState(ctx, tx, attemptID, environmentID, deploymentID)
+	if err != nil {
+		return err
+	}
+	if vacateOnly {
+		// Slice 23-F: nothing traffic-affecting can exist, so the slot is
+		// vacated (fence advanced, occupant cleared) without the block.
+		if _, err = tx.Exec(ctx, `UPDATE environment_slots SET fence=fence+1, current_attempt_id=NULL, updated_at=$2 WHERE environment_id=$1`,
+			environmentID, now); err != nil {
+			return fmt.Errorf("vacate environment slot for closed attempt: %w", err)
+		}
+	} else if _, err = tx.Exec(ctx, `UPDATE environment_slots SET fence=fence+1, current_attempt_id=NULL, reconciliation_required=true, reconciliation_attempt_id=$2, updated_at=$3 WHERE environment_id=$1`,
 		environmentID, attemptID, now); err != nil {
 		return fmt.Errorf("advance environment slot for closed attempt: %w", err)
 	}

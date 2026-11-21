@@ -549,6 +549,9 @@ Costs:
 - Lost/corrupt host fence state fails closed; stale cleanup cannot delete a newer release.
 - In-flight same-fence host mutation during expiry/cancellation blocks environment reuse until
   reconciliation; activation uses the atomic `activating` transition as its linearization point.
+  Expiry/cancellation/revocation while the deployment is queued, assigned, fetching or building (no
+  container call possible, amendment 2026-11-21) vacates the slot without the block; every other status
+  blocks, and a starting report racing the expiry is decided by the slot lock.
 - Database clock regression/failover beyond the monitored bound pauses queue authority changes and
   requires reconciliation.
 - Representative PostgreSQL 18 `EXPLAIN` plans use runnable and expiry indexes at backlog scale.
@@ -991,6 +994,51 @@ and only for stop-then-start deployment leases); activation-result field `outcom
 `succeeded=false`; otherwise 400 `invalid_request`). The control plane does not persist the opt-in per attempt (that
 would need a migration); it re-verifies every finalize condition when the report arrives, so the opt-in only governs
 what an agent is told, not what the server trusts.
+
+## Amendments (2026-11-21)
+
+**23-F: the reconciliation block is narrowed to phases that can mutate the host (owner decision D1).**
+Checked against `closeAttemptOrdinary`, `attemptLeftNoHostState` and `deploymentStatusLeavesNoHostState` in
+`internal/store/postgres/agent_lease_repository.go`, `ReportProgress` in `agent_lease_materialize.go`, and
+`progressReporter` in `internal/agent/executor/progress.go`.
+
+- **Predicate.** When an attempt is closed by expiry, cancellation-at-expiry or server revocation (the single
+  routine `closeAttemptOrdinary`), the slot is vacated (`fence = fence + 1`, `current_attempt_id = NULL`)
+  WITHOUT `reconciliation_required` if and only if (a) the deployment's status is in the allowlist
+  `{queued, assigned, fetching, building}` and (b) no `release_operations` row exists for the attempt (any
+  kind; the unresolved activate case is diverted earlier, a resolved or other one proves the host was
+  mutated). Otherwise the statement is unchanged: the slot is vacated and flagged with
+  `reconciliation_attempt_id`. The allowlist follows the negative-definition rule: `starting`,
+  `health_checking`, `activating`, any terminal status, an empty or future status, and a missing deployment
+  row all block. Attempt and job closure, retry/dead semantics, deployment transitions and events are
+  unchanged. The status and operation are read with plain SELECTs under the slot, job and attempt locks the
+  routine already holds, in the documented order (release_operations before deployments); no new lock is taken.
+- **Why fetching/building leave nothing traffic-affecting.** Checkout writes only a workspace; stranded
+  checkout workspaces are reclaimed by the quota service (at restart today, periodically once 23-H lands). A
+  build produces images and build cache, which retention and the cache pruner clean. The build phase also runs
+  `buildx create` / `inspect --bootstrap` (`internal/runtime/docker/builder.go`), which creates or starts the
+  shared `docker-container` BuildKit builder. That container is shared infrastructure, idempotent per
+  `BuilderName`, carries no attempt identity (it is not a candidate release container) and is reused by the next
+  attempt, so leaving it behind is safe. None of this touches a running release container, a route or a
+  predecessor. The reconciliation block exists for in-flight host mutation of the release; none can exist before
+  a candidate container is created or started.
+- **Precondition, enforced in two places.** (1) The store refuses `ReportProgress` unless the slot's `fence`
+  equals the reported fence, `current_attempt_id` equals the reporting attempt, the slot is not flagged, the job
+  has no cancel request, and the attempt is `leased` with unexpired authority. Expiry advances the fence and
+  clears `current_attempt_id`, so any later report from that attempt is refused. (2) The executor creates or
+  starts no container until its `starting` report was ACCEPTED under the current fence: the build-then-run,
+  stop-then-start and rollback paths all report `starting` first, and `progressReporter.report` now returns the
+  failure for that phase (`phaseRequiresAcceptance`), after at most three attempts with a 1s/2s backoff and only on
+  a positively known transient error (control plane unavailable, transport failure); a denial, stale fence or
+  unrecognized error is final so the attempt ends with a transient failure before any
+  Engine create or start call. Before this slice the report was best-effort and a refused `starting` report
+  would not have stopped the create; that gap is closed here. Earlier phases stay best-effort observability.
+- **Race.** A `starting` report and the expiry of the same attempt serialize on the slot row (`ReportProgress`
+  takes it `FOR SHARE`, expiry `FOR UPDATE SKIP LOCKED`). If the report commits first the deployment is
+  `starting` when expiry reads it and the slot is flagged; if expiry commits first the report is refused. A
+  state in which the deployment reached `starting` and the slot is unflagged is unreachable.
+- **Unchanged.** Any status outside the allowlist still blocks, including every `activating` case and any
+  attempt holding an activate operation. Clearing a block is unchanged (owning server or break-glass).
 
 ## References
 

@@ -2,7 +2,11 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"time"
 
+	agentclient "autodeploy/internal/agent/client"
 	"autodeploy/internal/agent/logship"
 	"autodeploy/internal/deployment"
 )
@@ -17,7 +21,8 @@ type controlPlaneProgress interface {
 // aborting Execute over a report failure -- ReportProgress's own doc says a
 // caller should not abort execution because a report failed, since a
 // genuine authorization failure surfaces again on the next lease renewal.
-// The one exception is the caller's own context: a cancelled/expired ctx
+// Two exceptions: the starting phase (phaseRequiresAcceptance), which gates
+// every container create/start, and the caller's own context: a cancelled/expired ctx
 // must make Execute return promptly (Agent.runLease waits for it), so
 // report still surfaces ctx.Err().
 //
@@ -58,14 +63,62 @@ func newProgressReporter(client controlPlaneProgress) *progressReporter {
 	return &progressReporter{client: client}
 }
 
+// startingRetryBackoff is the wait before the 2nd and 3rd attempt of a
+// required (starting) report: at most three attempts in total. A var so tests
+// can shorten it.
+var startingRetryBackoff = []time.Duration{time.Second, 2 * time.Second}
+
 // report calls the control plane, logging (never returning) a non-context
-// failure. It returns non-nil only when ctx itself is done.
+// failure, except for a phase that requires acceptance. It returns non-nil
+// when ctx itself is done or a required report was not accepted.
+//
+// A required report is retried only on a positively known transient error
+// (agentclient.ErrServiceUnavailable, ErrTransportFailure); a denial, stale
+// fence, integrity conflict, invalid request or anything unrecognized is
+// final (negative definition), so a refusal never turns into a create.
 func (r *progressReporter) report(ctx context.Context, attemptID, fence int64, phase deployment.Status) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_ = r.client.ReportProgress(ctx, attemptID, fence, phase)
-	return ctx.Err()
+	err := r.client.ReportProgress(ctx, attemptID, fence, phase)
+	for retry := 0; err != nil && phaseRequiresAcceptance(phase) && isTransientReportError(err) && retry < len(startingRetryBackoff); retry++ {
+		timer := time.NewTimer(startingRetryBackoff[retry])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		err = r.client.ReportProgress(ctx, attemptID, fence, phase)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil && phaseRequiresAcceptance(phase) {
+		return fmt.Errorf("progress %s not accepted by the control plane: %w", phase, err)
+	}
+	return nil
+}
+
+// isTransientReportError reports whether err is positively known to be a
+// transient control-plane or network failure.
+func isTransientReportError(err error) bool {
+	return errors.Is(err, agentclient.ErrServiceUnavailable) || errors.Is(err, agentclient.ErrTransportFailure)
+}
+
+// phaseRequiresAcceptance reports whether a refused or failed progress report
+// for phase must stop the attempt. It is the agent half of slice 23-F
+// (ADR 0004 amendment 2026-11-21): the control plane lets an expired or
+// revoked attempt vacate the slot without the reconciliation block while the
+// deployment is at or before building, which is sound only because no
+// container is created or started until the starting report was accepted
+// under the current fence (the store refuses that report once the attempt is
+// no longer the slot's current attempt). Every path that creates or starts a
+// container -- build-then-run, stop-then-start, rollback -- reports starting
+// first, so requiring acceptance here covers all of them. Earlier phases stay
+// best-effort observability: they precede no container call.
+func phaseRequiresAcceptance(phase deployment.Status) bool {
+	return phase == deployment.StatusStarting
 }
 
 // phaseTracker is Execute's local idempotency guard: it never lets the same

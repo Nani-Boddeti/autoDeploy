@@ -535,7 +535,8 @@ func TestAgentLeaseAcknowledgeCancellationClosesAttemptAndJob(t *testing.T) {
 func TestAgentLeaseExpireBatchExpiredVsCancelledClosure(t *testing.T) {
 	t.Run("expired", func(t *testing.T) {
 		f := newLeaseFixture(t, 200)
-		attemptID := f.leaseJob(t, 1, 1) // 1-second lease, already past by the time ExpireBatch runs
+		attemptID := f.leaseJob(t, 1, 1)                    // 1-second lease, already past by the time ExpireBatch runs
+		f.advanceDeploymentTo(t, deployment.StatusStarting) // 23-F: only a host-mutating phase blocks; earlier phases are in agent_lease_vacate_without_block_test.go
 		time.Sleep(1100 * time.Millisecond)
 		repo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 		processed, err := repo.ExpireBatch(context.Background(), 10)
@@ -684,8 +685,8 @@ func TestAgentLeaseExpireBatchInjectedFailureRollsBack(t *testing.T) {
 func TestServerRevokeServerClosesInFlightLease(t *testing.T) {
 	f := newLeaseFixture(t, 230)
 	d := f.withCredential(t, 60)
-	f.assignDeployment(t)
 	attemptID := f.leaseJob(t, 1, 90)
+	f.advanceDeploymentTo(t, deployment.StatusStarting) // 23-F: only a host-mutating phase blocks; earlier phases are in agent_lease_vacate_without_block_test.go
 	serverRepo := NewServerRepository(f.pool)
 	leaseRepo := NewAgentLeaseRepository(f.pool, NewDeploymentRepository(f.pool))
 	ctx := context.Background()

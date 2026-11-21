@@ -7,6 +7,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"autodeploy/internal/deployment"
 )
 
 // blockSecondAttempt resolves attempt A (not_activated), claims attempt B and
@@ -28,6 +30,7 @@ func blockSecondAttempt(t *testing.T, seed byte) (first, second activatedFixture
 	b := a
 	b.attemptID = leases[0].AttemptID
 	b.jobID = leases[0].JobID
+	b.advanceDeploymentTo(t, deployment.StatusStarting) // 23-F: only a host-mutating phase blocks
 	b.lapse(t, "2 seconds")
 	if closed, err := b.repo.expireOne(ctx, b.attemptID); err != nil || !closed {
 		t.Fatalf("expireOne B closed=%v err=%v", closed, err)
