@@ -447,23 +447,13 @@ func (s *service) spawn(parent context.Context, op checkoutcontain.GitOperation,
 	if err == nil {
 		err = cmd.Wait()
 	}
-	if !cleanup() {
-		return 125, false
+	out := classifyFailure(cleanup(), ctx.Err(), err)
+	if out.diag != "" {
+		// Last line wins at the client; the leading newline ends any partial git line.
+		_, _ = stderrFile.WriteString("\n" + out.diag + "\n")
 	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return 124, true
-	}
-	if ctx.Err() != nil {
-		return 125, false
-	}
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if exitCode := exitErr.ExitCode(); exitCode >= 1 && exitCode <= 255 {
-				return exitCode, false
-			}
-		}
-		return 125, false
+	if out.code != 0 {
+		return out.code, out.timedOut
 	}
 	cleaned = true
 	return 0, false
