@@ -106,6 +106,30 @@ journalctl -u autodeploy-agent | grep attempt_id=N
 (`journalctl -u autodeploy-agent -o cat --since -1h | grep attempt_id=N` for plain lines.) Containers created by an
 attempt carry its id in the `io.autodeploy.attempt-id` label (`internal/runtime/docker/labels.go`).
 
+## Agent refuses to claim: corrupt attempt state
+
+At startup the agent reads its durable attempt records (`/var/lib/autodeploy/agent/fences/attempts/`, one
+`attempt-<id>.json` per attempt it was executing). If any entry is unreadable, malformed, has unknown fields
+or a wrong version, or is not a record file, the agent fails closed. It logs, at error level:
+
+```
+agent attempt state unreadable; refusing to claim
+```
+
+Heartbeats continue, so the server shows the agent as online but it claims no work (idle). A corrupt fence
+file is reported separately (`agent fence state unreadable; refusing to act on environment`).
+
+Recovery:
+
+1. Inspect `/var/lib/autodeploy/agent/fences/attempts/` and identify the offending entry (compare with
+   `attempt_id` in `journalctl -u autodeploy-agent`).
+2. Move that entry aside, for example into a diagnosis directory outside `attempts/`. Never delete it: it is
+   the only evidence of how far the lost attempt got. A leftover `.fence-*.tmp` file is ignored and needs no
+   action.
+3. Restart the agent: `systemctl restart autodeploy-agent`. A lost attempt whose record you moved aside is
+   not acknowledged; its lease expires on the control plane (and blocks the environment if it had reached
+   `starting`, see ADR 0004).
+
 ## Data retention
 
 The control plane purges history older than 90 days once an hour (single runner across replicas, small batches, runs as the runtime database role): events of finished jobs and route events. Webhook deliveries (and their lifecycle repository rows) are never purged: delivery ids are replay protection. Events of unfinished jobs and the `reconciled` / `activation_late_report` job events (read by activation-resolution repeats) are never purged. Audit tables and `release_operations` are kept forever by design. Failures are logged as `event retention purge failed`.

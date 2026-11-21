@@ -128,6 +128,10 @@ type phaseTracker struct {
 	last    deployment.Status
 	reached bool
 	logs    *logship.Attempt // optional; nil-safe
+	// record, when non-nil, durably records the phase BEFORE it is reported or
+	// begins (slice 23-G), so the attempt record never claims an earlier phase
+	// than the work in progress. A failure stops the phase from starting.
+	record agentclient.PhaseRecorder
 }
 
 // advance reports phase through r unless phase is the phase already
@@ -135,6 +139,11 @@ type phaseTracker struct {
 func (t *phaseTracker) advance(ctx context.Context, r *progressReporter, attemptID, fence int64, phase deployment.Status) error {
 	if t.reached && t.last == phase {
 		return ctx.Err()
+	}
+	if t.record != nil {
+		if err := t.record(string(phase)); err != nil {
+			return fmt.Errorf("record phase %s: %w", phase, err)
+		}
 	}
 	if err := r.report(ctx, attemptID, fence, phase); err != nil {
 		return err

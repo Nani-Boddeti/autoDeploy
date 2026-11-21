@@ -95,6 +95,19 @@ type Agent struct {
 	// Drainer, after Recover, and stopped by ctx.
 	Cleaner DrainRunner
 
+	// Attempts, when non-nil, holds the durable attempt records (slice 23-G):
+	// a record is written when a lease starts executing, advanced before each
+	// phase, and deleted when the attempt ends in this process. At startup the
+	// leftovers are the attempts a previous process lost. Nil disables it.
+	Attempts *state.AttemptStore
+	// Activations lets startup recovery leave an attempt that already has a
+	// durable activation record to activation recovery. Wired with Attempts.
+	Activations *state.ActivationStore
+
+	// refuseClaims is set by Run when attempt state is corrupt: heartbeats
+	// continue but no lease is claimed (fail closed).
+	refuseClaims bool
+
 	// RenewInterval overrides the ADR 0004 30s renewal cadence; zero/negative
 	// uses renewInterval. Production leaves this unset -- it exists so
 	// tests can exercise the renewal loop without a real 30-second wait.
@@ -126,6 +139,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.Recover != nil {
 		a.Recover()
 	}
+	a.refuseClaims = !a.recoverLostAttempts(ctx)
 	if a.Reporter != nil {
 		done := make(chan struct{})
 		go func() {
@@ -189,7 +203,7 @@ func (a *Agent) tick(ctx context.Context) time.Duration {
 		}
 		return 0
 	}
-	if executorAvailable {
+	if executorAvailable && !a.refuseClaims {
 		a.claimAndRun(ctx)
 	}
 	return boundedHeartbeatInterval(result.HeartbeatIntervalSeconds)
@@ -263,8 +277,16 @@ func (a *Agent) runLease(ctx context.Context, lease Lease) {
 		return
 	}
 
+	if err := a.openAttempt(lease); err != nil {
+		a.logger().Error("agent failed to persist attempt record; refusing to act", logging.KeyAttemptID, lease.AttemptID)
+		return
+	}
+
 	executorCtx, cancelExecutor := context.WithCancel(ctx)
 	defer cancelExecutor()
+	if rec := a.phaseRecorder(lease.AttemptID); rec != nil {
+		executorCtx = WithPhaseRecorder(executorCtx, rec)
+	}
 	resultCh := make(chan Outcome, 1)
 	go func() { resultCh <- a.Executor.Execute(executorCtx, lease) }()
 
@@ -311,6 +333,9 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 	switch {
 	case outcome.HandedOff:
 		a.logger().Info("agent activation handed off to the reporter; sending no completion", logging.KeyAttemptID, lease.AttemptID)
+		// The executor persisted the activation record before handing off;
+		// that record now owns recovery.
+		a.closeAttempt(lease.AttemptID)
 		return
 	case outcome.AuthorizationUnknown:
 		a.logger().Warn("agent activation authorization unknown; sending no completion or cancel acknowledgement, the attempt will expire", logging.KeyAttemptID, lease.AttemptID)
@@ -332,6 +357,12 @@ func (a *Agent) reportOutcome(ctx context.Context, lease Lease, outcome Outcome,
 	}
 	if err != nil {
 		a.logger().Error("agent lease outcome report failed", logging.KeyAttemptID, lease.AttemptID)
+	}
+	// A cancel ack is final either way (a failed ack leaves the attempt to
+	// lease expiry; a restart must never complete a cancelled job). Otherwise
+	// the record is kept only while the completion could not be delivered.
+	if cancelled || err == nil || !isTransientCompleteError(ctx, err) {
+		a.closeAttempt(lease.AttemptID)
 	}
 }
 

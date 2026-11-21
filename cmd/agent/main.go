@@ -632,6 +632,16 @@ func runAgent(c command, stderr io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("build agent executor: %w", err)
 		}
+		attempts, err := fenceStore.Attempts()
+		if err != nil {
+			return fmt.Errorf("open agent attempt state: %w", err)
+		}
+		pendingActivations, err := fenceStore.Activations()
+		if err != nil {
+			return fmt.Errorf("open agent activation state: %w", err)
+		}
+		agent.Attempts = &attempts
+		agent.Activations = &pendingActivations
 		agent.Executor = exec
 		agent.Reporter = parts.reporter
 		agent.Recover = parts.recover

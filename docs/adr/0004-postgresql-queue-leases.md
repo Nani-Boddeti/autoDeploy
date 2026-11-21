@@ -1040,6 +1040,15 @@ Checked against `closeAttemptOrdinary`, `attemptLeftNoHostState` and `deployment
 - **Unchanged.** Any status outside the allowlist still blocks, including every `activating` case and any
   attempt holding an activate operation. Clearing a block is unchanged (owning server or break-glass).
 
+**23-G: restart recovery of lost attempts (owner decision D2).**
+
+- **No cross-process exclusion on the agent state dir.** The attempt records, like the fence and activation
+  stores, are excluded only in-process. If an old agent process is still alive during a restart, the new one may
+  Complete(failed, transient) the old process's claimed/fetching/building attempt. The consequence is bounded:
+  the attempt is retried under the normal limits, and the old process's later Activate or Complete is refused by
+  the fence or the closed attempt, so it cannot switch traffic. This is the same exclusion model as the existing
+  stores.
+
 ## References
 
 - [PostgreSQL SELECT locking and SKIP LOCKED](https://www.postgresql.org/docs/18/sql-select.html)

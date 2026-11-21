@@ -1154,7 +1154,8 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 	}
 
 	var deploymentID string
-	if err = tx.QueryRow(ctx, `SELECT deployment_id FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID); err != nil {
+	var jobCancelRequestedAt *time.Time
+	if err = tx.QueryRow(ctx, `SELECT deployment_id, cancel_requested_at FROM agent_jobs WHERE id=$1 FOR UPDATE`, jobID).Scan(&deploymentID, &jobCancelRequestedAt); err != nil {
 		return fmt.Errorf("lock agent job for complete: %w", err)
 	}
 
@@ -1248,7 +1249,14 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 	var retryAvailableAt time.Time
 	switch {
 	case outcome == queue.CompletionSucceeded:
+		// A success that raced a cancel request stays a success: the work is
+		// done and may already be live, so reporting it cancelled would lie.
 		newJobState = "succeeded"
+	case jobCancelRequestedAt != nil:
+		// A failure after the operator requested cancellation closes the job as
+		// cancelled, exactly like the cancel path. retry_wait would strand it:
+		// Claim never picks up a job with cancel_requested_at set.
+		newJobState = "cancelled"
 	case failureClass.Retryable() && attemptNumber < queue.MaxAttempts:
 		newJobState = "retry_wait"
 		retryAvailableAt = now.Add(queue.FullJitterDelay(attemptNumber))
@@ -1270,8 +1278,12 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 		return err
 	}
 
-	if newJobState == "dead" || newJobState == "failed" {
-		if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, deployment.StatusFailed, now, r.inject); err != nil {
+	if newJobState == "dead" || newJobState == "failed" || newJobState == "cancelled" {
+		target := deployment.StatusFailed
+		if newJobState == "cancelled" {
+			target = deployment.StatusCancelled
+		}
+		if err = transitionDeployment(ctx, tx, r.deployments, deploymentID, target, now, r.inject); err != nil {
 			return err
 		}
 		if err = r.inject("deployment"); err != nil {
@@ -1287,6 +1299,8 @@ func (r *AgentLeaseRepository) Complete(ctx context.Context, serverID string, pr
 		eventType = "retry_scheduled"
 	case "dead":
 		eventType = "dead"
+	case "cancelled":
+		eventType = "cancelled"
 	}
 	if err = appendAgentJobEvent(ctx, tx, jobID, &attemptID, eventType); err != nil {
 		return err

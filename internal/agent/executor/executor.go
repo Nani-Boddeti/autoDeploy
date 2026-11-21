@@ -235,7 +235,7 @@ func (e *Executor) Execute(ctx context.Context, lease agentclient.Lease) agentcl
 	defer logs.Close()
 	ctx = logship.WithAttempt(ctx, logs)
 	materializer.onFetched = logs.SetSecrets
-	tracker := &phaseTracker{logs: logs}
+	tracker := &phaseTracker{logs: logs, record: agentclient.PhaseRecorderFrom(ctx)}
 
 	// Step 20D: a rollback restarts a retained container; no checkout, build
 	// or create happens (rollback.go).
