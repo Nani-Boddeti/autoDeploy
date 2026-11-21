@@ -135,11 +135,11 @@ func verifyDirectory(dir string) error {
 	if !fi.IsDir() {
 		return fmt.Errorf("%w: %s", ErrNotDirectory, dir)
 	}
-	sys, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
+	uid, uidErr := ownerUID(fi)
+	if uidErr != nil {
 		return fmt.Errorf("traefik: cannot verify ownership of route directory %s", dir)
 	}
-	if err := checkDirectoryPolicy(uint32(sys.Uid), fi.Mode().Perm()); err != nil {
+	if err := checkDirectoryPolicy(uid, fi.Mode().Perm()); err != nil {
 		return fmt.Errorf("%w: %s", err, dir)
 	}
 	return nil
@@ -258,7 +258,7 @@ func createTempFile(dir, base string) (*os.File, string, error) {
 		}
 		name := base + "-" + suffix + routeTempFileExtension
 		path := filepath.Join(dir, name)
-		fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, uint32(routeFileMode))
+		fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|openNoFollow, uint32(routeFileMode))
 		if err != nil {
 			if errors.Is(err, syscall.EEXIST) {
 				lastErr = err
@@ -300,7 +300,7 @@ func randomHex(n int) (string, error) {
 // existing route file's content -- Write's idempotent-compare and
 // ReadDigest -- goes through this single function.
 func readRouteFileBounded(path string) ([]byte, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|openNoFollow, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return nil, fmt.Errorf("%w: %s", ErrSymlinkRefused, path)
@@ -334,7 +334,7 @@ func readRouteFileBounded(path string) ([]byte, error) {
 // dir between verifyDirectory's Lstat and this open; it is layered on top
 // of, not a replacement for, that earlier check.
 func openDirNoFollow(dir string) (*os.File, error) {
-	fd, err := syscall.Open(dir, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(dir, syscall.O_RDONLY|openNoFollow, 0)
 	if err != nil {
 		return nil, fmt.Errorf("traefik: open route directory %s: %w", dir, err)
 	}

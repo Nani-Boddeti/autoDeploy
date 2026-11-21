@@ -16,8 +16,6 @@ import (
 	"autodeploy/internal/checkoutquota"
 	"autodeploy/internal/crypto"
 	"autodeploy/internal/githubapp"
-
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -109,7 +107,7 @@ func (r *Result) Close() error {
 		r.err = err
 		return err
 	}
-	closeErr := unix.Close(r.alloc.Workspace)
+	closeErr := closeFD(r.alloc.Workspace)
 	r.closed = true
 	r.alloc.Workspace = -1
 	r.err = errors.Join(err, closeErr)
@@ -274,7 +272,7 @@ func (r *Runner) Checkout(ctx context.Context, lease Lease) (result *Result, err
 		return nil, ErrGitFailed
 	}
 	defer reader.Close()
-	askpassFD, dupErr := unix.Dup(int(reader.Fd()))
+	askpassFD, dupErr := dupFD(int(reader.Fd()))
 	if dupErr != nil {
 		return nil, errors.Join(ErrGitFailed, dupErr)
 	}
@@ -319,7 +317,7 @@ func (r *Runner) execute(ctx context.Context, lease Lease, workspace int, op che
 	askpassOwned := askpass >= 0
 	defer func() {
 		if askpassOwned {
-			_ = unix.Close(askpass)
+			_ = closeFD(askpass)
 		}
 	}()
 	stdoutR, stdoutW, err := pipe()
@@ -353,7 +351,7 @@ func (r *Runner) execute(ctx context.Context, lease Lease, workspace int, op che
 	}
 	// SpawnClient consumes its descriptor inputs. Keep the allocation's original
 	// descriptor exclusively for Result.Close and transfer one duplicate per op.
-	workspaceCopy, dupErr := unix.Dup(workspace)
+	workspaceCopy, dupErr := dupFD(workspace)
 	if dupErr != nil {
 		closeFDs(stdoutR, stdoutW, stderrR, stderrW)
 		_ = stdoutRedactor.Close()
@@ -385,19 +383,11 @@ var errNoMatch = errors.New("git grep found no matches")
 
 func isNoMatch(err error) bool { return errors.Is(err, errNoMatch) }
 
-func pipe() (int, int, error) {
-	fds := []int{0, 0}
-	if err := unix.Pipe(fds); err != nil {
-		return -1, -1, err
-	}
-	unix.CloseOnExec(fds[0])
-	unix.CloseOnExec(fds[1])
-	return fds[0], fds[1], nil
-}
+func pipe() (int, int, error) { return cloexecPipe() }
 func closeFDs(fds ...int) {
 	for _, fd := range fds {
 		if fd >= 0 {
-			_ = unix.Close(fd)
+			_ = closeFD(fd)
 		}
 	}
 }
