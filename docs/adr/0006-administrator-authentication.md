@@ -358,3 +358,41 @@ Implementation is not complete until automated tests cover:
 Run unit tests, race tests, PostgreSQL integration tests, static checks, formatting, and diff
 checks. Complete an independent security-focused code review before exposing any additional
 administrative route.
+
+## Amendment 2026-11-21: browser first-run setup gated by a host-printed one-time code
+
+Plan 24 (self-contained onboarding) lets the owner finish first-run in the browser. The original
+decision above ("created and recovered only by a local operator CLI", "no public bootstrap") is
+amended for **initial administrator creation only**; everything else in this ADR is unchanged.
+
+- **Gate.** `/setup` is usable only with a one-time setup code (`setup.v1.` plus 32 random bytes,
+  base64url) minted by the host operator with `autodeploy-run admin setup-token` and printed once
+  to that terminal. Possession of the code proves trusted-host access, which is the same boundary
+  the terminal CLI relies on. The code is not a public first-user race: a visitor without it
+  cannot create the administrator.
+- **Code properties.** Only a domain-separated SHA-256 digest is stored
+  (`installation_setup_tokens`). Single-use, 60 minute lifetime, compared in constant time,
+  consumed in the same transaction that creates the owner and user, rows retained. Minting a new
+  code retires every older unconsumed code in its own transaction, so at most one code is live and
+  a lost or leaked older code dies on re-mint. The mint command refuses once an administrator
+  exists.
+- **Route lifetime.** `/setup` exists only while `installation_auth.owner_id IS NULL`. Afterwards
+  every method answers exactly like an unknown path (404), so the route leaks nothing and cannot be
+  reopened (deletion or deactivation still does not reopen bootstrap, as above).
+- **Request protection.** Same as `/login`: Origin/Referer check against the public origin,
+  stateless login-style CSRF envelope, `__Host-` cookie, durable throttling per client IP only (a
+  separate bucket namespace; no global bucket an attacker could fill to lock the operator out), the
+  same CSP (no scripts). The code is checked with a cheap digest lookup before any password hashing,
+  and concurrent hashes are bounded by a small semaphore. Wrong, malformed, expired, and consumed codes produce one
+  uniform response. The code and password are never logged or echoed.
+- **Same bootstrap transaction.** The row lock on `installation_auth`, the owner/user inserts,
+  the Argon2id hash under the installation policy (calibrated at control-plane start when no
+  administrator exists yet), and the policy persistence are the single shared code path with the
+  terminal command. The audit action is `bootstrap_web` (terminal: `bootstrap`).
+- **Session.** `/setup` creates no session; it redirects to `/login` and the owner signs in
+  normally.
+- **Retained.** `admin bootstrap --username <name>` is unchanged and remains an alternative; the
+  terminal-only password-reset path is untouched (web password reset stays rejected).
+- **Residual risk.** The setup code travels through the operator's terminal and browser. Anyone who
+  can read the printed code within its lifetime and reach the HTTPS origin can create the
+  administrator; this is the same trust the operator already places in the host terminal.

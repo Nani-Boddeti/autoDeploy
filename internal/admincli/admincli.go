@@ -18,6 +18,19 @@ import (
 
 var ErrOperationFailed = errors.New("administrator operation failed")
 
+// ErrAdministratorExists is returned by SetupToken once first-run setup is
+// closed; it is safe to show the operator (it reveals nothing the terminal
+// operator cannot already see).
+var ErrAdministratorExists = errors.New("an administrator already exists")
+
+// SetupTokenTTL is the lifetime of a browser first-run setup code.
+const SetupTokenTTL = 60 * time.Minute
+
+// SetupTokenRepository is the narrow persistence surface of `admin setup-token`.
+type SetupTokenRepository interface {
+	IssueSetupToken(context.Context, [32]byte, time.Duration) error
+}
+
 type Terminal interface{ ReadPassword(string) ([]byte, error) }
 
 type Repository interface {
@@ -67,6 +80,34 @@ func Bootstrap(ctx context.Context, username string, dependencies Dependencies) 
 		return ErrOperationFailed
 	}
 	if err := dependencies.Repository.Bootstrap(ctx, postgres.BootstrapInput{OwnerID: ownerID, UserID: userID, Username: canonical, AuditID: auditID, Verifier: verifier, Policy: policy}); err != nil {
+		return ErrOperationFailed
+	}
+	return nil
+}
+
+// SetupToken mints a browser first-run setup code, stores only its digest, and
+// prints the code once to out. Minting retires any older unconsumed code. It
+// refuses (ErrAdministratorExists) once an administrator exists. Nothing is
+// printed unless the digest was durably stored.
+func SetupToken(ctx context.Context, repository SetupTokenRepository, randomness io.Reader, out io.Writer) error {
+	if repository == nil || out == nil {
+		return ErrOperationFailed
+	}
+	token, err := auth.NewSetupToken(randomness)
+	if err != nil {
+		return ErrOperationFailed
+	}
+	digest, err := auth.SetupTokenDigest(token)
+	if err != nil {
+		return ErrOperationFailed
+	}
+	if err = repository.IssueSetupToken(ctx, digest, SetupTokenTTL); err != nil {
+		if errors.Is(err, postgres.ErrAlreadyBootstrapped) {
+			return ErrAdministratorExists
+		}
+		return ErrOperationFailed
+	}
+	if _, err = io.WriteString(out, token.String()+"\n"); err != nil {
 		return ErrOperationFailed
 	}
 	return nil

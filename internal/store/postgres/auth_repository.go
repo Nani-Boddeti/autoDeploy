@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"autodeploy/internal/auth"
+	"autodeploy/internal/server"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -487,6 +488,21 @@ func (r *AuthRepository) CleanupThrottle(ctx context.Context, limit int) (int64,
 }
 
 func (r *AuthRepository) Bootstrap(ctx context.Context, in BootstrapInput) error {
+	return r.bootstrap(ctx, in, "bootstrap", nil)
+}
+
+// BootstrapWithSetupToken is the browser first-run path: the same bootstrap
+// transaction, but it additionally verifies and consumes the host-minted setup
+// code under the installation_auth row lock and audits as 'bootstrap_web'. A
+// code that is unknown, expired, or consumed yields ErrSetupCodeInvalid and
+// changes nothing.
+func (r *AuthRepository) BootstrapWithSetupToken(ctx context.Context, digest [32]byte, in BootstrapInput) error {
+	return r.bootstrap(ctx, in, "bootstrap_web", &digest)
+}
+
+// bootstrap is the single copy of the bootstrap transaction. When setupDigest
+// is non-nil the matching live setup code is consumed in the same transaction.
+func (r *AuthRepository) bootstrap(ctx context.Context, in BootstrapInput, action string, setupDigest *[32]byte) error {
 	if err := validateBootstrap(in); err != nil {
 		return err
 	}
@@ -502,6 +518,11 @@ func (r *AuthRepository) Bootstrap(ctx context.Context, in BootstrapInput) error
 	if owner != nil {
 		return ErrAlreadyBootstrapped
 	}
+	if setupDigest != nil {
+		if err = consumeSetupToken(ctx, tx, *setupDigest); err != nil {
+			return err
+		}
+	}
 	if _, err = tx.Exec(ctx, `INSERT INTO owners(id) VALUES($1)`, in.OwnerID); err != nil {
 		return fmt.Errorf("insert owner: %w", err)
 	}
@@ -511,13 +532,118 @@ func (r *AuthRepository) Bootstrap(ctx context.Context, in BootstrapInput) error
 	if _, err = tx.Exec(ctx, `UPDATE installation_auth SET owner_id=$1,password_policy_revision=$2,password_memory_kib=$3,password_iterations=$4,password_lanes=$5,bootstrapped_at=clock_timestamp() WHERE id=1 AND owner_id IS NULL`, in.OwnerID, int64(in.Policy.Revision), int32(in.Policy.MemoryKiB), int32(in.Policy.Iterations), int16(in.Policy.Lanes)); err != nil {
 		return fmt.Errorf("complete bootstrap: %w", err)
 	}
-	if err = insertAudit(ctx, tx, in.AuditID, in.UserID, in.OwnerID, "bootstrap", "success"); err != nil {
+	if err = insertAudit(ctx, tx, in.AuditID, in.UserID, in.OwnerID, action, "success"); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit auth bootstrap: %w", err)
 	}
 	return nil
+}
+
+// consumeSetupToken marks the live (unconsumed, unexpired) code matching
+// digest as consumed. Rows are compared in constant time in Go rather than by
+// SQL equality so presented material never influences lookup timing; mint
+// retires older codes, so the live set is tiny. The caller holds the
+// installation_auth row lock.
+func consumeSetupToken(ctx context.Context, tx pgx.Tx, digest [32]byte) error {
+	rows, err := tx.Query(ctx, `SELECT id, digest FROM installation_setup_tokens WHERE consumed_at IS NULL AND expires_at > clock_timestamp() ORDER BY id FOR UPDATE`)
+	if err != nil {
+		return fmt.Errorf("read setup tokens: %w", err)
+	}
+	matched := int64(0)
+	for rows.Next() {
+		var id int64
+		var stored []byte
+		if err = rows.Scan(&id, &stored); err != nil {
+			rows.Close()
+			return fmt.Errorf("read setup tokens: %w", err)
+		}
+		if digestMatches(stored, digest) {
+			matched = id
+		}
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("read setup tokens: %w", err)
+	}
+	if matched == 0 {
+		return ErrSetupCodeInvalid
+	}
+	if _, err = tx.Exec(ctx, `UPDATE installation_setup_tokens SET consumed_at=clock_timestamp() WHERE id=$1 AND consumed_at IS NULL`, matched); err != nil {
+		return fmt.Errorf("consume setup token: %w", err)
+	}
+	return nil
+}
+
+// IssueSetupToken stores a new setup code digest valid for ttl. Only while no
+// administrator exists (ErrAlreadyBootstrapped otherwise). Minting retires
+// every older unconsumed code in the same transaction, so at most one code is
+// ever live and a lost or leaked older code cannot be used after a re-mint.
+func (r *AuthRepository) IssueSetupToken(ctx context.Context, digest [32]byte, ttl time.Duration) error {
+	if ttl <= 0 || ttl > 24*time.Hour {
+		return errors.New("invalid setup token lifetime")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin setup token issue: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var owner *string
+	if err = tx.QueryRow(ctx, `SELECT owner_id FROM installation_auth WHERE id=1 FOR UPDATE`).Scan(&owner); err != nil {
+		return fmt.Errorf("lock installation authentication: %w", err)
+	}
+	if owner != nil {
+		return ErrAlreadyBootstrapped
+	}
+	if _, err = tx.Exec(ctx, `UPDATE installation_setup_tokens SET expires_at=GREATEST(issued_at + interval '1 microsecond', LEAST(expires_at, clock_timestamp())) WHERE consumed_at IS NULL AND expires_at > clock_timestamp()`); err != nil {
+		return fmt.Errorf("retire older setup tokens: %w", err)
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO installation_setup_tokens(digest,issued_at,expires_at) SELECT $1, t, t + make_interval(secs => $2) FROM (SELECT clock_timestamp() AS t) s`, digest[:], ttl.Seconds()); err != nil {
+		return fmt.Errorf("insert setup token: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit setup token issue: %w", err)
+	}
+	return nil
+}
+
+// SetupCodeLive reports whether digest matches a live (unexpired, unconsumed)
+// setup code, comparing in constant time. Read-only pre-check; the bootstrap
+// transaction remains the authority.
+func (r *AuthRepository) SetupCodeLive(ctx context.Context, digest [32]byte) (bool, error) {
+	rows, err := r.pool.Query(ctx, `SELECT digest FROM installation_setup_tokens WHERE consumed_at IS NULL AND expires_at > clock_timestamp()`)
+	if err != nil {
+		return false, fmt.Errorf("read setup tokens: %w", err)
+	}
+	defer rows.Close()
+	live := false
+	for rows.Next() {
+		var stored []byte
+		if err = rows.Scan(&stored); err != nil {
+			return false, fmt.Errorf("read setup tokens: %w", err)
+		}
+		live = digestMatches(stored, digest) || live
+	}
+	if err = rows.Err(); err != nil {
+		return false, fmt.Errorf("read setup tokens: %w", err)
+	}
+	return live, nil
+}
+
+func digestMatches(stored []byte, digest [32]byte) bool {
+	var candidate [32]byte
+	return len(stored) == 32 && copy(candidate[:], stored) == 32 && server.ConstantTimeEqualDigest(candidate, digest)
+}
+
+// SetupAvailable reports whether first-run setup is still open: no
+// administrator exists yet. It is the web layer's gate for /setup.
+func (r *AuthRepository) SetupAvailable(ctx context.Context) (bool, error) {
+	var open bool
+	if err := r.pool.QueryRow(ctx, `SELECT owner_id IS NULL FROM installation_auth WHERE id=1`).Scan(&open); err != nil {
+		return false, fmt.Errorf("read installation state: %w", err)
+	}
+	return open, nil
 }
 
 func (r *AuthRepository) LoadPasswordPolicy(ctx context.Context) (auth.Argon2Policy, error) {

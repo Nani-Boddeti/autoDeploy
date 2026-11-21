@@ -3,17 +3,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
+	"autodeploy/internal/auth"
+	"autodeploy/internal/store/postgres"
 	"autodeploy/migrations"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // scratchRuntimeDSN builds a fresh database, migrates it as the superuser test
@@ -99,6 +106,59 @@ func TestOpenPoolRefusesWhenMigrationMissingOrChanged(t *testing.T) {
 		}
 		if err.Error() != "database schema is not current; run autodeploy-run migrate" {
 			t.Fatalf("message %q", err.Error())
+		}
+	}
+}
+
+// TestSetupTokenPathsWorkAsRuntimeRole runs mint, pre-check, bootstrap and the
+// retire-on-remint update as the least-privilege runtime role (000032 grants
+// only SELECT, INSERT and UPDATE(consumed_at, expires_at)), and asserts the
+// withheld privileges really are withheld.
+func TestSetupTokenPathsWorkAsRuntimeRole(t *testing.T) {
+	ctx := context.Background()
+	dsn, _ := scratchRuntimeDSN(t)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	repo := postgres.NewAuthRepository(pool)
+	mint := func(seed byte) [32]byte {
+		token, tokenErr := auth.NewSetupToken(bytes.NewReader(bytes.Repeat([]byte{seed}, 32)))
+		if tokenErr != nil {
+			t.Fatal(tokenErr)
+		}
+		digest, _ := auth.SetupTokenDigest(token)
+		if err = repo.IssueSetupToken(ctx, digest, time.Hour); err != nil {
+			t.Fatalf("mint as runtime role: %v", err)
+		}
+		return digest
+	}
+	old, current := mint(1), mint(2) // second mint retires the first (UPDATE expires_at)
+	if live, err := repo.SetupCodeLive(ctx, old); err != nil || live {
+		t.Fatalf("retired code live=%v err=%v", live, err)
+	}
+	if live, err := repo.SetupCodeLive(ctx, current); err != nil || !live {
+		t.Fatalf("current code live=%v err=%v", live, err)
+	}
+	policy := auth.Argon2Policy{Revision: 1, MemoryKiB: 19 * 1024, Iterations: 2, Lanes: 1}
+	verifier, err := auth.HashPassword(strings.Repeat("p", 15), policy, bytes.NewReader(bytes.Repeat([]byte{9}, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := postgres.BootstrapInput{OwnerID: "owner-rt", UserID: "user-rt", Username: "administrator", AuditID: "audit-rt", Verifier: verifier, Policy: policy}
+	if err = repo.BootstrapWithSetupToken(ctx, current, in); err != nil {
+		t.Fatalf("bootstrap as runtime role: %v", err)
+	}
+	for name, statement := range map[string]string{
+		"delete":         `DELETE FROM installation_setup_tokens`,
+		"rewrite digest": `UPDATE installation_setup_tokens SET digest = digest`,
+		"truncate":       `TRUNCATE installation_setup_tokens`,
+	} {
+		_, execErr := pool.Exec(ctx, statement)
+		var pgErr *pgconn.PgError
+		if !errors.As(execErr, &pgErr) || pgErr.Code != "42501" {
+			t.Fatalf("%s: want insufficient_privilege, got %v", name, execErr)
 		}
 	}
 }

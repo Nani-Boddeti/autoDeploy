@@ -106,6 +106,12 @@ The installers refuse to run without `SHA256SUMS`; do not use `--insecure-no-che
        sudo /usr/local/lib/autodeploy/autodeploy-run admin bootstrap --username administrator
        sudo systemctl start autodeploy-controlplane
 
+   Alternative to `admin bootstrap` (browser first-run): start the control plane, then on the host run
+   `sudo /usr/local/lib/autodeploy/autodeploy-run admin setup-token`. It prints a one-time setup code (valid
+   60 minutes; running it again invalidates older unused codes; it refuses once an administrator exists).
+   Open `https://autodeploy.example.com/setup`, enter the code, choose a username and password, then sign in at
+   `/login`. `/setup` returns 404 once an administrator exists. Use one path or the other, not both.
+
    Sign in at `https://autodeploy.example.com`, register the server, put its id in
    `/etc/autodeploy/agent-local.env` (`AUTODEPLOY_AGENT_SERVER_ID=`), enroll with the one-time token typed at
    the hidden prompt exactly as `install-app.sh` printed (`agent enroll --base-url https://HOST ...`), then

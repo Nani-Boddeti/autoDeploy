@@ -224,3 +224,55 @@ func (f *fakeRepository) ResetPassword(ctx context.Context, u string, v auth.Pas
 	}
 	return nil
 }
+
+type fakeSetupRepository struct {
+	err    error
+	digest [32]byte
+	ttl    time.Duration
+	issued int
+}
+
+func (f *fakeSetupRepository) IssueSetupToken(_ context.Context, digest [32]byte, ttl time.Duration) error {
+	f.issued++
+	f.digest, f.ttl = digest, ttl
+	return f.err
+}
+
+func TestSetupTokenStoresDigestOnlyAndPrintsCodeOnce(t *testing.T) {
+	repo := &fakeSetupRepository{}
+	var out strings.Builder
+	if err := admincli.SetupToken(context.Background(), repo, strings.NewReader(strings.Repeat("s", 32)), &out); err != nil {
+		t.Fatal(err)
+	}
+	code := strings.TrimSpace(out.String())
+	token, err := auth.ParseSetupToken(code)
+	if err != nil || strings.Count(out.String(), "\n") != 1 {
+		t.Fatalf("output %q err %v", out.String(), err)
+	}
+	want, _ := auth.SetupTokenDigest(token)
+	if repo.digest != want || repo.issued != 1 || repo.ttl != 60*time.Minute {
+		t.Fatalf("issued=%d ttl=%v digestMatches=%v", repo.issued, repo.ttl, repo.digest == want)
+	}
+}
+
+func TestSetupTokenRefusesWhenAdministratorExists(t *testing.T) {
+	repo := &fakeSetupRepository{err: postgres.ErrAlreadyBootstrapped}
+	var out strings.Builder
+	err := admincli.SetupToken(context.Background(), repo, strings.NewReader(strings.Repeat("s", 32)), &out)
+	if !errors.Is(err, admincli.ErrAdministratorExists) || out.Len() != 0 {
+		t.Fatalf("err=%v output=%q", err, out.String())
+	}
+}
+
+func TestSetupTokenFailureIsSanitizedAndPrintsNothing(t *testing.T) {
+	var out strings.Builder
+	err := admincli.SetupToken(context.Background(), &fakeSetupRepository{err: errors.New("dsn secret")}, strings.NewReader(strings.Repeat("s", 32)), &out)
+	if !errors.Is(err, admincli.ErrOperationFailed) || strings.Contains(err.Error(), "secret") || out.Len() != 0 {
+		t.Fatalf("err=%v output=%q", err, out.String())
+	}
+	// Randomness failure never reaches the repository.
+	repo := &fakeSetupRepository{}
+	if err = admincli.SetupToken(context.Background(), repo, strings.NewReader("short"), &out); !errors.Is(err, admincli.ErrOperationFailed) || repo.issued != 0 {
+		t.Fatalf("err=%v issued=%d", err, repo.issued)
+	}
+}

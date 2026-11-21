@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"autodeploy/internal/admincli"
 	agenthttp "autodeploy/internal/agent/http"
 	"autodeploy/internal/auth"
 	"autodeploy/internal/config"
@@ -114,6 +116,33 @@ func controlplaneLogger(dst io.Writer, values [][]byte) *slog.Logger {
 	return logger
 }
 
+// startupPasswordPolicy returns the installation's stored password policy.
+// Before the first administrator exists there is none (ErrNotFound); the
+// control plane must still start so the browser first-run /setup can serve, so
+// it calibrates exactly as `admin bootstrap` does. The calibrated policy is
+// then what /setup hashes with and persists, so it matches the stored one
+// after bootstrap. durable=false tells the caller to let the web layer adopt
+// the persisted policy lazily (a terminal bootstrap may persist a different
+// calibration while this process runs). Any other load error stays fatal.
+func startupPasswordPolicy(ctx context.Context, repository interface {
+	LoadPasswordPolicy(context.Context) (auth.Argon2Policy, error)
+}, calibrate func() (auth.Argon2Policy, error)) (policy auth.Argon2Policy, durable bool, err error) {
+	policy, err = repository.LoadPasswordPolicy(ctx)
+	if errors.Is(err, postgres.ErrNotFound) {
+		policy, err = calibrate()
+		return policy, false, err
+	}
+	return policy, err == nil, err
+}
+
+func calibratePasswordPolicy() (auth.Argon2Policy, error) {
+	return admincli.Calibrate(func(policy auth.Argon2Policy) (time.Duration, error) {
+		start := time.Now()
+		_, err := auth.HashPassword("autodeploy-calibration-password", policy, bytes.NewReader(bytes.Repeat([]byte{0x6d}, 16)))
+		return time.Since(start), err
+	})
+}
+
 func run(ctx context.Context) error {
 	// One redacting process logger, installed as the default before any
 	// startup step can log, so stray library or std log output is redacted too.
@@ -167,7 +196,7 @@ func run(ctx context.Context) error {
 			return failAt(errors.New("secret subsystem unavailable"))
 		}
 	}
-	policy, err := repository.LoadPasswordPolicy(startupCtx)
+	policy, durablePolicy, err := startupPasswordPolicy(startupCtx, repository, calibratePasswordPolicy)
 	if err != nil {
 		return failAt(err)
 	}
@@ -175,9 +204,13 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return failAt(err)
 	}
+	var policyLoader func(context.Context) (auth.Argon2Policy, error)
+	if !durablePolicy {
+		policyLoader = repository.LoadPasswordPolicy
+	}
 	// The web and agent handlers log through processLogger: nothing in them
 	// may write to standard error directly.
-	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, DummyPassword: dummy, ActivationEnabled: activationEnabled, Logger: processLogger}
+	webOptions := web.Config{PublicOrigin: webConfig.PublicOrigin, CSRFKeys: webConfig.CSRFKeys, UsernameThrottleKeys: throttleKeys, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, AuthThrottleMaxRows: webConfig.AuthThrottleMaxRows, PasswordPolicy: policy, PolicyLoader: policyLoader, Setup: repository, DummyPassword: dummy, ActivationEnabled: activationEnabled, Logger: processLogger}
 	githubConfig, err := config.GitHubAppConfigFromEnvironment()
 	if err != nil {
 		return failAt(err)

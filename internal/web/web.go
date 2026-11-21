@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"autodeploy/internal/auth"
@@ -123,6 +124,11 @@ type Config struct {
 	CommitResolver        githubapp.CommitResolver
 	Now                   func() time.Time
 	Random                io.Reader
+	Setup                 SetupStore // browser first-run /setup; nil disables it (404)
+	// PolicyLoader is set only when the control plane started with no durable
+	// password policy (before the first administrator). Until it returns one, the
+	// calibrated PasswordPolicy is used; then the durable one replaces it.
+	PolicyLoader func(context.Context) (auth.Argon2Policy, error)
 	// Logger receives process-log lines. Nil discards them: it never
 	// defaults to standard error, so every line goes through the redacting
 	// logger the caller injects.
@@ -132,6 +138,14 @@ type Config struct {
 type Handler struct {
 	repository Repository
 	config     Config
+
+	// Lazily adopted durable password policy (see passwordPolicy).
+	setupSlots    chan struct{}
+	hashPassword  func(string, auth.Argon2Policy, io.Reader) (auth.PasswordVerifier, error)
+	policyMu      sync.Mutex
+	policyDurable bool
+	livePolicy    auth.Argon2Policy
+	liveDummy     auth.DummyPasswordVerifier
 
 	// Live-log streaming state (logs_stream.go). The timing fields are
 	// unexported test seams; zero means the production value.
@@ -174,7 +188,7 @@ func New(repository Repository, config Config) (*Handler, error) {
 	if config.Random == nil {
 		config.Random = rand.Reader
 	}
-	return &Handler{repository: repository, config: config}, nil
+	return &Handler{repository: repository, config: config, setupSlots: make(chan struct{}, setupHashSlots), hashPassword: auth.HashPassword}, nil
 }
 
 // discardLogger is the logger used when none is injected.
@@ -198,7 +212,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveStatic(w, r, asset)
 		return
 	}
-	if r.URL.RawQuery != "" && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" && r.URL.Path != "/deployments/logs/stream" {
+	if r.URL.RawQuery != "" && !(r.Method == http.MethodGet && r.URL.Path == "/login" && r.URL.RawQuery == loginSetupDoneQuery) && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" && r.URL.Path != "/deployments/logs/stream" {
 		http.NotFound(w, r)
 		return
 	}
@@ -461,6 +475,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			methodNotAllowed(w, http.MethodGet, http.MethodPost)
 		}
+	case "/setup":
+		switch r.Method {
+		case http.MethodGet:
+			h.getSetup(w, r)
+		case http.MethodPost:
+			h.postSetup(w, r)
+		default:
+			// A closed or disabled /setup must look like an unknown path.
+			if !h.setupOpen(w, r) {
+				return
+			}
+			methodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
 	case "/logout":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -485,28 +512,39 @@ func (h *Handler) getLogin(w http.ResponseWriter, r *http.Request) {
 		redirect(w, "/")
 		return
 	}
+	csrf, err := h.issueLoginCSRF(w, r)
+	if err != nil {
+		plain(w, http.StatusServiceUnavailable, "unavailable\n")
+		return
+	}
+	view := loginView{CSRF: csrf, SetupDone: r.URL.RawQuery == loginSetupDoneQuery}
+	if h.config.Setup != nil {
+		if open, openErr := h.config.Setup.SetupAvailable(r.Context()); openErr == nil && open {
+			view.SetupHint = true
+		}
+	}
+	renderLogin(w, view)
+}
+
+// issueLoginCSRF returns the stateless login-style CSRF token for the caller's
+// login envelope, minting and setting a fresh envelope cookie when the request
+// carries none (or an invalid/expired one). Shared by /login and /setup.
+func (h *Handler) issueLoginCSRF(w http.ResponseWriter, r *http.Request) (string, error) {
 	envelope, err := h.loginEnvelope(r)
 	if err != nil {
 		var nonce auth.LoginNonce
 		nonce, err = auth.NewLoginNonce(h.config.Random)
 		if err != nil {
-			plain(w, http.StatusServiceUnavailable, "unavailable\n")
-			return
+			return "", err
 		}
 		value, signErr := auth.NewLoginEnvelope(h.config.CSRFKeys, nonce, h.config.Now(), h.config.PublicOrigin)
 		if signErr != nil {
-			plain(w, http.StatusServiceUnavailable, "unavailable\n")
-			return
+			return "", signErr
 		}
 		http.SetCookie(w, loginCookie(value, h.config.Now()))
 		envelope = auth.LoginEnvelope{Nonce: nonce}
 	}
-	csrf, err := auth.NewLoginCSRF(h.config.CSRFKeys, envelope.Nonce, h.config.PublicOrigin)
-	if err != nil {
-		plain(w, http.StatusServiceUnavailable, "unavailable\n")
-		return
-	}
-	renderLogin(w, csrf)
+	return auth.NewLoginCSRF(h.config.CSRFKeys, envelope.Nonce, h.config.PublicOrigin)
 }
 
 func (h *Handler) postLogin(w http.ResponseWriter, r *http.Request) {
@@ -537,9 +575,10 @@ func (h *Handler) postLogin(w http.ResponseWriter, r *http.Request) {
 		redirect(w, "/login")
 		return
 	}
+	policy, dummy := h.passwordPolicy(r.Context())
 	reservation, err := h.repository.ReserveThrottle(r.Context(), identities, h.config.AuthThrottleMaxRows)
 	if err != nil || !reservation.Allowed {
-		_ = auth.VerifyDummyPassword(form.password, h.config.DummyPassword)
+		_ = auth.VerifyDummyPassword(form.password, dummy)
 		redirect(w, "/login")
 		return
 	}
@@ -551,10 +590,10 @@ func (h *Handler) postLogin(w http.ResponseWriter, r *http.Request) {
 	valid := false
 	var verification auth.PasswordVerification
 	if canonical && findErr == nil && user.Active {
-		verification, err = auth.VerifyPassword(form.password, user.Verifier, h.config.PasswordPolicy)
+		verification, err = auth.VerifyPassword(form.password, user.Verifier, policy)
 		valid = err == nil && verification.Valid
 	} else {
-		err = auth.VerifyDummyPassword(form.password, h.config.DummyPassword)
+		err = auth.VerifyDummyPassword(form.password, dummy)
 	}
 	if !valid || err != nil {
 		redirect(w, "/login")
@@ -572,7 +611,7 @@ func (h *Handler) postLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	replacement := (*auth.PasswordVerifier)(nil)
 	if verification.RehashNeeded {
-		value, hashErr := auth.HashPassword(form.password, h.config.PasswordPolicy, h.config.Random)
+		value, hashErr := auth.HashPassword(form.password, policy, h.config.Random)
 		if hashErr != nil {
 			plain(w, http.StatusServiceUnavailable, "unavailable\n")
 			return
@@ -2123,9 +2162,20 @@ func methodNotAllowed(w http.ResponseWriter, methods ...string) {
 	plain(w, http.StatusMethodNotAllowed, "method not allowed\n")
 }
 
-func renderLogin(w http.ResponseWriter, csrf string) {
+// loginSetupDoneQuery is the one query string /login accepts: the neutral
+// "administrator created, sign in" indication after a successful /setup.
+const loginSetupDoneQuery = "setup=done"
+
+type loginView struct {
+	CSRF      string
+	SetupDone bool
+	// SetupHint points a first-run operator at /setup while it is open.
+	SetupHint bool
+}
+
+func renderLogin(w http.ResponseWriter, view loginView) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = loginTemplate.Execute(w, csrf)
+	_ = loginTemplate.Execute(w, view)
 }
 
 // serverRow, reconcilingRow, and serversView are pre-formatted (all

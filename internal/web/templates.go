@@ -28,6 +28,7 @@ func parsePage(name string) *template.Template {
 
 var (
 	loginTemplate             = parsePage("login")
+	setupTemplate             = parsePage("setup")
 	landingTemplate           = parsePage("landing")
 	githubCompleteTemplate    = parsePage("github-complete")
 	githubContinueTemplate    = parsePage("github-continue")

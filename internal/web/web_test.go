@@ -31,6 +31,7 @@ type repositoryStub struct {
 	completeErr error
 	events      []string
 	revokes     int
+	replacement *auth.PasswordVerifier
 }
 
 func (s *repositoryStub) Ping(context.Context) error { return s.pingErr }
@@ -68,6 +69,7 @@ func (s *repositoryStub) CompleteLogin(_ context.Context, input postgres.Complet
 		return postgres.Session{}, errors.New("missing recovery identity")
 	}
 	s.completed = true
+	s.replacement = input.Replacement
 	return postgres.Session{}, nil
 }
 func (s *repositoryStub) ValidateSession(_ context.Context, token auth.SessionToken) (auth.Principal, error) {

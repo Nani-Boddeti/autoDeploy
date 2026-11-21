@@ -251,6 +251,7 @@ func routerPaths(t *testing.T) []string {
 // Static assets are served before the switch (staticAssets) and never appear here.
 var exemptRoutes = map[string]string{
 	"/login":                          "sign-in page, outside the shell",
+	"/setup":                          "first-run administrator setup, outside the shell; 404 once an administrator exists",
 	"/logout":                         "POST only",
 	"/livez":                          "liveness probe, plain text",
 	"/readyz":                         "readiness probe, plain text",

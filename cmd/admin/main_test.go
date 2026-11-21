@@ -59,3 +59,18 @@ func (*fakeSession) ReadPassword(string) ([]byte, error) { return nil, errors.Ne
 func (s *fakeSession) Close() error                      { s.closed = true; return nil }
 
 var _ io.Closer = (*fakeSession)(nil)
+
+func TestSetupTokenCommandIsExactAndNotAPasswordOperation(t *testing.T) {
+	if !isSetupTokenCommand([]string{"setup-token"}) {
+		t.Fatal("setup-token not recognized")
+	}
+	for _, args := range [][]string{nil, {"setup-token", "--username", "a"}, {"setup-token", "x"}, {"Setup-Token"}, {"bootstrap", "--username", "admin"}} {
+		if isSetupTokenCommand(args) {
+			t.Fatalf("accepted %#v", args)
+		}
+	}
+	// The password operations must keep rejecting it: it is not a parseArgs form.
+	if _, _, err := parseArgs([]string{"setup-token"}); err == nil {
+		t.Fatal("parseArgs accepted setup-token")
+	}
+}

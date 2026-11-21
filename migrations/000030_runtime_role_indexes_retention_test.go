@@ -60,7 +60,7 @@ func TestRuntimeRoleDefinition(t *testing.T) {
 	var missingDML, hasTruncate, hasTrigger int
 	if err := conn.QueryRow(ctx, `
 SELECT
-  count(*) FILTER (WHERE tablename <> 'schema_migrations' AND NOT (has_table_privilege('autodeploy_app', format('public.%I', tablename), 'SELECT')
+  count(*) FILTER (WHERE tablename NOT IN ('schema_migrations', 'installation_setup_tokens') AND NOT (has_table_privilege('autodeploy_app', format('public.%I', tablename), 'SELECT')
      AND has_table_privilege('autodeploy_app', format('public.%I', tablename), 'INSERT')
      AND has_table_privilege('autodeploy_app', format('public.%I', tablename), 'UPDATE')
      AND has_table_privilege('autodeploy_app', format('public.%I', tablename), 'DELETE'))),
@@ -69,6 +69,8 @@ SELECT
 FROM pg_tables WHERE schemaname='public'`).Scan(&missingDML, &hasTruncate, &hasTrigger); err != nil {
 		t.Fatal(err)
 	}
+	// installation_setup_tokens is deliberately narrower (000032; asserted in
+	// TestSetupTokenRuntimeGrants), so it is exempt from the full-DML rule only.
 	if missingDML != 0 || hasTruncate != 0 || hasTrigger != 0 {
 		t.Fatalf("grants wrong: tables lacking DML=%d with TRUNCATE=%d with TRIGGER=%d", missingDML, hasTruncate, hasTrigger)
 	}

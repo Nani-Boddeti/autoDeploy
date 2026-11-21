@@ -12,8 +12,11 @@ var (
 	ErrRevisionConflict    = errors.New("deployment revision conflict")
 	ErrRevisionOverflow    = errors.New("deployment revision exceeds PostgreSQL bigint")
 	ErrAlreadyBootstrapped = errors.New("administrator authentication already bootstrapped")
-	ErrUnauthenticated     = errors.New("unauthenticated")
-	ErrSessionRevoked      = errors.New("session already revoked")
+	// ErrSetupCodeInvalid is the single outcome for a first-run setup code that
+	// is unknown, expired, or already consumed: callers must not distinguish them.
+	ErrSetupCodeInvalid = errors.New("setup code invalid")
+	ErrUnauthenticated  = errors.New("unauthenticated")
+	ErrSessionRevoked   = errors.New("session already revoked")
 	// ErrWebhookIntegrity is a sanitized conflict between immutable webhook
 	// delivery, replay, intent, or job identities.
 	ErrWebhookIntegrity = errors.New("webhook integrity conflict")

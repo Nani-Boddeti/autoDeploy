@@ -23,6 +23,10 @@ import (
 )
 
 func main() {
+	if isSetupTokenCommand(os.Args[1:]) {
+		runSetupToken()
+		return
+	}
 	operation, username, err := parseArgs(os.Args[1:])
 	if err != nil {
 		fail()
@@ -56,6 +60,40 @@ func main() {
 		fail()
 	}
 	fmt.Fprintln(os.Stdout, "administrator operation completed")
+}
+
+// isSetupTokenCommand reports the exact argument form `setup-token` (no flags,
+// no value). It is a separate path from the terminal-only password commands:
+// it never reads a password and needs no TTY, so the installer can capture
+// the printed code.
+func isSetupTokenCommand(args []string) bool { return len(args) == 1 && args[0] == "setup-token" }
+
+// runSetupToken mints a browser first-run code. Only the code goes to stdout.
+func runSetupToken() {
+	err := func() error {
+		dsn, configErr := config.DatabaseURLFromEnvironment()
+		if configErr != nil {
+			return configErr
+		}
+		ctx := context.Background()
+		pool, poolErr := openPool(ctx, dsn)
+		if poolErr != nil {
+			return poolErr
+		}
+		defer pool.Close()
+		return admincli.SetupToken(ctx, postgres.NewAuthRepository(pool), nil, os.Stdout)
+	}()
+	switch {
+	case errors.Is(err, errSchemaNotCurrent):
+		fmt.Fprintln(os.Stderr, errSchemaNotCurrent.Error())
+		os.Exit(1)
+	case errors.Is(err, admincli.ErrAdministratorExists):
+		fmt.Fprintln(os.Stderr, "an administrator already exists; first-run setup is closed")
+		os.Exit(1)
+	case err != nil:
+		fail()
+	}
+	fmt.Fprintf(os.Stderr, "setup code valid for %d minutes; open /setup and enter it. Older unused codes are now invalid.\n", int(admincli.SetupTokenTTL.Minutes()))
 }
 
 // errSchemaNotCurrent is the only database-readiness text shown to the operator.
