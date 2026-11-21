@@ -38,7 +38,7 @@ const (
 	maxForwardedFor   = 32
 	// enrollmentTTLSeconds is the single-use enrollment token lifetime the
 	// web admin surface always requests (Step 6 Decision 4: 15 minutes).
-	enrollmentTTLSeconds = 900
+	enrollmentTTLSeconds = server.EnrollmentTTLSeconds
 )
 
 var errBadRequest = errors.New("bad request")

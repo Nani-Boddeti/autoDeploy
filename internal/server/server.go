@@ -33,6 +33,10 @@ const (
 // ProtocolVersion is the only agent protocol version this slice accepts.
 const ProtocolVersion = 1
 
+// EnrollmentTTLSeconds is the single-use enrollment token lifetime every
+// administrative surface (web UI and host CLI) requests (15 minutes).
+const EnrollmentTTLSeconds = 900
+
 // Server is an immutable-identity, mutable-status deployment-agent record.
 // OwnerID, ID, Name, and ProtocolVersion never change after creation; only
 // Status (active->revoked once) and LastHeartbeatAt (monotonic) do.

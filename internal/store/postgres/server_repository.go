@@ -147,10 +147,24 @@ func (r *ServerRepository) RegisterServer(ctx context.Context, principal auth.Pr
 	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
 		return server.Server{}, time.Time{}, err
 	}
-	actor := administratorActor(principal)
+	registered, expiresAt, err := r.registerServerTx(ctx, tx, principal.OwnerID, administratorActor(principal), "", in)
+	if err != nil {
+		return server.Server{}, time.Time{}, err
+	}
 
+	if err = tx.Commit(ctx); err != nil {
+		return server.Server{}, time.Time{}, fmt.Errorf("commit server register: %w", err)
+	}
+	return registered, expiresAt, nil
+}
+
+// registerServerTx is the register body shared by the UI path (RegisterServer,
+// after its session lock) and the host-trusted local path (RegisterLocalServer):
+// the server row, its first enrollment token digest and the "register" audit
+// event (with auditReason; empty for the UI), all in the caller's transaction.
+func (r *ServerRepository) registerServerTx(ctx context.Context, tx pgx.Tx, ownerID string, actor AuditActor, auditReason string, in RegisterServerInput) (server.Server, time.Time, error) {
 	var createdAt time.Time
-	err = tx.QueryRow(ctx, `INSERT INTO servers(id,owner_id,name,protocol_version,status) VALUES($1,$2,$3,$4,'active') RETURNING created_at`, in.ServerID, principal.OwnerID, in.Name, in.ProtocolVersion).Scan(&createdAt)
+	err := tx.QueryRow(ctx, `INSERT INTO servers(id,owner_id,name,protocol_version,status) VALUES($1,$2,$3,$4,'active') RETURNING created_at`, in.ServerID, ownerID, in.Name, in.ProtocolVersion).Scan(&createdAt)
 	if err != nil {
 		if isUniqueViolation(err) || isForeignKeyViolation(err) {
 			return server.Server{}, time.Time{}, ErrServerAuthorizationDenied
@@ -170,17 +184,14 @@ func (r *ServerRepository) RegisterServer(ctx context.Context, principal auth.Pr
 		return server.Server{}, time.Time{}, err
 	}
 
-	if err = insertServerAuditEvent(ctx, tx, actor, "register", &in.ServerID, nil, "success", ""); err != nil {
+	if err = insertServerAuditEvent(ctx, tx, actor, "register", &in.ServerID, nil, "success", auditReason); err != nil {
 		return server.Server{}, time.Time{}, err
 	}
 	if err = r.inject("audit_insert"); err != nil {
 		return server.Server{}, time.Time{}, err
 	}
 
-	if err = tx.Commit(ctx); err != nil {
-		return server.Server{}, time.Time{}, fmt.Errorf("commit server register: %w", err)
-	}
-	return server.Server{ID: in.ServerID, OwnerID: principal.OwnerID, Name: in.Name, ProtocolVersion: in.ProtocolVersion, Status: server.StatusActive, CreatedAt: createdAt}, expiresAt, nil
+	return server.Server{ID: in.ServerID, OwnerID: ownerID, Name: in.Name, ProtocolVersion: in.ProtocolVersion, Status: server.StatusActive, CreatedAt: createdAt}, expiresAt, nil
 }
 
 // IssueEnrollment reissues an enrollment token for an existing, active,
@@ -201,36 +212,44 @@ func (r *ServerRepository) IssueEnrollment(ctx context.Context, principal auth.P
 	if err = lockAdministratorSession(ctx, tx, principal); err != nil {
 		return time.Time{}, err
 	}
-	actor := administratorActor(principal)
+	expiresAt, err := r.issueEnrollmentTx(ctx, tx, principal.OwnerID, administratorActor(principal), serverID, digest, ttlSeconds)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return time.Time{}, fmt.Errorf("commit server enrollment reissue: %w", err)
+	}
+	return expiresAt, nil
+}
 
+// issueEnrollmentTx is the reissue body shared by IssueEnrollment (after its
+// session lock) and the host-trusted IssueLocalEnrollment.
+func (r *ServerRepository) issueEnrollmentTx(ctx context.Context, tx pgx.Tx, ownerID string, actor AuditActor, serverID string, digest [32]byte, ttlSeconds int) (time.Time, error) {
 	// No failure audit row here: the server's own existence (under this
 	// owner) is unconfirmed, and server_audit_events.server_id
 	// FK-references servers(id), so auditing an unknown ID would itself
 	// fail. A rolled-back transaction could not retain such a row anyway.
 	// lockActiveServer's owner scope makes an owner-B server indistinguishable
 	// from an unknown one to an owner-A principal.
-	if err = lockActiveServer(ctx, tx, serverID, principal.OwnerID); err != nil {
+	if err := lockActiveServer(ctx, tx, serverID, ownerID); err != nil {
 		return time.Time{}, err
 	}
 	var consumedAt *time.Time
-	if err = tx.QueryRow(ctx, `SELECT consumed_at FROM server_enrollment_tokens WHERE server_id=$1 AND purpose='enroll' FOR UPDATE`, serverID).Scan(&consumedAt); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT consumed_at FROM server_enrollment_tokens WHERE server_id=$1 AND purpose='enroll' FOR UPDATE`, serverID).Scan(&consumedAt); err != nil {
 		return time.Time{}, ErrServerAuthorizationDenied
 	}
 	if consumedAt != nil {
 		return time.Time{}, ErrServerAuthorizationDenied
 	}
 	var expiresAt time.Time
-	if err = tx.QueryRow(ctx, `UPDATE server_enrollment_tokens SET digest=$2,issued_at=clock_timestamp(),expires_at=clock_timestamp()+make_interval(secs=>$3) WHERE server_id=$1 AND purpose='enroll' AND consumed_at IS NULL RETURNING expires_at`, serverID, digest[:], ttlSeconds).Scan(&expiresAt); err != nil {
+	if err := tx.QueryRow(ctx, `UPDATE server_enrollment_tokens SET digest=$2,issued_at=clock_timestamp(),expires_at=clock_timestamp()+make_interval(secs=>$3) WHERE server_id=$1 AND purpose='enroll' AND consumed_at IS NULL RETURNING expires_at`, serverID, digest[:], ttlSeconds).Scan(&expiresAt); err != nil {
 		return time.Time{}, ErrServerAuthorizationDenied
 	}
-	if err = r.inject("enrollment_reissue"); err != nil {
+	if err := r.inject("enrollment_reissue"); err != nil {
 		return time.Time{}, err
 	}
-	if err = insertServerAuditEvent(ctx, tx, actor, "enrollment_issued", &serverID, nil, "success", ""); err != nil {
+	if err := insertServerAuditEvent(ctx, tx, actor, "enrollment_issued", &serverID, nil, "success", ""); err != nil {
 		return time.Time{}, err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return time.Time{}, fmt.Errorf("commit server enrollment reissue: %w", err)
 	}
 	return expiresAt, nil
 }

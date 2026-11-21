@@ -6,6 +6,7 @@ import (
 	"autodeploy/internal/admincli"
 	"errors"
 	"io"
+	"time"
 )
 
 func TestParseArgsRejectsEveryNonContractForm(t *testing.T) {
@@ -72,5 +73,38 @@ func TestSetupTokenCommandIsExactAndNotAPasswordOperation(t *testing.T) {
 	// The password operations must keep rejecting it: it is not a parseArgs form.
 	if _, _, err := parseArgs([]string{"setup-token"}); err == nil {
 		t.Fatal("parseArgs accepted setup-token")
+	}
+}
+
+func TestParseServerEnrollLocal(t *testing.T) {
+	host := func() (string, error) { return "web1.example.com", nil }
+	opts, err := parseServerEnrollLocal([]string{"--token-file", "/t", "--wait", "5m"}, host)
+	if err != nil || opts.Name != "web1" || opts.TokenFile != "/t" || opts.Wait != 5*time.Minute {
+		t.Fatalf("opts=%+v err=%v", opts, err)
+	}
+	opts, err = parseServerEnrollLocal([]string{"--token-file", "/t", "--name", "mine", "--server-id", "server_x"}, host)
+	if err != nil || opts.Name != "mine" || opts.ServerID != "server_x" {
+		t.Fatalf("opts=%+v err=%v", opts, err)
+	}
+	if opts, err = parseServerEnrollLocal([]string{"--token-file", "/t"}, func() (string, error) { return "", errors.New("x") }); err != nil || opts.Name != "local" {
+		t.Fatalf("fallback name: %+v %v", opts, err)
+	}
+	for _, args := range [][]string{nil, {"--name", "x"}, {"--token-file", "/t", "extra"}, {"--token-file", "/t", "--wait", "-1s"}, {"--token-file", "/t", "--token", "enr.v1.x"}, {"--token-file", "/t", "--name", " bad"}} {
+		if _, err := parseServerEnrollLocal(args, host); err == nil {
+			t.Fatalf("accepted %#v", args)
+		}
+	}
+}
+
+func TestParseServerEnrollLocalWaitOnly(t *testing.T) {
+	host := func() (string, error) { return "h", nil }
+	opts, err := parseServerEnrollLocal([]string{"--wait-only", "--wait", "2m"}, host)
+	if err != nil || !opts.WaitOnly || opts.TokenFile != "" || opts.Wait != 2*time.Minute {
+		t.Fatalf("opts=%+v err=%v", opts, err)
+	}
+	for _, args := range [][]string{{"--wait-only", "--token-file", "/t"}, {"--wait-only", "--name", "x"}, {"--wait-only", "--server-id", "s"}} {
+		if _, err := parseServerEnrollLocal(args, host); err == nil {
+			t.Fatalf("accepted %#v", args)
+		}
 	}
 }

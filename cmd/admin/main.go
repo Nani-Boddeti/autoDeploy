@@ -6,14 +6,17 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"autodeploy/internal/admincli"
 	"autodeploy/internal/auth"
 	"autodeploy/internal/config"
+	"autodeploy/internal/server"
 	"autodeploy/internal/store/postgres"
 	"autodeploy/migrations"
 
@@ -23,6 +26,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == serverEnrollLocalCommand {
+		runServerEnrollLocal(os.Args[2:])
+		return
+	}
 	if isSetupTokenCommand(os.Args[1:]) {
 		runSetupToken()
 		return
@@ -94,6 +101,114 @@ func runSetupToken() {
 		fail()
 	}
 	fmt.Fprintf(os.Stderr, "setup code valid for %d minutes; open /setup and enter it. Older unused codes are now invalid.\n", int(admincli.SetupTokenTTL.Minutes()))
+}
+
+const serverEnrollLocalCommand = "server-enroll-local"
+
+// parseServerEnrollLocal parses `server-enroll-local --token-file PATH [--name N]
+// [--server-id ID] [--wait DURATION]`. There is deliberately no flag that takes
+// a token: the token only ever goes to the file.
+func parseServerEnrollLocal(args []string, hostname func() (string, error)) (admincli.LocalEnrollOptions, error) {
+	var opts admincli.LocalEnrollOptions
+	fs := flag.NewFlagSet(serverEnrollLocalCommand, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.StringVar(&opts.TokenFile, "token-file", "", "")
+	fs.StringVar(&opts.Name, "name", "", "")
+	fs.StringVar(&opts.ServerID, "server-id", "", "")
+	fs.DurationVar(&opts.Wait, "wait", 0, "")
+	fs.BoolVar(&opts.WaitOnly, "wait-only", false, "")
+	// --wait-only takes no token file: it only waits for/checks the administrator.
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || (opts.TokenFile == "") == !opts.WaitOnly || opts.Wait < 0 || (opts.WaitOnly && (opts.Name != "" || opts.ServerID != "")) {
+		return opts, errors.New("usage: admin server-enroll-local --token-file PATH [--name NAME] [--server-id ID] [--wait DURATION] | --wait-only [--wait DURATION]")
+	}
+	if opts.WaitOnly {
+		return opts, nil
+	}
+	if opts.Name == "" {
+		host, err := hostname()
+		if err != nil {
+			host = ""
+		}
+		opts.Name, _, _ = strings.Cut(strings.TrimSpace(host), ".")
+		if opts.Name == "" {
+			opts.Name = "local"
+		}
+	}
+	if !server.ValidName(opts.Name) {
+		return opts, errors.New("invalid --name")
+	}
+	return opts, nil
+}
+
+// Exit codes of server-enroll-local (stdout carries only the server id). They avoid 2 (Go panic)
+// and the shell's 126+ range; any other nonzero code is a generic failure.
+const (
+	exitNoAdministrator  = 20 // first-run setup pending
+	exitNeedsReenroll    = 21 // token consumed, no active credential
+	exitRecordedIDGone   = 22 // recorded server id revoked or removed
+	exitAdministratorOff = 23 // administrator account disabled
+	exitAlreadyEnrolled  = 30 // active credential exists: id printed, nothing minted
+)
+
+// runServerEnrollLocal registers this host's server and writes its enrollment
+// token to --token-file. stdout carries only the server id; the token never
+// reaches stdout, stderr or any log. It needs no TTY and no password.
+// --wait-only just waits for an administrator (no token, no file).
+func runServerEnrollLocal(args []string) {
+	opts, err := parseServerEnrollLocal(args, os.Hostname)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	alreadyEnrolled := false
+	err = func() error {
+		dsn, configErr := config.DatabaseURLFromEnvironment()
+		if configErr != nil {
+			return configErr
+		}
+		ctx := context.Background()
+		pool, poolErr := openPool(ctx, dsn)
+		if poolErr != nil {
+			return poolErr
+		}
+		defer pool.Close()
+		repo := postgres.NewServerRepository(pool)
+		if opts.WaitOnly {
+			_, waitErr := admincli.WaitForAdministrator(ctx, repo, opts.Wait, nil)
+			return waitErr
+		}
+		var enrollErr error
+		alreadyEnrolled, enrollErr = admincli.EnrollLocal(ctx, repo, opts, os.Stdout)
+		return enrollErr
+	}()
+	codes := []struct {
+		target error
+		code   int
+	}{
+		{admincli.ErrAdministratorMissing, exitNoAdministrator},
+		{admincli.ErrServerNeedsReenroll, exitNeedsReenroll},
+		{admincli.ErrLocalServerUnavailable, exitRecordedIDGone},
+		{admincli.ErrAdministratorDisabled, exitAdministratorOff},
+		{admincli.ErrTokenFileUnusable, 1},
+	}
+	switch {
+	case err == nil:
+		if alreadyEnrolled {
+			os.Exit(exitAlreadyEnrolled)
+		}
+		return
+	case errors.Is(err, errSchemaNotCurrent):
+		fmt.Fprintln(os.Stderr, errSchemaNotCurrent.Error())
+		os.Exit(1)
+	}
+	for _, c := range codes {
+		if errors.Is(err, c.target) {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(c.code)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "server enrollment failed")
+	os.Exit(1)
 }
 
 // errSchemaNotCurrent is the only database-readiness text shown to the operator.

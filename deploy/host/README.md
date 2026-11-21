@@ -51,6 +51,10 @@ explicitly (`sudo tar -C /var/lib/autodeploy/diag -czf ~/diag.tgz <dir>`).
 `--destroy-data` deletes them too, lists what is lost (including KEK files) and aborts before deleting any
 secret if the Docker volume cannot be removed.
 
+## enroll-local.sh (root, on the host)
+
+`sudo enroll-local.sh [--wait DURATION] [--name NAME]` enrolls this host's agent automatically once the first administrator exists (token never displayed, in argv or logs); see docs/operations/vps-install.md section 4. Harness: `tests/enroll_local_test.sh`.
+
 ## enable-github.sh (root, on the host)
 
 Prerequisites: install-app.sh, create-credentials.sh, the database running and migrated, the GitHub

@@ -8,6 +8,7 @@
 # Usage (as root):  autodeploy-run migrate
 #                   autodeploy-run admin bootstrap --username administrator
 #                   autodeploy-run admin reset-password --username administrator
+#                   autodeploy-run admin server-enroll-local --token-file PATH   (no TTY; used by enroll-local.sh)
 #                   autodeploy-run secrets secret init-active-kek --kek kek-1
 #                   autodeploy-run secrets secret verify
 #
@@ -17,8 +18,9 @@
 # psql on stdin: never in argv, the environment or logs) and, on an existing install whose
 # controlplane/database-url still holds the owner URL, replaces it with the runtime URL.
 # `admin` and `secrets` run as the control-plane user with the runtime URL (no DDL needed).
-# `admin` and `secrets` need an interactive terminal (they refuse otherwise),
-# except `secrets secret verify`, which takes no value and may run piped.
+# `admin bootstrap|reset-password` and `secrets` need an interactive terminal (they refuse otherwise),
+# except `secrets secret verify`, `admin setup-token` and `admin server-enroll-local`, which read no
+# password or value from the terminal and may run piped.
 set -euo pipefail
 
 readonly APP_DIR=/usr/local/lib/autodeploy/app

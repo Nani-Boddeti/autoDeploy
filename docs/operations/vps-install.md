@@ -117,6 +117,26 @@ The installers refuse to run without `SHA256SUMS`; do not use `--insecure-no-che
    the hidden prompt exactly as `install-app.sh` printed (`agent enroll --base-url https://HOST ...`), then
    `sudo systemctl start autodeploy-agent`.
 
+   Automatic alternative to that register/enroll/start sequence (and to step 4's preflights): once the first
+   administrator exists, run `sudo ./enroll-local.sh [--wait 30m] [--name NAME]`. It registers this server under
+   the owner (default name: short hostname), writes the one-time token to a root-made 0700 directory under
+   `/run` (never printed, never in argv, never in the environment), records `AUTODEPLOY_AGENT_SERVER_ID` in
+   `agent-local.env`, runs `agent enroll --token-file` as the agent user, always removes the token file, starts
+   `autodeploy-agent` and runs both preflights. `--wait` polls for the first administrator (use it while you
+   finish `/setup`). It is idempotent: an existing agent credential makes it a no-op, and a crash between steps
+   is resumed with a fresh token and no duplicate server. If this host's server is enrolled in the control plane
+   but the host has no credential, it stops and tells you to use Servers > Re-enroll. The audit actor is the
+   owner's single administrator user, the same shape as UI registration (its `register` audit row carries the
+   reason `local-enroll`; only servers registered this way are ever reused by name, never ones you registered in
+   the UI). One run at a time (flock); stale `/run/autodeploy-enroll.*` directories of a crashed run are swept
+   after 15 minutes.
+
+   Restores: a host that still has `/var/lib/autodeploy/agent/credential` but whose control plane lost the
+   matching credential (database restore) is a no-op for this script (the credential file exists); use
+   Servers > Re-enroll in the UI and enroll as in the manual steps. Likewise, if the control plane has the server
+   enrolled but the host has no credential, the script stops with the same guidance; if the recorded id was
+   revoked or removed it tells you to clear `AUTODEPLOY_AGENT_SERVER_ID` in `agent-local.env` and re-run.
+
 4. Verify: `sudo ./preflight-app.sh` and `sudo ./preflight-checkout.sh`. In public mode `preflight-app.sh`
    checks: DNS of the control plane host resolves to this host's public address (warns under NAT), the hosts
    line `CP_HOST -> 127.0.0.1`, ports 80/443 owned by Traefik, the ACME directory is reachable, `acme.json`
