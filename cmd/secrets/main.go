@@ -1,6 +1,8 @@
-// Command secrets performs terminal-only secret operations: KEK rotation
-// (init-active-kek, rewrap, can-retire), secret value entry (put, replace) and
-// the read-only decrypt canary (verify). verify reads page by page, not from
+// Command secrets performs secret operations: KEK rotation (init-active-kek,
+// rewrap, can-retire), secret value entry (put, replace; these need an
+// interactive terminal for hidden input) and the read-only decrypt canary
+// (verify). verify and init-active-kek read no secret value and need no
+// terminal (the host installer runs init-active-kek without one). verify reads page by page, not from
 // one snapshot: run it with writers stopped (control plane down) for a
 // complete result; under concurrent rewrap/replace it is best-effort.
 package main
@@ -252,8 +254,9 @@ func run(c command, preflight func() (terminalSession, error), exec func(context
 	return runWithOutput(c, preflight, exec, os.Stdout)
 }
 func runWithOutput(c command, preflight func() (terminalSession, error), exec func(context.Context, command) (string, error), output io.Writer) error {
-	// verify takes no value, so it needs no terminal and may run piped.
-	if c.action != "verify" {
+	// verify and init-active-kek take no secret value, so they need no terminal and may run piped
+	// (the host installer initialises the key ledger without a TTY).
+	if c.action != "verify" && c.action != "init-active-kek" {
 		t, err := preflight()
 		if err != nil {
 			return err

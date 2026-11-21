@@ -61,6 +61,10 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          if [[ "$TAG" == *-dev* ]]; then
+            echo "::error::tag '$TAG' is a development version; releases must not carry -dev"
+            exit 1
+          fi
           f=deploy/host/install.sh
           if [ ! -f "$f" ]; then echo "install.sh not present yet: skipping"; exit 0; fi
           have="$(sed -n 's/^AUTODEPLOY_VERSION="\(.*\)"$/\1/p' "$f")"

@@ -35,6 +35,25 @@ func TestVerifyDoesNotRequireTerminal(t *testing.T) {
 	}
 }
 
+// init-active-kek reads no secret value, so the installer (no terminal) may run it; the other
+// mutating actions still need one.
+func TestInitActiveKEKDoesNotRequireTerminal(t *testing.T) {
+	var out bytes.Buffer
+	pre := func() (terminalSession, error) {
+		t.Fatal("terminal preflight ran for init-active-kek")
+		return nil, nil
+	}
+	exec := func(context.Context, command) (string, error) { return "active secret key initialized", nil }
+	if err := runWithOutput(command{action: "init-active-kek", oldKEK: "kek-1"}, pre, exec, &out); err != nil || out.String() != "active secret key initialized\n" {
+		t.Fatalf("%q %v", out.String(), err)
+	}
+	for _, action := range []string{"put", "replace", "rewrap", "can-retire"} {
+		if err := runWithOutput(command{action: action}, func() (terminalSession, error) { return nil, userError("interactive terminal required") }, exec, &out); err == nil {
+			t.Fatalf("%s skipped the terminal preflight", action)
+		}
+	}
+}
+
 func TestVerifyOutputAndFailureExit(t *testing.T) {
 	operator := &fakeSecretOperator{verifyResult: secret.VerifyResult{Checked: 3, Failed: 1, Failures: []secret.VerifyFailure{{VersionID: "version-2", KEKID: "kek-a", Reason: secret.VerifyKEKMissing}}}}
 	deps := testSecretDeps(t, operator)

@@ -4,6 +4,8 @@ AutoDeploy is a self-hosted control plane and outbound deployment-agent platform
 
 Implementation is active. The authoritative continuation brief is [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md). The working plan is [tasks/todo.md](tasks/todo.md); accepted architecture decisions are in [docs/adr](docs/adr).
 
+Quick start (Ubuntu 24.04 VPS, domain pointing at it): download `install.sh` from a release tag and run it with `sudo bash install.sh`; see [Quick install](docs/operations/vps-install.md#quick-install-recommended). The installer is not available until the first signed release is published (plan 24).
+
 Do not place credentials in this repository, environment files, logs, commands, migrations, or documentation. Production credentials are protected mounted files outside the checkout.
 
 .tmp/ is intentionally untracked but not gitignored. Exclude it manually and do not use blanket git add.

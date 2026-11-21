@@ -66,7 +66,8 @@ func (r *KeyRepository) LedgerReady(ctx context.Context, kekID, generationID str
 	return exists, nil
 }
 
-// InitializeActiveLedger is terminal-only recovery/bootstrap. It never resets
+// InitializeActiveLedger is host-operator recovery/bootstrap (run by root on the
+// host, or by the installer; it reads no secret and needs no terminal). It never resets
 // or reuses a KEK ledger and rejects IDs referenced by any envelope.
 func (r *KeyRepository) InitializeActiveLedger(ctx context.Context, kekID, generationID string) error {
 	if r == nil || r.pool == nil || !validKEKID(kekID) || !validGenerationID(generationID) {

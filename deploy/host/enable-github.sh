@@ -6,6 +6,15 @@
 # Usage (as root):
 #   enable-github.sh --app-id N --client-id ID --slug SLUG --owner-id N \
 #       --owner-type User|Organization --private-key FILE [--replace-key] [--bindir DIR] [--kek-id ID]
+#   enable-github.sh --kek-only [--bindir DIR] [--kek-id ID]
+#
+#   --kek-only          installer mode (install.sh, plan 24-B): ONLY the secret (KEK) subsystem. Creates the KEK,
+#                       its manifest and the key ledger without a terminal, and writes controlplane-github.env
+#                       with just AUTODEPLOY_SECRET_SUBSYSTEM_ENABLED/AUTODEPLOY_KEK_MANIFEST_FILE when that file
+#                       does not exist yet (an existing file is kept: a later full run rewrites it). It takes none
+#                       of the GitHub App flags, installs no App key or webhook secret, and does not restart the
+#                       control plane (the caller starts it afterwards). Needs a `secrets` binary that runs
+#                       init-active-kek without a terminal (same release).
 #
 #   --private-key FILE  the .pem downloaded from the App settings, copied to the host. It is
 #                       copied (never printed) to the control plane's credential directory.
@@ -33,8 +42,8 @@
 #      and its manifest              /etc/autodeploy/controlplane/kek-manifest.json (non-secret
 #      JSON bound to the database generation read from PostgreSQL)
 #   4. initialises the key ledger once: `autodeploy-run secrets secret init-active-kek --kek <ID>`
-#      (cmd/secrets needs an interactive terminal; a ledger that already exists is detected and
-#      left alone)
+#      (a ledger that already exists is detected and left alone; with --kek-only no terminal is
+#      needed, the full mode keeps its terminal guard)
 #   5. writes /etc/autodeploy/controlplane-github.env (root 0644, paths and ids only), which the
 #      control plane unit reads after controlplane.env, and restarts autodeploy-controlplane.
 # Secret files are owned by autodeploy-controlplane, mode 0600, created by /dev/urandom or copied
@@ -63,10 +72,11 @@ unset DOCKER_CONTEXT
 log() { printf '==> %s\n' "$*"; }
 die() { printf 'enable-github: error: %s\n' "$*" >&2; exit 1; }
 
-app_id="" client_id="" slug="" owner_id="" owner_type="" key_src="" replace_key=0 bindir="" kek_id=kek-1
+app_id="" client_id="" slug="" owner_id="" owner_type="" key_src="" replace_key=0 bindir="" kek_id=kek-1 kek_only=0
 while (($#)); do
   case "$1" in
     --replace-key) replace_key=1; shift ;;
+    --kek-only) kek_only=1; shift ;;
     --app-id | --client-id | --slug | --owner-id | --owner-type | --private-key | --bindir | --kek-id)
       (($# >= 2)) || die "$1 needs a value"
       case "$1" in
@@ -87,6 +97,9 @@ readonly KEK_ID="$kek_id"
 readonly KEK_FILE="$CP_DIR/secret-$KEK_ID"
 [[ $EUID -eq 0 ]] || die "must run as root"
 # ---- 1. validate inputs (mirrors internal/config/database.go) -------------------------
+if ((kek_only)); then
+  [[ -z $app_id$client_id$slug$owner_id$owner_type$key_src && $replace_key == 0 ]] || die "--kek-only takes no GitHub App flags"
+else
 [[ $app_id =~ ^[1-9][0-9]{0,17}$ ]] || die "--app-id must be a positive integer"
 [[ $owner_id =~ ^[1-9][0-9]{0,17}$ ]] || die "--owner-id must be a positive integer"
 [[ $owner_type == User || $owner_type == Organization ]] || die "--owner-type must be User or Organization"
@@ -102,6 +115,7 @@ grep -q -- '^-----BEGIN \(RSA \)\?PRIVATE KEY-----' "$key_src" || die "--private
 command -v openssl >/dev/null || die "openssl required"
 openssl rsa -in "$key_src" -noout -passin pass: >/dev/null 2>&1 || die "--private-key does not parse as an RSA private key"
 installation_url="https://github.com/apps/$slug/installations/new"
+fi
 
 # ---- 2. preconditions -------------------------------------------------------------------
 if [[ -n $bindir ]]; then
@@ -136,7 +150,9 @@ write_file() { # dst owner group mode (content on stdin; 0600 temp file renamed 
 }
 
 # ---- 3. GitHub App private key -------------------------------------------------------------
-if [[ -e $KEY_DST ]]; then
+if ((kek_only)); then
+  :
+elif [[ -e $KEY_DST ]]; then
   if cmp -s "$key_src" "$KEY_DST"; then
     log "App private key already installed (identical)"
   elif ((replace_key)); then
@@ -151,6 +167,7 @@ else
 fi
 
 # ---- 4. webhook secret (32 bytes: LoadKey demands exactly 32; hex text is pasteable) -----
+if ((!kek_only)); then
 if [[ -e $WEBHOOK_FILE ]]; then
   log "webhook secret exists; keeping it"
 else
@@ -158,6 +175,7 @@ else
   openssl rand -hex 16 | tr -d '\n' | write_file "$WEBHOOK_FILE" "$CP_USER" "$CP_USER" 0600
 fi
 [[ "$(stat -c %s "$WEBHOOK_FILE")" == 32 ]] || die "$WEBHOOK_FILE is not exactly 32 bytes"
+fi
 
 # ---- 5. KEK and manifest ---------------------------------------------------------------------
 generation="$(psql_cp "SELECT id FROM secret_database_generation WHERE singleton")"
@@ -182,6 +200,19 @@ else
 fi
 
 # ---- 6. non-secret environment file --------------------------------------------------------
+if ((kek_only)); then
+  if [[ -e $GITHUB_ENV ]]; then
+    log "$GITHUB_ENV exists; keeping it"
+  else
+    log "writing $GITHUB_ENV (secret subsystem only)"
+    tmp="$(mktemp "$GITHUB_ENV.XXXXXX")"
+    printf '%s\n' "# Generated by deploy/host/enable-github.sh --kek-only. Non-secret. A later full enable-github.sh run rewrites it." \
+      "AUTODEPLOY_SECRET_SUBSYSTEM_ENABLED=true" "AUTODEPLOY_KEK_MANIFEST_FILE=$MANIFEST" >"$tmp"
+    chown root:root "$tmp"
+    chmod 0644 "$tmp"
+    mv -f "$tmp" "$GITHUB_ENV"
+  fi
+else
 log "writing $GITHUB_ENV"
 tmp="$(mktemp "$GITHUB_ENV.XXXXXX")"
 cat >"$tmp" <<ENVEOF
@@ -203,6 +234,7 @@ ENVEOF
 chown root:root "$tmp"
 chmod 0644 "$tmp"
 mv -f "$tmp" "$GITHUB_ENV"
+fi
 
 # ---- 7. key ledger (once) -----------------------------------------------------------------
 ledger="$(psql_cp "SELECT count(*) FROM secret_wrap_invocations WHERE kek_id='$KEK_ID' AND database_generation_id='$generation'")"
@@ -210,9 +242,14 @@ if [[ $ledger == 1 ]]; then
   log "key ledger already initialised for $KEK_ID"
 else
   [[ $ledger == 0 ]] || die "unexpected ledger state ($ledger rows)"
-  [[ -t 0 && -t 1 ]] || die "cmd/secrets needs an interactive terminal: run this script from a terminal, not a pipe"
+  ((kek_only)) || [[ -t 0 && -t 1 ]] || die "cmd/secrets needs an interactive terminal: run this script from a terminal, not a pipe"
   log "initialising the key ledger for $KEK_ID"
   "$RUN" secrets secret init-active-kek --kek "$KEK_ID"
+fi
+
+if ((kek_only)); then
+  log "secret subsystem initialised (KEK $KEK_ID); the control plane was not restarted"
+  exit 0
 fi
 
 # ---- 8. restart and report -------------------------------------------------------------------

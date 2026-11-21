@@ -5,6 +5,61 @@ TLS comes from Let's Encrypt through Traefik (`--mode public`). For a private LA
 use the default `--mode lan` (see `deploy/host/README.md`). Switching an existing LAN install to public
 in place is not supported: install fresh.
 
+## Quick install (recommended)
+
+Status: the installer is built and tested against a local container harness only; it has not run on a real
+host yet, and no signed release exists until the owner completes the release setup
+(`docs/operations/releases.md`). Until then use the manual path below.
+
+On a fresh Ubuntu 24.04 x86_64 server (2+ vCPU, 2+ GB RAM, 40+ GB free disk, ports 80/443 free) whose domain
+already points at the server, as a user with `sudo`. Replace `vX.Y.Z` with the release tag:
+
+    curl --proto '=https' --tlsv1.2 -fsSLo install.sh https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/vX.Y.Z/deploy/host/install.sh
+    sudo bash install.sh
+
+Do not pipe it into `bash`: it asks its questions (domain, ACME email, firewall) on the terminal and refuses to
+read answers from a pipe. For unattended use pass them as flags:
+`sudo bash install.sh --domain autodeploy.example.com --email ops@example.com --firewall no --yes` (add
+`--ssh-port N` with `--firewall yes`; `--setup-wait 30m` bounds the wait for the browser step).
+
+**Check the script before you run it.** `install.sh` comes from the git tag, not from a release asset, so its
+trust is the repository and tag protection plus the key fingerprint it carries. Read it (`less install.sh`), then
+compare the fingerprint of the key it embeds, and the hash of the script, with the values published in the
+README or the release notes, obtained over a different channel:
+
+    awk '/^release@autodeploy/ {print $3, $4}' install.sh >embedded.pub && ssh-keygen -lf embedded.pub
+    sha256sum install.sh
+
+The installer prints the same fingerprint again before it downloads anything, and fails if the key is still
+the placeholder.
+
+The installer refuses a development build, a build whose embedded key is still the placeholder, a downgrade
+(`--allow-downgrade` overrides it), a non-Ubuntu-24.04 or non-x86_64 host, `docker.io` or snap Docker, busy
+ports 80/443, lan-mode hosts and a domain different from the previous install. It downloads the signed release
+for its own version over HTTPS only (`--release-dir DIR` uses a local copy for offline installs, verified the
+same way), verifies signature, checksums and version in a private root-only directory before extracting
+anything, installs Docker CE and buildx from Docker's official apt repository if needed, then runs the steps of
+section 4 in order. A DNS record that does not point at this host is a warning you must confirm (`--yes`). Docker is accepted only
+as Docker CE at `/usr/bin/docker` (package `docker-ce`); podman-docker shims, snap and other paths are refused.
+Docker's apt signing key is downloaded to a private directory and installed only if its fingerprint equals the
+one pinned in the installer (`9DC858229FC7DD38854AE2D88D81803C0EBFCD88`). `--allow-dev`, `--allowed-signers` and
+`--yes-i-am-testing` exist only for development builds and are hard errors on a release. Your answers are saved in
+`/etc/autodeploy/installer.env` (root-only) so a re-run after a partial install keeps them.
+
+At the end it prints `https://<domain>/setup` and a one-time code, **once, on the terminal only** (never in the
+log). Open the page, enter the code, create the administrator, and the installer enrolls this host's agent
+and finishes. If you do not finish within the wait, it exits with code 4 (the stack is installed and the version
+is recorded; only the browser setup is pending, intentionally); run it again for a new code. Log:
+`/var/log/autodeploy-install.log` (root-only, no setup code or secret). Installed version:
+`/etc/autodeploy/installed-version`. The verified kit scripts (`preflight-app.sh`, `uninstall.sh`,
+`enable-github.sh`, ...) are kept in `/usr/local/share/autodeploy/kit`. Re-running the installer upgrades.
+
+Creating the GitHub App: a one-click flow is planned (plan 24-E). Until it ships, create the App on
+github.com and use `sudo /usr/local/share/autodeploy/kit/enable-github.sh` (see its header) as the break-glass
+path.
+
+The manual path below stays valid and is what the installer automates.
+
 ## 1. Requirements
 
 - Ubuntu 24.04 LTS, x86_64 only. systemd >= 254 (`systemctl --version`), cgroup v2
