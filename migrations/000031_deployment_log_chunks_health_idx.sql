@@ -1,0 +1,15 @@
+-- 23-D: partial index for the newest-health-line lookups.
+--
+-- The operations and environment read models fetch, per attempt, the newest
+-- health-stream chunk matching a coarse LIKE (failure reason / last probe):
+--   WHERE attempt_id = $1 AND stream = 'health' AND body LIKE '...%'
+--   ORDER BY id DESC LIMIT 1
+-- Without this index the lookup walks every build/phase chunk of the attempt
+-- via deployment_log_chunks_attempt_id_idx. Health lines are few, so the
+-- partial index stays tiny and the newest match is one backward index scan.
+--
+-- Plain CREATE INDEX, not CONCURRENTLY: Apply runs each migration inside one
+-- transaction under an advisory lock, where CONCURRENTLY is not allowed. The
+-- table is bounded by the retention purge, so the build lock is short. A new
+-- index needs no grants (privileges are per table).
+CREATE INDEX deployment_log_chunks_health_idx ON deployment_log_chunks (attempt_id, id DESC) WHERE stream = 'health';
