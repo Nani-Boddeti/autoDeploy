@@ -305,7 +305,7 @@ If the dump is older than work the agent has already done, the database and the 
   pending drain obligations live in `/var/lib/autodeploy/agent/drains/`. A record for an attempt the
   restored database does not know, or in a different phase, can conflict: expect the environment to show
   **reconciliation required**. Resolve it in the UI with the resolve form
-  (`POST /environments/resolve`, rendered on the Servers page; the administrator states what really
+  (`POST /environments/resolve`, rendered on the Reconciliation page; the administrator states what really
   happened: `activated`, `not_activated` or `no_activation`, with a reason, which is audited). Do not
   delete the agent's records by hand to silence it; first list them
   (`ls /var/lib/autodeploy/agent/activations /var/lib/autodeploy/agent/drains`) and compare the attempt ids

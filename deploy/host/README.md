@@ -66,8 +66,8 @@ terminal required), writes `/etc/autodeploy/controlplane-github.env` (non-secret
 control plane, printing the last journal lines. Re-running is safe; existing secrets are never
 overwritten. Afterwards `shred -u` the `.pem`, set the App webhook (`/webhooks/github`, secret from
 `/etc/autodeploy/controlplane/github-webhook-secret-1`, event `push`), then use `/github/setup` in
-the UI to install the App (landing page button) and bind the repository with the "Bind a repository"
-form on the landing page (POST `/github/bindings`).
+the UI to install the App (GitHub page in the sidebar, `/github`) and bind the repository with the
+"Bind a repository" form on the same page (POST `/github/bindings`).
 
 ## Add a secret
 
@@ -80,7 +80,7 @@ file; refused when stdin is not a terminal). The environment must already be kno
 command prints `secret head id: <id>` and `version: 1` (never the value). The audit actor records the
 sudo operator, e.g. `terminal:alice(as autodeploy-controlplane)` (names outside `^[a-z_][a-z0-9_-]{0,31}$`,
 such as `john.doe`, are recorded as `unknown`; this is attribution, not authentication). Paste the id into the
-environment's "Add binding" form on the Servers page: kind secret, the same variable name and the same
+environment's "Add binding" form on the Runtime config page: kind secret, the same variable name and the same
 scope. `--name` is only validated, not stored: the variable name is set in the binding form, and both
 must match what the Dockerfile or app expects. To rotate:
 
@@ -124,7 +124,8 @@ example `127.0.0.1:9101`; pass it on every run) enables the metrics listener.
 ## First deploy order (UI)
 
 Bind (project ID, environment ID, branch, server) -> Projects page "Deploy" (this creates the job that
-makes the environment known) -> Servers page: environment runtime configuration -> route hostname ->
+makes the environment known) -> Runtime config page (pick the environment in the strip) -> Routes page
+(route hostname) ->
 only then enroll and start the agent, so the first claim finds a complete configuration. The agent
 reads the finished checkout through the `autodeploy-checkout` group (workspace mode 0750); the checkout
 helper fetches over HTTPS through `git-remote-https` (install-checkout.sh installs it next to git).

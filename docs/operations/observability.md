@@ -57,7 +57,7 @@ Thresholds are suggestions; the repository does not fix them (**operator decisio
 | --- | --- |
 | `autodeploy_db_up == 0` for a few minutes | Database unreachable or the snapshot is too slow (see scale note). |
 | `autodeploy_agent_heartbeat_age_seconds` > N | Agent down or cut off. The agent's default heartbeat interval is 20 s (`internal/agent/client/run.go`), so N around 90 to 120 s is three to six missed beats. Absent series for a known server also means no heartbeat has ever arrived. |
-| `autodeploy_environments_reconciliation_required > 0` | An environment is blocked until an operator resolves it (resolve form on the Servers page; see `backup-restore.md` after a restore). |
+| `autodeploy_environments_reconciliation_required > 0` | An environment is blocked until an operator resolves it (resolve form on the Reconciliation page, which the sidebar badge counts; see `backup-restore.md` after a restore). |
 | `autodeploy_release_operations_open` not decreasing | A release operation (started or switch_authorized) is stuck open; look at the environment and the agent log for that attempt. |
 | rate of `autodeploy_http_requests_total{code="5xx"}` > 0 sustained | Server errors on a surface (`web`, `agent`, `webhook`). |
 | `autodeploy_lease_sweep_runs_total{result="error"}` or `autodeploy_log_purge_runs_total{result="error"}` increasing | Background maintenance failing. |
