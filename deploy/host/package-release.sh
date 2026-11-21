@@ -66,7 +66,7 @@ tar_det() { # deterministic tar | gzip -n: tar_det OUT BASEDIR NAME
 # package-release.sh, verify-release.sh and release-signing/) is not in the kit: the kit must never
 # carry the trust anchor (install.sh embeds the key; see tasks/24-plan.md 24-B).
 KIT_ALLOWLIST=(README.md backup-db.sh create-credentials.sh diagnose.sh enable-github.sh enroll-local.sh
-  install-app.sh install-checkout.sh netcheck.sh preflight-app.sh preflight-checkout.sh private-ca.sh
+  install-app.sh install-checkout.sh netcheck.sh preflight-agent.sh preflight-app.sh preflight-checkout.sh private-ca.sh
   stage-lib.sh uninstall.sh libexec systemd traefik)
 repo="$(git -C "$here" rev-parse --show-toplevel)"
 git -C "$repo" -c tar.umask=0022 archive --format=tar --prefix="autodeploy-host-kit-$version/" "$commit:deploy/host" "${KIT_ALLOWLIST[@]}" \

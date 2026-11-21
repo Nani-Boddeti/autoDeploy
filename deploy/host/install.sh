@@ -34,6 +34,23 @@
 # is installed and only the browser setup is pending (intentional).
 # Re-running is an upgrade: the setup code is skipped when an administrator exists, enrollment when this host
 # is already enrolled. lan-mode hosts and a different domain are refused.
+#
+# EXTRA SERVER (plan 24-F): an agent-only server for an existing control plane. On the Servers page choose "Add
+# server"; it shows the two commands (download this installer from the tag, then run it):
+#   sudo bash install.sh --role agent --control-plane-host CP.EXAMPLE.COM --server-id server_XXXX [--email ADDR|none] ...
+#   --role all|agent           all (default) = this installer as above; agent = agent, Traefik (ACME for the apps),
+#                              checkout isolation, Docker. No PostgreSQL, control plane, setup code or /etc/hosts block.
+#   --control-plane-host FQDN  (agent) the control plane's public hostname; its https://FQDN/readyz must answer with a
+#                              certificate the system trusts. Not a DNS check against THIS host.
+#   --server-id ID             (agent) the id the Servers page shows (server_...)
+#   --token-file FILE          (agent, no terminal) file holding the one-time enrollment token: a regular file owned by
+#                              root, mode 0600, not a symlink. Without it the installer asks for the token at a HIDDEN
+#                              prompt on /dev/tty. The token is never accepted on the command line, an environment
+#                              variable or a URL; it goes into a private 0600 copy readable only by the agent user,
+#                              which is removed on success and on failure.
+# The agent role takes --email, --firewall, --ssh-port, --acme-staging and --yes like the default role (the apps on
+# this server get certificates for their own hostnames); --domain and --setup-wait are refused. A re-run of an
+# enrolled server does not ask for the token. A different control plane host, server id or role is refused.
 set -euo pipefail
 umask 077
 
@@ -47,6 +64,10 @@ readonly LOG=/var/log/autodeploy-install.log
 readonly RUN=/usr/local/lib/autodeploy/autodeploy-run
 readonly AGENT_CREDENTIAL=/var/lib/autodeploy/agent/credential
 readonly KIT_COPY=/usr/local/share/autodeploy/kit
+readonly AGENT_USER=autodeploy-agent
+readonly APP_DIR=/usr/local/lib/autodeploy/app
+readonly AGENT_STATE=/var/lib/autodeploy/agent
+readonly AGENT_LOCAL_ENV="$ETC_DIR/agent-local.env"
 readonly WORK_PARENT=/var/tmp
 
 # Original stdout, kept for the one-time setup code: it goes to the terminal only, never through the log tee.
@@ -54,6 +75,7 @@ exec 3>&1
 
 LOG_READY=0
 WORK=""
+TOKDIR="" REC_TMP="" SECRET=""
 say() { printf '==> %s\n' "$*"; if ((LOG_READY)); then printf '==> %s\n' "$*" >>"$LOG"; fi; }
 warn() { printf 'install.sh: WARNING: %s\n' "$*" >&2; if ((LOG_READY)); then printf 'WARNING: %s\n' "$*" >>"$LOG"; fi; }
 die() {
@@ -64,6 +86,10 @@ die() {
 usage_die() { printf 'install.sh: %s\n' "$*" >&2; printf 'See the header of install.sh for the flags (sed -n 2,30p install.sh).\n' >&2; exit 2; }
 
 cleanup() {
+  SECRET=""
+  # The token copy (24-F): removed on every exit path, success or failure. Only this run's own directory.
+  case "$TOKDIR" in /run/autodeploy-enroll.*) [[ -d $TOKDIR && ! -L $TOKDIR ]] && rm -rf -- "$TOKDIR" ;; esac
+  [[ -z $REC_TMP ]] || rm -f -- "$REC_TMP"
   case "$WORK" in "$WORK_PARENT"/autodeploy-install.*) [[ -d $WORK ]] && rm -rf -- "$WORK" ;; esac
   return 0
 }
@@ -174,15 +200,18 @@ verify_release_dir() (
 # END VERIFY-RELEASE LOGIC
 
 # ---- arguments -----------------------------------------------------------------------------------
-DOMAIN="" EMAIL="" FIREWALL="" SSH_PORT="" ACME_STAGING="" ASSUME_YES=0 SETUP_WAIT=60m
+DOMAIN="" EMAIL="" FIREWALL="" SSH_PORT="" ACME_STAGING="" ASSUME_YES=0 SETUP_WAIT=60m SETUP_WAIT_GIVEN=0
 ALLOW_DOWNGRADE=0 ALLOW_DEV=0 ALLOWED_FILE="" RELEASE_DIR="" TESTING_OK=0
+ROLE=all CP_HOST_FLAG="" SERVER_ID="" TOKEN_FILE=""
 while (($#)); do
   case "$1" in
-    --domain | --email | --firewall | --ssh-port | --setup-wait | --release-dir | --allowed-signers)
+    --domain | --email | --firewall | --ssh-port | --setup-wait | --release-dir | --allowed-signers \
+      | --role | --control-plane-host | --server-id | --token-file)
       (($# >= 2)) || usage_die "$1 needs a value"
       case "$1" in
         --domain) DOMAIN="$2" ;; --email) EMAIL="$2" ;; --firewall) FIREWALL="$2" ;; --ssh-port) SSH_PORT="$2" ;;
-        --setup-wait) SETUP_WAIT="$2" ;; --release-dir) RELEASE_DIR="$2" ;; --allowed-signers) ALLOWED_FILE="$2" ;;
+        --setup-wait) SETUP_WAIT="$2"; SETUP_WAIT_GIVEN=1 ;; --release-dir) RELEASE_DIR="$2" ;; --allowed-signers) ALLOWED_FILE="$2" ;;
+        --role) ROLE="$2" ;; --control-plane-host) CP_HOST_FLAG="$2" ;; --server-id) SERVER_ID="$2" ;; --token-file) TOKEN_FILE="$2" ;;
       esac
       shift 2 ;;
     --acme-staging) ACME_STAGING=1; shift ;;
@@ -197,6 +226,16 @@ done
 [[ -z $FIREWALL || $FIREWALL == yes || $FIREWALL == no ]] || usage_die "--firewall must be yes or no"
 [[ -z $SSH_PORT || ( $SSH_PORT =~ ^[1-9][0-9]{0,4}$ && $SSH_PORT -le 65535 ) ]] || usage_die "--ssh-port must be a port number"
 [[ $SETUP_WAIT =~ ^[0-9]+(ns|us|ms|s|m|h)([0-9]+(ns|us|ms|s|m|h))*$ ]] || usage_die "--setup-wait must be a duration such as 30m"
+[[ $ROLE == all || $ROLE == agent ]] || usage_die "--role must be all or agent"
+if [[ $ROLE == agent ]]; then
+  [[ -n $CP_HOST_FLAG ]] || usage_die "--role agent needs --control-plane-host FQDN (the control plane's public hostname)"
+  [[ -n $SERVER_ID ]] || usage_die "--role agent needs --server-id ID (the id the Servers page shows for this server)"
+  [[ -z $DOMAIN ]] || usage_die "--domain is for the control plane (--role all); an agent server names its control plane with --control-plane-host"
+  ((!SETUP_WAIT_GIVEN)) || usage_die "--setup-wait belongs to the control plane's first-run setup and has no meaning with --role agent"
+  DOMAIN="$CP_HOST_FLAG" # from here on DOMAIN is the control plane host the agent reports to
+elif [[ -n $CP_HOST_FLAG || -n $SERVER_ID || -n $TOKEN_FILE ]]; then
+  usage_die "--control-plane-host, --server-id and --token-file are only valid with --role agent"
+fi
 
 # ---- preflight (nothing is changed below this line until the release is verified) ----------------
 [[ $EUID -eq 0 ]] || die "must run as root: use 'sudo bash install.sh'"
@@ -225,6 +264,14 @@ tty_ask() { # prompt -> stdout (the answer). Reads /dev/tty only, never a piped 
   printf '%s' "$1" >/dev/tty
   IFS= read -r ans </dev/tty || die "no answer on the terminal"
   printf '%s' "$ans"
+}
+# Every function that touches the token starts with `local -; set +x`: under `bash -x` the trace of its commands (which
+# expand $SECRET) would otherwise put the token into stderr and any captured log.
+tty_secret() { # prompt -> SECRET (hidden input, /dev/tty only; never echoed, never argv, never stdout)
+  local -; set +x
+  printf '%s' "$1" >/dev/tty
+  IFS= read -rs SECRET </dev/tty || { printf '\n' >/dev/tty; SECRET=""; die "no answer on the terminal"; }
+  printf '\n' >/dev/tty
 }
 confirm() { # question: --yes accepts; a terminal asks; otherwise refuse with the flag to use
   if ((ASSUME_YES)); then warn "$1 (continuing because of --yes)"; return 0; fi
@@ -285,7 +332,7 @@ disk_kb="$(df -Pk /var/lib 2>/dev/null | awk 'NR==2 {print $4}')"
 for tool in ssh-keygen tar gzip sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found (try: apt install openssh-client tar gzip coreutils)"
 done
-[[ -n $RELEASE_DIR ]] || command -v curl >/dev/null 2>&1 || die "curl not found (apt install curl)"
+[[ -n $RELEASE_DIR && $ROLE == all ]] || command -v curl >/dev/null 2>&1 || die "curl not found (apt install curl)"
 
 # semver compare: prints -1, 0 or 1 for A vs B (both vX.Y.Z[-pre]); a pre-release sorts below its release.
 semver_cmp() {
@@ -320,7 +367,7 @@ semver_cmp() {
 cfg() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1 || true; }
 INSTALLER_ENV="$ETC_DIR/installer.env"
 UPGRADE=0 RERUN=0 PREV_DOMAIN="" PREV_EMAIL="" PREV_STAGING=""
-S_DOMAIN="" S_EMAIL="" S_STAGING="" S_FIREWALL="" S_SSH_PORT=""
+S_DOMAIN="" S_EMAIL="" S_STAGING="" S_FIREWALL="" S_SSH_PORT="" S_ROLE=""
 if [[ -e $INSTALLER_ENV ]]; then
   RERUN=1
   [[ -f $INSTALLER_ENV && ! -L $INSTALLER_ENV ]] || die "$INSTALLER_ENV is not a regular file"
@@ -329,6 +376,8 @@ if [[ -e $INSTALLER_ENV ]]; then
   S_STAGING="$(cfg "$INSTALLER_ENV" INSTALLER_ACME_STAGING)"
   S_FIREWALL="$(cfg "$INSTALLER_ENV" INSTALLER_FIREWALL)"
   S_SSH_PORT="$(cfg "$INSTALLER_ENV" INSTALLER_SSH_PORT)"
+  S_ROLE="$(cfg "$INSTALLER_ENV" INSTALLER_ROLE)"
+  [[ ${S_ROLE:-all} == "$ROLE" ]] || die "an earlier run of this installer on this host chose --role ${S_ROLE:-all}, not --role $ROLE: switching a host's role is not supported. If that run never got past its first steps, remove $INSTALLER_ENV yourself and re-run."
 fi
 if [[ -e $ETC_DIR/host.env ]]; then
   UPGRADE=1 RERUN=1
@@ -336,7 +385,14 @@ if [[ -e $ETC_DIR/host.env ]]; then
   prev_mode="$(cfg "$ETC_DIR/host.env" AUTODEPLOY_TLS_MODE)"
   PREV_EMAIL="$(cfg "$ETC_DIR/host.env" AUTODEPLOY_ACME_EMAIL)"
   PREV_STAGING="$(cfg "$ETC_DIR/host.env" AUTODEPLOY_ACME_STAGING)"
+  prev_role="$(cfg "$ETC_DIR/host.env" AUTODEPLOY_ROLE)"
+  [[ ${prev_role:-all} == "$ROLE" ]] || die "this host was installed with role=${prev_role:-all} (host.env), not --role $ROLE: switching a host's role in place is not supported. Uninstall (uninstall.sh --yes) and install fresh."
   [[ $prev_mode == public ]] || die "this host has a lan-mode (private CA) AutoDeploy install (AUTODEPLOY_TLS_MODE='${prev_mode:-lan}'). This installer only handles public hosts; switching an install in place is not supported."
+fi
+# Only once enrolled: before that a mistyped id or host can be corrected on a re-run.
+if [[ $ROLE == agent && -e $AGENT_LOCAL_ENV && -e $AGENT_CREDENTIAL ]]; then # the server id this host's agent unit runs with (parsed, never sourced)
+  rec_id="$(cfg "$AGENT_LOCAL_ENV" AUTODEPLOY_AGENT_SERVER_ID)"
+  [[ -z $rec_id || $rec_id == "$SERVER_ID" ]] || die "this host is already set up as server $rec_id, not $SERVER_ID: one host is one server. Re-run with --server-id $rec_id, or uninstall and install fresh."
 fi
 if [[ -e $VERSION_FILE ]]; then
   installed="$(head -n1 "$VERSION_FILE" 2>/dev/null)" || die "cannot read the installed version file $VERSION_FILE: fix its permissions or content (it must hold one line such as v1.2.3)"
@@ -361,7 +417,10 @@ valid_public_host() { # same rule as install-app.sh
 REF_DOMAIN="$PREV_DOMAIN"
 if [[ -n $REF_DOMAIN ]]; then
   [[ -n $DOMAIN ]] || DOMAIN="$REF_DOMAIN"
-  if [[ $DOMAIN != "$REF_DOMAIN" ]]; then
+  if [[ $DOMAIN != "$REF_DOMAIN" && $ROLE == agent && -e $AGENT_CREDENTIAL ]]; then
+    die "this agent server is enrolled with the control plane $REF_DOMAIN, not $DOMAIN: pointing an enrolled agent at another control plane is not supported. Re-run with --control-plane-host $REF_DOMAIN, or uninstall and install fresh."
+  fi
+  if [[ $DOMAIN != "$REF_DOMAIN" && $ROLE == all ]]; then
     die "a previous install used the domain $REF_DOMAIN, not $DOMAIN. Changing the domain is not supported by this installer: re-run with --domain $REF_DOMAIN (or without --domain)."
   fi
 fi
@@ -397,7 +456,12 @@ if ((${#missing[@]})) && ((!INTERACTIVE)); then
   exit 1
 fi
 if [[ -z $DOMAIN ]]; then DOMAIN="$(tty_ask 'Control plane domain (e.g. autodeploy.example.com, DNS must point at this host): ')"; fi
-valid_public_host "$DOMAIN" || die "invalid --domain '$DOMAIN': need a lowercase FQDN (IP literals and *.test/.local/.localhost/.internal are rejected)"
+if [[ $ROLE == agent ]]; then
+  valid_public_host "$DOMAIN" || die "invalid --control-plane-host '$DOMAIN': need the control plane's lowercase FQDN, not a URL (IP literals and *.test/.local/.localhost/.internal are rejected)"
+  [[ $SERVER_ID =~ ^server_[A-Za-z0-9_-]{1,100}$ ]] || die "invalid --server-id: use the server id shown on the Servers page (server_ followed by letters, digits, - or _)"
+else
+  valid_public_host "$DOMAIN" || die "invalid --domain '$DOMAIN': need a lowercase FQDN (IP literals and *.test/.local/.localhost/.internal are rejected)"
+fi
 if [[ -z $EMAIL ]]; then EMAIL="$(tty_ask "ACME email for Let's Encrypt notices (or 'none'): ")"; fi
 if [[ $EMAIL == none ]]; then EMAIL=""; fi
 if [[ -n $EMAIL ]]; then
@@ -410,9 +474,51 @@ if [[ -z $FIREWALL ]]; then
   [[ $FIREWALL =~ ^[Yy] ]] && FIREWALL=yes || FIREWALL=no
 fi
 
-say "installing AutoDeploy $AUTODEPLOY_VERSION on $DOMAIN$( ((UPGRADE)) && echo ' (upgrade of an existing install)')"
+# ---- agent role: enrollment token handling (24-F) --------------------------------------------------------
+# The token is a one-time secret: it is read at a hidden /dev/tty prompt or from a root-owned 0600 file, held in the
+# shell variable SECRET only for as long as it takes to write it into a private 0600 copy for the agent user, and it
+# is never printed, logged, passed in argv, exported or put in a URL. Error messages never include its value.
+accept_secret() { # trims surrounding whitespace from the global SECRET, then 0 only if it looks like an enrollment token
+  local -; set +x
+  SECRET="${SECRET#"${SECRET%%[![:space:]]*}"}"
+  SECRET="${SECRET%"${SECRET##*[![:space:]]}"}"
+  [[ $SECRET =~ ^enr\.v1\.[A-Za-z0-9_-]{20,200}$ ]]
+}
+read_token_file() { # FILE -> SECRET. One open file descriptor: every check is on the file actually read (no swap race).
+  local -; set +x
+  local f="$1" ftype uid mode size
+  [[ ! -L $f ]] || die "--token-file $f is a symlink: refusing"
+  [[ -f $f ]] || die "--token-file $f is not a regular file"
+  exec 8<"$f" || die "cannot open --token-file $f"
+  IFS='|' read -r ftype uid mode size < <(stat -L -c '%F|%u|%a|%s' /proc/self/fd/8) || { exec 8<&-; die "cannot inspect --token-file $f"; }
+  if [[ $ftype != "regular file" || $uid != 0 ]]; then exec 8<&-; die "--token-file $f must be a regular file owned by root (it is not): copy the token into a file created by root with mode 0600"; fi
+  if [[ $mode != 600 && $mode != 400 ]]; then exec 8<&-; die "--token-file $f must have mode 0600 (it has $mode): chmod 0600 it first"; fi
+  if ((size > 512)); then exec 8<&-; die "--token-file $f is too large to hold an enrollment token"; fi
+  IFS= read -r SECRET <&8 || true
+  exec 8<&-
+  accept_secret || { SECRET=""; die "the token in --token-file $f has an unexpected format (the value is not shown): copy the token from the Servers page again"; }
+}
+if [[ $ROLE == agent ]]; then
+  if [[ -e $AGENT_CREDENTIAL ]]; then
+    [[ -z $TOKEN_FILE ]] || warn "this host is already enrolled: --token-file is ignored"
+  elif [[ -n $TOKEN_FILE ]]; then
+    read_token_file "$TOKEN_FILE"; SECRET="" # validated now (before any change); read again when it is needed
+  elif ((!INTERACTIVE)); then
+    die "this installer needs the one-time enrollment token from the Servers page, but there is no terminal to ask on: run it from a terminal (it asks at a hidden prompt) or pass --token-file FILE (a file owned by root, mode 0600)."
+  fi
+fi
+
+if [[ $ROLE == agent ]]; then
+  say "installing the AutoDeploy agent $AUTODEPLOY_VERSION on this server (control plane https://$DOMAIN, server $SERVER_ID)$( ((UPGRADE)) && echo ' (upgrade of an existing install)')"
+else
+  say "installing AutoDeploy $AUTODEPLOY_VERSION on $DOMAIN$( ((UPGRADE)) && echo ' (upgrade of an existing install)')"
+fi
 if ((INTERACTIVE)) && ((!ASSUME_YES)); then
-  printf 'Domain: %s\nACME email: %s\nFirewall: %s\n' "$DOMAIN" "${EMAIL:-none}" "$FIREWALL" >/dev/tty
+  if [[ $ROLE == agent ]]; then
+    printf 'Role: agent-only server\nControl plane: https://%s\nServer id: %s\nACME email: %s\nFirewall: %s\n' "$DOMAIN" "$SERVER_ID" "${EMAIL:-none}" "$FIREWALL" >/dev/tty
+  else
+    printf 'Domain: %s\nACME email: %s\nFirewall: %s\n' "$DOMAIN" "${EMAIL:-none}" "$FIREWALL" >/dev/tty
+  fi
   [[ "$(tty_ask 'Proceed? [y/N] ')" =~ ^[Yy] ]] || die "aborted by the operator"
 fi
 
@@ -429,6 +535,14 @@ if ((!UPGRADE)); then
   fi
 fi
 
+curl_https() { curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 20 --max-time 900 "$@"; }
+check_cp_reachable() { # the agent role's counterpart of check_dns: can THIS host reach the control plane over HTTPS?
+  local url="https://$DOMAIN/readyz"
+  # System trust store only (no -k, no --cacert): the agent itself talks to the control plane the same way.
+  curl_https --max-time 15 --retry 2 -o /dev/null "$url" \
+    || die "cannot reach the control plane at $url from this server (it must answer over HTTPS with a certificate this server trusts). Check the --control-plane-host spelling, that the control plane is running (its own installer finished) and that this server has outbound HTTPS and working DNS. $1"
+  say "the control plane answers $url"
+}
 check_dns() {
   local src4 resolved r has_a=0 mism="" shown
   src4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}' || true)"
@@ -458,7 +572,11 @@ check_dns() {
     say "DNS for $DOMAIN resolves to this host ($shown)"
   fi
 }
-check_dns
+if [[ $ROLE == all ]]; then
+  check_dns
+elif [[ ! -e $AGENT_CREDENTIAL ]]; then
+  check_cp_reachable "Nothing was changed on this server."
+fi
 
 # ---- Docker state (read-only) -------------------------------------------------------------------------
 # AutoDeploy needs Docker CE from Docker's apt repository at exactly /usr/bin/docker (the units pin it).
@@ -509,7 +627,6 @@ if [[ -n $ALLOWED_FILE ]]; then warn "TESTING ONLY: trusting $ALLOWED_FILE inste
 # ---- download (or copy), verify, then extract ------------------------------------------------------
 V="$AUTODEPLOY_VERSION"
 ASSETS=("autodeploy-host-kit-$V.tar.gz" "autodeploy-binaries-$V.tar.gz" VERSION SHA256SUMS SHA256SUMS.sig)
-curl_https() { curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 20 --max-time 900 "$@"; }
 if [[ -n $RELEASE_DIR ]]; then
   say "using local release assets from $RELEASE_DIR"
   for a in "${ASSETS[@]}"; do
@@ -547,7 +664,9 @@ extract_safe "$WORK/release/autodeploy-host-kit-$V.tar.gz" "$WORK/kit-x" "autode
 extract_safe "$WORK/release/autodeploy-binaries-$V.tar.gz" "$WORK/bin-x" binaries
 KIT="$WORK/kit-x/autodeploy-host-kit-$V"
 BINDIR="$WORK/bin-x/binaries"
-for f in install-checkout.sh install-app.sh create-credentials.sh enable-github.sh enroll-local.sh; do
+kit_files=(install-checkout.sh install-app.sh create-credentials.sh enable-github.sh enroll-local.sh)
+[[ $ROLE == agent ]] && kit_files+=(preflight-agent.sh preflight-checkout.sh)
+for f in "${kit_files[@]}"; do
   [[ -f $KIT/$f && -x $KIT/$f ]] || die "kit file $f is missing or not executable in the verified release"
 done
 [[ -f $BINDIR/SHA256SUMS ]] || die "the binaries archive has no SHA256SUMS"
@@ -617,9 +736,151 @@ install -d -m 0755 "$ETC_DIR"
 [[ ! -L $INSTALLER_ENV && ! -L $INSTALLER_ENV.new ]] || die "$INSTALLER_ENV or $INSTALLER_ENV.new is a symlink: refusing"
 printf '%s\n' "# Written by install.sh: the choices you confirmed. Non-secret. Re-runs reuse them." \
   "INSTALLER_DOMAIN=$DOMAIN" "INSTALLER_EMAIL=${EMAIL:-none}" "INSTALLER_ACME_STAGING=$ACME_STAGING" \
-  "INSTALLER_FIREWALL=$FIREWALL" "INSTALLER_SSH_PORT=$SSH_PORT" >"$INSTALLER_ENV.new"
+  "INSTALLER_FIREWALL=$FIREWALL" "INSTALLER_SSH_PORT=$SSH_PORT" "INSTALLER_ROLE=$ROLE" >"$INSTALLER_ENV.new"
 chmod 0600 "$INSTALLER_ENV.new"
 mv -f "$INSTALLER_ENV.new" "$INSTALLER_ENV"
+
+# Keep the verified kit on the host (uninstall.sh, preflight-*.sh, backup-db.sh, enable-github.sh live there). Done
+# BEFORE enrollment so an enrollment failure or a long wait still leaves the tools in place. The copy is replaced
+# atomically: build KIT_COPY.new root-owned and not group/world-writable, move the old one aside, move the new one
+# in, then remove the old one (all installer-owned artifacts).
+install_kit_copy() {
+  local new="$KIT_COPY.new" old="$KIT_COPY.old" d
+  install -d -m 0755 -o root -g root "$KIT_PARENT"
+  check_kit_parent
+  [[ ! -L $KIT_COPY ]] || die "$KIT_COPY is a symlink: refusing"
+  for d in "$new" "$old"; do
+    [[ ! -L $d ]] || die "$d is a symlink: refusing"
+    if [[ -e $d ]]; then rm -rf -- "$d"; fi # leftover of an interrupted earlier install.sh run
+  done
+  mkdir -m 0755 "$new"
+  cp -a "$KIT/." "$new/"
+  chown -R root:root "$new"
+  chmod -R go-w "$new"
+  if [[ -e $KIT_COPY ]]; then mv -- "$KIT_COPY" "$old"; fi
+  mv -- "$new" "$KIT_COPY"
+  if [[ -e $old ]]; then rm -rf -- "$old"; fi
+}
+
+# ==== agent role (plan 24-F): checkout kit, Docker, Traefik with ACME, agent; no PostgreSQL, control plane or setup ====
+record_server_id() { # the unit starts the agent with the id in agent-local.env (set only when empty or equal)
+  local cur
+  [[ -e $AGENT_LOCAL_ENV ]] || die "$AGENT_LOCAL_ENV is missing: install-app.sh did not create it"
+  cur="$(cfg "$AGENT_LOCAL_ENV" AUTODEPLOY_AGENT_SERVER_ID)"
+  [[ $cur != "$SERVER_ID" ]] || return 0
+  [[ -z $cur ]] || die "$AGENT_LOCAL_ENV already records server $cur, not $SERVER_ID; refusing to overwrite it"
+  REC_TMP="$(mktemp "$AGENT_LOCAL_ENV.XXXXXX")"
+  grep -v '^AUTODEPLOY_AGENT_SERVER_ID=' "$AGENT_LOCAL_ENV" >"$REC_TMP" || [[ $? -eq 1 ]] || die "cannot read $AGENT_LOCAL_ENV"
+  printf 'AUTODEPLOY_AGENT_SERVER_ID=%s\n' "$SERVER_ID" >>"$REC_TMP"
+  chmod 0644 "$REC_TMP"
+  chown root:root "$REC_TMP"
+  mv -f "$REC_TMP" "$AGENT_LOCAL_ENV"
+  REC_TMP=""
+}
+traefik_api_up() { # Traefik's management API answers 401 on loopback (plain HTTP over bash /dev/tcp, like http_ready)
+  local line
+  line="$( (exec 4<>/dev/tcp/127.0.0.1/8080 && printf 'GET /api/version HTTP/1.0\r\nHost: 127.0.0.1:8080\r\n\r\n' >&4 && read -r -t 5 line <&4 && printf '%s' "$line") 2>/dev/null)" || return 1
+  [[ $line == HTTP/*" 401"* ]]
+}
+write_token_copy() { # SECRET -> $TOKDIR/token. The directory stays root-owned 0700 while root creates and writes the file.
+  local -; set +x
+  TOKDIR="$(mktemp -d /run/autodeploy-enroll.XXXXXX)"
+  chmod 0700 "$TOKDIR"
+  install -m 0600 -o "$AGENT_USER" -g "$AGENT_USER" /dev/null "$TOKDIR/token"
+  printf '%s\n' "$SECRET" >"$TOKDIR/token"
+  SECRET=""
+  # Only now hand the agent access: group agent, 0710 = it can traverse to its own file but can never create,
+  # rename or replace entries in the directory, so no swap is possible while it runs.
+  chgrp "$AGENT_USER" "$TOKDIR"
+  chmod 0710 "$TOKDIR"
+}
+enroll_agent() {
+  local rc
+  if [[ -e $AGENT_CREDENTIAL ]]; then
+    say "this server is already enrolled: no token needed"
+    record_server_id # normally already done; covers a run that stopped right after the enrollment
+    return 0
+  fi
+  # Stale token directories of a crashed earlier run (exact prefix, real directories, root or agent owned, older than
+  # the token lifetime), swept like enroll-local.sh does.
+  find /run -maxdepth 1 -mindepth 1 -type d -name 'autodeploy-enroll.*' -mmin +15 \
+    \( -user root -o -user "$AGENT_USER" \) -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
+  # The control plane could have gone away during the install: check again BEFORE asking for the token.
+  check_cp_reachable "Nothing was enrolled; re-run this installer when it is back."
+  if [[ -n $TOKEN_FILE ]]; then
+    read_token_file "$TOKEN_FILE"
+  else
+    ((INTERACTIVE)) || die "no terminal to ask for the enrollment token on, and no --token-file given"
+    tty_secret "Paste the one-time enrollment token from the Servers page (input is hidden), then press Enter: "
+    accept_secret || { SECRET=""; die "that does not look like an enrollment token (the value is not shown). Copy it again from the Servers page; it is shown once and valid for 15 minutes."; }
+  fi
+  # A private copy the agent user can read (write_token_copy). printf is a shell builtin, so the token never reaches an
+  # argv. cleanup() removes it on every exit path; it is also removed right after the enroll call.
+  write_token_copy
+  run_step_rc "enrolling this server's agent with the control plane" \
+    runuser -u "$AGENT_USER" -- env -i PATH=/usr/bin:/bin "$APP_DIR/agent" enroll \
+      --base-url "https://$DOMAIN" --server-id "$SERVER_ID" --state-dir "$AGENT_STATE" --token-file "$TOKDIR/token"
+  rc=$STEP_RC
+  rm -rf -- "$TOKDIR"
+  TOKDIR=""
+  ((rc == 0)) || die "agent enroll failed (exit $rc); the token copy was removed. The token is single use and expires after 15 minutes: on the control plane's Servers page use 'Reissue enrollment token' for $SERVER_ID, then re-run this installer (a mistyped --server-id or --control-plane-host can be corrected on the re-run). See $LOG"
+  # Recorded only after the control plane accepted this id: a mistyped id must not stick.
+  record_server_id
+}
+
+if [[ $ROLE == agent ]]; then
+  run_step "1/6 checkout isolation (install-checkout.sh)" "$KIT/install-checkout.sh" "$BINDIR"
+  app_args=(--mode public --role agent --control-plane-host "$DOMAIN")
+  [[ -z $EMAIL ]] || app_args+=(--acme-email "$EMAIL")
+  [[ $ACME_STAGING != 1 ]] || app_args+=(--acme-staging)
+  if [[ $FIREWALL == yes ]]; then
+    app_args+=(--configure-firewall)
+    [[ -z $SSH_PORT ]] || app_args+=("--yes-firewall-ssh-port=$SSH_PORT")
+  fi
+  app_args+=("$BINDIR")
+  STEP_TTY=1 # only this step may prompt (the firewall SSH-port confirmation)
+  run_step "2/6 agent-only stack (install-app.sh --role agent)" "$KIT/install-app.sh" "${app_args[@]}"
+  STEP_TTY=0
+  run_step "3/6 Traefik API credentials (create-credentials.sh --traefik-only)" "$KIT/create-credentials.sh" --traefik-only
+  run_step "4/6 starting Traefik" systemctl start autodeploy-traefik
+  install_kit_copy # before enrollment, so a failure still leaves the tools in place
+  say "waiting for Traefik's management API"
+  api_ready=0
+  for _ in $(seq 1 60); do
+    if traefik_api_up; then api_ready=1; break; fi
+    sleep 2
+  done
+  ((api_ready)) || warn "Traefik's management API did not answer within 2 minutes (the Traefik image may still be downloading); the preflight below will report it"
+  say "5/6 enrolling this server"
+  enroll_agent
+  run_step "6/6 starting the agent" systemctl start autodeploy-agent.service
+
+  install -d -m 0755 "$ETC_DIR"
+  printf '%s\n' "$AUTODEPLOY_VERSION" >"$VERSION_FILE.new"
+  chmod 0644 "$VERSION_FILE.new"
+  mv -f "$VERSION_FILE.new" "$VERSION_FILE"
+
+  pre_rc=0
+  run_step_rc "preflight (preflight-agent.sh)" "$KIT_COPY/preflight-agent.sh"; ((STEP_RC == 0)) || pre_rc=1
+  run_step_rc "preflight (preflight-checkout.sh)" "$KIT_COPY/preflight-checkout.sh"; ((STEP_RC == 0)) || pre_rc=1
+  ((pre_rc == 0)) || die "this server is enrolled and its agent started, but a preflight reported failures (see above and $LOG). Fix them and re-run this installer."
+
+  say "AutoDeploy agent $AUTODEPLOY_VERSION is installed: server $SERVER_ID reports to https://$DOMAIN"
+  cat <<SUMMARY_EOF
+
+  This server:      $SERVER_ID (control plane https://$DOMAIN)
+  Installer log:    $LOG
+  Kit scripts:      $KIT_COPY (preflight-agent.sh, preflight-checkout.sh, uninstall.sh, ...)
+
+  Next steps
+    1. On the control plane, bind an environment to this server (Projects / GitHub page, "Server" field).
+    2. DNS: the hostname of every app you deploy to this server must have an A/AAAA record pointing at THIS
+       server's IP address (not at the control plane); ports 80 and 443 must be reachable from the internet.
+       Traefik requests each app's certificate from Let's Encrypt when its first deployment is routed here.
+    3. If you used --token-file, delete that file now (the token is spent).
+SUMMARY_EOF
+  exit 0
+fi
 
 run_step "1/9 checkout isolation (install-checkout.sh)" "$KIT/install-checkout.sh" "$BINDIR"
 
@@ -663,27 +924,6 @@ for _ in $(seq 1 60); do
 done
 ((ready)) || die "the control plane did not answer http://$gateway:$port/readyz: check 'journalctl -u autodeploy-controlplane'"
 
-# Keep the verified kit on the host (uninstall.sh, preflight-*.sh, backup-db.sh, enable-github.sh live there). Done
-# BEFORE enrollment so an enrollment failure or a long wait still leaves the tools in place. The copy is replaced
-# atomically: build KIT_COPY.new root-owned and not group/world-writable, move the old one aside, move the new one
-# in, then remove the old one (all installer-owned artifacts).
-install_kit_copy() {
-  local new="$KIT_COPY.new" old="$KIT_COPY.old" d
-  install -d -m 0755 -o root -g root "$KIT_PARENT"
-  check_kit_parent
-  [[ ! -L $KIT_COPY ]] || die "$KIT_COPY is a symlink: refusing"
-  for d in "$new" "$old"; do
-    [[ ! -L $d ]] || die "$d is a symlink: refusing"
-    if [[ -e $d ]]; then rm -rf -- "$d"; fi # leftover of an interrupted earlier install.sh run
-  done
-  mkdir -m 0755 "$new"
-  cp -a "$KIT/." "$new/"
-  chown -R root:root "$new"
-  chmod -R go-w "$new"
-  if [[ -e $KIT_COPY ]]; then mv -- "$KIT_COPY" "$old"; fi
-  mv -- "$new" "$KIT_COPY"
-  if [[ -e $old ]]; then rm -rf -- "$old"; fi
-}
 install_kit_copy
 
 SETUP_INCOMPLETE=0

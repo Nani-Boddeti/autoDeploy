@@ -119,6 +119,7 @@ hosts_state() { # [BEGIN END] (default: private-ca markers) -> none | ok ; dies 
   if [[ "$nb" == 1 && "$ne" == 1 ]] && ((lb < le)); then echo ok; return; fi
   die "$HOSTS_FILE has a damaged autodeploy block (BEGIN x$nb, END x$ne, or out of order); fix it by hand and re-run. Nothing was changed."
 }
+HOST_ROLE="$(sed -n 's/^AUTODEPLOY_ROLE=//p' "$ETC_DIR/host.env" 2>/dev/null | head -n1)" # agent-only host (plan 24-F) or empty
 HOSTS_STATE="$(hosts_state)" || exit 1
 PUBLIC_HOSTS_STATE="$(hosts_state "$PUBLIC_MARK_BEGIN" "$PUBLIC_MARK_END")" || exit 1
 
@@ -247,7 +248,11 @@ if ((KEEP)); then
   else
     find "$STATE_ROOT" -mindepth 1 -maxdepth 1 ! -name checkout.xfs ! -name checkout-quota -exec rm -rf -- {} +
   fi
-  log "kept: $ETC_DIR/secrets $ETC_DIR/controlplane $IMAGE $LEDGER_DIR (and Docker volume $PG_VOLUME)"
+  if [[ $HOST_ROLE == agent ]]; then
+    log "kept: $IMAGE $LEDGER_DIR"
+  else
+    log "kept: $ETC_DIR/secrets $ETC_DIR/controlplane $IMAGE $LEDGER_DIR (and Docker volume $PG_VOLUME)"
+  fi
 else
   if [[ -d $ACME_DIR ]]; then log "removing $ACME_DIR (--destroy-data)"; fi
   rm -rf -- "${ETC_DIR:?}" "${STATE_ROOT:?}"
@@ -255,6 +260,9 @@ fi
 
 # ---- 7. report leftovers -------------------------------------------------------------
 log "done."
+if [[ $HOST_ROLE == agent ]]; then
+  log "this was an agent-only server: revoke it on the control plane's Servers page (Revoke), or it stays listed as an active server."
+fi
 if have_docker; then
   left="$(docker ps -a --filter 'name=^autodeploy-rt-' --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')"
   [[ -z "$left" ]] || warn "application containers created by the agent remain (not touched): $left"

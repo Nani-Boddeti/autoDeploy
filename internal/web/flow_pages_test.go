@@ -3,8 +3,10 @@ package web
 import (
 	"bytes"
 	"context"
+	"html"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -178,4 +180,140 @@ func TestStylesheetPreRulesAreScoped(t *testing.T) {
 			t.Errorf("log line rule changed: %s", want)
 		}
 	}
+}
+
+// TestEnrollmentPageAddServerCommands (24-F): the token page shows the two commands for a
+// new VPS, with this control plane's host and the server id, and the token is NOT in them.
+func TestEnrollmentPageAddServerCommands(t *testing.T) {
+	const token = "tok-UNIQUE-0123456789abcdef"
+	expires := time.Date(2026, 8, 10, 0, 14, 30, 0, time.UTC)
+	h, _, p := serversHandler(t)
+	h.config.PublicOrigin = "https://admin.example.com"
+	page := renderTo(t, func(w http.ResponseWriter) {
+		h.renderEnrollmentToken(w, httptest.NewRequest(http.MethodPost, "https://admin.example.com/servers/enrollment", nil), p, "srv_9", token, expires)
+	})
+	text := htmlUnescape(page)
+	contains(t, text,
+		"Add a new server",
+		"curl --proto '=https' --tlsv1.2 -fsSLo install.sh https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/<version>/deploy/host/install.sh",
+		"sudo bash install.sh --role agent --control-plane-host admin.example.com --server-id srv_9",
+		"paste this when the installer asks",
+		"DNS",
+		"/etc/autodeploy/installed-version",
+	)
+	// The token sits in its own <pre class="token"> only, never inside any command.
+	for _, block := range regexp.MustCompile(`(?s)<pre class="command">(.*?)</pre>`).FindAllStringSubmatch(page, -1) {
+		if strings.Contains(block[1], token) || strings.Contains(block[1], "enr.v1.") {
+			t.Fatalf("a command block contains the token: %s", block[1])
+		}
+	}
+	if n := strings.Count(page, token); n != 1 {
+		t.Fatalf("token appears %d times, want exactly 1", n)
+	}
+	if strings.Contains(page, "<script") {
+		t.Fatal("add-server section uses script")
+	}
+}
+
+func TestAddServerCommandsRejectHostileValues(t *testing.T) {
+	for name, tc := range map[string]struct{ origin, id, want, lacks string }{
+		"hostile id":         {"https://cp.example.test", "srv; rm -rf /", "--server-id <SERVER_ID>", "rm -rf"},
+		"subst origin":       {"https://cp.$(id).example.test", "srv_1", "--control-plane-host <CP_HOST>", "$(id)"},
+		"origin with port":   {"https://cp.example.test:8443", "srv_1", "--control-plane-host <CP_HOST>", "8443"},
+		"http origin":        {"http://cp.example.test", "srv_1", "--control-plane-host <CP_HOST>", "http://cp"},
+		"valid values kept":  {"https://cp.example.com", "srv_1", "--control-plane-host cp.example.com --server-id srv_1", ""},
+		"numeric last label": {"https://cp.example.123", "srv_1", "--control-plane-host <CP_HOST>", "123"},
+		"reserved suffix":    {"https://cp.example.internal", "srv_1", "--control-plane-host <CP_HOST>", "internal"},
+		"ip literal":         {"https://10.0.0.1", "srv_1", "--control-plane-host <CP_HOST>", "10.0.0"},
+	} {
+		cmd := addServerCommands(tc.origin, tc.id, "")
+		if !strings.Contains(cmd, tc.want) || (tc.lacks != "" && strings.Contains(cmd, tc.lacks)) {
+			t.Errorf("%s: commands = %q", name, cmd)
+		}
+	}
+}
+
+func htmlUnescape(s string) string { return html.UnescapeString(s) }
+
+func versionPage(t *testing.T, setup func(path string), kind string) string {
+	t.Helper()
+	h, _, p := serversHandler(t)
+	h.config.PublicOrigin = "https://admin.example.com"
+	path := t.TempDir() + "/installed-version"
+	setup(path)
+	h.config.InstalledVersionPath = path
+	return renderTo(t, func(w http.ResponseWriter) {
+		h.renderEnrollment(w, httptest.NewRequest(http.MethodPost, "https://admin.example.test/servers/enrollment", nil), p, "srv_9", "tok-UNIQUE-0123456789abcdef", time.Date(2026, 8, 10, 0, 14, 30, 0, time.UTC), kind)
+	})
+}
+
+func TestEnrollmentPageShowsInstalledVersion(t *testing.T) {
+	write := func(content string) func(string) {
+		return func(p string) {
+			if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	good := htmlUnescape(versionPage(t, write("v1.2.3\n"), enrollKindRegister))
+	contains(t, good, "/autoDeploy/v1.2.3/deploy/host/install.sh")
+	lacks(t, good, "<version>", "installed-version")
+	for name, setup := range map[string]func(string){
+		"missing":   func(string) {},
+		"dev":       write("v1.2.3-dev\n"),
+		"malformed": write("1.2.3\n"),
+		"injection": write("v1.2.3;rm\n"),
+		"too long":  write("v1.2.3-" + strings.Repeat("a", 80) + "\n"),
+		"symlink": func(p string) {
+			target := p + ".real"
+			if err := os.WriteFile(target, []byte("v1.2.3\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, p); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		page := htmlUnescape(versionPage(t, setup, enrollKindRegister))
+		if !strings.Contains(page, "/autoDeploy/<version>/deploy/host/install.sh") || !strings.Contains(page, "installed-version") {
+			t.Errorf("%s: no placeholder fallback with the hint", name)
+		}
+	}
+	// A new value is picked up on the next render (nothing cached at startup).
+	h, _, p := serversHandler(t)
+	path := t.TempDir() + "/v"
+	h.config.InstalledVersionPath = path
+	render := func() string {
+		return htmlUnescape(renderTo(t, func(w http.ResponseWriter) {
+			h.renderEnrollment(w, httptest.NewRequest(http.MethodPost, "https://admin.example.test/x", nil), p, "srv_9", "tok-UNIQUE-0123456789abcdef", time.Now(), enrollKindRegister)
+		}))
+	}
+	lacks(t, render(), "/v2.0.0/")
+	if err := os.WriteFile(path, []byte("v2.0.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	contains(t, render(), "/v2.0.0/")
+}
+
+func TestEnrollmentPageHeadingFollowsContext(t *testing.T) {
+	none := func(string) {}
+	contains(t, versionPage(t, none, enrollKindRegister), "Add a new server")
+	reissue := versionPage(t, none, enrollKindReissue)
+	contains(t, reissue, "Install on the new server (token reissued)", "install.sh --role agent")
+	re := versionPage(t, none, enrollKindReenroll)
+	lacks(t, re, "Add a new server", "install.sh --role agent")
+	contains(t, re, "agent enroll")
+}
+
+func TestEnrollmentPageIgnoresForgedHostHeader(t *testing.T) {
+	h, _, p := serversHandler(t)
+	h.config.PublicOrigin = "https://admin.example.com"
+	req := httptest.NewRequest(http.MethodPost, "https://evil.example.test/servers/enrollment", nil)
+	req.Host = "evil.example.test"
+	req.Header.Set("X-Forwarded-Host", "evil.example.test")
+	page := htmlUnescape(renderTo(t, func(w http.ResponseWriter) {
+		h.renderEnrollment(w, req, p, "srv_9", "tok-UNIQUE-0123456789abcdef", time.Now(), enrollKindRegister)
+	}))
+	contains(t, page, "--control-plane-host admin.example.com")
+	lacks(t, page, "evil.example.test")
 }

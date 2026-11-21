@@ -8,7 +8,19 @@
 # owner afterwards. It enables but does not start anything.
 #
 # Usage (as root):
-#   install-app.sh [--insecure-no-checksum] [--mode lan|public] [public-mode options] BINDIR
+#   install-app.sh [--insecure-no-checksum] [--mode lan|public] [--role all|agent] [public-mode options] BINDIR
+#
+#   --role all      (default) control plane + agent + PostgreSQL + Traefik on this host. Output unchanged.
+#   --role agent    AGENT-ONLY extra server (plan 24-F): agent binary and unit, Docker network, Traefik with the
+#                   ACME resolver (apps on this server need certificates for their own hostnames), route directory
+#                   and the Traefik API credential directories. Installs NO control plane, PostgreSQL, migrations,
+#                   controlplane.env, control plane route, or /etc/hosts mapping (the agent reaches the control
+#                   plane over the internet, so the control plane host must NOT map to 127.0.0.1 here). Requires
+#                   --mode public and --control-plane-host FQDN (the agent's AUTODEPLOY_AGENT_BASE_URL is
+#                   https://FQDN). The role is recorded in host.env (AUTODEPLOY_ROLE=agent; absent = all); reruns keep
+#                   it and an in-place role switch, or a different control plane host, is refused. lan mode is not
+#                   supported for agent hosts (decision D4: remote agents trust system roots only).
+#   --control-plane-host FQDN   (--role agent only) the control plane's public hostname.
 #
 #   --mode lan      (default) private-CA / LAN host. Generated files are unchanged from earlier kits
 #                   (pinned by tests/lan_mode_identical.sh); host.env gains AUTODEPLOY_TLS_MODE=lan.
@@ -84,7 +96,7 @@ readonly AGENT_STATE="$STATE_ROOT/agent"
 readonly TRAEFIK_STATE="$STATE_ROOT/traefik"
 readonly ROUTE_DIR="$TRAEFIK_STATE/dynamic"
 readonly CHECKOUT_ENV="$ETC_DIR/checkout.env"
-readonly UNITS=(autodeploy-postgres autodeploy-traefik autodeploy-controlplane autodeploy-agent)
+UNITS=(autodeploy-postgres autodeploy-traefik autodeploy-controlplane autodeploy-agent) # agent role narrows it after parsing
 readonly BRIDGE_NAME=br-autodeploy # fixed so the firewall rule can name the interface (<= 15 chars)
 
 CP_ID="${CONTROLPLANE_ID:-802}"
@@ -105,6 +117,8 @@ readonly ACME_DIR="$TRAEFIK_STATE/acme"
 readonly PUBLIC_HOSTS_BEGIN="# BEGIN autodeploy-public-cp (managed by deploy/host/install-app.sh)"
 readonly PUBLIC_HOSTS_END="# END autodeploy-public-cp"
 MODE=lan
+ROLE=all
+CP_HOST_FLAG=""
 ACME_CHALLENGE=http
 ACME_STAGING=0
 ACME_EMAIL=""
@@ -143,6 +157,8 @@ AUTODEPLOY_ACME_STAGING=$ACME_STAGING
 AUTODEPLOY_ACME_EMAIL=$ACME_EMAIL
 ENVEOF
   fi
+  # Only agent hosts carry a role line: host.env of a full install stays byte-identical to earlier kits.
+  if [[ "$ROLE" == agent ]]; then printf 'AUTODEPLOY_ROLE=agent\n'; fi
 }
 
 render_cp_route() {
@@ -225,6 +241,21 @@ render_traefik_static() {
   done <"$1"
 }
 
+# render_agent_unit SRC: role all = SRC verbatim. Agent role = SRC without the control plane unit in After=
+# (that unit does not exist on an agent host). The line must match exactly once, else die.
+render_agent_unit() {
+  if [[ "$ROLE" != agent ]]; then cat "$1"; return; fi
+  local line n=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "After=autodeploy-checkout-quota.service autodeploy-checkout-exec.service docker.service autodeploy-traefik.service autodeploy-controlplane.service")
+        printf '%s\n' "After=autodeploy-checkout-quota.service autodeploy-checkout-exec.service docker.service autodeploy-traefik.service"; n=$((n + 1)) ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done <"$1"
+  [[ $n == 1 ]] || die "agent unit template changed: the After= line was not found exactly once ($n)"
+}
+
 valid_public_host() { # FQDN, not an IP literal, not a reserved/private suffix
   local label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
   [[ "$1" =~ ^($label\.)+$label$ && ${#1} -le 253 ]] || return 1
@@ -272,6 +303,10 @@ while (($#)); do
     --insecure-no-checksum) INSECURE_NO_CHECKSUM=1; shift ;;
     --mode) (($# >= 2)) || die "--mode needs lan|public"; MODE="$2"; shift 2 ;;
     --mode=*) MODE="${1#*=}"; shift ;;
+    --role) (($# >= 2)) || die "--role needs all|agent"; ROLE="$2"; shift 2 ;;
+    --role=*) ROLE="${1#*=}"; shift ;;
+    --control-plane-host) (($# >= 2)) || die "--control-plane-host needs a hostname"; CP_HOST_FLAG="$2"; shift 2 ;;
+    --control-plane-host=*) CP_HOST_FLAG="${1#*=}"; shift ;;
     --acme-challenge) (($# >= 2)) || die "--acme-challenge needs http|tls-alpn"; ACME_CHALLENGE="$2"; ACME_OPT=1; shift 2 ;;
     --acme-challenge=*) ACME_CHALLENGE="${1#*=}"; ACME_OPT=1; shift ;;
     --acme-staging) ACME_STAGING=1; ACME_OPT=1; shift ;;
@@ -285,6 +320,16 @@ while (($#)); do
 done
 [[ -n "$BINDIR" ]] || die "usage: install-app.sh [--insecure-no-checksum] [--mode lan|public] BINDIR"
 [[ "$MODE" == lan || "$MODE" == public ]] || die "invalid --mode: $MODE (lan|public)"
+[[ "$ROLE" == all || "$ROLE" == agent ]] || die "invalid --role: $ROLE (all|agent)"
+if [[ "$ROLE" == agent ]]; then
+  [[ "$MODE" == public ]] || die "--role agent supports public mode only (remote agents trust system roots, decision D4 of plan 24): re-run with --mode public. A lan (private CA) host cannot be an extra agent server."
+  [[ -n "$CP_HOST_FLAG" ]] || die "--role agent requires --control-plane-host FQDN (the public hostname of the control plane this agent reports to)"
+  [[ -z "$CP_HOST_GIVEN" || "$CP_HOST_GIVEN" == "$CP_HOST_FLAG" ]] || die "AUTODEPLOY_CONTROLPLANE_HOST ($CP_HOST_GIVEN) differs from --control-plane-host ($CP_HOST_FLAG): pass the flag only"
+  CP_HOST="$CP_HOST_FLAG" CP_HOST_GIVEN="$CP_HOST_FLAG"
+  UNITS=(autodeploy-traefik autodeploy-agent)
+elif [[ -n "$CP_HOST_FLAG" ]]; then
+  die "--control-plane-host is only valid with --role agent (a full install takes AUTODEPLOY_CONTROLPLANE_HOST)"
+fi
 if [[ "$MODE" == lan && "$ACME_OPT" == 1 ]]; then die "--acme-*/--configure-firewall/--yes-firewall-ssh-port only apply with --mode public"; fi
 if [[ "$MODE" == public ]]; then
   [[ -n "$CP_HOST_GIVEN" ]] || die "--mode public requires AUTODEPLOY_CONTROLPLANE_HOST (the real FQDN that points at this host; there is no default)"
@@ -367,6 +412,23 @@ if [[ "$MODE" == lan && "$prev_mode" == public ]]; then
   die "$ETC_DIR/host.env says public: re-run with --mode public (public -> lan in place is unsupported; uninstall and install fresh)."
 fi
 
+# No in-place role switch either (all <-> agent): the unit set, credentials and routes differ. host.env without a
+# role line = all. An agent host also keeps the control plane it was installed against.
+prev_role="all"
+if [[ -r "$ETC_DIR/host.env" ]]; then
+  prev_role="$(sed -n 's/^AUTODEPLOY_ROLE=//p' "$ETC_DIR/host.env" | head -n1)"
+  prev_role="${prev_role:-all}"
+fi
+if [[ -e "$ETC_DIR/host.env" && "$prev_role" != "$ROLE" ]]; then
+  die "$ETC_DIR/host.env says role=$prev_role but this run asked for --role $ROLE: switching an install's role in place is unsupported. Uninstall (deploy/host/uninstall.sh --yes) and install fresh."
+fi
+# Only once enrolled: before that the host may still be corrected (a mistyped --control-plane-host), because the
+# credential binds the agent to a control plane and nothing else does.
+if [[ "$ROLE" == agent && -e "$ETC_DIR/host.env" && -e "$AGENT_STATE/credential" ]]; then
+  prev_cp_host="$(sed -n 's/^AUTODEPLOY_CONTROLPLANE_HOST=//p' "$ETC_DIR/host.env" | head -n1)"
+  [[ "$prev_cp_host" == "$CP_HOST" ]] || die "this agent host was installed against the control plane $prev_cp_host, not $CP_HOST: pointing an enrolled agent at another control plane is unsupported. Uninstall and install fresh."
+fi
+
 # Firewall flag: detect sshd port(s) and get the typed confirmation BEFORE anything is changed.
 FIREWALL_SSH_PORTS=()
 if ((CONFIGURE_FIREWALL)); then
@@ -428,15 +490,22 @@ AGENT_GID="$(id -g "$AGENT_USER")"
 
 log "staging and validating inputs"
 stage_init
-for b in controlplane agent migrate admin secrets; do stage_copy "$BINDIR/$b" "$b" "$b"; done
+# Role agent installs the agent binary only; the other binaries are neither staged, verified nor installed.
+BINARIES=(controlplane agent migrate admin secrets)
+if [[ "$ROLE" == agent ]]; then BINARIES=(agent); fi
+for b in "${BINARIES[@]}"; do stage_copy "$BINDIR/$b" "$b" "$b"; done
 stage_verify "$BINDIR"
-for b in controlplane agent migrate admin secrets; do stage_require_elf "$b" "$b"; done
+for b in "${BINARIES[@]}"; do stage_require_elf "$b" "$b"; done
 if [[ "$MODE" == public ]]; then tls_kit_file=traefik/traefik-public.yml; else tls_kit_file=traefik/autodeploy-tls.yml; fi
 for f in traefik/traefik.yml "$tls_kit_file" traefik/autodeploy-api.yml libexec/autodeploy-run \
-  systemd/autodeploy-postgres.service systemd/autodeploy-traefik.service \
-  systemd/autodeploy-controlplane.service systemd/autodeploy-agent.service; do
+  systemd/autodeploy-traefik.service systemd/autodeploy-agent.service; do
   [[ -f "$KIT_DIR/$f" ]] || die "kit file missing: $KIT_DIR/$f"
 done
+if [[ "$ROLE" == all ]]; then
+  for f in systemd/autodeploy-postgres.service systemd/autodeploy-controlplane.service; do
+    [[ -f "$KIT_DIR/$f" ]] || die "kit file missing: $KIT_DIR/$f"
+  done
+fi
 
 # ---- helpers ------------------------------------------------------------------------
 install_file() { # src dst mode  -> 0 if replaced, 1 if already identical (atomic replace)
@@ -476,6 +545,9 @@ fi
 # control plane needs no stable numeric identity for any on-disk binding (unlike the
 # checkout UID/GID in the quota ledger); a fixed ID just keeps credential-file ownership
 # reproducible across reinstalls.
+# The control plane identity exists on full installs only (block not re-indented on purpose: a mechanical
+# `if` wrap keeps the diff of the full-install path empty).
+if [[ "$ROLE" == all ]]; then
 log "ensuring identity $CP_USER ($CP_ID)"
 if ! getent group "$CP_USER" >/dev/null; then
   if getent group "$CP_ID" >/dev/null; then die "gid $CP_ID is already used by group $(getent group "$CP_ID" | cut -d: -f1)"; fi
@@ -491,6 +563,7 @@ CP_UID="$(id -u "$CP_USER")"
 [[ "$(getent passwd "$CP_USER" | cut -d: -f7)" == /usr/sbin/nologin ]] || die "$CP_USER must have the nologin shell"
 [[ "$(id -G "$CP_USER")" == "$(id -g "$CP_USER")" ]] || die "$CP_USER must have no supplementary groups"
 [[ "$CP_UID" != "$(id -u "$AGENT_USER")" ]] || die "control plane and agent UIDs must differ"
+fi
 
 # docker group: root-equivalent (the agent can start privileged containers through
 # dockerd). Inherent to driving dockerd; only the agent gets it, and ONLY the agent:
@@ -542,9 +615,9 @@ mkdir_as root root 0755 "$STATE_ROOT"
 mkdir_as root root 0755 /usr/local/lib
 mkdir_as root root 0755 "$LIB_DIR"
 mkdir_as root root 0755 "$APP_DIR"
-mkdir_as root "$CP_USER" 0750 "$ETC_DIR/controlplane"
+if [[ "$ROLE" == all ]]; then mkdir_as root "$CP_USER" 0750 "$ETC_DIR/controlplane"; fi
 mkdir_as root "$AGENT_USER" 0750 "$ETC_DIR/agent"
-mkdir_as root root 0700 "$ETC_DIR/secrets"
+if [[ "$ROLE" == all ]]; then mkdir_as root root 0700 "$ETC_DIR/secrets"; fi
 mkdir_as root root 0700 "$ETC_DIR/traefik-secrets"
 mkdir_as root root 0755 "$ETC_DIR/traefik"
 if [[ "$MODE" == public ]]; then
@@ -567,7 +640,7 @@ chown root:"$AGENT_USER" "$ROUTE_DIR"
 
 # ---- 3. binaries --------------------------------------------------------------------
 log "installing binaries into $APP_DIR (root:root 0755)"
-for b in controlplane agent migrate admin secrets; do
+for b in "${BINARIES[@]}"; do
   if install_file "$STAGE/$b" "$APP_DIR/$b" 0755; then
     case "$b" in controlplane) mark CP_CHANGED ;; agent) mark AGENT_CHANGED ;; *) ;; esac
   fi
@@ -634,7 +707,9 @@ ufw_delete_by_comment() { # fixed comment text; deletes highest rule numbers fir
     if [[ -n "$n" ]]; then ufw --force delete "$n" >/dev/null 2>&1; fi
   done < <(ufw status numbered | sed -n "s/^\[ *\([0-9][0-9]*\)\].*# $1.*/\1/p" | sort -rn)
 }
-if ufw_active; then
+if [[ "$ROLE" == agent ]]; then
+  : # no control plane here, so no Traefik -> control plane firewall rule and no warning about it
+elif ufw_active; then
   ufw_delete_by_comment 'autodeploy: traefik'
   log "ufw is active: allowing $TRAEFIK_IP -> $ENV_GATEWAY port $CP_PORT/tcp on $BRIDGE_NAME"
   ufw allow in on "$BRIDGE_NAME" from "$TRAEFIK_IP" to "$ENV_GATEWAY" port "$CP_PORT" proto tcp comment 'autodeploy: traefik' >/dev/null
@@ -654,6 +729,7 @@ render_host_env | put_generated "$ETC_DIR/host.env" TRAEFIK_CHANGED
 # GitHub App and the secret (KEK) subsystem are left disabled: cmd/controlplane serves the
 # agent checkout routes only with the GitHub App enabled (503 otherwise), so enable both
 # (see deploy/README.md) before the 18e end-to-end deploy.
+if [[ "$ROLE" == all ]]; then
 put_generated "$ETC_DIR/controlplane.env" CP_CHANGED <<ENVEOF
 # Generated by deploy/host/install-app.sh. Non-secret. Do not edit by hand.
 AUTODEPLOY_REPOSITORY_ROOT=/srv/autodeploy
@@ -668,6 +744,7 @@ AUTODEPLOY_TRUSTED_PROXY_CIDRS=$TRAEFIK_IP/32
 AUTODEPLOY_AGENT_ENABLED=true
 ${METRICS_LISTEN:+AUTODEPLOY_METRICS_LISTEN_ADDRESS=$METRICS_LISTEN}
 ENVEOF
+fi
 put_generated "$ETC_DIR/agent.env" AGENT_CHANGED <<ENVEOF
 # Generated by deploy/host/install-app.sh. Non-secret. Do not edit by hand.
 AUTODEPLOY_AGENT_BASE_URL=https://$CP_HOST
@@ -696,12 +773,16 @@ install_file "$KIT_DIR/traefik/autodeploy-api.yml" "$ROUTE_DIR/autodeploy-api.ym
 if [[ "$MODE" != public ]]; then
   install_file "$KIT_DIR/traefik/autodeploy-tls.yml" "$ROUTE_DIR/autodeploy-tls.yml" 0644 || true
 fi
-cp_route="$(mktemp)"
-render_cp_route >"$cp_route"
-install_file "$cp_route" "$ROUTE_DIR/autodeploy-controlplane.yml" 0644 || true
-rm -f "$cp_route"
+if [[ "$ROLE" == all ]]; then
+  cp_route="$(mktemp)"
+  render_cp_route >"$cp_route"
+  install_file "$cp_route" "$ROUTE_DIR/autodeploy-controlplane.yml" 0644 || true
+  rm -f "$cp_route"
+fi
 
-if [[ "$MODE" == public ]]; then manage_public_hosts_block; fi
+# The managed /etc/hosts block maps the control plane host to 127.0.0.1: right on the control plane host, WRONG on
+# an agent host, whose agent must reach the control plane over the internet.
+if [[ "$MODE" == public && "$ROLE" == all ]]; then manage_public_hosts_block; fi
 
 # ---- 6. units -----------------------------------------------------------------------
 log "installing units"
@@ -710,6 +791,9 @@ for u in "${UNITS[@]}"; do
   if [[ "$MODE" == public && "$u" == autodeploy-traefik ]]; then
     unit_src="$(mktemp)"
     render_traefik_unit "$KIT_DIR/systemd/$u.service" >"$unit_src"
+  elif [[ "$ROLE" == agent && "$u" == autodeploy-agent ]]; then
+    unit_src="$(mktemp)"
+    render_agent_unit "$KIT_DIR/systemd/$u.service" >"$unit_src"
   fi
   if install_file "$unit_src" "$UNIT_DIR/$u.service" 0644; then
     case "$u" in
@@ -735,6 +819,8 @@ state_report() {
   echo "install-app: host state: binaries, units and configuration are INSTALLED; no service was restarted," >&2
   echo "install-app: so running services still use their previous binaries. Fix the cause, then re-run install-app.sh." >&2
 }
+# Database, migrations and the control plane restart exist on full installs only (block not re-indented on purpose).
+if [[ "$ROLE" == all ]]; then
 # A previous run (or autodeploy-run migrate) switched database-url to the runtime role but may have
 # died before restarting the control plane, which then still holds owner-credential connections.
 CP_MARKER=/var/lib/autodeploy/controlplane-restart-pending
@@ -767,8 +853,11 @@ else
   log "autodeploy-postgres is not running: migrations skipped (nothing to restart; migrate after starting it, see below)"
 fi
 
+fi # ROLE all (database block)
+
 # A running service keeps its old binary/config until restarted. PostgreSQL is left alone.
 if ((WAS_TRAEFIK && TRAEFIK_CHANGED)); then log "restarting autodeploy-traefik"; systemctl restart autodeploy-traefik.service; fi
+if [[ "$ROLE" == all ]]; then
 if ((WAS_CP && (CP_CHANGED || CP_RESTART_DUE))); then
   log "restarting autodeploy-controlplane"
   # set -e is active: a failed restart aborts here and the marker is KEPT for the next run.
@@ -791,8 +880,41 @@ elif ((CP_RESTART_DUE)); then
   # Control plane not running: nothing holds old credentials; its next start uses the runtime URL.
   rm -f "$CP_MARKER"
 fi
+fi # ROLE all (control plane restart)
 if ((WAS_AGENT && AGENT_CHANGED)); then log "restarting autodeploy-agent"; systemctl restart autodeploy-agent.service; fi
 if ((PG_UNIT_CHANGED)); then log "note: the PostgreSQL unit changed; restart it yourself when convenient (systemctl restart autodeploy-postgres)"; fi
+
+if [[ "$ROLE" == agent ]]; then
+  if ((UPGRADE)); then
+    cat <<UPGEOF
+
+==> upgraded (public mode, agent role): agent binary and units refreshed, running services restarted.
+ Next: sudo $KIT_DIR/preflight-agent.sh            # read-only; re-checks the host
+UPGEOF
+  else
+    cat <<AGENTEOF
+
+==> installed (public mode, agent-only server for the control plane https://$CP_HOST). Nothing was started and no secret exists yet.
+ install.sh --role agent runs the next steps for you. By hand, as root, in order:
+
+ 1. DNS: an A/AAAA record for every app hostname you will deploy to THIS server must point at this host, and
+    80/tcp + 443/tcp must be reachable from the internet (${ACME_CHALLENGE} challenge; ACME staging=$ACME_STAGING).
+    ACME state (account key, certificates) lives in $ACME_DIR/acme.json: back it up.
+ 2. Generate the Traefik API credential (random, never printed, never in argv/env):
+      sudo $KIT_DIR/create-credentials.sh --traefik-only
+ 3. sudo systemctl start autodeploy-traefik
+ 4. Add this server on the control plane's Servers page, then enroll it with the one-time token typed at a hidden
+    prompt (install.sh does this; never put the token in a command line):
+      read -rs -p 'enrollment token: ' T; echo
+      printf '%s\n' "\$T" | sudo -u $AGENT_USER $APP_DIR/agent enroll \\
+        --base-url https://$CP_HOST --server-id <SERVER_ID> --state-dir $AGENT_STATE
+      unset T
+ 5. sudo systemctl start autodeploy-agent
+ 6. sudo $KIT_DIR/preflight-agent.sh            # read-only; also run preflight-checkout.sh
+AGENTEOF
+  fi
+  exit 0
+fi
 
 if ((UPGRADE)); then
   cat <<UPGEOF

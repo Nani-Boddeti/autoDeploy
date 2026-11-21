@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -102,8 +103,11 @@ type RouteHeadAdmin interface {
 
 type Config struct {
 	// ActivationEnabled hides the "activation disabled" notice when true.
-	ActivationEnabled     bool
-	PublicOrigin          string
+	ActivationEnabled bool
+	PublicOrigin      string
+	// InstalledVersionPath is the file holding the release tag install.sh recorded; empty means
+	// defaultInstalledVersionPath. Read per render of the token page, never cached.
+	InstalledVersionPath  string
 	CSRFKeys              auth.CSRFKeyRing
 	UsernameThrottleKeys  auth.UsernameThrottleKeyRing
 	TrustedProxyCIDRs     []netip.Prefix
@@ -1011,7 +1015,7 @@ func (h *Handler) serversEnrollment(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnrollmentToken(w, r, p, serverID, token, expiresAt)
+	h.renderEnrollment(w, r, p, serverID, token, expiresAt, enrollKindReissue)
 }
 
 // serversReenroll issues a single-use re-enrollment token for an already
@@ -1050,7 +1054,7 @@ func (h *Handler) serversReenroll(w http.ResponseWriter, r *http.Request) {
 		badRequest(w)
 		return
 	}
-	h.renderEnrollmentToken(w, r, p, serverID, token, expiresAt)
+	h.renderEnrollment(w, r, p, serverID, token, expiresAt, enrollKindReenroll)
 }
 
 // serversRevoke revokes a server and its active credential. Revocation
@@ -2244,11 +2248,57 @@ func formatCredentialVersion(version int) string {
 // log. Cache-Control: no-store is already set process-wide by
 // securityHeaders above.
 func (h *Handler) renderEnrollmentToken(w http.ResponseWriter, r *http.Request, p auth.Principal, serverID, token string, expiresAt time.Time) {
+	h.renderEnrollment(w, r, p, serverID, token, expiresAt, enrollKindRegister)
+}
+
+// Which flow minted the token; it decides the page's install section (24-F).
+const (
+	enrollKindRegister = "register" // new server: the two-command install
+	enrollKindReissue  = "reissue"  // token reissued for a not-yet-enrolled server: same install
+	enrollKindReenroll = "reenroll" // credential replacement on a running agent: manual command only
+)
+
+const defaultInstalledVersionPath = "/etc/autodeploy/installed-version"
+
+var installedVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
+
+// installedVersion returns the release tag install.sh recorded, or "" when the file is missing, not a
+// regular file (symlinks refused), too large, malformed, or a development version. Read per call.
+func (h *Handler) installedVersion() string {
+	path := h.config.InstalledVersionPath
+	if path == "" {
+		path = defaultInstalledVersionPath
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 64 {
+		return ""
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) > 64 {
+		return ""
+	}
+	v := strings.TrimSuffix(string(raw), "\n")
+	if !installedVersionPattern.MatchString(v) || strings.Contains(v, "-dev") {
+		return ""
+	}
+	return v
+}
+
+func (h *Handler) renderEnrollment(w http.ResponseWriter, r *http.Request, p auth.Principal, serverID, token string, expiresAt time.Time, kind string) {
 	minutes := 0
 	if left := expiresAt.Sub(h.config.Now()); left > 0 {
 		minutes = int((left + time.Minute - 1) / time.Minute)
 	}
-	renderOperations(w, enrollmentTokenTemplate, enrollmentView{Nav: h.navFor(r.Context(), "servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt), ValidMinutes: minutes, Command: enrollCommand(h.config.PublicOrigin, serverID)})
+	view := enrollmentView{Nav: h.navFor(r.Context(), "servers", p), ServerID: serverID, Token: token, ExpiresAt: formatTimestamp(expiresAt), ValidMinutes: minutes, Command: enrollCommand(h.config.PublicOrigin, serverID)}
+	if kind != enrollKindReenroll {
+		view.AddServer = addServerCommands(h.config.PublicOrigin, serverID, h.installedVersion())
+		view.VersionKnown = h.installedVersion() != ""
+		view.AddHeading = "Add a new server"
+		if kind == enrollKindReissue {
+			view.AddHeading = "Install on the new server (token reissued)"
+		}
+	}
+	renderOperations(w, enrollmentTokenTemplate, view)
 }
 
 var (
@@ -2274,6 +2324,46 @@ func enrollCommand(origin, serverID string) string {
 		"printf '%s\\n' \"$T\" | sudo -u autodeploy-agent /usr/local/lib/autodeploy/app/agent enroll \\\n" +
 		"  --base-url " + origin + " --server-id " + serverID + " --state-dir /var/lib/autodeploy/agent\n" +
 		"unset T"
+}
+
+var enrollHostPattern = regexp.MustCompile(`^https://([^/:?#@]+)$`)
+
+// validInstallHost mirrors install.sh valid_public_host: a lowercase FQDN that is not an IP literal, has no
+// numeric last label and no reserved suffix, so the command shown is one install.sh will accept.
+func validInstallHost(h string) bool {
+	label := `[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?`
+	if len(h) > 253 || !regexp.MustCompile(`^(`+label+`\.)+`+label+`$`).MatchString(h) {
+		return false
+	}
+	if regexp.MustCompile(`^[0-9.]+$`).MatchString(h) || regexp.MustCompile(`^[0-9]+$`).MatchString(h[strings.LastIndex(h, ".")+1:]) {
+		return false
+	}
+	for _, suffix := range []string{".test", ".local", ".localhost", ".internal"} {
+		if strings.HasSuffix(h, suffix) {
+			return false
+		}
+	}
+	return h != "localhost"
+}
+
+// addServerCommands is the two-step install for a NEW VPS (plan 24-F): download install.sh from
+// the release tag ref, then run it with the agent role. The enrollment token is never part of it:
+// install.sh reads it at a hidden terminal prompt. version is the tag install.sh recorded on this
+// control plane host, or "" (placeholder <version>). Origin and id land in a command pasted as root,
+// so anything that is not plainly an acceptable host name (no port) or id gets a placeholder.
+func addServerCommands(origin, serverID, version string) string {
+	host := "<CP_HOST>"
+	if m := enrollHostPattern.FindStringSubmatch(origin); m != nil && validInstallHost(m[1]) {
+		host = m[1]
+	}
+	if !enrollServerIDPattern.MatchString(serverID) {
+		serverID = "<SERVER_ID>"
+	}
+	if !installedVersionPattern.MatchString(version) {
+		version = "<version>"
+	}
+	return "curl --proto '=https' --tlsv1.2 -fsSLo install.sh https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/" + version + "/deploy/host/install.sh\n" +
+		"sudo bash install.sh --role agent --control-plane-host " + host + " --server-id " + serverID
 }
 
 // serversTemplate lists registered servers with a registration form, a

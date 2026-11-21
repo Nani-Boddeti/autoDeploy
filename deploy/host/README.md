@@ -63,6 +63,10 @@ secret if the Docker volume cannot be removed.
 
 `sudo enroll-local.sh [--wait DURATION] [--name NAME]` enrolls this host's agent automatically once the first administrator exists (token never displayed, in argv or logs); see docs/operations/vps-install.md section 4. Harness: `tests/enroll_local_test.sh`.
 
+## Agent-only extra server (install-app.sh --role agent, install.sh --role agent)
+
+`install.sh --role agent --control-plane-host FQDN --server-id ID` (commands shown by the Servers page > Add server) sets up an agent-only server; the token is pasted at a hidden prompt or read from a root-owned 0600 `--token-file`, never a command line. Checks: `preflight-agent.sh`; see docs/operations/vps-install.md "Add another server". Harness: `tests/script_structure_test.sh` (agent scenarios), `tests/install_sh_test.sh` (agent-* scenarios).
+
 ## enable-github.sh (root, on the host)
 
 Prerequisites: install-app.sh, create-credentials.sh, the database running and migrated, the GitHub

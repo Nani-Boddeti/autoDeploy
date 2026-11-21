@@ -117,6 +117,12 @@ type enrollmentView struct {
 	ValidMinutes int
 	// Command is the host-side enrollment command; it never contains the token.
 	Command string
+	// AddServer is the two-command install of a new VPS (24-F); it never contains the token.
+	AddServer string
+	// AddHeading is the install section's heading ("" hides the section: re-enrollment of a running agent).
+	AddHeading string
+	// VersionKnown is true when AddServer carries the real release tag instead of <version>.
+	VersionKnown bool
 }
 
 type githubCompleteView struct {

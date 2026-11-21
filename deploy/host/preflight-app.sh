@@ -35,6 +35,12 @@ cfg() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n1; }
 export DOCKER_HOST=unix:///var/run/docker.sock DOCKER_CONFIG=/nonexistent
 unset DOCKER_CONTEXT
 
+# An agent-only host (install-app.sh --role agent, plan 24-F) has no control plane to check: point at its own script.
+if [[ "$(cfg "$HOST_ENV" AUTODEPLOY_ROLE)" == agent ]]; then
+  bad "this is an agent-only host (host.env AUTODEPLOY_ROLE=agent): run preflight-agent.sh instead of preflight-app.sh"
+  printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
+  exit 1
+fi
 if [[ ! -r $HOST_ENV || ! -r $CP_ENV ]]; then
   bad "$HOST_ENV and $CP_ENV readable (run install-app.sh first)"
   printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"

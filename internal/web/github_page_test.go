@@ -122,3 +122,16 @@ func TestGitHubPostsRedirectToGitHubPage(t *testing.T) {
 		}
 	}
 }
+
+// TestGitHubPageBindFormDnsHint (24-F): choosing a server other than this control plane's own
+// means the app hostname's DNS must point at that server; static text, no script.
+func TestGitHubPageBindFormDnsHint(t *testing.T) {
+	h, _, _, p := githubPageHandler(t)
+	page := pageGet(t, h, p, "/github")
+	form := page[strings.Index(page, `action="/github/bindings"`):]
+	form = form[:strings.Index(form, "</form>")]
+	contains(t, form, `class="hint dns-hint"`, "DNS", "that server")
+	if strings.Contains(form, "<script") {
+		t.Fatal("bind form uses script")
+	}
+}

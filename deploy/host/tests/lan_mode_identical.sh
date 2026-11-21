@@ -101,6 +101,27 @@ grep -v 'END autodeploy-public-cp' "$HOSTS_FILE" >"$SCRATCH/hosts.dmg" || true
 cp "$SCRATCH/hosts.dmg" "$HOSTS_FILE"
 if (manage_public_hosts_block) >/dev/null 2>&1; then fail "damaged hosts block refused"; else pass "damaged hosts block refused"; fi
 
+# ---- role (plan 24-F): role all stays byte-identical, role agent adds exactly one host.env line -------
+MODE=public CP_HOST=cp.example.com TRAEFIK_BIND=0.0.0.0 ROLE=all
+render_host_env >"$SCRATCH/role-all.env"
+check "role all public host.env has no role line" bash -c "! grep -q AUTODEPLOY_ROLE '$SCRATCH/role-all.env'"
+MODE=lan ROLE=all CP_HOST=autodeploy.autodeploy.test TRAEFIK_BIND=127.0.0.1
+render_host_env >"$SCRATCH/role-all-lan.env"
+check "role all lan host.env still = pre-change output + AUTODEPLOY_TLS_MODE=lan" cmp "$SCRATCH/host.env.want" "$SCRATCH/role-all-lan.env"
+MODE=public ROLE=agent CP_HOST=cp.example.com TRAEFIK_BIND=0.0.0.0
+render_host_env >"$SCRATCH/role-agent.env"
+diff "$SCRATCH/role-all.env" "$SCRATCH/role-agent.env" >"$SCRATCH/role.diff" || true
+check "role agent host.env differs by exactly the AUTODEPLOY_ROLE=agent line" bash -c "[[ \$(grep -c '^[<>]' '$SCRATCH/role.diff') == 1 ]] && grep -qx '> AUTODEPLOY_ROLE=agent' '$SCRATCH/role.diff'"
+ROLE=all
+render_agent_unit "$KIT_DIR/systemd/autodeploy-agent.service" >"$SCRATCH/agent.unit.all"
+check "role all agent unit rendered = source file (byte-identical)" cmp "$KIT_DIR/systemd/autodeploy-agent.service" "$SCRATCH/agent.unit.all"
+ROLE=agent
+render_agent_unit "$KIT_DIR/systemd/autodeploy-agent.service" >"$SCRATCH/agent.unit.agent"
+diff "$KIT_DIR/systemd/autodeploy-agent.service" "$SCRATCH/agent.unit.agent" >"$SCRATCH/unit.diff" || true
+check "role agent unit differs in exactly the After= line (2 diff lines)" bash -c "[[ \$(grep -c '^[<>]' '$SCRATCH/unit.diff') == 2 ]] && grep -q '^< After=.*autodeploy-controlplane.service' '$SCRATCH/unit.diff' && grep -qx '> After=autodeploy-checkout-quota.service autodeploy-checkout-exec.service docker.service autodeploy-traefik.service' '$SCRATCH/unit.diff'"
+check "role agent unit has no controlplane word outside comments" bash -c "! grep -v '^#' '$SCRATCH/agent.unit.agent' | grep -q controlplane"
+ROLE=all
+
 echo
 if ((FAILS)); then echo "$FAILS check(s) FAILED" >&2; exit 1; fi
 echo "all checks passed"

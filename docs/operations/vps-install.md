@@ -60,6 +60,54 @@ path.
 
 The manual path below stays valid and is what the installer automates.
 
+### Add another server
+
+An extra server runs only the agent (plus Traefik for the apps you deploy to it); the control plane, PostgreSQL
+and the setup code stay on the first server. Requirements: a second Ubuntu 24.04 x86_64 VPS (same sizing as
+section 1), ports 80/443 open to the internet, a working control plane reachable at `https://<control plane host>`
+with a certificate trusted by system roots (public mode; lan/private-CA agents are out of scope), and the
+installer's release tag (`cat /etc/autodeploy/installed-version` on the control plane).
+
+1. On the control plane's **Servers** page, enter a name and press **Add server**. The page that follows shows
+   the two commands for the new VPS and, once, the one-time enrollment token (valid 15 minutes):
+
+       curl --proto '=https' --tlsv1.2 -fsSLo install.sh https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/<version>/deploy/host/install.sh
+       sudo bash install.sh --role agent --control-plane-host <control plane host> --server-id <server id>
+
+   The page fills in `<version>` from `/etc/autodeploy/installed-version` when that file holds a valid release tag; otherwise replace it by hand. The token is **not** part of the command. A mistyped server id or control plane host can be corrected by re-running until the server is enrolled.
+2. Run them on the new VPS. The installer first checks that `https://<control plane host>/readyz` answers, then
+   installs Docker, the checkout isolation, the agent and Traefik (Let's Encrypt for the apps), and asks
+   `Paste the one-time enrollment token from the Servers page` at a **hidden** prompt on the terminal. Paste the token
+   there. Without a terminal, create a file owned by root with mode 0600 holding the token and pass
+   `--token-file FILE` (then delete the file; the token is spent). The token is never accepted on the command line,
+   an environment variable or a URL, is copied to a private 0600 file readable only by the agent user for the
+   single `agent enroll` call, and that copy is removed on success and on failure. The installer then starts the
+   agent and runs `preflight-agent.sh` and `preflight-checkout.sh` (kept in `/usr/local/share/autodeploy/kit`).
+   `--email`, `--firewall`, `--ssh-port`, `--acme-staging` and `--yes` work as for the first server.
+3. If the token expired or enrollment failed, use **Reissue enrollment token** on the Servers page and run the
+   installer again; it resumes. A server that is already enrolled is not asked for a token again; re-running
+   upgrades it. A different control plane host, server id or role on an installed server is refused.
+4. Bind an environment to the new server (the **Server** field of the bind form). **DNS:** each app hostname
+   deployed to that server must point at the *new server's* IP address, not at the control plane.
+
+After uninstalling an extra server (`uninstall.sh --yes`), revoke it on the Servers page, or it stays listed as active.
+
+Differences from the first server (`install-app.sh --role agent`):
+
+| | first server (`--role all`) | extra server (`--role agent`) |
+|---|---|---|
+| installed | control plane, agent, PostgreSQL, Traefik | agent, Traefik, checkout isolation |
+| `/etc/hosts` entry for the control plane host | yes (127.0.0.1) | never |
+| control plane route in Traefik | yes | none |
+| ACME resolver in Traefik | yes | yes (for the apps) |
+| `controlplane.env`, migrations, KEK, setup code | yes | no |
+| agent unit ordered after the control plane unit | yes | no |
+| credentials | `create-credentials.sh` | `create-credentials.sh --traefik-only` |
+| `host.env` role line | none (= all) | `AUTODEPLOY_ROLE=agent` |
+| preflight | `preflight-app.sh` | `preflight-agent.sh` |
+
+Not proven yet (needs two real hosts, see plan 24, 24-F): the two-host end to end.
+
 ## 1. Requirements
 
 - Ubuntu 24.04 LTS, x86_64 only. systemd >= 254 (`systemctl --version`), cgroup v2

@@ -77,6 +77,11 @@ in_kit=0; for e in "${KIT_ALLOWLIST[@]}"; do [[ "install.sh" == "$e" ]] && in_ki
 grep -q 'install.sh' <(sed -n '/^EXCLUDED=(/,/)$/p' "$TESTS_DIR/verify_release_test.sh") \
   && pass "install.sh is classified EXCLUDED by the kit drift test" || fail "install.sh missing from verify_release_test.sh EXCLUDED"
 
+# The agent role verifies its two preflight scripts in the kit (L2).
+grep -qE 'kit_files\+=\(preflight-agent.sh' "$INSTALL" && grep -qE 'preflight-checkout.sh' "$INSTALL" \
+  && pass "install.sh checks preflight-agent.sh and preflight-checkout.sh in the verified kit for the agent role" \
+  || fail "install.sh does not check preflight-agent.sh in the kit"
+
 # Static curl rule: every curl invocation in install.sh goes through curl_https (the single wrapper).
 bad_curl="$(grep -nE '(^|[^_a-z])curl([[:space:]]|$)' "$INSTALL" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -vE 'pkgs=|install -y|command -v curl|curl_https\(\)|--proto|curl -h|apt-get|install_pkgs|echo|printf|say|die|warn|"[^"]*curl[^"]*"|apt install' || true)"
 [[ -z "$bad_curl" ]] && pass "no bare curl invocation outside the https-only wrapper" || fail "bare curl invocation(s): $bad_curl"
@@ -172,7 +177,12 @@ cp -R "$KIT_DIR" "$R/deploy/host"
 rm -rf "$R/deploy/host/static-git" "$R/deploy/host/tests" "$R/deploy/host/release-signing" "$R/deploy/host/install.sh"
 H="$R/deploy/host"
 stub() { printf '#!/bin/bash\n%s\n' "$2" >"$H/$1"; chmod 0755 "$H/$1"; }
-stub install-checkout.sh 'echo "kit install-checkout.sh $*" >>/tmp/calls'
+stub install-checkout.sh 'echo "kit install-checkout.sh $*" >>/tmp/calls
+id -u autodeploy-agent >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin autodeploy-agent >/dev/null 2>&1'
+stub preflight-agent.sh 'echo "kit preflight-agent.sh $*" >>/tmp/calls
+[[ -e /tmp/ctl/pffail ]] && { echo "FAIL simulated preflight failure"; exit 1; }
+exit 0'
+stub preflight-checkout.sh 'echo "kit preflight-checkout.sh $*" >>/tmp/calls; exit 0'
 stub create-credentials.sh 'echo "kit create-credentials.sh $*" >>/tmp/calls
 [[ -e /tmp/ctl/failcreds ]] && { echo "create-credentials: simulated failure" >&2; exit 1; }
 exit 0'
@@ -182,12 +192,45 @@ stub enroll-local.sh 'echo "kit enroll-local.sh $*" >>/tmp/calls
 [[ -e /tmp/ctl/enrollfail ]] && { echo "enroll: simulated failure" >&2; exit 1; }
 mkdir -p /var/lib/autodeploy/agent; : >/var/lib/autodeploy/agent/credential; touch /tmp/state-admin'
 stub install-app.sh 'K="$(cd -- "$(dirname -- "$0")" && pwd)"
+umask 022 # like the real script: traversable directories
 echo "kit install-app.sh host=${AUTODEPLOY_CONTROLPLANE_HOST:-} $*" >>/tmp/calls
 st=0; [[ " $* " == *" --acme-staging "* ]] && st=1
-em=""; prev=""; for a in "$@"; do [[ $prev == --acme-email ]] && em="$a"; prev="$a"; done
+em=""; prev=""; role=all; cph="$AUTODEPLOY_CONTROLPLANE_HOST"
+for a in "$@"; do
+  [[ $prev == --acme-email ]] && em="$a"
+  [[ $prev == --role ]] && role="$a"
+  [[ $prev == --control-plane-host ]] && cph="$a"
+  prev="$a"
+done
 mkdir -p /etc/autodeploy /usr/local/lib/autodeploy
-printf "AUTODEPLOY_ENV_GATEWAY=127.0.0.1\nAUTODEPLOY_CONTROLPLANE_PORT=18081\nAUTODEPLOY_CONTROLPLANE_HOST=%s\nAUTODEPLOY_TLS_MODE=public\nAUTODEPLOY_ACME_STAGING=%s\nAUTODEPLOY_ACME_EMAIL=%s\n" "$AUTODEPLOY_CONTROLPLANE_HOST" "$st" "$em" >/etc/autodeploy/host.env
+printf "AUTODEPLOY_ENV_GATEWAY=127.0.0.1\nAUTODEPLOY_CONTROLPLANE_PORT=18081\nAUTODEPLOY_CONTROLPLANE_HOST=%s\nAUTODEPLOY_TLS_MODE=public\nAUTODEPLOY_ACME_STAGING=%s\nAUTODEPLOY_ACME_EMAIL=%s\n" "$cph" "$st" "$em" >/etc/autodeploy/host.env
+[[ $role == agent ]] && echo AUTODEPLOY_ROLE=agent >>/etc/autodeploy/host.env
+[[ -e /etc/autodeploy/agent-local.env ]] || printf "# Owner-edited\nAUTODEPLOY_AGENT_SERVER_ID=\n" >/etc/autodeploy/agent-local.env
+if [[ $role == agent ]]; then
+  mkdir -p /usr/local/lib/autodeploy/app /var/lib/autodeploy/agent
+  chown autodeploy-agent:autodeploy-agent /var/lib/autodeploy/agent; chmod 0700 /var/lib/autodeploy/agent
+  install -m 0755 "$K/libexec/fake-agent" /usr/local/lib/autodeploy/app/agent
+fi
 install -m 0755 "$K/libexec/autodeploy-run" /usr/local/lib/autodeploy/autodeploy-run'
+# Fake agent binary (installed by the install-app stub for --role agent). Run as the agent user by install.sh:
+# records argv, insists on an agent-owned 0600 token file, keeps what it read ONLY in /tmp/seen-token (test
+# observation) and creates the credential unless /tmp/ctl/enrollfail exists.
+cat >"$H/libexec/fake-agent" <<'STUBEOF'
+#!/bin/bash
+echo "agent $*" >>/tmp/calls
+if [[ "${1:-}" == enroll ]]; then
+  tf=""; prev=""; for a in "$@"; do [[ $prev == --token-file ]] && tf="$a"; prev="$a"; done
+  [[ -n $tf && -f $tf && ! -L $tf && "$(stat -c %U:%a "$tf")" == autodeploy-agent:600 ]] || { echo "fake-agent: token file missing or not agent-owned 0600" >&2; exit 3; }
+  [[ "$(stat -c %U:%G:%a "$(dirname "$tf")")" == root:autodeploy-agent:710 ]] || { echo "fake-agent: token dir must be root:agent 0710 (agent cannot create or replace entries)" >&2; exit 4; }
+  env >/tmp/seen-env
+  cat "$tf" >/tmp/seen-token
+  [[ -e /tmp/ctl/enrollfail ]] && { echo "enroll: simulated failure" >&2; exit 1; }
+  : >/var/lib/autodeploy/agent/credential
+  echo "enrolled: credential_version=1" >&2
+fi
+exit 0
+STUBEOF
+chmod 0755 "$H/libexec/fake-agent"
 cat >"$H/libexec/autodeploy-run" <<'STUBEOF'
 #!/bin/bash
 echo "run $* stdin=$(readlink /proc/self/fd/0)" >>/tmp/calls
@@ -250,7 +293,7 @@ SCEN="$1"; INSTALLER="$2"; shift 2
 RC=0
 ck() { if eval "$2"; then echo "CHECK ok   [$SCEN] $1"; else echo "CHECK FAIL [$SCEN] $1"; RC=1; fi; }
 S=/tmp/stubs; mkdir -p $S /tmp/ctl /run/systemd/system /etc/apt/keyrings
-: >/tmp/calls
+: >/tmp/calls; chmod 0666 /tmp/calls
 cat >$S/uname <<'X'
 #!/bin/bash
 if [[ "${1:-}" == -m ]]; then [[ -e /tmp/ctl/arch ]] && cat /tmp/ctl/arch || echo x86_64; else exec /usr/bin/uname "$@"; fi
@@ -325,6 +368,13 @@ for a in "$@"; do [[ $prev == -o ]] && out="$a"; [[ $a == https://* ]] && url="$
 case "$url" in
   *download.docker.com*) if [[ -e /tmp/ctl/keykind ]]; then cat /tmp/ctl/keykind >"$out"; else echo GOODKEY >"$out"; fi ;;
   *releases/download/*) f="/fx/${RELSERVE:-rel_ok}/${url##*/}"; [[ -f $f ]] || exit 22; cp "$f" "$out" ;;
+  */readyz)
+    [[ -e /tmp/ctl/cpdown ]] && exit 7
+    if [[ -e /tmp/ctl/cpdown-after-first ]]; then
+      [[ -e /tmp/ctl/readyz-seen ]] && exit 7
+      : >/tmp/ctl/readyz-seen
+    fi
+    [[ -n $out ]] && : >"$out" ;;
   *) exit 22 ;;
 esac
 X
@@ -376,11 +426,20 @@ chmod +x /usr/bin/docker
 export AUTODEPLOY_INSTALL_TEST_PATH=/tmp/stubs
 printf 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n' >/tmp/readyz.resp
 nohup bash -c 'while true; do nc -l 127.0.0.1 18081 </tmp/readyz.resp >>/tmp/readyz.req 2>/dev/null; done' >/dev/null 2>&1 &
+printf 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n' >/tmp/api401.resp
+nohup bash -c 'while true; do nc -l 127.0.0.1 8080 </tmp/api401.resp >/dev/null 2>&1; done' >/dev/null 2>&1 &
 mkdir -p /fxrw
 BASE=(--domain cp.example.com --email ops@example.com --firewall no --allow-dev --yes-i-am-testing --allowed-signers /fx/allowed_signers --release-dir /fx/rel_ok)
 run() { # args...: run the installer, capture rc/out/err
   bash "/fx/$INSTALLER" "$@" >/tmp/out 2>/tmp/err </dev/null; IRC=$?
   cat /tmp/out /tmp/err | sed 's/^/  | /' | tail -n 6
+}
+feed() { # TEXT: wait for the "Proceed?" prompt, answer y, wait for the token prompt, then type TEXT (hidden prompt)
+  local i
+  for i in $(seq 1 150); do grep -q "Proceed? " /tmp/ttyout 2>/dev/null && break; /usr/bin/sleep 0.1; done
+  /usr/bin/sleep 0.3; printf 'y\n'
+  for i in $(seq 1 150); do grep -q "Paste the one-time enrollment token" /tmp/ttyout 2>/dev/null && break; /usr/bin/sleep 0.1; done
+  /usr/bin/sleep 0.4; printf '%s\n' "$1"
 }
 nocall() { ! grep -qE "$1" /tmp/calls; }
 nothing_changed() {
@@ -388,6 +447,11 @@ nothing_changed() {
     && ! grep -q 'download.docker.com' /tmp/calls \
     && [[ ! -e /etc/apt/keyrings/docker.asc && ! -e /etc/apt/sources.list.d/docker.sources ]] \
     && [[ ! -e /etc/autodeploy/installer.env ]]
+}
+TOK=enr.v1.AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_ABCDE
+AB=(--role agent --control-plane-host cp.example.com --server-id server_abc123 --email ops@example.com --firewall no --allow-dev --yes-i-am-testing --allowed-signers /fx/allowed_signers --release-dir /fx/rel_ok)
+nothing_changed_except_env() {
+  ! grep -qE '^(kit |apt-get|run |systemctl start|systemctl enable)' /tmp/calls && ! grep -q 'download.docker.com' /tmp/calls
 }
 tmpgone() { ! ls -d /var/tmp/autodeploy-install.* >/dev/null 2>&1; }
 msg() { grep -qi -- "$1" /tmp/out /tmp/err; }
@@ -691,6 +755,239 @@ version-file-unreadable)
   mkdir -p /etc/autodeploy/installed-version
   run "${BASE[@]}"
   ck "unreadable installed-version gives a clear message" '((IRC != 0)) && msg "installed-version" && nothing_changed' ;;
+# ---- plan 24-F: --role agent (extra server) ------------------------------------------------------------
+agent-flags)
+  AB=(--role agent --control-plane-host cp.example.com --server-id server_abc123 --email ops@example.com --firewall no --allow-dev --yes-i-am-testing --allowed-signers /fx/allowed_signers --release-dir /fx/rel_ok)
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  TF=(--token-file /tmp/tokfile)
+  COMMON=(--email ops@example.com --firewall no --allow-dev --yes-i-am-testing --allowed-signers /fx/allowed_signers --release-dir /fx/rel_ok)
+  run --role agent --server-id server_abc123 "${COMMON[@]}" "${TF[@]}"
+  ck "missing --control-plane-host: usage error (exit 2)" '((IRC == 2)) && msg "control-plane-host"'; ck "nothing ran" 'nothing_changed'
+  run --role agent --control-plane-host cp.example.com "${COMMON[@]}" "${TF[@]}"
+  ck "missing --server-id: usage error (exit 2)" '((IRC == 2)) && msg "server-id"'; ck "nothing ran" 'nothing_changed'
+  for bad in 'bad id' 'srv_1' 'server_' '../x' 'server_a/b' "server_$(printf 'a%.0s' $(seq 1 101))"; do
+    run "${AB[@]/server_abc123/$bad}" "${TF[@]}"
+    ck "server id '${bad:0:20}' refused (same format as enroll-local.sh)" '((IRC != 0)) && msg "server id"'
+  done
+  ck "nothing ran after the id refusals" 'nothing_changed'
+  run "${AB[@]/cp.example.com/10.0.0.1}" "${TF[@]}"
+  ck "IP literal control plane host refused" '((IRC != 0)) && msg "control-plane-host"'
+  run "${AB[@]/cp.example.com/cp.test}" "${TF[@]}"
+  ck "reserved suffix refused" '((IRC != 0)) && msg "control-plane-host"'
+  run "${AB[@]/cp.example.com/https://cp.example.com}" "${TF[@]}"
+  ck "a URL instead of a hostname refused" '((IRC != 0)) && msg "control-plane-host"'
+  run "${AB[@]}" "${TF[@]}" --domain cp.example.com
+  ck "--domain refused with --role agent" '((IRC == 2)) && msg "domain"'
+  run "${AB[@]}" "${TF[@]}" --setup-wait 5m
+  ck "--setup-wait refused with --role agent" '((IRC == 2)) && msg "setup-wait"'
+  run "${BASE[@]}" --server-id server_abc123
+  ck "--server-id refused with the default role" '((IRC == 2)) && msg "role agent"'
+  run "${BASE[@]}" --control-plane-host cp.example.com
+  ck "--control-plane-host refused with the default role" '((IRC == 2)) && msg "role agent"'
+  run "${BASE[@]}" --token-file /tmp/tokfile
+  ck "--token-file refused with the default role" '((IRC == 2)) && msg "role agent"'
+  run "${AB[@]/agent/bogus}" "${TF[@]}"
+  ck "unknown role refused" '((IRC == 2)) && msg "role"'
+  run "${AB[@]}"
+  ck "no terminal and no --token-file: refused up front, naming both ways to give the token" '((IRC != 0)) && msg "--token-file" && msg "terminal"'
+  ck "...and nothing was changed" 'nothing_changed'
+  run "${AB[@]}" --token-file /tmp/nonexistent
+  ck "missing token file refused" '((IRC != 0)) && msg "token-file"'
+  ln -s /tmp/tokfile /tmp/toklink
+  run "${AB[@]}" --token-file /tmp/toklink
+  ck "symlinked token file refused" '((IRC != 0)) && msg "symlink"'
+  cp /tmp/tokfile /tmp/tok644; chmod 0644 /tmp/tok644
+  run "${AB[@]}" --token-file /tmp/tok644
+  ck "token file with group/other access refused" '((IRC != 0)) && msg "0600"'
+  cp /tmp/tokfile /tmp/tokown; chown nobody /tmp/tokown 2>/dev/null; chmod 0600 /tmp/tokown
+  run "${AB[@]}" --token-file /tmp/tokown
+  ck "token file not owned by root refused" '((IRC != 0)) && msg "root"'
+  echo "not-a-token" >/tmp/tokbad; chmod 0600 /tmp/tokbad
+  run "${AB[@]}" --token-file /tmp/tokbad
+  ck "malformed token refused WITHOUT echoing it" '((IRC != 0)) && msg "format" && ! grep -q "not-a-token" /tmp/out /tmp/err /var/log/autodeploy-install.log'
+  ck "no refusal installed or changed anything" 'nothing_changed'
+  ck "no token copy directory was ever created" '! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1' ;;
+agent-tokenfile)
+  echo 198.51.100.7 >/tmp/ctl/dns   # DNS of the control plane host points elsewhere: an agent host must not care
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "exit 0" '((IRC == 0))'
+  ck "step order: reachability, checkout, app (agent), traefik-only credentials, traefik, enroll, agent start, preflights" 'order_ok "^curl .*https://cp.example.com/readyz" "^kit install-checkout.sh" "^kit install-app.sh" "^kit create-credentials.sh --traefik-only" "^systemctl start autodeploy-traefik" "^agent enroll" "^systemctl start autodeploy-agent" "^kit preflight-agent.sh" "^kit preflight-checkout.sh"'
+  ck "no control plane step ran: no postgres, migrate, kek, setup code, enroll-local, controlplane unit" '! grep -qE "^run |enroll-local|enable-github|autodeploy-postgres|autodeploy-controlplane|setup-token|pg_isready" /tmp/calls'
+  ck "no setup URL or setup code printed" '! grep -q "/setup" /tmp/out && ! grep -q "setup.v1" /tmp/out'
+  ck "install-app got --mode public --role agent --control-plane-host and no host env" 'grep -E "^kit install-app.sh host= --mode public --role agent --control-plane-host cp.example.com --acme-email ops@example.com .*/binaries$" /tmp/calls'
+  ck "install-app got no --configure-firewall (--firewall no)" '! grep -q -- "--configure-firewall" /tmp/calls'
+  ck "agent enroll argv: base url, server id, state dir and a token FILE path only" 'grep -E "^agent enroll --base-url https://cp.example.com --server-id server_abc123 --state-dir /var/lib/autodeploy/agent --token-file /run/autodeploy-enroll\.[A-Za-z0-9]+/token$" /tmp/calls'
+  ck "readyz checked twice over https with system roots (no -k, no --cacert), once up front and once right before enrolling" '[[ "$(grep -c "^curl .*https://cp.example.com/readyz" /tmp/calls)" == 2 ]] && ! grep "readyz" /tmp/calls | grep -qE -- "-k|--insecure|--cacert|--capath" && grep "readyz" /tmp/calls | grep -q -- "--proto =https" && grep "readyz" /tmp/calls | grep -q -- "--tlsv1.2"'
+  ck "the second readyz check comes right before the agent enroll" 'l="$(grep -n "^curl .*readyz" /tmp/calls | tail -n1 | cut -d: -f1)"; e="$(grep -n "^agent enroll" /tmp/calls | cut -d: -f1)"; ((l < e)) && ((l > $(grep -n "^systemctl start autodeploy-traefik" /tmp/calls | cut -d: -f1)))'
+  ck "the agent read the token from its 0600 copy (fake agent checked owner and mode)" '[[ "$(cat /tmp/seen-token)" == "$TOK" ]]'
+  ck "the token is in NO argv, call log, output, error, installer log, config or kit copy" '! grep -rqF -- "$TOK" /tmp/calls /tmp/out /tmp/err /var/log/autodeploy-install.log /etc/autodeploy /usr/local/share/autodeploy /var/lib/autodeploy 2>/dev/null'
+  ck "the token copy and its directory are gone after success" '! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1'
+  ck "the operator-supplied token file is left alone" '[[ -f /tmp/tokfile ]]'
+  ck "the agent's environment never held the token" '! grep -qF -- "$TOK" /tmp/seen-env'
+  ck "server id recorded in agent-local.env for the agent unit" 'grep -qx "AUTODEPLOY_AGENT_SERVER_ID=server_abc123" /etc/autodeploy/agent-local.env'
+  ck "credential exists" '[[ -e /var/lib/autodeploy/agent/credential ]]'
+  ck "choices persisted with the role and the control plane host" 'grep -qx "INSTALLER_ROLE=agent" /etc/autodeploy/installer.env && grep -qx "INSTALLER_DOMAIN=cp.example.com" /etc/autodeploy/installer.env && ! grep -q "$TOK" /etc/autodeploy/installer.env'
+  ck "installed-version recorded; kit copy kept" '[[ -s /etc/autodeploy/installed-version && -x /usr/local/share/autodeploy/kit/preflight-agent.sh ]]'
+  ck "the DNS mismatch of the control plane host was not an issue (no DNS comparison on an agent host)" '! msg "198.51.100.7"'
+  ck "summary tells the owner about app DNS and the next step" 'msg "this server" && msg "DNS"'
+  ck "tmp dir removed" 'tmpgone' ;;
+agent-tty)
+  command -v script >/dev/null || { echo "CHECK ok   [agent-tty] (script not available: skipped)"; echo "RESULT rc=0"; exit 0; }
+  : >/tmp/ttyout
+  feed "$TOK" \
+    | script -qec "bash /fx/$INSTALLER ${AB[*]}" /tmp/ttyout >/tmp/out 2>/tmp/err; IRC=$?
+  sed 's/^/  | /' /tmp/ttyout | tail -n 4
+  ck "exit 0 with the token pasted at the terminal prompt" '((IRC == 0))'
+  ck "the hidden prompt was shown on the terminal" 'grep -q "Paste the one-time enrollment token from the Servers page" /tmp/ttyout'
+  ck "the pasted token was NOT echoed to the terminal" '! grep -qF -- "$TOK" /tmp/ttyout'
+  ck "the agent read it from the 0600 copy" '[[ "$(cat /tmp/seen-token)" == "$TOK" ]]'
+  ck "the token is in no argv, call log, output, error, log or config" '! grep -rqF -- "$TOK" /tmp/calls /tmp/out /tmp/err /var/log/autodeploy-install.log /etc/autodeploy /usr/local/share/autodeploy 2>/dev/null'
+  ck "token copy removed" '! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1'
+  ck "enroll came after the reachability check" 'order_ok "^curl .*readyz" "^agent enroll"' ;;
+agent-tty-badtoken)
+  command -v script >/dev/null || { echo "CHECK ok   [agent-tty-badtoken] (script not available: skipped)"; echo "RESULT rc=0"; exit 0; }
+  : >/tmp/ttyout
+  feed "this-is-not-a-token-SECRETISH" \
+    | script -qec "bash /fx/$INSTALLER ${AB[*]}" /tmp/ttyout >/tmp/out 2>/tmp/err; IRC=$?
+  sed 's/^/  | /' /tmp/ttyout | tail -n 5
+  ck "a malformed pasted token is refused" '((IRC != 0)) && grep -qi "format\|look like" /tmp/ttyout /tmp/err /tmp/out'
+  ck "the pasted text is not echoed anywhere" '! grep -rqF "SECRETISH" /tmp/ttyout /tmp/out /tmp/err /var/log/autodeploy-install.log /tmp/calls'
+  ck "no agent enroll, no token copy" '! grep -q "^agent enroll" /tmp/calls && ! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1' ;;
+agent-enroll-fail)
+  : >/tmp/ctl/enrollfail
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "enroll failure is an error" '((IRC != 0))'
+  ck "the agent was invoked, and its failure explained with the reissue hint" 'grep -q "^agent enroll" /tmp/calls && msg "Reissue"'
+  ck "the token copy is removed on failure too" '! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1'
+  ck "the token is in no argv, call log, output, error or log" '! grep -rqF -- "$TOK" /tmp/calls /tmp/out /tmp/err /var/log/autodeploy-install.log /etc/autodeploy 2>/dev/null'
+  ck "agent not started, no credential, version not recorded" '! grep -q "^systemctl start autodeploy-agent" /tmp/calls && [[ ! -e /var/lib/autodeploy/agent/credential && ! -e /etc/autodeploy/installed-version ]]'
+  ck "kit copy was made BEFORE enrollment" '[[ -x /usr/local/share/autodeploy/kit/preflight-agent.sh ]]'
+  rm -f /tmp/ctl/enrollfail; : >/tmp/calls
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "a rerun after the failure enrolls (fresh token copy)" '((IRC == 0)) && [[ -e /var/lib/autodeploy/agent/credential ]]' ;;
+agent-cp-unreachable)
+  : >/tmp/ctl/cpdown
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "refused" '((IRC != 0))'
+  ck "the message names the readiness URL and the TLS/DNS hint" 'msg "https://cp.example.com/readyz"'
+  ck "refused before any change: nothing changed, no token copy, no enroll" 'nothing_changed && ! grep -q "^agent " /tmp/calls && ! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1'
+  ck "the check is https only" 'grep "readyz" /tmp/calls | grep -q -- "--proto =https"' ;;
+agent-cp-unreachable-tty)
+  command -v script >/dev/null || { echo "CHECK ok   [agent-cp-unreachable-tty] (script not available: skipped)"; echo "RESULT rc=0"; exit 0; }
+  : >/tmp/ctl/cpdown; : >/tmp/ttyout
+  ( /usr/bin/sleep 1; printf 'y\n'; /usr/bin/sleep 0.5; printf '%s\n' "$TOK" ) | script -qec "bash /fx/$INSTALLER ${AB[*]}" /tmp/ttyout >/tmp/out 2>/tmp/err; IRC=$?
+  ck "refused" '((IRC != 0)) && grep -q "readyz" /tmp/ttyout /tmp/err /tmp/out'
+  ck "the token prompt was never shown" '! grep -q "Paste the one-time enrollment token" /tmp/ttyout'
+  ck "nothing changed" 'nothing_changed' ;;
+agent-cp-lost-midway)
+  : >/tmp/ctl/cpdown-after-first
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "control plane lost between the first check and the enrollment: refused before enrolling" '((IRC != 0)) && msg "readyz"'
+  ck "the install steps ran, but no enroll, no token copy, no agent start" 'grep -q "^kit install-app.sh" /tmp/calls && ! grep -q "^agent " /tmp/calls && ! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1 && ! grep -q "^systemctl start autodeploy-agent" /tmp/calls' ;;
+agent-xtrace)
+  command -v script >/dev/null || { echo "CHECK ok   [agent-xtrace] (script not available: skipped)"; echo "RESULT rc=0"; exit 0; }
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  bash -x "/fx/$INSTALLER" "${AB[@]}" --token-file /tmp/tokfile >/tmp/out 2>/tmp/err </dev/null; IRC=$?
+  ck "bash -x with --token-file: exit 0" '((IRC == 0))'
+  ck "bash -x trace and output never hold the token (file route)" '! grep -rqF -- "$TOK" /tmp/out /tmp/err /var/log/autodeploy-install.log /tmp/calls /tmp/seen-env'
+  ck "the trace really ran (positive control)" 'grep -q "^+ " /tmp/err'
+  rm -rf /var/lib/autodeploy/agent/credential /etc/autodeploy/installer.env; : >/tmp/ttyout; : >/tmp/calls
+  feed "$TOK" | script -qec "bash -x /fx/$INSTALLER ${AB[*]}" /tmp/ttyout >/tmp/out2 2>/tmp/err2; IRC=$?
+  ck "bash -x on a pty: exit 0" '((IRC == 0))'
+  ck "bash -x trace and output never hold the typed token (pty route)" '! grep -rqF -- "$TOK" /tmp/ttyout /tmp/out2 /tmp/err2 /var/log/autodeploy-install.log /tmp/calls /tmp/seen-env'
+  ck "the agent did get it" '[[ "$(cat /tmp/seen-token)" == "$TOK" ]]' ;;
+agent-wrong-id)
+  : >/tmp/ctl/enrollfail
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]/server_abc123/server_wrong1}" --token-file /tmp/tokfile
+  ck "enroll with the mistyped id fails" '((IRC != 0))'
+  ck "the mistyped id was NOT locked in (agent-local.env untouched)" '! grep -q "server_wrong1" /etc/autodeploy/agent-local.env'
+  rm -f /tmp/ctl/enrollfail; : >/tmp/calls
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "rerun with the right id succeeds, not refused" '((IRC == 0)) && [[ -e /var/lib/autodeploy/agent/credential ]]'
+  ck "the right id is recorded after enrollment" 'grep -qx "AUTODEPLOY_AGENT_SERVER_ID=server_abc123" /etc/autodeploy/agent-local.env' ;;
+agent-wrong-host)
+  : >/tmp/ctl/enrollfail
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]/cp.example.com/cpwrong.example.com}" --token-file /tmp/tokfile
+  ck "enroll against the mistyped host fails" '((IRC != 0))'
+  ck "host.env holds the mistyped host for now" 'grep -qx AUTODEPLOY_CONTROLPLANE_HOST=cpwrong.example.com /etc/autodeploy/host.env'
+  rm -f /tmp/ctl/enrollfail; : >/tmp/calls
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "rerun with the right host succeeds (not enrolled yet, so correctable)" '((IRC == 0))'
+  ck "host.env now names the right host and the install-app got it" 'grep -qx AUTODEPLOY_CONTROLPLANE_HOST=cp.example.com /etc/autodeploy/host.env && grep -q "install-app.sh .*--control-plane-host cp.example.com" /tmp/calls'
+  ck "installer.env follows" 'grep -qx INSTALLER_DOMAIN=cp.example.com /etc/autodeploy/installer.env' ;;
+agent-token-whitespace)
+  command -v script >/dev/null || { echo "CHECK ok   [agent-token-whitespace] (script not available: skipped)"; echo "RESULT rc=0"; exit 0; }
+  : >/tmp/ttyout
+  feed "  $TOK  " | script -qec "bash /fx/$INSTALLER ${AB[*]}" /tmp/ttyout >/tmp/out 2>/tmp/err; IRC=$?
+  ck "a pasted token with surrounding spaces is accepted" '((IRC == 0))'
+  ck "the agent got the trimmed token" '[[ "$(cat /tmp/seen-token)" == "$TOK" ]]'
+  rm -rf /var/lib/autodeploy/agent/credential /etc/autodeploy/installer.env
+  printf '  %s \r\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "a token file with spaces and CRLF is accepted too" '((IRC == 0))' ;;
+agent-stale-sweep)
+  mkdir -m 0700 /run/autodeploy-enroll.OLD123 /run/autodeploy-enroll.NEW123
+  touch -d '2 hours ago' /run/autodeploy-enroll.OLD123
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "exit 0" '((IRC == 0))'
+  ck "a stale token directory of a crashed run is swept, a fresh one is left" '[[ ! -e /run/autodeploy-enroll.OLD123 && -d /run/autodeploy-enroll.NEW123 ]]' ;;
+agent-rerun)
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile; ck "first run ok" '((IRC == 0))'
+  : >/tmp/calls; rm -f /tmp/seen-token
+  run "${AB[@]}"
+  ck "rerun without any token or terminal succeeds (already enrolled)" '((IRC == 0))'
+  ck "rerun does not enroll, does not copy a token, does not prompt" '! grep -q "^agent " /tmp/calls && ! grep -q "Paste the one-time" /tmp/out && [[ ! -e /tmp/seen-token ]] && ! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1'
+  ck "rerun says it is already enrolled" 'msg "already enrolled"'
+  ck "rerun is an upgrade: install-app --role agent again, agent started, preflights run" 'grep -q "^kit install-app.sh .*--role agent" /tmp/calls && grep -q "^systemctl start autodeploy-agent" /tmp/calls && grep -q "^kit preflight-agent.sh" /tmp/calls'
+  ck "rerun asks nothing of the control plane: no setup code, no control plane step" '! grep -qE "^run |enroll-local|setup-token" /tmp/calls'
+  ck "rerun mentions upgrade" 'msg "upgrade"' ;;
+agent-rerun-mismatch)
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile; ck "first run ok" '((IRC == 0))'
+  quiet() { ! grep -qE "^(kit |apt-get|run |systemctl start|systemctl enable|agent |curl .*releases)" /tmp/calls; }
+  : >/tmp/calls
+  run "${AB[@]/cp.example.com/other.example.com}"
+  ck "a different control plane host is refused, naming the recorded one" '((IRC != 0)) && msg "cp.example.com" && msg "other.example.com"'
+  ck "...before anything ran" 'quiet'
+  run "${AB[@]/server_abc123/server_zzz999}"
+  ck "a different server id is refused, naming the recorded one" '((IRC != 0)) && msg "server_abc123" && msg "server_zzz999"'
+  ck "...before anything ran" 'quiet'
+  run "${BASE[@]}"
+  ck "the default role on an agent host is refused (no in-place role switch)" '((IRC != 0)) && msg "role" && msg "agent"'
+  ck "...before anything ran" 'quiet'
+  ck "host.env and agent-local.env unchanged" 'grep -qx AUTODEPLOY_ROLE=agent /etc/autodeploy/host.env && grep -qx AUTODEPLOY_AGENT_SERVER_ID=server_abc123 /etc/autodeploy/agent-local.env' ;;
+agent-role-all-then-agent)
+  run "${BASE[@]}"; ck "full install ok" '((IRC == 0))'
+  ck "host.env of the full install has no role line" '! grep -q AUTODEPLOY_ROLE /etc/autodeploy/host.env'
+  : >/tmp/calls
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "agent role over a full install refused" '((IRC != 0)) && msg "role"'
+  ck "...before any kit script or agent ran" '! grep -qE "^(kit |agent |systemctl start)" /tmp/calls' ;;
+agent-installer-env-role)
+  mkdir -p /etc/autodeploy; printf 'INSTALLER_DOMAIN=cp.example.com\nINSTALLER_EMAIL=none\nINSTALLER_ACME_STAGING=0\nINSTALLER_FIREWALL=no\nINSTALLER_SSH_PORT=\nINSTALLER_ROLE=agent\n' >/etc/autodeploy/installer.env
+  run "${BASE[@]}"
+  ck "an aborted agent run's installer.env blocks the default role" '((IRC != 0)) && msg "role" && nothing_changed_except_env' ;;
+agent-lan-host)
+  mkdir -p /etc/autodeploy; printf 'AUTODEPLOY_CONTROLPLANE_HOST=cp.example.com\nAUTODEPLOY_TLS_MODE=lan\nAUTODEPLOY_ROLE=agent\n' >/etc/autodeploy/host.env
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "lan host refused for the agent role too" '((IRC != 0)) && msg "lan"' ;;
+agent-preflight-fail)
+  : >/tmp/ctl/pffail
+  printf '%s\n' "$TOK" >/tmp/tokfile; chmod 0600 /tmp/tokfile
+  run "${AB[@]}" --token-file /tmp/tokfile
+  ck "a failing agent preflight makes the installer exit nonzero" '((IRC != 0)) && msg "preflight"'
+  ck "...after enrolling and starting the agent, with the version recorded" '[[ -e /var/lib/autodeploy/agent/credential ]] && grep -q "^systemctl start autodeploy-agent" /tmp/calls && [[ -s /etc/autodeploy/installed-version ]]'
+  ck "token copy removed" '! ls -d /run/autodeploy-enroll.* >/dev/null 2>&1' ;;
 setup-incomplete)
   : >/tmp/ctl/noadmin; run "${BASE[@]}"
   ck "exit 4: installed, first-run setup not finished" '((IRC == 4))'
@@ -716,6 +1013,8 @@ for s in os-debian os-2204 arch-arm not-root res-ram res-cpu res-disk res-cgroup
   docker-install docker-usrlocal docker-podman docker-not-ce docker-badkey docker-nobuildx noninteractive-missing noninteractive-fw-yes-noport unattended unattended-options download \
   placeholder-allow-dev-nokey dev-version-refused signers-without-dev rerun rerun-admin-exists rerun-noargs downgrade other-domain lan-host \
   dns-mismatch dns-none bad-domain interactive setup-incomplete \
+  agent-flags agent-tokenfile agent-tty agent-tty-badtoken agent-enroll-fail agent-cp-unreachable agent-cp-unreachable-tty agent-cp-lost-midway \
+  agent-xtrace agent-wrong-id agent-wrong-host agent-token-whitespace agent-stale-sweep agent-rerun agent-rerun-mismatch agent-role-all-then-agent agent-installer-env-role agent-lan-host agent-preflight-fail \
   dev-needs-confirmation dns-abort-rerun ports-after-abort installer-env-symlink verify-fail-no-env partial-rerun pg-timeout enroll-fail kit-symlink version-file-unreadable; do
   run_sc "$s"
 done

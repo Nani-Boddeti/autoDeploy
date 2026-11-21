@@ -26,6 +26,10 @@
 # existing install whose database-url still holds the owner URL, replaces it with the runtime URL.
 # create-credentials.sh itself never overwrites an existing database-url.
 #
+# `--traefik-only` (plan 24-F, agent-only hosts from install-app.sh --role agent) creates just the two Traefik
+# API files above: no database, control plane or key material, and no control plane identity is needed. A host whose
+# host.env says AUTODEPLOY_ROLE=agent refuses the plain form (it has no control plane to credential).
+#
 # The Traefik API pair is created together (the same password, in two forms). The
 # enrollment token is NOT created here: it is issued once by the control plane UI and is
 # typed at a hidden prompt (see the end of install-app.sh).
@@ -40,10 +44,12 @@ set -euo pipefail
 umask 077
 
 DB_ONLY=0
+TRAEFIK_ONLY=0
 case "${1:-}" in
   "") ;;
   --database-only) DB_ONLY=1 ;;
-  *) printf 'usage: create-credentials.sh [--database-only]\n' >&2; exit 2 ;;
+  --traefik-only) TRAEFIK_ONLY=1 ;;
+  *) printf 'usage: create-credentials.sh [--database-only|--traefik-only]\n' >&2; exit 2 ;;
 esac
 
 readonly ETC_DIR=/etc/autodeploy
@@ -57,8 +63,14 @@ die() { printf 'create-credentials: error: %s\n' "$*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "must run as root"
 command -v openssl >/dev/null || die "openssl required"
 ((DB_ONLY)) || command -v htpasswd >/dev/null || die "htpasswd required (apt-get install apache2-utils)"
-for u in "$CP_USER" "$AGENT_USER"; do id -u "$u" >/dev/null 2>&1 || die "identity $u missing: run install-app.sh first"; done
-for d in secrets controlplane traefik-secrets agent; do [[ -d "$ETC_DIR/$d" ]] || die "$ETC_DIR/$d missing: run install-app.sh first"; done
+if ((!TRAEFIK_ONLY)) && [[ "$(sed -n 's/^AUTODEPLOY_ROLE=//p' "$ETC_DIR/host.env" 2>/dev/null | head -n1)" == agent ]]; then
+  die "this is an agent-only host (host.env AUTODEPLOY_ROLE=agent): it has no database or control plane credentials; run create-credentials.sh --traefik-only"
+fi
+ids=("$AGENT_USER")
+dirs=(traefik-secrets agent)
+if ((!TRAEFIK_ONLY)); then ids=("$CP_USER" "$AGENT_USER"); dirs=(secrets controlplane traefik-secrets agent); fi
+for u in "${ids[@]}"; do id -u "$u" >/dev/null 2>&1 || die "identity $u missing: run install-app.sh first"; done
+for d in "${dirs[@]}"; do [[ -d "$ETC_DIR/$d" ]] || die "$ETC_DIR/$d missing: run install-app.sh first"; done
 
 rand_hex() { openssl rand -hex 24; } # 192 bits; hex so it needs no URL escaping
 
@@ -70,6 +82,30 @@ write_file() { # dst owner group  (content on stdin; written to a 0600 temp file
   chmod 0600 "$tmp"
   mv -f "$tmp" "$1"
 }
+
+# The Traefik management API credential pair (bcrypt htpasswd for Traefik, plaintext pair for the agent).
+make_traefik_credentials() {
+  local USERS_FILE="$ETC_DIR/traefik-secrets/api-users" CRED_FILE="$ETC_DIR/agent/traefik-api-credentials" api_pw
+  if [[ -e "$USERS_FILE" && -e "$CRED_FILE" ]]; then
+    log "Traefik API credentials exist; keeping them"
+  elif [[ -e "$USERS_FILE" || -e "$CRED_FILE" ]]; then
+    die "only one of $USERS_FILE / $CRED_FILE exists; they must match. Remove both and re-run"
+  else
+    log "creating Traefik API credentials (bcrypt cost 10)"
+    api_pw="$(rand_hex)"
+    # htpasswd -i reads the password from stdin: nothing secret in argv.
+    printf '%s' "$api_pw" | htpasswd -niB -C 10 "$API_USER" | write_file "$USERS_FILE" root root
+    printf '%s:%s\n' "$API_USER" "$api_pw" | write_file "$CRED_FILE" "$AGENT_USER" "$AGENT_USER"
+    unset api_pw
+    grep -q "^$API_USER:\\\$2" "$USERS_FILE" || die "generated htpasswd entry is not bcrypt"
+  fi
+}
+if ((TRAEFIK_ONLY)); then
+  make_traefik_credentials
+  log "Traefik API credentials ready (names only: $ETC_DIR/traefik-secrets/api-users $ETC_DIR/agent/traefik-api-credentials)"
+  log "Restart autodeploy-traefik if it was already running (it reads api-users at start)."
+  exit 0
+fi
 
 # ---- PostgreSQL passwords and database URLs ----------------------------------------
 # Owner role `autodeploy` (superuser, created by the postgres container from postgres-password):
@@ -127,21 +163,7 @@ for k in username-throttle-key-1 csrf-key-1; do
 done
 
 # ---- Traefik management API: bcrypt hash for Traefik, plaintext pair for the agent ---
-USERS_FILE="$ETC_DIR/traefik-secrets/api-users"
-CRED_FILE="$ETC_DIR/agent/traefik-api-credentials"
-if [[ -e "$USERS_FILE" && -e "$CRED_FILE" ]]; then
-  log "Traefik API credentials exist; keeping them"
-elif [[ -e "$USERS_FILE" || -e "$CRED_FILE" ]]; then
-  die "only one of $USERS_FILE / $CRED_FILE exists; they must match. Remove both and re-run"
-else
-  log "creating Traefik API credentials (bcrypt cost 10)"
-  api_pw="$(rand_hex)"
-  # htpasswd -i reads the password from stdin: nothing secret in argv.
-  printf '%s' "$api_pw" | htpasswd -niB -C 10 "$API_USER" | write_file "$USERS_FILE" root root
-  printf '%s:%s\n' "$API_USER" "$api_pw" | write_file "$CRED_FILE" "$AGENT_USER" "$AGENT_USER"
-  unset api_pw
-  grep -q "^$API_USER:\\\$2" "$USERS_FILE" || die "generated htpasswd entry is not bcrypt"
-fi
+make_traefik_credentials
 
 log "done. Credential files (names only):"
 find "$ETC_DIR/secrets" "$ETC_DIR/controlplane" "$ETC_DIR/traefik-secrets" "$ETC_DIR/agent" -maxdepth 1 -type f \
