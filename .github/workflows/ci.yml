@@ -17,6 +17,8 @@ jobs:
           POSTGRES_DB: autodeploy_test
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
         options: >-
           --health-cmd "pg_isready -U postgres -d autodeploy_test"
           --health-interval 5s
