@@ -256,8 +256,12 @@ func TestWebConfigFromEnvironment(t *testing.T) {
 
 func tempDir(t *testing.T) string {
 	t.Helper()
-	path, err := os.MkdirTemp("/private/tmp", "autodeploy-config-test-")
+	path, err := os.MkdirTemp("", "autodeploy-config-test-")
 	if err != nil {
+		t.Fatal(err)
+	}
+	// Resolve symlinks (macOS /var -> /private/var) so path validation sees a canonical path.
+	if path, err = filepath.EvalSymlinks(path); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(path) })

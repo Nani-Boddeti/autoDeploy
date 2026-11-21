@@ -51,8 +51,12 @@ func TestQAKEKRingRejectsObviouslyNonRandomZeroKey(t *testing.T) {
 
 func qaSecureTempDir(t *testing.T) string {
 	t.Helper()
-	path, err := os.MkdirTemp("/private/tmp", "autodeploy-secret-qa-")
+	path, err := os.MkdirTemp("", "autodeploy-secret-qa-")
 	if err != nil {
+		t.Fatal(err)
+	}
+	// Resolve symlinks (macOS /var -> /private/var) so path validation sees a canonical path.
+	if path, err = filepath.EvalSymlinks(path); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(path) })

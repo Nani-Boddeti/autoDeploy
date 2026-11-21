@@ -47,8 +47,12 @@ func TestLoadKeyRejectsInPlaceMutationAndAcceptsAtomicReplacement(t *testing.T) 
 
 func keyedBytes(first byte) []byte { value := make([]byte, 32); value[0] = first; return value }
 func stableReadTempDir(t *testing.T) string {
-	path, err := os.MkdirTemp("/private/tmp", "autodeploy-stable-read-")
+	path, err := os.MkdirTemp("", "autodeploy-stable-read-")
 	if err != nil {
+		t.Fatal(err)
+	}
+	// Resolve symlinks (macOS /var -> /private/var) so path validation sees a canonical path.
+	if path, err = filepath.EvalSymlinks(path); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(path) })
