@@ -23,6 +23,14 @@ HEAD where `executorEnabled` (cmd/agent) and `activationEnabled` (cmd/controlpla
 `true`; the working tree is untouched and the worktree is removed on exit. The result is
 gate-flipped: for the acer only, never release or commit it. Uncommitted changes are not built.
 
+## Signed releases
+
+Tag `v*` builds, signs and publishes the kit and binaries (docs/operations/releases.md: owner setup,
+release cutting, key rotation, trust model). Verify a download with
+`verify-release.sh DIR --allowed-signers FILE --expect-version vX.Y.Z` (both mandatory; the kit does not
+carry the key). The canonical public key lives in `release-signing/allowed_signers` in the git repo.
+Release key fingerprint (`ssh-keygen -lf`): `<published by the owner after key setup>`; compare it out of band.
+
 ## Installing binaries: SHA256SUMS is mandatory
 
 `install-app.sh` and `install-checkout.sh` refuse to run when `BINDIR/SHA256SUMS` is missing (the

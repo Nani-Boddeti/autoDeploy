@@ -9,7 +9,7 @@ A non-technical owner buys an Ubuntu 24.04 VPS, points a domain at it, runs **on
 creates the GitHub App **with one click**, and can add **extra servers with one command** per server.
 
 Target user journey:
-1. `curl -fsSLo install.sh https://github.com/<owner>/autoDeploy/releases/latest/download/install.sh && sudo bash install.sh`
+1. `curl -fsSLo install.sh https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/<tag>/deploy/host/install.sh && sudo bash install.sh` (fetched from a git tag ref, not a release asset; the installer embeds the signing public key and verifies the release before using it)
 2. Installer asks: control plane domain, ACME email, open firewall? (reads answers from /dev/tty)
 3. Installer installs Docker + everything, starts services, prints `https://<domain>/setup` + one-time setup code
 4. Browser: enter code, create admin → "Create GitHub App" → install it → bind repo → push deploys
@@ -34,15 +34,26 @@ Owner decision D5: build plan 24 now; all public-VPS proofs (remaining ~8%, gate
 ## Slices (one subagent per slice; Sonnet implements → fresh review → fix → orchestrator verify → Haiku commit)
 
 ### 24-A Release pipeline + signing
+Status 2026-11-21: **implemented; review 1 FAILED, fixes applied (C1 C2 H1-H3 M1-M7 + lows), pending re-review** (nothing committed). Files: `.github/workflows/release.yml` (jobs build / dry-run / sign[environment `release`] / publish[`contents: write`]), `deploy/host/package-release.sh`, `verify-release.sh`, `release-signing/allowed_signers` (PLACEHOLDER, canonical source that 24-B embeds), `tests/verify_release_test.sh` (also a step in ci.yml), `docs/operations/releases.md`. The kit carries NO trust anchor (no verify-release.sh, no allowed_signers); `--allowed-signers` and `--expect-version` are mandatory; a signed `VERSION` asset binds the tag; dry runs sign with a throwaway key and never read the real secret; publishing uses `gh release create` (no third-party action); static git is built fresh (no cache). Release builds `--gates disabled`.
+- Owner actions (final list, do none until the VPS round is near; none performed): (1) generate the key (`ssh-keygen -t ed25519 -C release@autodeploy`); (2) create environment `release` with required reviewer = owner and deployment refs restricted to `v*` tags; (3) `gh secret set AUTODEPLOY_RELEASE_SIGNING_KEY --env release < key` (environment secret, no repo secret); (4) commit the real public key into `allowed_signers`; (5) publish the fingerprint (`ssh-keygen -lf`) in README/release notes out of band; (6) tag ruleset on `v*` (restrict creation, block update and delete); (7) protect `main`; (8) offline key backup, delete the local copy only after confirming it. Commands: docs/operations/releases.md.
+- Deferred to the VPS round (not proven): first real tagged release on GitHub, environment approval flow, `gh release create` path, fresh static-git build in CI, `release` job re-verify of the downloaded artifact on Actions, signature check of a downloaded release on a real host, gate flip before the first production release.
+- Residual risk: repo write access is the root of trust (install.sh is fetched from a git ref and embeds the key): protect `main` and `v*` tags with rules.
 - GitHub Actions workflow on tag `v*`: build static linux/amd64 binaries (`build-host-binaries.sh --gates disabled|enabled per decision`), static git, `deploy/host` kit tarball, `SHA256SUMS`, signature.
-- Signature: **`ssh-keygen -Y sign/verify`** (recommended; openssh is preinstalled on Ubuntu → no extra tool on the host). Public key pinned inside `install.sh`; private key = repo secret (or owner signs locally — decision D1).
-- `install.sh` published as a release asset; its own SHA256 published in README/release notes (replaces the "separate channel" rule; ADR/README updated).
+- Signature: **`ssh-keygen -Y sign/verify`** (recommended; openssh is preinstalled on Ubuntu → no extra tool on the host). Public key pinned inside `install.sh`; private key = GitHub ENVIRONMENT secret (D1; environment `release`, required reviewer).
+- `install.sh` is NOT a release asset (a same-channel asset could be swapped together with the key): it is fetched from the git tag ref; its trust is the repo/tag protection plus the published key fingerprint (README/release notes; ADR/README updated).
 - Tests: workflow dry-run on a fork tag; verify script rejects tampered tarball, wrong key, missing signature.
 
 ### 24-B Bootstrap installer `install.sh` (single host)
 - Preflight: root, x86_64, `/etc/os-release` = Ubuntu 24.04 (clear refusal otherwise), systemd, cgroup v2, ≥2 vCPU/2 GB/40 GB free (30G checkout image), ports 80/443 free, DNS of domain resolves to this host (reuse public preflight).
 - Installs Docker CE + buildx from Docker's official apt repo (skip if present & active; refuse `docker.io`/snap docker with a clear message); apt deps (apache2-utils, openssl, curl, xfsprogs, strace, dnsutils).
-- Downloads release → verifies signature + SHA256SUMS → runs existing scripts in order: `install-checkout.sh`, `install-app.sh --mode public`, `create-credentials.sh`, start postgres/traefik, `migrate`, start controlplane. Existing scripts stay the source of truth (wrap, don't rewrite).
+- `install.sh` is fetched from `https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/<tag>/deploy/host/install.sh` (git tag ref, not a release asset). It embeds the `allowed_signers` lines literally and the verify logic (or fetches `verify-release.sh` from the same git ref), writes the key to a 0600 file in a private `mktemp -d`, ALWAYS passes `--allowed-signers` and `--expect-version <tag>`, verifies BEFORE extracting or executing anything from the release, and prints the key fingerprint. Residual risk: repo write access is the root of trust, so protect `main` and `v*` tags with rules.
+- **24-B tightening (review 2):**
+  - Version: `install.sh` carries `AUTODEPLOY_VERSION="vX.Y.Z"` as a committed constant. The release `build` guard (already in release.yml; skips while install.sh is absent) fails when that constant != the pushed tag.
+  - Downgrade: refuse to install an older version over a newer installed one unless `--allow-downgrade`.
+  - Verify logic is embedded in `install.sh`, not fetched.
+  - Downloads: `curl --proto '=https' --tlsv1.2 -fsSL` only; asset names derived from `AUTODEPLOY_VERSION`, never globbed; into a root-owned 0700 `mktemp -d`; extraction only after verification, from that dir, refusing absolute or `..` member paths.
+  - Key drift: the embedded key block must byte-equal `deploy/host/release-signing/allowed_signers`; add this CI check in 24-B.
+- Downloads release → verifies signature + SHA256SUMS (`verify-release.sh`) → runs existing scripts in order: `install-checkout.sh`, `install-app.sh --mode public`, `create-credentials.sh`, start postgres/traefik, `migrate`, start controlplane. Existing scripts stay the source of truth (wrap, don't rewrite).
 - Prompts via `/dev/tty`; every prompt also has a flag for unattended use (`--domain --email --firewall yes|no --yes`).
 - KEK init done here non-interactively-but-root (new `secrets secret init-active-kek --installer` path or run with /dev/tty) so 24-E needs no TTY later.
 - Idempotent rerun = upgrade (existing upgrade banner); refuses lan installs.

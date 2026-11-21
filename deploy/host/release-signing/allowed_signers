@@ -1,0 +1,5 @@
+# Public key(s) that may sign autodeploy releases (ssh-keygen -Y verify "allowed signers" format).
+# PLACEHOLDER: the owner replaces the line below with the real public key
+# (docs/operations/releases.md, "One-time owner setup"). verify-release.sh REFUSES to verify while
+# the word PLACEHOLDER appears anywhere in this file.
+release@autodeploy namespaces="autodeploy-release" ssh-ed25519 PLACEHOLDER-REPLACE-WITH-REAL-PUBLIC-KEY

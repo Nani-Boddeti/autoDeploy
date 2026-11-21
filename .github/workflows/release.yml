@@ -1,0 +1,217 @@
+name: Release
+
+# Plan 24-A. Tag `v*` builds, signs and publishes a GitHub Release. Manual runs (workflow_dispatch)
+# with dry_run=true build and sign with an EPHEMERAL throwaway key and never publish; they never read
+# the real signing secret. Release builds are gate-disabled (--gates disabled) until the gate flip in
+# the VPS round (owner decision D5).
+# Trust model: the signing key is an ENVIRONMENT secret of environment `release` (required reviewer,
+# deployment refs restricted to v* tags). Owner setup: docs/operations/releases.md.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and sign with a throwaway key only; do not publish a GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      real: ${{ steps.ver.outputs.real }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Guard (real releases only)
+        if: github.ref_type == 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$TAG' is not vMAJOR.MINOR.PATCH[-prerelease]: refusing to release"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::tagged commit is not reachable from origin/main: refusing to release"
+            exit 1
+          fi
+
+      - name: Guard install.sh version constant (skips while install.sh is absent)
+        if: github.ref_type == 'tag' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          f=deploy/host/install.sh
+          if [ ! -f "$f" ]; then echo "install.sh not present yet: skipping"; exit 0; fi
+          have="$(sed -n 's/^AUTODEPLOY_VERSION="\(.*\)"$/\1/p' "$f")"
+          if [ "$(printf '%s\n' "$have" | wc -l)" != 1 ] || [ "$have" != "$TAG" ]; then
+            echo "::error::install.sh AUTODEPLOY_VERSION ('$have') does not match tag '$TAG'"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+
+      - name: Version
+        id: ver
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          if [ "$REF_TYPE" = tag ] && [ "$DRY_RUN" != true ]; then
+            echo "version=$REF_NAME" >>"$GITHUB_OUTPUT"
+            echo "real=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "version=dryrun-$(git rev-parse --short=12 HEAD)" >>"$GITHUB_OUTPUT"
+            echo "real=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      # Fresh build every release, no cache: a poisoned cache entry must not be able to reach the
+      # signed release. The git source tarball is hash-pinned inside static-git/Dockerfile.
+      - name: Build static git
+        run: deploy/host/build-static-git.sh "$RUNNER_TEMP/static-git"
+
+      - name: Build host binaries (gates disabled)
+        run: deploy/host/build-host-binaries.sh --gates disabled "$RUNNER_TEMP/binaries" "$RUNNER_TEMP/static-git"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries
+          path: ${{ runner.temp }}/binaries/
+          if-no-files-found: error
+          retention-days: 1
+
+  # Never sees the real secret: signs with a key generated on the spot.
+  dry-run:
+    needs: build
+    if: needs.build.outputs.real != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries
+          path: ${{ runner.temp }}/binaries
+      - name: Package and sign with a throwaway key
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -C dry-run -f "$RUNNER_TEMP/dryrun-key"
+          deploy/host/package-release.sh --version "$VERSION" --binaries "$RUNNER_TEMP/binaries" \
+            --key "$RUNNER_TEMP/dryrun-key" --out "$RUNNER_TEMP/release" --commit "$GITHUB_SHA" --self-check-only
+      - name: Remove throwaway key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/dryrun-key" "$RUNNER_TEMP/dryrun-key.pub"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dry-run-assets
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 3
+
+  # The only job that can read AUTODEPLOY_RELEASE_SIGNING_KEY (an environment secret).
+  sign:
+    needs: build
+    if: needs.build.outputs.real == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries
+          path: ${{ runner.temp }}/binaries
+      - name: Package, checksum, sign and self-verify
+        env:
+          SIGNING_KEY: ${{ secrets.AUTODEPLOY_RELEASE_SIGNING_KEY }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::environment secret AUTODEPLOY_RELEASE_SIGNING_KEY is not set: refusing to build an unsigned release (docs/operations/releases.md)"
+            exit 1
+          fi
+          umask 077
+          keyfile="$RUNNER_TEMP/release-signing-key"
+          printf '%s\n' "$SIGNING_KEY" >"$keyfile"
+          chmod 0600 "$keyfile"
+          # Fails (placeholder, or key not matching the committed public key) rather than shipping.
+          deploy/host/package-release.sh --version "$VERSION" --binaries "$RUNNER_TEMP/binaries" \
+            --key "$keyfile" --out "$RUNNER_TEMP/release" --commit "$GITHUB_SHA" \
+            --allowed-signers deploy/host/release-signing/allowed_signers
+      - name: Remove signing key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/release-signing-key"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [build, sign]
+    if: needs.build.outputs.real == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release
+      - name: Re-verify the downloaded assets against the committed public key
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          chmod 0755 "$RUNNER_TEMP/release"
+          deploy/host/verify-release.sh "$RUNNER_TEMP/release" \
+            --allowed-signers deploy/host/release-signing/allowed_signers --expect-version "$TAG"
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          files=("$RUNNER_TEMP"/release/*)
+          gh release create "$TAG" "${files[@]}" --repo "$REPO" --verify-tag --title "$TAG" \
+            --notes "Signed release (gates disabled). Verify with deploy/host/verify-release.sh; docs/operations/releases.md."

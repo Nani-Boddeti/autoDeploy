@@ -23,3 +23,6 @@
 
 # Local admin credentials (never commit)
 /admin-credentials.txt
+
+# Editor/backup leftovers (e.g. deploy/host/uninstall.sh.bak0)
+*.bak*

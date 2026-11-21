@@ -39,3 +39,4 @@ jobs:
       # coverage; that requires an explicitly provisioned host.
       - run: GOOS=linux GOARCH=amd64 go build ./cmd/checkout-quota-service ./cmd/checkout-exec ./internal/gitcheckout
       - run: GOOS=linux GOARCH=arm64 go build ./cmd/checkout-quota-service ./cmd/checkout-exec ./internal/gitcheckout
+      - run: deploy/host/tests/verify_release_test.sh
