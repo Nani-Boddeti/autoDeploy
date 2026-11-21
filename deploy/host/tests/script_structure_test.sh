@@ -91,12 +91,15 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
 fi
 
 # Driver, executed inside the container: SCENARIO = lan | public | public-refuse | lan-h1 | public-h1
+# | lan-upgrade | public-upgrade (second run on the same host after setup: upgrade banner, no fresh steps)
 IFS= read -r -d '' DRIVER <<'DRIVEREOF' || true
 set -u
 SCENARIO="$1"
-mode=lan; mutate=0; refuse=0
+mode=lan; mutate=0; refuse=0; upgrade=0
 case "$SCENARIO" in
   public) mode=public ;;
+  lan-upgrade) upgrade=1 ;;
+  public-upgrade) mode=public; upgrade=1 ;;
   public-refuse) mode=public; refuse=1 ;;
   lan-h1) mutate=1 ;;
   public-h1) mode=public; mutate=1 ;;
@@ -190,6 +193,8 @@ fi
 ck "no 'command not found'" '! grep -q "command not found" "$OUT"'
 ck "install-app.sh exit 0" '((IRC == 0))'
 ck "installer reached the final summary" 'grep -q "^==> installed" "$OUT"'
+ck "fresh run prints the fresh banner" 'grep -q "Nothing was started and no secret exists yet" "$OUT"'
+ck "fresh run does not print the upgrade banner" '! grep -q "^==> upgraded" "$OUT"'
 for f in host.env controlplane.env agent.env agent-local.env traefik/traefik.yml; do
   ck "generated /etc/autodeploy/$f" "[[ -s /etc/autodeploy/$f ]]"
 done
@@ -207,6 +212,19 @@ if [[ $mode == public ]]; then
   ck "hosts block maps cp.example.com" "grep -qx '127.0.0.1 cp.example.com' /tmp/hosts-test"
 else
   ck "autodeploy-tls.yml installed in lan mode" "[[ -s $R/autodeploy-tls.yml ]]"
+fi
+if ((upgrade)); then
+  # What a real host has after setup: create-credentials.sh wrote the database credentials.
+  mkdir -p /etc/autodeploy/secrets /etc/autodeploy/controlplane
+  echo placeholder >/etc/autodeploy/secrets/postgres-password
+  OUT2=/tmp/install2.out
+  "$K/install-app.sh" "${args[@]}" "$BIN" >"$OUT2" 2>&1
+  IRC2=$?
+  sed 's/^/  | /' "$OUT2" | tail -n 8
+  ck "upgrade run exit 0" '((IRC2 == 0))'
+  ck "upgrade run prints the upgrade banner" 'grep -q "^==> upgraded ($mode mode)" "$OUT2"'
+  ck "upgrade banner points at preflight-app.sh" 'grep -q "preflight-app.sh" "$OUT2"'
+  ck "upgrade run does not print fresh next steps" '! grep -q "Nothing was started and no secret exists yet" "$OUT2" && ! grep -q "create-credentials.sh" "$OUT2" && ! grep -q "admin bootstrap" "$OUT2"'
 fi
 exit "$RC"
 DRIVEREOF
@@ -229,6 +247,8 @@ run_scenario() {
 run_expect_pass lan
 run_expect_pass public
 run_expect_pass public-refuse
+run_expect_pass lan-upgrade
+run_expect_pass public-upgrade
 run_expect_fail lan-h1
 run_expect_fail public-h1
 

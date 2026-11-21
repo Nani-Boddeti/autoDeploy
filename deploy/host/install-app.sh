@@ -463,6 +463,12 @@ WAS_CP=0 WAS_AGENT=0 WAS_TRAEFIK=0
 if was_active autodeploy-controlplane; then WAS_CP=1; fi
 if was_active autodeploy-agent; then WAS_AGENT=1; fi
 if was_active autodeploy-traefik; then WAS_TRAEFIK=1; fi
+# Host state at the start of this run (before anything below creates files): decides which final
+# banner prints. An installed host has a running unit or the database credentials from create-credentials.sh.
+UPGRADE=0
+if ((WAS_CP || WAS_AGENT || WAS_TRAEFIK)) || [[ -e "$ETC_DIR/controlplane/database-url" || -e "$ETC_DIR/secrets/postgres-password" ]]; then
+  UPGRADE=1
+fi
 
 # ---- 1. identities ------------------------------------------------------------------
 # 802: next free number after the checkout kit's 800/801, same fixed-ID convention and
@@ -787,6 +793,15 @@ elif ((CP_RESTART_DUE)); then
 fi
 if ((WAS_AGENT && AGENT_CHANGED)); then log "restarting autodeploy-agent"; systemctl restart autodeploy-agent.service; fi
 if ((PG_UNIT_CHANGED)); then log "note: the PostgreSQL unit changed; restart it yourself when convenient (systemctl restart autodeploy-postgres)"; fi
+
+if ((UPGRADE)); then
+  cat <<UPGEOF
+
+==> upgraded ($MODE mode): binaries and units refreshed, pending migrations applied, running services restarted.
+ Next: sudo $KIT_DIR/preflight-app.sh            # read-only; re-checks the host
+UPGEOF
+  exit 0
+fi
 
 if [[ "$MODE" == public ]]; then
   cat <<PUBEOF

@@ -134,3 +134,4 @@ Process (as in 22-3):
 
 ## Progress
 - 2026-11-21: facts gathered (2 read-only sweeps), plan drafted. Owner approved. Decisions: D1 narrow the block to container phases (starting/health_checking/activating); D2 a restarted agent reports lost checkout/build attempts as failed, transient; D3 quota reclaim TTL 6h.
+- 2026-11-21: 23-A cb29c69 (web error mapping; old tests that pinned 400 replaced, reasoning in the commit). 23-B a9d3a05 (cross-GOOS vet via unix helpers plus !unix stubs; darwin still runs all 157 tests). 23-C (installer upgrade banner): Docker scenarios lan-upgrade/public-upgrade fail-first then pass; lan_mode_identical passes on debian:bookworm (fails on the BusyBox bash image for both HEAD and the change, a diff implementation difference; run it on Debian/Ubuntu).
