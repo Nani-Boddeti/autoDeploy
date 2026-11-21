@@ -632,3 +632,4 @@ environment blocked. Owner: probe with the target the predecessor was deployed w
   (1) narrow the block to attempts that reached a host-mutating phase (ADR amendment + predicate), (2) restarted agent
   should log attempts it lost / persist a minimal attempt-started record to ack or fail cleanly. Clear via Servers page
   resolve (attempt 32, no_activation). K2 (kill after activation authorized) still to run.
+- 2026-11-21: the follow-ups recorded above (attempt 28 exit 125 anomaly, installer upgrade printing fresh-install steps, narrowing the ADR 0004 block plus restarted-agent lost-attempt handling, quota reclaim of stranded allocations, windows vet; rewrap generation binding was already fixed in d02edb3) are closed by plan 23 (tasks/23-plan.md), proven on the acer in round 8 and pushed at 519f78a.
