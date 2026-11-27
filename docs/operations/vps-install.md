@@ -1,70 +1,126 @@
-# Installing on a fresh public VPS (provider-neutral)
+# Installing AutoDeploy on a fresh public VPS (provider-neutral)
 
-Target: one Ubuntu 24.04 LTS x86_64 server with a public address and DNS you control, any provider.
-TLS comes from Let's Encrypt through Traefik (`--mode public`). For a private LAN host with a private CA,
-use the default `--mode lan` (see `deploy/host/README.md`). Switching an existing LAN install to public
-in place is not supported: install fresh.
+**Status: pre-release.** Everything below was built and tested locally only (unit tests, a PostgreSQL integration
+suite and an Ubuntu 24.04 container harness). Nothing has been run on a real VPS yet, no signed release exists
+yet (the owner still has to complete the release setup in `docs/operations/releases.md`), and one-click GitHub App
+creation (plan 24-E) is not built. Until the first signed release is published, the Quick install cannot work:
+use the manual install in the Appendix.
 
-## Quick install (recommended)
+Contents: [What you need](#what-you-need) · [Quick install](#quick-install) · [First login](#first-login) ·
+[Connect GitHub](#connect-github) · [Add another server](#add-another-server) ·
+[Upgrade, uninstall, troubleshooting](#upgrade) · [Appendix: manual install](#appendix-manual-install)
 
-Status: the installer is built and tested against a local container harness only; it has not run on a real
-host yet, and no signed release exists until the owner completes the release setup
-(`docs/operations/releases.md`). Until then use the manual path below.
+## What you need
 
-On a fresh Ubuntu 24.04 x86_64 server (2+ vCPU, 2+ GB RAM, 40+ GB free disk, ports 80/443 free) whose domain
-already points at the server, as a user with `sudo`. Replace `vX.Y.Z` with the release tag:
+- One server (a "VPS") from any provider, running **Ubuntu 24.04 LTS, x86_64**, with at least **2 vCPU, 2 GB RAM and
+  40 GB free disk**. It must be a full virtual machine, not a container-style plan.
+- A **domain name** you control with an **A record** pointing at the server's public IP address (for example
+  `autodeploy.example.com`). Create the record before you start; it can take a while to spread.
+- An **email address** for Let's Encrypt certificate notices (optional, but you get no expiry warnings without it).
+- Ports **22, 80 and 443** reachable from the internet (also in the provider's own firewall). Nothing else may use
+  80 or 443 on the server.
+- A login on the server that can use `sudo`.
+
+TLS certificates come from Let's Encrypt through Traefik (public mode). A private LAN host with a private CA is a
+different setup (`--mode lan`, see `deploy/host/README.md`); switching an existing LAN install to public is not
+supported: install fresh.
+
+## Quick install
+
+Replace `vX.Y.Z` with the release tag you are installing (see the project's releases page). Run both commands on
+the server:
 
     curl --proto '=https' --tlsv1.2 -fsSLo install.sh https://raw.githubusercontent.com/Nani-Boddeti/autoDeploy/vX.Y.Z/deploy/host/install.sh
     sudo bash install.sh
 
-Do not pipe it into `bash`: it asks its questions (domain, ACME email, firewall) on the terminal and refuses to
-read answers from a pipe. For unattended use pass them as flags:
-`sudo bash install.sh --domain autodeploy.example.com --email ops@example.com --firewall no --yes` (add
-`--ssh-port N` with `--firewall yes`; `--setup-wait 30m` bounds the wait for the browser step).
+Do not pipe the download into `bash`: the installer asks its questions on the terminal and refuses to read
+answers from a pipe.
 
-**Check the script before you run it.** `install.sh` comes from the git tag, not from a release asset, so its
-trust is the repository and tag protection plus the key fingerprint it carries. Read it (`less install.sh`), then
-compare the fingerprint of the key it embeds, and the hash of the script, with the values published in the
-README or the release notes, obtained over a different channel:
+**Check the key fingerprint first.** `install.sh` comes from the git tag, not from a release asset. Its trust rests
+on the repository and tag protection plus the signing key it carries. Before you run it, compare the key it
+embeds with the fingerprint the owner published (README or release notes, a different channel than the
+download). Reading the script is also a good idea (`less install.sh`):
 
     awk '/^release@autodeploy/ {print $3, $4}' install.sh >embedded.pub && ssh-keygen -lf embedded.pub
-    sha256sum install.sh
 
-The installer prints the same fingerprint again before it downloads anything, and fails if the key is still
-the placeholder.
+The installer prints the same fingerprint again before it downloads anything, and stops if the key is still the
+placeholder. You can also compare `sha256sum install.sh` with a hash published by the owner.
 
-The installer refuses a development build, a build whose embedded key is still the placeholder, a downgrade
-(`--allow-downgrade` overrides it), a non-Ubuntu-24.04 or non-x86_64 host, `docker.io` or snap Docker, busy
-ports 80/443, lan-mode hosts and a domain different from the previous install. It downloads the signed release
-for its own version over HTTPS only (`--release-dir DIR` uses a local copy for offline installs, verified the
-same way), verifies signature, checksums and version in a private root-only directory before extracting
-anything, installs Docker CE and buildx from Docker's official apt repository if needed, then runs the steps of
-section 4 in order. A DNS record that does not point at this host is a warning you must confirm (`--yes`). Docker is accepted only
-as Docker CE at `/usr/bin/docker` (package `docker-ce`); podman-docker shims, snap and other paths are refused.
-Docker's apt signing key is downloaded to a private directory and installed only if its fingerprint equals the
-one pinned in the installer (`9DC858229FC7DD38854AE2D88D81803C0EBFCD88`). `--allow-dev`, `--allowed-signers` and
-`--yes-i-am-testing` exist only for development builds and are hard errors on a release. Your answers are saved in
-`/etc/autodeploy/installer.env` (root-only) so a re-run after a partial install keeps them.
+**What the installer asks** (each question has a flag, so it can also run unattended):
 
-At the end it prints `https://<domain>/setup` and a one-time code, **once, on the terminal only** (never in the
-log). Open the page, enter the code, create the administrator, and the installer enrolls this host's agent
-and finishes. If you do not finish within the wait, it exits with code 4 (the stack is installed and the version
-is recorded; only the browser setup is pending, intentionally); run it again for a new code. Log:
-`/var/log/autodeploy-install.log` (root-only, no setup code or secret). Installed version:
-`/etc/autodeploy/installed-version`. The verified kit scripts (`preflight-app.sh`, `uninstall.sh`,
-`enable-github.sh`, ...) are kept in `/usr/local/share/autodeploy/kit`. Re-running the installer upgrades.
+| Question | Flag |
+|---|---|
+| Control plane domain (its A record must point at this server) | `--domain autodeploy.example.com` |
+| Let's Encrypt email, or `none` | `--email ops@example.com` |
+| Configure the firewall (ufw: allow SSH, 80, 443; deny the rest)? | `--firewall yes` or `--firewall no` |
+| With `--firewall yes` and no terminal: the SSH port you use | `--ssh-port N` |
+| Final "Proceed?" confirmation (and DNS-mismatch warnings) | `--yes` |
 
-Creating the GitHub App: a one-click flow is planned (plan 24-E). Until it ships, create the App on
-github.com and use `sudo /usr/local/share/autodeploy/kit/enable-github.sh` (see its header) as the break-glass
-path.
+Unattended example: `sudo bash install.sh --domain autodeploy.example.com --email ops@example.com --firewall no --yes`.
+Other flags: `--setup-wait 30m` (how long to wait for the browser step, default 60m), `--acme-staging` (Let's
+Encrypt test certificates; a manual dry run only, deploys will not pass their health probe),
+`--allow-downgrade`, `--release-dir DIR` (a local copy of the release for offline installs, verified the same way).
+Your answers are saved in `/etc/autodeploy/installer.env` (root-only), so a re-run after an interrupted install
+keeps them.
 
-The manual path below stays valid and is what the installer automates.
+**What it does.** It checks the server (OS, CPU, memory, disk, ports 80/443, DNS), downloads the signed release for
+its own version over HTTPS only, verifies signature, checksums and version in a private root-only directory
+before it extracts anything, installs Docker CE and buildx from Docker's official apt repository if needed (the
+apt key is accepted only if its fingerprint equals the one pinned in the installer), then installs and starts
+the stack. A DNS record that does not point at this server is a warning you confirm (or accept with `--yes`).
 
-### Add another server
+**What it prints at the end**, once, on the terminal only (it is never written to the log):
+
+      Finish setup in your browser (valid 60 minutes):
+        URL : https://<your domain>/setup
+        Code: setup.v1.<random characters>
+
+The installer then waits for you to finish the browser step, enrolls this server's own agent, and prints a
+summary. If you do not finish within the wait it exits with code 4: the stack is installed, only the browser
+setup is pending; run `sudo bash install.sh` again for a new code.
+
+Useful files: log `/var/log/autodeploy-install.log` (root-only, never contains the setup code or any secret);
+installed version `/etc/autodeploy/installed-version`; the verified kit scripts (`preflight-app.sh`,
+`uninstall.sh`, `enable-github.sh`, `backup-db.sh`, ...) in `/usr/local/share/autodeploy/kit`.
+
+## First login
+
+1. Open the `https://<your domain>/setup` address the installer printed, enter the code, choose an administrator
+   username and password (twice), and submit. Then sign in at `https://<your domain>/login`.
+2. **Lost or expired code** (it lives 60 minutes): on the server run
+   `sudo /usr/local/lib/autodeploy/autodeploy-run admin setup-token`. It prints a new code, invalidates older
+   unused ones, and refuses once an administrator exists. Re-running the installer also issues a new code.
+3. **Alternative without the browser:** create the administrator in the terminal with
+   `sudo /usr/local/lib/autodeploy/autodeploy-run admin bootstrap --username administrator` (it asks for the
+   password), then `sudo /usr/local/share/autodeploy/kit/enroll-local.sh --wait 30m` to enroll this server's agent.
+   Use one path or the other, not both. `/setup` returns 404 as soon as an administrator exists.
+
+## Connect GitHub
+
+**Coming (plan 24-E, not built yet): one-click "Create GitHub App" in the browser will replace this step.** Until
+it ships, creating the App is manual and uses the break-glass script `enable-github.sh`. Do not expect a "Create
+GitHub App" button today.
+
+1. On github.com create a GitHub App for your account or organization and download its private key (`.pem`) to
+   the server. The App needs read access to repository contents and metadata, and the `push` event.
+2. On the server, as root:
+
+       sudo /usr/local/share/autodeploy/kit/enable-github.sh --app-id N --client-id ID --slug SLUG --owner-id N \
+         --owner-type User|Organization --private-key ~/app.pem
+
+   Full description and what it does: `deploy/host/README.md`, section "enable-github.sh". Afterwards `shred -u`
+   the `.pem`.
+3. Set the App's webhook URL to `https://<your domain>/webhooks/github` with the secret from
+   `/etc/autodeploy/controlplane/github-webhook-secret-1` and the `push` event. Then in the UI open **GitHub**
+   (`/github`), install the App on your repositories, and bind a repository with the **Bind a repository** form.
+   Push to deploy. (Remember: release builds ship with the deployment gates off until the VPS round, so deploys do
+   not run yet.)
+
+## Add another server
 
 An extra server runs only the agent (plus Traefik for the apps you deploy to it); the control plane, PostgreSQL
 and the setup code stay on the first server. Requirements: a second Ubuntu 24.04 x86_64 VPS (same sizing as
-section 1), ports 80/443 open to the internet, a working control plane reachable at `https://<control plane host>`
+"What you need"), ports 80/443 open to the internet, a working control plane reachable at `https://<control plane host>`
 with a certificate trusted by system roots (public mode; lan/private-CA agents are out of scope), and the
 installer's release tag (`cat /etc/autodeploy/installed-version` on the control plane).
 
@@ -107,6 +163,62 @@ Differences from the first server (`install-app.sh --role agent`):
 | preflight | `preflight-app.sh` | `preflight-agent.sh` |
 
 Not proven yet (needs two real hosts, see plan 24, 24-F): the two-host end to end.
+
+## Upgrade
+
+Download `install.sh` from the newer tag (same `curl` command as in Quick install, with the new `vX.Y.Z`), check the
+fingerprint again, and run `sudo bash install.sh`. A re-run is an upgrade: it keeps your saved answers, skips the
+setup code when an administrator exists and skips enrollment when this server is already enrolled. It refuses to
+install an older version over a newer installed one (`refusing the downgrade`); `--allow-downgrade` overrides that on
+purpose. The installed version is in `/etc/autodeploy/installed-version`. Changing the domain, switching between
+Let's Encrypt staging and production, or switching a host's role is refused (see below).
+
+## Uninstall
+
+On the server: `sudo /usr/local/share/autodeploy/kit/uninstall.sh --yes`. It keeps your data (the PostgreSQL
+volume, credentials, KEK files, ACME certificates and the checkout image) unless you add `--destroy-data`, which
+lists what will be lost, including the KEK files. Without `--yes` it only prints what it would remove. It leaves the
+ufw allow rules in place on purpose.
+
+For an **extra server**, also open the control plane's **Servers** page and **Revoke** that server afterwards, or it
+stays listed as active. Back up first (section 6 of the appendix and `docs/operations/backup-restore.md`).
+
+## Troubleshooting
+
+Start with the log: `/var/log/autodeploy-install.log` (root-only; it never contains the setup code, enrollment token
+or any secret). The installer stops before changing anything when a check fails. Common refusals (messages abbreviated):
+
+| The installer says | What it means / what to do |
+|---|---|
+| `must run as root: use 'sudo bash install.sh'` | Run it with `sudo`. |
+| `Ubuntu 24.04 LTS only`, `x86_64 only` | Wrong OS or CPU; use an Ubuntu 24.04 x86_64 image. |
+| `at least 2 vCPU` / `2 GB RAM` / `40 GB free disk` | The server is too small. |
+| `cgroup v2 is required`, `systemd is required` | Not a normal Ubuntu 24.04 VM image; use a full VM. |
+| `this is a development build ... not a release` | You did not download `install.sh` from a release tag. |
+| `release public key ... is still the PLACEHOLDER` | The owner has not finished the release setup (`docs/operations/releases.md`). No installer from this tag can work. |
+| `--allow-dev, --allowed-signers and --yes-i-am-testing are accepted only by development builds` | Testing flags are refused on a release by design; remove them. |
+| `release verification failed ... Nothing was installed.` | Signature, checksum or version did not match. Do not work around it; re-download and compare the fingerprint, and tell the owner. |
+| `port 80 and/or 443 is already in use by: ...` | Stop the other web server first; Traefik needs both ports. |
+| `has no A record yet` / DNS mismatch warning | Fix the domain's A record, wait for DNS, re-run (or `--yes` to continue anyway; certificates will not issue until DNS is right). |
+| `docker.io`, `podman-docker` or a snap Docker is installed | Remove it yourself; the installer wants Docker CE from Docker's apt repository. |
+| `the Docker apt key does not match the pinned fingerprint` | Nothing was installed from it; do not override, report it. |
+| `refusing the downgrade` | The installed version is newer; use `--allow-downgrade` only if you mean it. |
+| `a previous install used the domain ..., not ...` | Changing the domain is not supported; re-run with the old domain, or uninstall and install fresh. |
+| `lan-mode (private CA) AutoDeploy install` | This installer only handles public hosts; install fresh. |
+| `an earlier run ... chose --role ...` / `installed with role=...` | A host's role cannot be switched; uninstall and install fresh. |
+| `cannot reach the control plane at https://.../readyz` (extra server) | Check the `--control-plane-host` spelling, that the control plane is up, and that its certificate is trusted by this server. |
+| `PostgreSQL did not become ready within 60 s` | See `docker logs autodeploy-postgres` and `journalctl -u autodeploy-postgres`. |
+| `the control plane did not answer .../readyz` | See `journalctl -u autodeploy-controlplane`. |
+| exit code 4 | Installed, but you did not finish the browser setup in time; re-run for a new code. |
+
+More on certificates, DNS, rate limits and NAT: appendix section 7. Host diagnostics: `sudo ./diagnose.sh` (see
+`deploy/host/README.md`).
+
+# Appendix: manual install
+
+The step-by-step path the installer automates. It stays valid, for example until the first signed release exists
+or when you want to see every step. The sections keep their numbers 1 to 7 on purpose, because installer messages
+refer to them (for example "section 4, step 2").
 
 ## 1. Requirements
 

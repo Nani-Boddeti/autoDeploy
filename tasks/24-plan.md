@@ -104,8 +104,28 @@ Status 2026-11-21: **implemented, pending review** (nothing committed). Proven l
 - Tests: golden `lan_mode_identical` unchanged for `--role all`; container harness for `--role agent` asserts no CP artifacts; two-host e2e (VPS + acer or two VPSes): bind env to server 2, push, healthy deploy + route on server 2.
 
 ### 24-G Docs + fresh-VPS end-to-end
+Status 2026-11-21: **docs done (2026-11-21); VPS proof pending.** Docs: `docs/operations/vps-install.md` restructured around the one-command install (manual path kept as the appendix), README quick start, `deploy/host/README.md` script index, `releases.md` and IMPLEMENTATION_STATUS refreshed. ADR 0002/0006 amendments: 0006 was amended in 24-C; the 0002 amendment waits for 24-E.
 - Rewrite `docs/operations/vps-install.md` around the one-liner (manual path kept as appendix); README quick start; ADR 0002/0006 amendments; IMPLEMENTATION_STATUS.
 - Proof: brand-new VPS, only the one command + browser; record timings; then add a second server.
+
+## VPS round checklist (run top to bottom; nothing here is proven yet)
+
+Order matters: owner setup unlocks the release, the release unlocks the installer, the installer unlocks everything after. Mark each item with the date and evidence when done.
+
+1. **Owner GitHub setup** (docs/operations/releases.md): generate the signing key; environment `release` (required reviewer, `v*` tag rule); environment secret `AUTODEPLOY_RELEASE_SIGNING_KEY`; commit the real public key (`allowed_signers` and the block in `install.sh`); publish the fingerprint out of band; `v*` tag ruleset; protect `main`; offline key backup (delete the local key only after confirming it).
+2. **Buy the VPS and DNS**: Ubuntu 24.04 x86_64, domain A record, ports 22/80/443 open at the provider. Also a second host (or second VPS) for step 11.
+3. **Gate flip decision** (D5): flip `executorEnabled`/`activationEnabled` in committed code for the first production release (release builds are `--gates disabled` until then); the first release must not be cut earlier.
+4. **First signed release**: set `AUTODEPLOY_VERSION` in `install.sh` to the tag, dry run first, tag, reviewer approval of the `release` environment, `gh release create` path, fresh static-git build in CI, `release` job re-verify on Actions; verify the downloaded release with `verify-release.sh` on the VPS using the real key.
+5. **Fresh-VPS one-command install (24-B, 24-G proof)**: only the two commands plus the browser; record timings; real Docker CE apt install and pinned key, apt lock timeout, `curl` from GitHub Releases, `ssh-keygen -Y verify`, preflight, DNS check, firewall prompt with real ufw/sshd, port-holder report, `/readyz` wait, interactive prompts on a real tty, kit copy ownership.
+6. **Browser first run and local enroll (24-C, 24-D)**: `/setup` with the printed code (and a lost code via `admin setup-token`), `enroll-local.sh --wait` hand-off, real runuser/`/run` token file handling, agent start, `preflight-app.sh` and `preflight-checkout.sh` after auto-enroll, flock and hard-link behaviour on a real fs.
+7. **Public ACME end to end (gate 3)**: Let's Encrypt via the installer (staging then production, per vps-install.md appendix section 4), certificate for the control plane host and for an app hostname, first deploy waiting on issuance.
+8. **First deploy and the open dev checks**: GitHub App via `enable-github.sh` (or 24-E if built by then), bind, push, healthy deploy; **build secret mounts** (`RUN --mount=type=secret`) on a real build; blue/green and rollback on the VPS.
+9. **Upgrade and downgrade**: re-run `install.sh` of a newer tag over the install; confirm the downgrade refusal; `uninstall.sh` against an installer-made host.
+10. **24E manifest flow** (only if built before the round): manifest creation against real GitHub on the public origin, state replay and expiry, the root `github-apply` unit.
+11. **Two-host test (24-F)**: Add server on the Servers page, `install.sh --role agent` on server 2 (hidden `/dev/tty` prompt, `--token-file`, Let's Encrypt trust from a second host, `create-credentials.sh --traefik-only`, `install-app.sh --role agent`, `preflight-agent.sh`, ufw rules), bind an environment to server 2, push, healthy deploy and route with the app certificate via ACME HTTP-01 on server 2, `uninstall.sh` on an agent host, revoke on the Servers page.
+12. **24h retention check**: leave the host running continuously for 24 hours, then run the retention check as defined in IMPLEMENTATION_STATUS (see the 24h retention item there).
+13. **Backup/restore drill (last, owner decision)**: `backup-db.sh`, KEK files and `acme.json` to separate locations, restore per docs/operations/backup-restore.md, `secrets secret verify`, re-enroll if the credential is unknown.
+14. **Close out**: update IMPLEMENTATION_STATUS (progress numbers, gates), mark the slices proven here, flip nothing else.
 
 ## Owner decisions (2026-11-21)
 

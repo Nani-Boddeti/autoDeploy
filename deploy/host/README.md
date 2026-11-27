@@ -1,12 +1,37 @@
 # Host kit: enabling GitHub, building binaries, installing
 
+## Script index
+
+Run as root on the host unless noted. Not every script is in the release kit (the kit never carries the signing key or the release tooling).
+
+| Script | Purpose |
+|---|---|
+| `install.sh` | One-command installer (fetched from a git tag, not a release asset): verifies the signed release, installs Docker CE and the stack, prints the `/setup` URL and one-time code. `--role agent` sets up an extra server. |
+| `install-checkout.sh` | Checkout isolation (XFS image, helpers, cgroup delegation). |
+| `install-app.sh` | Application stack (control plane, agent, PostgreSQL, Traefik); `--role all\|agent`, `--mode lan\|public`. |
+| `create-credentials.sh` | Database and Traefik credentials (`--traefik-only` on an agent-only host). |
+| `enroll-local.sh` | Enrolls this host's agent automatically once the first administrator exists. |
+| `enable-github.sh` | Manual GitHub App setup (break-glass until the one-click flow, plan 24-E, exists). |
+| `preflight-app.sh` | Read-only checks of a full host. |
+| `preflight-agent.sh` | Read-only checks of an agent-only host (use instead of `preflight-app.sh`). |
+| `preflight-checkout.sh` | Read-only checks of the checkout isolation. |
+| `verify-release.sh` | Verifies a downloaded release directory (signature, checksums, version); not in the kit. |
+| `package-release.sh` | Assembles, checksums and signs the release assets (used by the release workflow); not in the kit. |
+| `backup-db.sh` | Logical PostgreSQL dump. |
+| `uninstall.sh` | Removes what the installers created (`--yes`, optional `--destroy-data`). |
+| `diagnose.sh`, `netcheck.sh` | Diagnostic reports. |
+| `private-ca.sh` | Private CA for lan mode. |
+| `build-host-binaries.sh`, `build-static-git.sh`, `build-acer-binaries.sh` | Build scripts on the development machine (the last one is the gate-flipped LAN test build). |
+| `stage-lib.sh` | Shared helper sourced by the installers. |
+
 ## Public VPS install
 
-Any Ubuntu 24.04 x86_64 VPS with a public IP and DNS: follow docs/operations/vps-install.md (Docker
-prerequisites, `install-app.sh --mode public`, ACME certificates, firewall, backups). Build the binaries
+Any Ubuntu 24.04 x86_64 VPS with a public IP and DNS: follow docs/operations/vps-install.md (one-command
+install first, the manual path with `install-app.sh --mode public`, ACME, firewall and backups in its
+appendix). The one-command installer is unproven on a real host and needs a signed release (docs/operations/releases.md). The manual path builds the binaries
 with `deploy/host/build-host-binaries.sh --gates enabled|disabled OUTDIR GITDIR` (the gate choice is
 mandatory and explicit; it prints the sha256 of `SHA256SUMS` to transfer separately). The acer notes
-below describe the LAN test host (`--mode lan`, the default, private CA).
+below describe the former LAN test host (`--mode lan`, the default, private CA); that host is no longer available.
 
 LAN note: re-running `install-app.sh` on an existing LAN host adds `AUTODEPLOY_TLS_MODE=lan` to host.env (an
 active Traefik restarts once), and lan `preflight-app.sh` gained loop-control, docker buildx, free-disk and

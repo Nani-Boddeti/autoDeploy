@@ -23,7 +23,7 @@ flip in the VPS round (decision D5). Do not cut a production release before then
 ## Trust model
 
 - The trust anchor is the public key in `deploy/host/release-signing/allowed_signers` (canonical
-  source in the repo; 24-B's `install.sh` embeds these lines literally). It must never be taken from
+  source in the repo; `install.sh` embeds these lines literally; CI fails if its embedded block differs from this file). It must never be taken from
   the downloaded release or the kit: the kit does not contain it, and `verify-release.sh` has no default
   for `--allowed-signers`.
 - Residual risk: write access to the repo (and its tags) is the root of trust, because `install.sh` is
@@ -44,7 +44,8 @@ ssh-keygen -t ed25519 -C release@autodeploy -N '' -f ~/autodeploy-release-key
 #    deployment branches and tags = selected, add tag pattern `v*`. Then store the key as an
 #    ENVIRONMENT secret (not a repo secret):
 gh secret set AUTODEPLOY_RELEASE_SIGNING_KEY --env release --repo Nani-Boddeti/autoDeploy < ~/autodeploy-release-key
-# 3. Commit the PUBLIC key: replace the PLACEHOLDER line in deploy/host/release-signing/allowed_signers with
+# 3. Commit the PUBLIC key: replace the PLACEHOLDER line in deploy/host/release-signing/allowed_signers AND the
+#    identical line in the block embedded in deploy/host/install.sh (CI fails on any difference) with
 printf 'release@autodeploy namespaces="autodeploy-release" %s\n' "$(cut -d' ' -f1,2 ~/autodeploy-release-key.pub)"
 # 4. Fingerprint to publish (README / release notes / your site):
 ssh-keygen -lf ~/autodeploy-release-key.pub
@@ -60,6 +61,11 @@ The workflow fails closed: no secret, a placeholder `allowed_signers`, or a secr
 the committed public key means no release. A dry run never reads the secret.
 
 ## Cut a release
+
+`deploy/host/install.sh` carries its own version as the line `AUTODEPLOY_VERSION="vX.Y.Z"` (committed as
+`v0.0.0-dev`, which installs refuse). Before tagging, commit that line with the exact tag value, with the real
+public key already in `allowed_signers` and the installer's embedded key block. The `build` job fails when the
+constant differs from the pushed tag, or when the tag contains `-dev`.
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0   # build, then the `release` environment waits for your approval
