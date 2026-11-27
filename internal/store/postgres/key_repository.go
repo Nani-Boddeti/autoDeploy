@@ -86,7 +86,7 @@ func (r *KeyRepository) InitializeActiveLedger(ctx context.Context, kekID, gener
 		return ErrKeyLedgerContinuity
 	}
 	var referenced bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM secret_versions WHERE kek_id=$1)`, kekID).Scan(&referenced); err != nil || referenced {
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM secret_versions WHERE kek_id=$1) OR EXISTS(SELECT 1 FROM github_manifest_apps WHERE private_key_kek_id=$1 OR webhook_secret_kek_id=$1)`, kekID).Scan(&referenced); err != nil || referenced {
 		return ErrKeyLedgerContinuity
 	}
 	command, err := tx.Exec(ctx, `INSERT INTO secret_wrap_invocations(kek_id,reserved_invocations,database_generation_id) VALUES($1,0,$2) ON CONFLICT DO NOTHING`, kekID, generationID)

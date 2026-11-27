@@ -267,8 +267,9 @@ func (r *SecretRepository) CountVersionsByKEK(ctx context.Context, kekID string)
 	}
 	var count int64
 	// Revoked historical references intentionally remain counted: key removal
-	// stays blocked until the explicit retention/cleanup policy permits it.
-	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM secret_versions WHERE kek_id=$1`, kekID).Scan(&count); err != nil {
+	// stays blocked until the explicit retention/cleanup policy permits it. The
+	// manifest-created GitHub App's envelopes (immutable, no rewrap) also pin a KEK.
+	if err := r.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM secret_versions WHERE kek_id=$1) + (SELECT count(*) FROM github_manifest_apps WHERE private_key_kek_id=$1 OR webhook_secret_kek_id=$1)`, kekID).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count secret key references: %w", err)
 	}
 	return count, nil

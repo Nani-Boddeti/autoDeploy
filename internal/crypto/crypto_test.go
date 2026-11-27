@@ -220,3 +220,55 @@ func TestDecryptMalformedKEKIsInvalidKeyNotUnknown(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func controlPlaneScope() Scope {
+	return Scope{OwnerID: "owner", ProjectID: "system", EnvironmentID: "system", VariableID: "github-app-private-key", SecretVersionID: "registration-1", Purpose: "control_plane", DeliveryScope: "control_plane"}
+}
+
+func TestControlPlaneScopeRoundTripAndBinding(t *testing.T) {
+	plain := []byte("pem-bytes")
+	envelope, err := Encrypt(testRing(), &testReservation{}, controlPlaneScope(), plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decrypt(testRing(), controlPlaneScope(), envelope)
+	if err != nil || !bytes.Equal(got, plain) {
+		t.Fatalf("round trip: %q, %v", got, err)
+	}
+	for name, mutate := range map[string]func(*Scope){
+		"variable":       func(s *Scope) { s.VariableID = "github-webhook-secret" },
+		"secret version": func(s *Scope) { s.SecretVersionID = "registration-2" },
+		"owner":          func(s *Scope) { s.OwnerID = "other" },
+	} {
+		scope := controlPlaneScope()
+		mutate(&scope)
+		if _, err := Decrypt(testRing(), scope, envelope); !errors.Is(err, ErrCryptographicFail) {
+			t.Fatalf("%s substitution: err=%v, want cryptographic failure", name, err)
+		}
+	}
+}
+
+func TestControlPlaneScopeRejectsMixedPairs(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"control_plane", "build"}, {"control_plane", "runtime"},
+		{"build", "control_plane"}, {"runtime", "control_plane"}, {"provider", "control_plane"},
+	} {
+		scope := controlPlaneScope()
+		scope.Purpose, scope.DeliveryScope = pair[0], pair[1]
+		if _, err := Encrypt(testRing(), &testReservation{}, scope, []byte("x")); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("%v accepted: %v", pair, err)
+		}
+	}
+}
+
+func TestControlPlaneAADDomainDiffersFromProjectScopes(t *testing.T) {
+	envelope, err := Encrypt(testRing(), &testReservation{}, controlPlaneScope(), []byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := controlPlaneScope()
+	other.Purpose, other.DeliveryScope = "runtime", "runtime"
+	if _, err := Decrypt(testRing(), other, envelope); !errors.Is(err, ErrCryptographicFail) {
+		t.Fatalf("control_plane envelope opened as runtime scope: %v", err)
+	}
+}

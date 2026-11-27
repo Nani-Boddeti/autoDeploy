@@ -207,6 +207,11 @@ func validScope(scope Scope) bool {
 			return false
 		}
 	}
+	// The control_plane pair is reserved for the control plane's own secrets (for
+	// example the GitHub App key); it must never mix with project purposes.
+	if scope.Purpose == "control_plane" || scope.DeliveryScope == "control_plane" {
+		return scope.Purpose == "control_plane" && scope.DeliveryScope == "control_plane"
+	}
 	return (scope.Purpose == "build" || scope.Purpose == "runtime" || scope.Purpose == "provider") && (scope.DeliveryScope == "build" || scope.DeliveryScope == "runtime")
 }
 
