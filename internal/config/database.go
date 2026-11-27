@@ -146,6 +146,34 @@ func GitHubAppSignerFromMountedKey(c GitHubAppConfig) (*githubapp.Signer, error)
 	return signer, nil
 }
 
+// GitHubWebhookSecretRingFromBytes builds the single-version webhook ring for
+// an App whose secret was loaded from the database. It applies the same
+// minimum length as the mounted-file loader and copies secret, so the caller
+// may (and should) clear its own buffer afterwards. There are no retained
+// versions: the database App has exactly one secret.
+func GitHubWebhookSecretRingFromBytes(secret []byte) (githubhttp.SecretRing, error) {
+	// The 1 KiB cap is new; the file loader's exact rules are intentionally not
+	// mirrored beyond the 32-byte minimum (GitHub-issued secrets differ).
+	if len(secret) < 32 || len(secret) > 1024 {
+		return githubhttp.SecretRing{}, ErrInvalidEnvironment
+	}
+	return githubhttp.SecretRing{ActiveVersion: "1", Active: append([]byte(nil), secret...), Retained: map[string][]byte{}}, nil
+}
+
+// GitHubAppSignerFromPEM builds the App signer from PEM bytes using the same
+// parser as the mounted-file loader (credential.ParseRSAPrivateKeyPEM). It never retains or clears pemBytes; the caller owns that buffer.
+func GitHubAppSignerFromPEM(clientID string, pemBytes []byte) (*githubapp.Signer, error) {
+	key, err := credential.ParseRSAPrivateKeyPEM(pemBytes)
+	if err != nil {
+		return nil, ErrInvalidEnvironment
+	}
+	signer, err := githubapp.NewSigner(key, clientID, nil, nil)
+	if err != nil {
+		return nil, ErrInvalidEnvironment
+	}
+	return signer, nil
+}
+
 // GitHubAppConfigFromEnvironment is opt-in, preserving existing installations.
 func GitHubAppConfigFromEnvironment() (GitHubAppConfig, error) {
 	raw := os.Getenv(GitHubAppEnabledEnv)

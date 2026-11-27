@@ -4,7 +4,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -93,6 +92,9 @@ func controlPlanePoolConfig(dsn string) (*pgxpool.Config, error) {
 
 func main() {
 	if err := run(context.Background()); err != nil {
+		if code := exitCodeFor(err); code == restartExitCode {
+			os.Exit(code)
+		}
 		logger := controlplaneLogger(os.Stderr, nil)
 		// Only the source line of the failing startup step is logged: error
 		// text can carry configuration values (e.g. a database URL).
@@ -215,6 +217,22 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return failAt(err)
 	}
+	restart := newRestartHook(restartDelay, processLogger)
+	manifestRepository := postgres.NewGitHubManifestRepository(pool)
+	// Source precedence: env App > database (manifest-created) App > none.
+	githubSource, dbAppIgnored, err := resolveGitHubSource(startupCtx, manifestRepository, githubConfig.Enabled, loadKEKProvider, processLogger)
+	if err != nil {
+		return failAt(err)
+	}
+	webOptions.GitHubAppSource, webOptions.GitHubDBAppIgnored = githubSource, dbAppIgnored
+	if githubSource == gitHubSourceNone {
+		// Creation is only offered when no App exists. The KEK ring is loaded
+		// per call, never held resident (see secretMaterializerFactory).
+		webOptions.GitHubManifestStore = manifestRepository
+		webOptions.GitHubKEKProvider = loadKEKProvider
+		webOptions.GitHubManifestConverter = githubapp.NewManifestClient()
+		webOptions.RequestRestart = restart.Request
+	}
 	var webhookHandler http.Handler
 	// checkoutStore and checkoutService back the agent-facing checkout routes
 	// (Step 3c part 2). Both are only ever non-nil when the GitHub App
@@ -225,42 +243,38 @@ func run(ctx context.Context) error {
 	// installation-token minting is reachable through checkoutService.
 	var checkoutStore agenthttp.CheckoutReservationStore
 	var checkoutService *githubapp.CheckoutService
-	if githubConfig.Enabled {
-		webhookSecrets, webhookErr := config.GitHubWebhookSecretRingFromEnvironment()
-		if webhookErr != nil {
-			return failAt(errors.New("GitHub setup unavailable"))
+	if githubSource != gitHubSourceNone {
+		var wiring githubAppWiring
+		switch githubSource {
+		case gitHubSourceEnv:
+			webhookSecrets, webhookErr := config.GitHubWebhookSecretRingFromEnvironment()
+			if webhookErr != nil {
+				return failAt(errGitHubSetupUnavailable)
+			}
+			signer, signerErr := config.GitHubAppSignerFromMountedKey(githubConfig)
+			if signerErr != nil {
+				clearWebhookSecrets(&webhookSecrets)
+				return failAt(errGitHubSetupUnavailable)
+			}
+			wiring = githubAppWiring{
+				identity:        githubapp.AppIdentity{AppID: githubConfig.AppID, ClientID: githubConfig.ClientID, Slug: githubConfig.Slug},
+				owner:           githubapp.Owner{AccountID: githubConfig.OwnerAccountID, Type: githubConfig.OwnerType},
+				installationURL: githubConfig.InstallationURL,
+				signer:          signer,
+				webhookRing:     webhookSecrets,
+			}
+		case gitHubSourceDatabase:
+			var loadErr error
+			if wiring, loadErr = loadDatabaseGitHubApp(startupCtx, manifestRepository, loadKEKProvider); loadErr != nil {
+				return failAt(loadErr)
+			}
 		}
-		defer clearWebhookSecrets(&webhookSecrets)
-		signer, signerErr := config.GitHubAppSignerFromMountedKey(githubConfig)
-		if signerErr != nil {
-			return failAt(errors.New("GitHub setup unavailable"))
+		defer clearWebhookSecrets(&wiring.webhookRing)
+		services, wireErr := wireGitHubApp(ctx, pool, webConfig.TrustedProxyCIDRs, &webOptions, wiring)
+		if wireErr != nil {
+			return failAt(wireErr)
 		}
-		provider, providerErr := githubapp.NewHTTPProvider(signer, "autodeploy-controlplane")
-		if providerErr != nil {
-			return failAt(errors.New("GitHub setup unavailable"))
-		}
-		identity := githubapp.AppIdentity{AppID: githubConfig.AppID, ClientID: githubConfig.ClientID, Slug: githubConfig.Slug}
-		owner := githubapp.Owner{AccountID: githubConfig.OwnerAccountID, Type: githubConfig.OwnerType}
-		githubRepository := postgres.NewGitHubRepository(pool)
-		if registerErr := githubRepository.EnsureAppRegistration(ctx, identity, owner); registerErr != nil {
-			return failAt(errors.New("GitHub setup unavailable"))
-		}
-		setup, setupErr := githubapp.NewSetupService(githubRepository, provider, identity, owner, rand.Reader)
-		if setupErr != nil {
-			return failAt(errors.New("GitHub setup unavailable"))
-		}
-		webOptions.GitHubSetup, webOptions.GitHubInstallationURL = setup, githubConfig.InstallationURL
-		webOptions.RepositoryLister = githubRepository
-		webhookRepository := postgres.NewWebhookJobRepository(pool, postgres.NewDeploymentRepository(pool))
-		// Manual deploy (step 19d) needs the GitHub App provider to resolve and
-		// verify commits, so it is only wired when the subsystem is enabled.
-		webOptions.ManualDeploy, webOptions.CommitResolver = webhookRepository, provider
-		webhookHandler = githubhttp.Handler{Secrets: webhookSecrets, TrustedProxyCIDRs: webConfig.TrustedProxyCIDRs, Processor: postgres.NewWebhookProcessor(webhookRepository)}
-		checkoutService, err = githubapp.NewCheckoutService(githubRepository, provider)
-		if err != nil {
-			return failAt(errors.New("GitHub setup unavailable"))
-		}
-		checkoutStore = githubRepository
+		webhookHandler, checkoutStore, checkoutService = services.webhookHandler, services.checkoutStore, services.checkoutService
 	}
 	// serverRepository and leaseRepository back the session/CSRF-protected
 	// web /servers and /environments/resolve admin routes (Step 6b);
@@ -429,6 +443,7 @@ func run(ctx context.Context) error {
 		}
 	}()
 
+	restarting := false
 	stopped := make(chan os.Signal, 1)
 	signal.Notify(stopped, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(stopped)
@@ -440,6 +455,8 @@ func run(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 	case <-stopped:
+	case <-restart.Requested():
+		restarting = true
 	}
 	shutdownContext, cancel := newShutdownContext()
 	defer cancel()
@@ -455,6 +472,11 @@ func run(ctx context.Context) error {
 		}
 	}
 	stopRetention(shutdownContext)
+	if restarting {
+		// Exit non-zero after the same graceful shutdown so systemd's
+		// Restart=on-failure starts the unit again with the new App.
+		return errors.Join(shutdownErr, errRestartRequested)
+	}
 	if shutdownErr != nil {
 		return shutdownErr
 	}

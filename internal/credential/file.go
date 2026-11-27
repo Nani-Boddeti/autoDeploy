@@ -5,8 +5,6 @@ package credential
 
 import (
 	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/url"
@@ -75,29 +73,7 @@ func LoadRSAPrivateKey(path, workspaceRoot string, expectedUID int) (*rsa.Privat
 		return nil, ErrInvalidCredentialFile
 	}
 	defer clear(contents)
-	block, rest := pem.Decode(contents)
-	if block == nil || len(rest) != 0 || block.Headers["Proc-Type"] != "" || block.Headers["DEK-Info"] != "" {
-		return nil, ErrInvalidCredentialFile
-	}
-	var key *rsa.PrivateKey
-	switch block.Type {
-	case "RSA PRIVATE KEY":
-		key, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-	case "PRIVATE KEY":
-		var parsed any
-		parsed, err = x509.ParsePKCS8PrivateKey(block.Bytes)
-		if rsaKey, ok := parsed.(*rsa.PrivateKey); ok {
-			key = rsaKey
-		} else if err == nil {
-			err = errors.New("non-RSA private key")
-		}
-	default:
-		err = errors.New("unsupported private key encoding")
-	}
-	if err != nil || key == nil || key.N.BitLen() < 2048 || key.Validate() != nil {
-		return nil, ErrInvalidCredentialFile
-	}
-	return key, nil
+	return ParseRSAPrivateKeyPEM(contents)
 }
 
 func loadCredential(path, workspaceRoot string, expectedUID, limit int) ([]byte, error) {
