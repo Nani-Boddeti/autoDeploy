@@ -3,6 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -107,6 +108,22 @@ func structureFixtures() map[string]structureFixture {
 		}
 		return b.String()
 	}
+	createPage := func(t *testing.T, tpl *template.Template, view any) string {
+		var b bytes.Buffer
+		if err := tpl.Execute(&b, view); err != nil {
+			t.Fatal(err)
+		}
+		return b.String()
+	}
+	createHandoff := func(t *testing.T) string {
+		return createPage(t, githubCreateTemplate, githubCreateView{Nav: flowNav(t), Action: "https://github.com/settings/apps/new?state=s", Manifest: "{}"})
+	}
+	createContinue := func(t *testing.T) string {
+		return createPage(t, githubCreateContinueTemplate, githubContinueView{Nav: flowNav(t)})
+	}
+	createComplete := func(t *testing.T) string {
+		return createPage(t, githubCreateCompleteTemplate, githubCompleteView{Nav: flowNav(t), CSRF: "c"})
+	}
 	detail := func(populated bool) func(t *testing.T) string {
 		return func(t *testing.T) string {
 			h, ops, p := operationsHandler(t)
@@ -190,10 +207,13 @@ func structureFixtures() map[string]structureFixture {
 				return pageGet(t, h, p, "/reconciliation")
 			},
 		},
-		"/deployments/detail":    {empty: detail(false), populated: detail(true)},
-		"/servers/enrollment":    {empty: enrollment("", "", time.Time{}), populated: enrollment("srv_1", "tok-1", time.Date(2026, 8, 10, 0, 30, 0, 0, time.UTC))},
-		"/github/setup/callback": {empty: continuePage, populated: continuePage},
-		"/github/setup/complete": {empty: completePage, populated: completePage},
+		"/deployments/detail":     {empty: detail(false), populated: detail(true)},
+		"/servers/enrollment":     {empty: enrollment("", "", time.Time{}), populated: enrollment("srv_1", "tok-1", time.Date(2026, 8, 10, 0, 30, 0, 0, time.UTC))},
+		"/github/create":          {empty: createHandoff, populated: createHandoff},
+		"/github/create/callback": {empty: createContinue, populated: createContinue},
+		"/github/create/complete": {empty: createComplete, populated: createComplete},
+		"/github/setup/callback":  {empty: continuePage, populated: continuePage},
+		"/github/setup/complete":  {empty: completePage, populated: completePage},
 	}
 }
 

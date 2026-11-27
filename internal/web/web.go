@@ -22,6 +22,7 @@ import (
 
 	"autodeploy/internal/auth"
 	"autodeploy/internal/buildsecret"
+	secretcrypto "autodeploy/internal/crypto"
 	"autodeploy/internal/github"
 	"autodeploy/internal/githubapp"
 	"autodeploy/internal/healthgate"
@@ -101,7 +102,44 @@ type RouteHeadAdmin interface {
 	AssignRouteHostname(context.Context, auth.Principal, string, string, *int64) (postgres.RouteHead, error)
 }
 
+// GitHub App sources reported in Config.GitHubAppSource.
+const (
+	GitHubAppSourceNone     = "none"
+	GitHubAppSourceEnv      = "env"
+	GitHubAppSourceDatabase = "database"
+)
+
+// GitHubManifestStore is the manifest-flow persistence surface (implemented by
+// *postgres.GitHubManifestRepository). It is wired only when no App exists.
+type GitHubManifestStore interface {
+	CreateManifestState(ctx context.Context, digest [32]byte, principal auth.Principal, ttl time.Duration) error
+	ConsumeManifestStateForCreate(ctx context.Context, digest [32]byte, principal auth.Principal) error
+	InsertRegistration(ctx context.Context, in postgres.ManifestRegistrationInput, provider secretcrypto.KeyProvider) (postgres.ManifestRegistration, error)
+	// PriorAppRegistered reports an App id recorded by an earlier (env) App;
+	// creating a new App is then refused.
+	PriorAppRegistered(ctx context.Context) (bool, error)
+}
+
+// GitHubManifestConverter exchanges a manifest code for the created App
+// (implemented by *githubapp.ManifestClient).
+type GitHubManifestConverter interface {
+	ConvertManifestCode(ctx context.Context, code string) (githubapp.ManifestConversion, error)
+}
+
 type Config struct {
+	// GitHubAppSource is "none", "env" or "database" (GitHubAppSource*). Empty
+	// means "none". GitHubDBAppIgnored is true when the environment App wins
+	// while a database App also exists.
+	GitHubAppSource    string
+	GitHubDBAppIgnored bool
+	// GitHubManifestStore, GitHubKEKProvider, GitHubManifestConverter and
+	// RequestRestart are set only when GitHubAppSource is "none". The KEK
+	// provider loads the ring per call (no resident KEK). RequestRestart
+	// schedules one graceful process restart; safe to call repeatedly.
+	GitHubManifestStore     GitHubManifestStore
+	GitHubKEKProvider       func() (secretcrypto.KeyProvider, error)
+	GitHubManifestConverter GitHubManifestConverter
+	RequestRestart          func()
 	// ActivationEnabled hides the "activation disabled" notice when true.
 	ActivationEnabled bool
 	PublicOrigin      string
@@ -142,6 +180,9 @@ type Config struct {
 type Handler struct {
 	repository Repository
 	config     Config
+	// createBudget bounds GitHub App creation consume, convert and insert;
+	// zero means createCompleteDeadline (tests shorten it).
+	createBudget time.Duration
 
 	// Lazily adopted durable password policy (see passwordPolicy).
 	setupSlots    chan struct{}
@@ -216,7 +257,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		serveStatic(w, r, asset)
 		return
 	}
-	if r.URL.RawQuery != "" && !(r.Method == http.MethodGet && r.URL.Path == "/login" && r.URL.RawQuery == loginSetupDoneQuery) && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" && r.URL.Path != "/deployments/logs/stream" {
+	if r.URL.RawQuery != "" && !(r.Method == http.MethodGet && r.URL.Path == "/login" && r.URL.RawQuery == loginSetupDoneQuery) && r.URL.Path != "/github/setup/callback" && r.URL.Path != "/github/create/callback" && r.URL.Path != "/environments/config" && r.URL.Path != "/environments/route" && r.URL.Path != "/deployments" && r.URL.Path != "/deployments/detail" && r.URL.Path != "/deployments/logs" && r.URL.Path != "/deployments/logs/stream" {
 		http.NotFound(w, r)
 		return
 	}
@@ -227,6 +268,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.githubCallback(w, r)
+	case "/github/create":
+		if r.URL.RawQuery != "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.githubCreate(w, r)
+	case "/github/create/callback":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.githubCreateCallback(w, r)
+	case "/github/create/complete":
+		if r.URL.RawQuery != "" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method == http.MethodGet {
+			h.githubCreateCompleteGet(w, r)
+		} else if r.Method == http.MethodPost {
+			h.githubCreateCompletePost(w, r)
+		} else {
+			methodNotAllowed(w, http.MethodGet, http.MethodPost)
+		}
 	case "/github/setup/complete":
 		if r.URL.RawQuery != "" {
 			http.NotFound(w, r)
@@ -2103,9 +2172,15 @@ func (h *Handler) newID() (string, error) {
 	}
 	return "w1_" + base64.RawURLEncoding.EncodeToString(value), nil
 }
+
+// contentSecurityPolicy is the one CSP every response carries; formAction is
+// 'self' everywhere except the GitHub App manifest hand-off page (github_create.go).
+func contentSecurityPolicy(formAction string) string {
+	return "default-src 'none'; base-uri 'none'; form-action " + formAction + "; frame-ancestors 'none'; style-src 'self'; script-src 'self'; connect-src 'self'"
+}
 func (h *Handler) securityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'self'; script-src 'self'; connect-src 'self'")
+	w.Header().Set("Content-Security-Policy", contentSecurityPolicy("'self'"))
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "same-origin")

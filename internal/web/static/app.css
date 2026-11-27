@@ -514,3 +514,7 @@ ul.next { display: flex; flex-wrap: wrap; gap: var(--space-xs) var(--space-lg); 
 .steps li::before { content: counter(step) ". "; font-variant-numeric: tabular-nums; }
 .steps li.done { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-line); }
 .steps li[aria-current="step"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent-line); }
+
+/* GitHub App creation: account type choice. */
+fieldset.choice { display: flex; flex-wrap: wrap; gap: var(--space-xs) var(--space-md); min-width: 0; margin: 0; padding: 0; border: 0; }
+fieldset.choice legend { padding: 0; margin-bottom: var(--space-2xs); color: var(--soft); font-size: 0.9rem; font-weight: 500; }

@@ -1,0 +1,4 @@
+{{template "head" "Finish GitHub App setup"}}{{template "nav" .Nav}}<main><h1>Finish GitHub App setup</h1>
+{{template "createsteps" 1}}
+<form method="post" action="/github/create/complete"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Finish setup</button></form>
+<p class="hint">AutoDeploy restarts for a few seconds to load the App.</p></main>{{template "foot"}}

@@ -1,0 +1,5 @@
+{{template "head" "Continue to GitHub"}}{{template "nav" .Nav}}<main><h1>Continue to GitHub</h1>
+{{template "createsteps" 0}}
+<p>GitHub will show the App settings and ask you to confirm before it creates the App.</p>
+<form method="post" action="{{.Action}}"><input type="hidden" name="manifest" value="{{.Manifest}}"><button type="submit">Continue to GitHub</button></form>
+<p class="hint"><a href="/github">Cancel</a></p></main>{{template "foot"}}

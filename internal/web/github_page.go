@@ -31,6 +31,16 @@ type githubView struct {
 	HasBindings         bool
 	BindingsUnavailable bool
 	Bindings            []githubBindingRow
+
+	// CreateMode shows only the "Create GitHub App" form (no App exists).
+	CreateMode bool
+	// CreateBlocked replaces the form with CreateBlockedText (prior App, or the check failed).
+	CreateBlocked                  bool
+	CreateBlockedText              string
+	CreateError                    string
+	AccountType, OrgLogin, AppName string
+	// DBAppIgnored notes an App stored from the browser that the env App overrides.
+	DBAppIgnored bool
 }
 
 // githubPage renders the install, refresh and bind forms plus the bindings
@@ -47,7 +57,20 @@ func (h *Handler) githubPage(w http.ResponseWriter, r *http.Request) {
 		plain(w, http.StatusServiceUnavailable, "unavailable\n")
 		return
 	}
-	view := githubView{Nav: h.navFor(r.Context(), "github", principal), CSRF: csrf, ShowBind: h.config.GitHubSetup != nil}
+	if h.manifestEnabled() {
+		prior, err := h.config.GitHubManifestStore.PriorAppRegistered(r.Context())
+		switch {
+		case err != nil:
+			h.logger().Error("github app create: prior app check failed", "category", "prior_app_check")
+			h.githubCreateForm(w, r, principal, http.StatusServiceUnavailable, githubView{CreateBlocked: true, CreateBlockedText: msgCreateCheckFailed})
+		case prior:
+			h.githubCreateForm(w, r, principal, http.StatusOK, githubView{CreateBlocked: true, CreateBlockedText: msgCreatePriorApp})
+		default:
+			h.githubCreateForm(w, r, principal, http.StatusOK, githubView{})
+		}
+		return
+	}
+	view := githubView{DBAppIgnored: h.config.GitHubAppSource == GitHubAppSourceEnv && h.config.GitHubDBAppIgnored, Nav: h.navFor(r.Context(), "github", principal), CSRF: csrf, ShowBind: h.config.GitHubSetup != nil}
 	if view.ShowBind {
 		facts := h.loadSetupFacts(r.Context(), principal)
 		view.Repositories = facts.repos

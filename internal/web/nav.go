@@ -83,6 +83,9 @@ var navRoutes = []navRoute{
 	{"/reconciliation", "GET", routeNav},
 	{"/deployments/detail", "GET", routeDetail},
 	{"/servers/enrollment", "POST", routeFlow},
+	{"/github/create", "POST", routeFlow},
+	{"/github/create/callback", "GET", routeFlow},
+	{"/github/create/complete", "GET", routeFlow},
 	{"/github/setup/callback", "GET", routeFlow},
 	{"/github/setup/complete", "GET", routeFlow},
 }

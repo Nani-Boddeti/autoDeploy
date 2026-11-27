@@ -1,0 +1,4 @@
+{{template "headtop"}}{{if .Refresh}}<meta http-equiv="refresh" content="10;url=/github">{{end}}<title>{{.Title}}</title></head><body>{{template "nav" .Nav}}<main><h1>{{.Heading}}</h1>
+{{template "createsteps" .Step}}
+{{if .IsError}}<p class="notice" role="alert">{{.Body}}</p>{{else}}<p>{{.Body}}</p>{{end}}{{if .Note}}<p class="hint">{{.Note}}</p>{{end}}
+<ul>{{range .Links}}<li><a href="{{.Href}}">{{.Text}}</a></li>{{end}}</ul></main>{{template "foot"}}
