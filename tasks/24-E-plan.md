@@ -1,6 +1,6 @@
 # 24-E GitHub App manifest flow — detailed plan
 
-Date: 2026-11-27. Status: APPROVED 2026-11-27 (owner: no changes outside the GitHub setup scope). Parent: tasks/24-plan.md (24-E). Amends ADR 0002.
+Date: 2026-11-27. Status: DONE 2026-11-27, pushed (owner approved; no changes outside the GitHub setup scope). Parent: tasks/24-plan.md (24-E). Amends ADR 0002.
 
 ## Owner decision (2026-11-27)
 - **E-D1 storage = DB + self-restart** (replaces the spool + root `.path` design in 24-plan.md). Reason: the control plane unit writes nothing to disk (`ProtectSystem=strict`, no `ReadWritePaths`); a root oneshot parsing CP-written files would be a new privilege boundary. Chosen: CP stores the App PEM + webhook secret KEK-encrypted in Postgres, exits with a dedicated code, systemd (`Restart=on-failure`) restarts it, startup loads the App from the DB.
@@ -76,3 +76,4 @@ Date: 2026-11-27. Status: APPROVED 2026-11-27 (owner: no changes outside the Git
 - 2026-11-27 orchestrator finding: EnsureAppRegistration refuses a different App id in the 000005 singleton. If that row exists while source is none (env file removed later), creating an App via the manifest → every startup fails. Fix (E1 follow-up): refuse create/consume/insert while github_app_registrations has a row (ErrManifestPriorAppRegistered); E4 then shows "an App was configured here before; use the break-glass procedure" and hides the create form. Recovery docs must cover the 000005 row (+ its FK dependents), not only github_manifest_apps.
 - E5 DONE 2026-11-27 (uncommitted): install.sh hint, enable-github.sh header (break-glass + precedence), vps-install.md "Connect GitHub" + Break-glass + Wrong-App recovery (also deletes the 000005 row; blocked by webhook_deliveries FK RESTRICT once any delivery exists → open follow-up), backup-restore.md KEK note, ADR 0002 amendment, status docs. Prior-App guard done in store + web (ErrManifestPriorAppRegistered, /github notice). Final mac sweep running.
 - Follow-ups (not in 24-E): App rewrap for KEK rotation; supported recovery for a wrong App after webhook deliveries exist; `secrets secret verify` coverage of App envelopes.
+- 2026-11-27 PUSHED: 7af6284 E1, 791b65c E2, f991389 E4, 02871b1 E3, da2bb3c E5 (E4 before E3 so each commit builds; each intermediate built + vetted). Final mac sweep: gofmt, vet linux/darwin, unit, race, integration (fresh DB ad_final), host harness all green; windows vet failure is pre-existing (24-D admincli).
