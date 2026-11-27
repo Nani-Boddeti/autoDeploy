@@ -3,7 +3,7 @@
 **Status: pre-release.** Everything below was built and tested locally only (unit tests, a PostgreSQL integration
 suite and an Ubuntu 24.04 container harness). Nothing has been run on a real VPS yet, no signed release exists
 yet (the owner still has to complete the release setup in `docs/operations/releases.md`), and one-click GitHub App
-creation (plan 24-E) is not built. Until the first signed release is published, the Quick install cannot work:
+creation (plan 24-E) has never run against real GitHub. Until the first signed release is published, the Quick install cannot work:
 use the manual install in the Appendix.
 
 Contents: [What you need](#what-you-need) · [Quick install](#quick-install) · [First login](#first-login) ·
@@ -97,9 +97,72 @@ installed version `/etc/autodeploy/installed-version`; the verified kit scripts 
 
 ## Connect GitHub
 
-**Coming (plan 24-E, not built yet): one-click "Create GitHub App" in the browser will replace this step.** Until
-it ships, creating the App is manual and uses the break-glass script `enable-github.sh`. Do not expect a "Create
-GitHub App" button today.
+After the install and the browser `/setup`, create the GitHub App from the control plane (plan 24-E, never run
+against real GitHub yet):
+
+1. Open `https://<your domain>/github` and press **Create GitHub App**. Choose a personal account or an
+   organization (give the org login) and a name (at most 34 characters, unique on GitHub).
+2. GitHub shows its confirm page. Confirm, then you return to AutoDeploy. Press **Continue**, then confirm.
+3. AutoDeploy shows "restarting". The control plane restarts itself once (about 10 seconds; it exits with code 75
+   and systemd `Restart=on-failure` starts it again). Then `/github` shows **Install**: install the App on your
+   repositories and bind a repository with the **Bind a repository** form, as before. Push to deploy. (Release
+   builds ship with the deployment gates off until the VPS round, so deploys do not run yet.)
+
+The App is created private with the webhook `https://<your domain>/webhooks/github` (active), the `push` event,
+Contents read and Metadata read permissions, and the setup URL `https://<your domain>/github/setup/callback`.
+You do not set anything on github.com by hand.
+
+**Where it is stored.** The App private key and webhook secret are stored in PostgreSQL, encrypted with the KEK
+(`control_plane` scope). The client secret GitHub returns is not stored. Database backups therefore contain the
+App (encrypted); a restore needs the KEK files too (`backup-restore.md`, sections 1 and 3). One App only; the
+stored App cannot be edited or replaced from the UI.
+
+**Precedence.** If the host file `/etc/autodeploy/controlplane-github.env` enables an App (`enable-github.sh`),
+it wins and a browser-created App is ignored; `/github` shows a note when that happens.
+
+**LAN mode.** Creation works, but GitHub cannot deliver webhooks to a private address (existing limitation).
+
+**Reverse proxy.** `/github/create/callback` carries a single-use `code` and `state` in the query string. Do not
+log query strings for that path in any proxy in front of AutoDeploy.
+
+**If something goes wrong**
+- "expired" or "already used" link: start again from `/github`.
+- "wait 2 minutes": another attempt is in flight or just failed; wait, then start again.
+- "rate limited": GitHub throttled the request; try again later.
+- "GitHub may have created the App": open github.com/settings/apps (or the organization's) and delete that App,
+  then start again.
+
+**Wrong App created, or you want a different one.** The stored App is immutable by design, so removing it is an
+operator action. Stop and think first: this discards the App's installations on AutoDeploy. As the database
+owner role (not `autodeploy_app`; the same access `backup-restore.md` uses), with the control plane stopped
+(`systemctl stop autodeploy-controlplane`):
+
+    docker exec -i autodeploy-postgres psql -U autodeploy -d autodeploy -X -v ON_ERROR_STOP=1 <<'SQL'
+    BEGIN;
+    ALTER TABLE github_manifest_apps DISABLE TRIGGER github_manifest_apps_no_delete;
+    DELETE FROM github_manifest_apps;
+    ALTER TABLE github_manifest_apps ENABLE TRIGGER github_manifest_apps_no_delete;
+    DELETE FROM github_app_registrations;
+    COMMIT;
+    SQL
+
+Then delete the App on GitHub and `systemctl start autodeploy-controlplane`. The second `DELETE` is needed once
+the old App was loaded at least once: the control plane records the App id in `github_app_registrations`
+(migration 000005) and refuses to start the GitHub subsystem with a different App id. It fails on a foreign key
+if webhook deliveries reference the old App (`webhook_deliveries.app_registration_id`, migration 000010, `ON DELETE RESTRICT`); in that case the transaction rolls back and
+this recovery is not supported yet (open issue: it needs a reviewed procedure for jobs of a removed App). Installation and binding rows of the
+old App are not cleaned up by this SQL; rebind after installing the new App.
+
+**Retiring the KEK.** `autodeploy-run secrets secret can-retire --kek <id>` refuses a KEK that wraps the App's
+envelopes. The App cannot be rewrapped yet (follow-up), so retiring that KEK requires recreating the App.
+
+**Unproven until the VPS round:** the manifest permission keys, the real GitHub conversion response, and the
+restart under systemd (VPS checklist step 10 in `tasks/24-plan.md`).
+
+### Break-glass: create the App by hand
+
+Use only if the browser flow is unavailable. `enable-github.sh` stays supported and, when enabled, overrides a
+browser-created App.
 
 1. On github.com create a GitHub App for your account or organization and download its private key (`.pem`) to
    the server. The App needs read access to repository contents and metadata, and the `push` event.
@@ -111,10 +174,8 @@ GitHub App" button today.
    Full description and what it does: `deploy/host/README.md`, section "enable-github.sh". Afterwards `shred -u`
    the `.pem`.
 3. Set the App's webhook URL to `https://<your domain>/webhooks/github` with the secret from
-   `/etc/autodeploy/controlplane/github-webhook-secret-1` and the `push` event. Then in the UI open **GitHub**
-   (`/github`), install the App on your repositories, and bind a repository with the **Bind a repository** form.
-   Push to deploy. (Remember: release builds ship with the deployment gates off until the VPS round, so deploys do
-   not run yet.)
+   `/etc/autodeploy/controlplane/github-webhook-secret-1` and the `push` event. Then open **GitHub** (`/github`),
+   install the App and bind a repository.
 
 ## Add another server
 

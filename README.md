@@ -6,7 +6,7 @@ Implementation is active. The authoritative continuation brief is [docs/IMPLEMEN
 
 ## Quick start
 
-Status: **pre-release.** The one-command installer and the signed release pipeline are built and tested locally only (unit tests, PostgreSQL integration tests, container harness). They are unproven on a real public VPS, and no signed release has been published yet. Browser one-click GitHub App creation (plan 24-E) is not built.
+Status: **pre-release.** The one-command installer and the signed release pipeline are built and tested locally only (unit tests, PostgreSQL integration tests, container harness). They are unproven on a real public VPS, and no signed release has been published yet. Browser one-click GitHub App creation (plan 24-E) is built and tested locally only; it has never run against real GitHub.
 
 What you need: an Ubuntu 24.04 x86_64 VPS (2 vCPU, 2 GB RAM, 40 GB disk) from any provider, a domain with an A record pointing at it, and an email address for certificates.
 

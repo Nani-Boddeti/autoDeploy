@@ -978,8 +978,8 @@ cat <<SUMMARY_EOF
 
   Next steps
     1. Sign in at https://$DOMAIN with the administrator you created in the browser.
-    2. Create the GitHub App. A one-click flow is planned (plan 24-E); until it ships, use the manual
-       break-glass path: sudo $KIT_COPY/enable-github.sh (see its header) after creating the App on github.com.
+    2. Create the GitHub App: open https://$DOMAIN/github and press "Create GitHub App". (Break-glass only:
+       sudo $KIT_COPY/enable-github.sh, see its header, after creating the App by hand on github.com.)
     3. Bind a repository to a project and push to deploy.
 SUMMARY_EOF
 if ((SETUP_INCOMPLETE)); then

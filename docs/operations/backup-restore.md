@@ -105,7 +105,11 @@ Then, as an explicit operator responsibility (the repository decides none of thi
    a KEK, `autodeploy-run secrets secret can-retire --kek <id>` must succeed; it checks the live database
    only. **Rule:** while any retained dump is older than the rewrap that moved its versions off `<id>`,
    keep `<id>` (this is ADR 0003: "Retain retiring KEKs until every required database backup is migrated
-   or expires"). Do not run `can-retire` as the decision on its own. Backup retention period and
+   or expires"). A browser-created GitHub App (plan 24-E) keeps its private key and webhook secret in the
+   database, wrapped by a KEK: `can-retire` refuses that KEK, and the App cannot be rewrapped yet, so retiring
+   it means recreating the App (`vps-install.md`, "Connect GitHub"). Restoring a database that holds the App
+   needs the KEK files of set B, or the control plane cannot start its GitHub subsystem.
+   Do not run `can-retire` as the decision on its own. Backup retention period and
    frequency are an **Operator decision** (the ADR leaves them open).
 
 ## 3. Restore procedure (strict order)

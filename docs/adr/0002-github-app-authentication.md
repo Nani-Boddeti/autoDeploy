@@ -298,6 +298,44 @@ Costs:
   rebind in between fails closed (conflict or unauthorized, nothing written).
 - The administrator, not a webhook sender, is the recorded actor.
 
+## Amendment (2026-11-27): GitHub App creation through the manifest flow (plan 24-E)
+
+### Decision
+
+- The default way to create the App is the GitHub manifest flow from the control plane (`/github`, "Create
+  GitHub App"). The manifest requests exactly the registration in "App registration, permissions, and events":
+  private, webhook `/webhooks/github` active, `push`, Contents read, Metadata read, setup URL
+  `/github/setup/callback`. The one-time `code` is exchanged only in a same-site POST with session, CSRF and an
+  unconsumed state bound to that session; the cross-site callback never exchanges.
+- The App private key and webhook secret are stored in PostgreSQL as KEK envelopes (purpose and delivery
+  `control_plane`, scope `system`). The client secret is not stored (no user OAuth). One App per installation,
+  immutable.
+- After creation the control plane exits with code 75 and systemd restarts it; startup loads the App from the
+  database through the same wiring as the env-configured App. A decrypt or parse failure fails startup visibly.
+- Precedence: the host env file (`enable-github.sh`, now break-glass) wins; the database App is used only when the
+  env App is not enabled, and `/github` says when it is ignored.
+
+### Consequences
+
+- Database backups contain the App (encrypted); a restore needs the KEK files. KEK retirement is refused while a
+  KEK wraps the App (`can-retire`); the App is not rewrapped, so retiring it means recreating the App.
+- A wrong App is removed only by an operator, as the database owner role, by disabling the delete trigger
+  (procedure in `docs/operations/vps-install.md`). The stored App is never replaced from the UI.
+- Browser creation is refused while `github_app_registrations` (000005) already records an App (for example an
+  earlier env-configured App), because startup refuses a different App id there; that case uses break-glass.
+- A restart (seconds) drops in-flight requests; it happens once per creation.
+- Manifest permission keys and the real conversion response are unproven until the VPS round.
+
+### Rejected alternatives
+
+- Spool directory plus a root `.path`/oneshot unit that installs files like `enable-github.sh`: the control plane
+  unit writes nothing to disk (`ProtectSystem=strict`), and a root unit parsing control-plane-written files is a
+  new privilege boundary and a new writable path.
+- Hot-wiring the App without a restart: webhook handler, setup service, checkout and repository lister are wired
+  once at startup; the refactor is large and risky for little gain.
+- Keeping manual creation as the default: error-prone (permissions, webhook secret copy). It remains as the
+  documented break-glass path.
+
 ## References
 
 - [About authentication with a GitHub App](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/about-authentication-with-a-github-app)

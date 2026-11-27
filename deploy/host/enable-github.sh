@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# BREAK-GLASS since plan 24-E: the default way to create the GitHub App is the browser flow (/github, "Create
+# GitHub App"; the App is stored encrypted in the database). This script remains for creating the App by hand on
+# github.com. Precedence: when this script's controlplane-github.env enables the App
+# (AUTODEPLOY_GITHUB_APP_ENABLED=true), it WINS and a browser-created App is ignored (/github shows a note).
+#
 # AutoDeploy host kit: enable the GitHub App and the secret (KEK) subsystem on the control
 # plane. Run as root, once, after install-app.sh + create-credentials.sh + migrate, with the
 # GitHub App already created by the owner on github.com.

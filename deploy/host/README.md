@@ -11,7 +11,7 @@ Run as root on the host unless noted. Not every script is in the release kit (th
 | `install-app.sh` | Application stack (control plane, agent, PostgreSQL, Traefik); `--role all\|agent`, `--mode lan\|public`. |
 | `create-credentials.sh` | Database and Traefik credentials (`--traefik-only` on an agent-only host). |
 | `enroll-local.sh` | Enrolls this host's agent automatically once the first administrator exists. |
-| `enable-github.sh` | Manual GitHub App setup (break-glass until the one-click flow, plan 24-E, exists). |
+| `enable-github.sh` | Manual GitHub App setup (break-glass; the default is the browser "Create GitHub App" on `/github`, plan 24-E). It wins over a browser-created App. |
 | `preflight-app.sh` | Read-only checks of a full host. |
 | `preflight-agent.sh` | Read-only checks of an agent-only host (use instead of `preflight-app.sh`). |
 | `preflight-checkout.sh` | Read-only checks of the checkout isolation. |
